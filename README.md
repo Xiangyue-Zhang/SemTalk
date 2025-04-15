@@ -3,7 +3,7 @@
 This is the code for [SemTalk: Holistic Co-speech Motion Generation with Frame-level Semantic Emphasis](https://arxiv.org/abs/2412.16563) by Xiangyue Zhang, et al.
 
 
-![](https://github.com/Xiangyue-Zhang/SemTalk/assets/f1_3.png)
+![](https://xiangyuezhang.com/assets/img/papers/SemTalk/f1_3.png)
 
 
 - [ ] Inference code
