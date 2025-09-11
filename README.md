@@ -12,6 +12,10 @@
 # 📣 Updates
 
 - **[2025.09.11]** 🔥 Release: - [✔] Inference code - [✔] Training code
+- 
+# 💖 Inference Data
+
+If you would like to compare your paper’s results with SemTalk but find it too difficult to run the repository, you can simply download the test `.npz` file from [Google Drive](https://drive.google.com/file/d/1hm812R7QOIoLK9mxbDIKqNGF8xEuRzf9/view?usp=sharing).
 
 # ⚒️ Quick Start
 
