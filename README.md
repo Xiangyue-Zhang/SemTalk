@@ -9,11 +9,6 @@
 
 </div>
 
-<div align="center">
-We will release the codes as soon as possible!
-
-</div>
-
 # 📣 Updates
 
 - **[2025.09.11]** 🔥 Release: - [✔] Inference code - [✔] Training code
