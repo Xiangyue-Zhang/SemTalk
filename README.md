@@ -184,10 +184,11 @@ Thanks to [EMAGE](https://github.com/PantoMatrix/PantoMatrix/tree/main/scripts/E
 If you find our code or paper helps, please consider citing:
 
 ```bibtex
-@article{zhang2024semtalk,
+@inproceedings{zhang2025semtalk,
   title={SemTalk: Holistic Co-speech Motion Generation with Frame-level Semantic Emphasis},
   author={Zhang, Xiangyue and Li, Jianfang and Zhang, Jiaxu and Dang, Ziqiang and Ren, Jianqiang and Bo, Liefeng and Tu, Zhigang},
-  journal={arXiv preprint arXiv:2412.16563},
-  year={2024}
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={13761--13771},
+  year={2025}
 }
 ```
