@@ -840,16 +840,17 @@ class CustomTrainer(train.BaseTrainer):
         tar_exps = loaded_data["tar_exps"].cuda()
         tar_contact = loaded_data["tar_contact"].cuda()
         tar_trans = loaded_data["tar_trans"].cuda()
-        n = frames
-        remain = n%8
-        if remain != 0:
-            tar_pose = tar_pose[:, :n-remain, :]
-            tar_beta = tar_beta[:, :n-remain, :]
-            tar_trans = tar_trans[:, :n-remain, :]
-            tar_exps = tar_exps[:, :n-remain, :]
-            tar_contact = tar_contact[:, :n-remain, :]
-            n = n - remain
+        pos_len = tar_pose.shape[1]
+        remain = pos_len%8
         
+        if remain != 0:
+            tar_pose = tar_pose[:, :pos_len-remain, :]
+            tar_beta = tar_beta[:, :pos_len-remain, :]
+            tar_trans = tar_trans[:, :pos_len-remain, :]
+            tar_exps = tar_exps[:, :pos_len-remain, :]
+            tar_contact = tar_contact[:, :pos_len-remain, :]
+            pos_len = pos_len - remain
+        n = pos_len
         tar_pose_jaw = tar_pose[:, :, 66:69]
         tar_pose_jaw = rc.axis_angle_to_matrix(tar_pose_jaw.reshape(bs, n, 1, 3))
         tar_pose_jaw = rc.matrix_to_rotation_6d(tar_pose_jaw).reshape(bs, n, 1*6)
