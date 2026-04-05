@@ -24,7 +24,7 @@ from .utils.audio_features import Wav2Vec2Model
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
 from .utils import other_tools
-from utils.project_paths import smplx_model_dir
+from utils.project_paths import hubert_dir, smplx_model_dir, vocab_path
 from funasr import AutoModel
 import torch.distributed as dist
 
@@ -177,9 +177,9 @@ class CustomDataset(Dataset):
         if self.args.addHubert:
             from transformers import Wav2Vec2Processor, HubertModel
             print("Loading the Wav2Vec2 Processor...")
-            self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained("./facebook/hubert-large-ls960-ft")
+            self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained(str(hubert_dir()))
             print("Loading the HuBERT Model...")
-            self.hubert_model = HubertModel.from_pretrained("./facebook/hubert-large-ls960-ft")
+            self.hubert_model = HubertModel.from_pretrained(str(hubert_dir()))
             self.hubert_model = self.hubert_model.to(self.args.device)
             if loader_type == "test":
                 self.hubert_model.eval()
@@ -236,7 +236,7 @@ class CustomDataset(Dataset):
             self.max_audio_pre_len = self.args.test_length*self.args.audio_sr
         
         if args.word_rep is not None:
-            with open(f"{args.data_path}weights/vocab.pkl", 'rb') as f:
+            with open(vocab_path(args), 'rb') as f:
                 self.lang_model = pickle.load(f)
                 
         preloaded_dir = self.args.cache_path + loader_type + f"/{args.pose_rep}_cache"      

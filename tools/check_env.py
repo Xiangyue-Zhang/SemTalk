@@ -9,6 +9,14 @@ from pathlib import Path
 import yaml
 
 
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.project_paths import hubert_dir, whisper_dir
+
+
 REQUIRED_PACKAGES = [
     "torch",
     "torchaudio",
@@ -30,7 +38,7 @@ def _status(ok: bool, label: str, detail: str = ""):
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return REPO_ROOT
 
 
 def _load_config(repo_root: Path, config_path: str):
@@ -141,10 +149,8 @@ def main():
     for name in pretrained_vq:
         _exists(weights_dir / "pretrained_vq" / name, f"pretrained VQ `{name}`")
 
-    hubert_dir = repo_root / "facebook" / "hubert-large-ls960-ft"
-    whisper_dir = repo_root / "Systran" / "faster-whisper-large-v3"
-    _exists(hubert_dir, "HuBERT directory")
-    _exists(whisper_dir, "faster-whisper directory")
+    _exists(hubert_dir(), "HuBERT directory")
+    _exists(whisper_dir(), "faster-whisper directory")
 
     if ok:
         print("Environment check passed.")

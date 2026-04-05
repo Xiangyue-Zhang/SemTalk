@@ -39,6 +39,19 @@ def pretrained_vq_path(name: str) -> Path:
     return pretrained_vq_dir() / PRETRAINED_VQ_FILES[name]
 
 
+def hubert_dir() -> Path:
+    return repo_path("facebook", "hubert-large-ls960-ft")
+
+
+def whisper_dir() -> Path:
+    return repo_path("Systran", "faster-whisper-large-v3")
+
+
+def vocab_path(args) -> Path:
+    data_root = resolve_path(getattr(args, "data_path", "./BEAT2/beat_english_v2.0.0/"))
+    return data_root / "weights" / "vocab.pkl"
+
+
 def configure_runtime_env():
     default_cache_root = Path(os.environ.get("SEMTALK_CACHE_ROOT", repo_path(".cache")))
     default_tmp_root = Path(os.environ.get("SEMTALK_TMPDIR", repo_path(".tmp")))
