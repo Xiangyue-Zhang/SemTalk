@@ -27,7 +27,7 @@ def resolve_path(path_like, base: Path | None = None) -> Path:
 
 
 def smplx_model_dir(args) -> Path:
-    base = Path(getattr(args, "data_path_1", "./BEAT2/pretrained/"))
+    base = Path(getattr(args, "data_path_1", "./weights/"))
     return resolve_path(base / "smplx_models")
 
 

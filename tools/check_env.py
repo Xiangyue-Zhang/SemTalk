@@ -112,7 +112,7 @@ def main():
     ok &= _check_packages()
 
     data_path = _join(repo_root, cfg.get("data_path", "./BEAT2/beat_english_v2.0.0/"))
-    data_path_1 = _join(repo_root, cfg.get("data_path_1", "./BEAT2/pretrained/"))
+    data_path_1 = _join(repo_root, cfg.get("data_path_1", "./weights/"))
     weights_dir = repo_root / "weights"
     demo_dir = repo_root / "demo"
 
