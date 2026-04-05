@@ -23,11 +23,6 @@ If you would like to compare your paper’s results with SemTalk but find it too
 
 # ⚡ Quick Start
 
-SemTalk now includes two helper entrypoints:
-
-- `python tools/check_env.py`: check whether your local environment and assets are ready
-- `python tools/run.py ...`: unified commands for dataset generation, training, testing, and inference
-
 The shortest path to a runnable setup is:
 
 ```shell
@@ -36,15 +31,14 @@ conda activate semtalk
 conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
 pip install -r requirements.txt
 pip install -U whisperx
-python tools/check_env.py --config configs/semtalk_sparse.yaml
 ```
 
 If your data and weights are already ready, inference becomes:
 
 ```shell
-python tools/run.py infer \
-  --config configs/semtalk_sparse.yaml \
-  --audio demo/2_scott_0_1_1_test.wav
+python train.py --config configs/semtalk_sparse.yaml \
+  --inference \
+  --audio_infer_path demo/2_scott_0_1_1_test.wav
 ```
 
 # ⚒️ Environment
@@ -64,23 +58,6 @@ pip install -r requirements.txt
 pip install -U whisperx
 sudo apt-get update && sudo apt-get install -y ffmpeg  # if you don't have ffmpeg
 ```
-
-## Check Environment
-
-After installing dependencies and preparing the assets below, run:
-
-```shell
-python tools/check_env.py --config configs/semtalk_sparse.yaml
-```
-
-This checker validates:
-
-- Python and core packages
-- PyTorch and CUDA visibility
-- BEAT2 data folders
-- SMPL-X model folder
-- `weights/` and pretrained checkpoints
-- HuBERT and faster-whisper local directories
 
 ## Download Data
 
@@ -143,7 +120,7 @@ Finally, these SemTalk folder should be orgnized as follows:
 1. To generate the training dataset, run:
 
 ```shell
-python tools/run.py build-dataset --split train
+python dataloaders/save_train_dataset.py
 ```
 
 This process may take some time, so please be patient.
@@ -151,7 +128,7 @@ This process may take some time, so please be patient.
 2. To generate the test dataset, run:
 
 ```shell
-python tools/run.py build-dataset --split test
+python dataloaders/save_test_dataset.py
 ```
 
 # 🚀Training, Testing, and Inference
@@ -163,29 +140,29 @@ python tools/run.py build-dataset --split test
 You can either train your own RVQ-VAE weights and place them under `path-to-SemTalk/weights` using the commands below, or simply use our [pretrained weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing).
 
 ```shell
-python tools/run.py train-rvq configs/cnn_vqvae_face_30.yaml # face
+python train.py --config configs/cnn_vqvae_face_30.yaml --train_rvq # face
 ```
 
 ```shell
-python tools/run.py train-rvq configs/cnn_vqvae_hands_30.yaml # hands
+python train.py --config configs/cnn_vqvae_hands_30.yaml --train_rvq # hands
 ```
 
 ```shell
-python tools/run.py train-rvq configs/cnn_vqvae_upper_30.yaml # upper body
+python train.py --config configs/cnn_vqvae_upper_30.yaml --train_rvq # upper body
 ```
 
 ```shell
-python tools/run.py train-rvq configs/cnn_vqvae_lower_foot_30.yaml # lower foot
+python train.py --config configs/cnn_vqvae_lower_foot_30.yaml --train_rvq # lower foot
 ```
 
 ```shell
-python tools/run.py train-rvq configs/cnn_vqvae_lower_30.yaml # lower body
+python train.py --config configs/cnn_vqvae_lower_30.yaml --train_rvq # lower body
 ```
 
 ### Stage1: Base Motion Generation
 
 ```shell
-python tools/run.py train-base --config configs/semtalk_base.yaml
+python train.py --config configs/semtalk_base.yaml
 ```
 
 **Notice**: Once you have obtained the optimal base motion generation weights, please update the path field to `base_ckpt` in `configs/semtalk_sparse.yaml`.
@@ -195,7 +172,7 @@ python tools/run.py train-base --config configs/semtalk_base.yaml
 ### Stage2: Sparse Motion Generation
 
 ```shell
-python tools/run.py train-sparse --config configs/semtalk_sparse.yaml
+python train.py --config configs/semtalk_sparse.yaml
 ```
 
 ## Testing of SemTalk
@@ -203,7 +180,7 @@ python tools/run.py train-sparse --config configs/semtalk_sparse.yaml
 **Notice**: Before running the test code, make sure the `load_ckpt` and `base_ckpt` paths in `configs/semtalk_sparse.yaml` are set correctly.
 
 ```shell
-python tools/run.py test --config configs/semtalk_sparse.yaml
+python train.py --config configs/semtalk_sparse.yaml --test_state
 ```
 
 ## Inference
@@ -211,7 +188,7 @@ python tools/run.py test --config configs/semtalk_sparse.yaml
 you can put your inference wav format aduio on `./demo` path, for example, you can run:
 
 ```shell
-python tools/run.py infer --config configs/semtalk_sparse.yaml --audio ./demo/2_scott_0_1_1.wav
+python train.py --config configs/semtalk_sparse.yaml --inference --audio_infer_path ./demo/2_scott_0_1_1.wav
 ```
 
 # 🗂️ Repository Layout
@@ -221,10 +198,9 @@ If you are opening the codebase for the first time, these folders are the import
 - `configs/`: experiment and path configuration
 - `dataloaders/`: dataset preprocessing and dataset loading
 - `models/`: RVQ-VAE and SemTalk model definitions
-- `tools/`: lightweight wrappers for common workflows
 - `train.py`: original training entrypoint
 
-The original research code structure is still preserved. The new `tools/` scripts are only a cleaner wrapper around the existing workflow.
+The original research code structure is still preserved.
 Common repository paths are now centralized in `utils/project_paths.py`, so preprocessing, training, and checkpoints use the same path conventions.
 This also covers the local HuBERT / faster-whisper directories and shared `vocab.pkl` lookup, which reduces machine-specific path edits when moving the repo.
 
