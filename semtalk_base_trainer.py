@@ -17,7 +17,7 @@ from loguru import logger
 from utils import rotation_conversions as rc
 import smplx
 from utils import config, logger_tools, other_tools, metric, data_transfer
-from utils.project_paths import pretrained_vq_path
+from utils.semtalk_components import build_semtalk_joint_context, load_pretrained_vq_suite
 from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
@@ -31,65 +31,29 @@ class CustomTrainer(train.BaseTrainer):
         self.args = args
         self.now_epoch = 0
         self.best_fid = float("inf")
-        self.ori_joint_list = joints_list[self.args.ori_joints]
-        self.tar_joint_list_face = joints_list["beat_smplx_face"]
-        self.tar_joint_list_upper = joints_list["beat_smplx_upper"]
-        self.tar_joint_list_hands = joints_list["beat_smplx_hands"]
-        self.tar_joint_list_lower = joints_list["beat_smplx_lower"]
-       
-        self.joint_mask_face = np.zeros(len(list(self.ori_joint_list.keys()))*3)
-        self.joints = 55
-        for joint_name in self.tar_joint_list_face:
-            self.joint_mask_face[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_upper = np.zeros(len(list(self.ori_joint_list.keys()))*3)
-        for joint_name in self.tar_joint_list_upper:
-            self.joint_mask_upper[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_hands = np.zeros(len(list(self.ori_joint_list.keys()))*3)
-        for joint_name in self.tar_joint_list_hands:
-            self.joint_mask_hands[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_lower = np.zeros(len(list(self.ori_joint_list.keys()))*3)
-        for joint_name in self.tar_joint_list_lower:
-            self.joint_mask_lower[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
+        joint_context = build_semtalk_joint_context(self.args.ori_joints)
+        self.ori_joint_list = joint_context["ori_joint_list"]
+        self.tar_joint_list_face = joint_context["target_joint_sets"]["face"]
+        self.tar_joint_list_upper = joint_context["target_joint_sets"]["upper"]
+        self.tar_joint_list_hands = joint_context["target_joint_sets"]["hands"]
+        self.tar_joint_list_lower = joint_context["target_joint_sets"]["lower"]
+        self.joint_mask_face = joint_context["masks"]["face"]
+        self.joint_mask_upper = joint_context["masks"]["upper"]
+        self.joint_mask_hands = joint_context["masks"]["hands"]
+        self.joint_mask_lower = joint_context["masks"]["lower"]
+        self.joints = joint_context["joints"]
 
         self.tracker = other_tools.EpochTracker([ "hubert_cons","beat_cons","acc_face", "acc_hands", "acc_upper", "acc_lower", "fid", "l1div", "bc", "rec", "trans", "vel", "transv", 'dis', 'gen', 'acc', 'transa', 'exp', 'lvd', 'mse', "cls", "rec_face", "latent", "cls_full", "cls_self", "cls_word", "latent_word","latent_self"], [False,True,True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False,False,False,False,  False,False,False,False,False,False])
-        ##### vq_model #####
-        vq_model_module = __import__(f"models.motion_representation", fromlist=["something"])
-        rvq_model_module = __import__(f"models.rvq", fromlist=["something"])
-        self.args.vae_layer = 2
-        self.args.vae_length = 256
-        self.args.vae_test_dim = 106 # face
-        self.vq_model_face = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
+        vq_suite = load_pretrained_vq_suite(self.args, self.rank, args.e_name, include_global_motion=True)
+        self.vq_model_face = vq_suite["face"]
+        self.vq_model_upper = vq_suite["upper"]
+        self.vq_model_hands = vq_suite["hands"]
+        self.vq_model_lower = vq_suite["lower"]
+        self.global_motion = vq_suite["global_motion"]
 
-        other_tools.load_checkpoints(self.vq_model_face, str(pretrained_vq_path("face")), args.e_name)
-        self.args.vae_test_dim = 78 # upper body
-        self.vq_model_upper = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_upper, str(pretrained_vq_path("upper")), args.e_name)
-
-
-        self.args.vae_test_dim = 180 # hands
-        self.vq_model_hands = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_hands, str(pretrained_vq_path("hands")), args.e_name)        
-        
-        self.args.vae_test_dim = 61 # lower body
-        self.args.vae_layer = 4
-        self.vq_model_lower = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_lower, str(pretrained_vq_path("lower")), args.e_name)
-
-
-        self.args.vae_test_dim = 61 #global motion
-        self.args.vae_layer = 4
-        self.global_motion = getattr(vq_model_module, "VAEConvZero")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.global_motion, str(pretrained_vq_path("global_motion")), args.e_name)
-        
         self.args.vae_test_dim = 330
         self.args.vae_layer = 4
         self.args.vae_length = 240
-
-        self.vq_model_face.eval()
-        self.vq_model_upper.eval()
-        self.vq_model_hands.eval()
-        self.vq_model_lower.eval()
-        self.global_motion.eval()
 
         self.cls_loss = nn.NLLLoss().to(self.rank)
         self.reclatent_loss = nn.MSELoss().to(self.rank)

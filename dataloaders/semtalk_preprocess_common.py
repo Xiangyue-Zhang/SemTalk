@@ -11,8 +11,7 @@ from tqdm import tqdm
 
 from utils import other_tools
 from utils import rotation_conversions as rc
-from utils.project_paths import pretrained_vq_path
-from dataloaders.data_tools import joints_list
+from utils.semtalk_components import build_semtalk_joint_context, load_pretrained_vq_suite
 
 
 def _to_np(x):
@@ -127,48 +126,35 @@ class PreprocessProcessor:
         self.args = args
         self.include_sem_mean = include_sem_mean
 
-        rvq_model_module = __import__("models.rvq", fromlist=["something"])
-        self.args.vae_test_dim = 106
-        self.vq_model_face = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_face, str(pretrained_vq_path("face")), "vq_face")
+        vq_suite = load_pretrained_vq_suite(
+            self.args,
+            args.device,
+            {
+                "face": "vq_face",
+                "upper": "vq_upper",
+                "hands": "vq_hands",
+                "lower": "vq_lower",
+            },
+            include_global_motion=False,
+        )
+        self.vq_model_face = vq_suite["face"]
+        self.vq_model_upper = vq_suite["upper"]
+        self.vq_model_hands = vq_suite["hands"]
+        self.vq_model_lower = vq_suite["lower"]
 
-        self.args.vae_test_dim = 78
-        self.vq_model_upper = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_upper, str(pretrained_vq_path("upper")), "vq_upper")
-
-        self.args.vae_test_dim = 180
-        self.vq_model_hands = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_hands, str(pretrained_vq_path("hands")), "vq_hands")
-
-        self.args.vae_test_dim = 61
-        self.vq_model_lower = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_lower, str(pretrained_vq_path("lower")), "vq_lower")
-
-        self.ori_joint_list = joints_list[self.args.ori_joints]
-        self.tar_joint_list_face = joints_list["beat_smplx_face"]
-        self.tar_joint_list_upper = joints_list["beat_smplx_upper"]
-        self.tar_joint_list_hands = joints_list["beat_smplx_hands"]
-        self.tar_joint_list_lower = joints_list["beat_smplx_lower"]
-        self.joints = 55
-
-        self.joint_mask_face = np.zeros(len(list(self.ori_joint_list.keys())) * 3)
-        for joint_name in self.tar_joint_list_face:
-            self.joint_mask_face[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_upper = np.zeros(len(list(self.ori_joint_list.keys())) * 3)
-        for joint_name in self.tar_joint_list_upper:
-            self.joint_mask_upper[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_hands = np.zeros(len(list(self.ori_joint_list.keys())) * 3)
-        for joint_name in self.tar_joint_list_hands:
-            self.joint_mask_hands[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        self.joint_mask_lower = np.zeros(len(list(self.ori_joint_list.keys())) * 3)
-        for joint_name in self.tar_joint_list_lower:
-            self.joint_mask_lower[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
+        joint_context = build_semtalk_joint_context(self.args.ori_joints)
+        self.ori_joint_list = joint_context["ori_joint_list"]
+        self.tar_joint_list_face = joint_context["target_joint_sets"]["face"]
+        self.tar_joint_list_upper = joint_context["target_joint_sets"]["upper"]
+        self.tar_joint_list_hands = joint_context["target_joint_sets"]["hands"]
+        self.tar_joint_list_lower = joint_context["target_joint_sets"]["lower"]
+        self.joints = joint_context["joints"]
+        self.joint_mask_face = joint_context["masks"]["face"]
+        self.joint_mask_upper = joint_context["masks"]["upper"]
+        self.joint_mask_hands = joint_context["masks"]["hands"]
+        self.joint_mask_lower = joint_context["masks"]["lower"]
 
         self.clip_model = self.load_and_freeze_clip(device=device)
-        self.vq_model_face.eval()
-        self.vq_model_upper.eval()
-        self.vq_model_hands.eval()
-        self.vq_model_lower.eval()
 
     def encode_text(self, raw_text, device):
         text = clip.tokenize(raw_text, truncate=True).to(device)
