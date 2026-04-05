@@ -226,6 +226,7 @@ If you are opening the codebase for the first time, these folders are the import
 
 The original research code structure is still preserved. The new `tools/` scripts are only a cleaner wrapper around the existing workflow.
 Common repository paths are now centralized in `utils/project_paths.py`, so preprocessing, training, and checkpoints use the same path conventions.
+This also covers the local HuBERT / faster-whisper directories and shared `vocab.pkl` lookup, which reduces machine-specific path edits when moving the repo.
 
 # ✅ Reproducibility Check
 

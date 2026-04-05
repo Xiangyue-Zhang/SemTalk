@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from numpy.lib import stride_tricks
 import pickle
 from funasr import AutoModel
+from utils.project_paths import hubert_dir, whisper_dir, vocab_path
 
-# 可根据需要调整这个常量到你的本地路径
-LOCAL_WHISPER_MODEL_DIR = os.path.abspath("./Systran/faster-whisper-large-v3")
+LOCAL_WHISPER_MODEL_DIR = str(whisper_dir())
 
 def _normalize_word(w: str, lower: bool = True) -> str:
     if w is None:
@@ -40,7 +40,7 @@ def get_word_sentence(
       in_sentence: List[List[str]], 长度 = (frame - 4) // (window - 4)
                    第 k 个句子覆盖帧区间 [k*(window-4), k*(window-4)+window)
     """
-    with open(f"{args.data_path}weights/vocab.pkl", 'rb') as f:
+    with open(vocab_path(args), 'rb') as f:
         lang_model = pickle.load(f)
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,9 +177,9 @@ def get_hubert(audio_file, args):
     audio_each_file = librosa.resample(aud_ori, orig_sr=sr, target_sr=args.audio_sr)
     from transformers import Wav2Vec2Processor, HubertModel
     print("Loading the Wav2Vec2 Processor...")
-    wav2vec2_processor = Wav2Vec2Processor.from_pretrained("../facebook/hubert-large-ls960-ft")
+    wav2vec2_processor = Wav2Vec2Processor.from_pretrained(str(hubert_dir()))
     print("Loading the HuBERT Model...")
-    hubert_model = HubertModel.from_pretrained("../facebook/hubert-large-ls960-ft")
+    hubert_model = HubertModel.from_pretrained(str(hubert_dir()))
     hubert_model.eval()
     if args.audio_rep == "onset+amplitude":
         frame_length = 1024

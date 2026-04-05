@@ -30,6 +30,18 @@ from optimizers.loss_factory import get_loss_func
 configure_runtime_env()
 
 
+def _load_model_checkpoint_or_fail(model, load_ckpt: str, load_name: str = "semtalk_model"):
+    if os.path.exists(load_ckpt):
+        logger.info(f"Loading checkpoint from {load_ckpt}")
+        other_tools.load_checkpoints(model, load_ckpt, load_name)
+        logger.info("Checkpoint loaded successfully")
+        model.eval()
+        return
+
+    logger.warning(f"Checkpoint {load_ckpt} does not exist. Starting training from scratch.")
+    raise FileNotFoundError(f"Checkpoint {load_ckpt} does not exist.")
+
+
 class BaseTrainer(object):
     def __init__(self, args):
         self.args = args
@@ -232,29 +244,15 @@ def main_worker(rank, world_size, args):
     if args.inference:
         if rank == 0:
             if load_ckpt := args.load_ckpt:
-                if os.path.exists(load_ckpt):
-                    logger.info(f"Loading checkpoint from {load_ckpt}")
-                    other_tools.load_checkpoints(trainer.model, load_ckpt, "semtalk_model")
-                    logger.info("Checkpoint loaded successfully")
-                    trainer.model.eval()
-                else:
-                    logger.warning(f"Checkpoint {load_ckpt} does not exist. Starting training from scratch.")
-                    raise FileNotFoundError(f"Checkpoint {load_ckpt} does not exist.")
+                _load_model_checkpoint_or_fail(trainer.model, load_ckpt)
             trainer.inference(args.audio_infer_path)
         return
     if args.test_state:
         if rank == 0:
             if load_ckpt := args.load_ckpt:
-                if os.path.exists(load_ckpt):
-                    logger.info(f"Loading checkpoint from {load_ckpt}")
-                    other_tools.load_checkpoints(trainer.model, load_ckpt, "semtalk_model")
-                    logger.info("Checkpoint loaded successfully")
-                    trainer.model.eval()
-                    fid = trainer.test(0)
-                    exit(0)
-                else:
-                    logger.warning(f"Checkpoint {load_ckpt} does not exist. Starting training from scratch.")
-                    raise FileNotFoundError(f"Checkpoint {load_ckpt} does not exist.")
+                _load_model_checkpoint_or_fail(trainer.model, load_ckpt)
+                fid = trainer.test(0)
+                exit(0)
     # other_tools.load_checkpoints(trainer.model, '/mnt/disk2T/mm_data/zxy/SemTalk/weights/best_semtalk_base.bin', 'sem_model')
     # other_tools.load_checkpoints(trainer.model, '/mnt/disk2T/mm_data/zxy/SemTalk/weights/best_semtalk_sparse.bin', 'sem_model')
     
