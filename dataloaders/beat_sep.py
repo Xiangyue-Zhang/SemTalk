@@ -23,6 +23,7 @@ from .utils.audio_features import Wav2Vec2Model
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
 from .utils import other_tools
+from utils.project_paths import smplx_model_dir
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):
@@ -105,7 +106,7 @@ class CustomDataset(Dataset):
     
     def calculate_mean_velocity(self, save_path):
         self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
+            str(smplx_model_dir(self.args)),
             model_type='smplx',
             gender='NEUTRAL_2020', 
             use_face_contour=False,

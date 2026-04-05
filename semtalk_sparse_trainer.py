@@ -17,6 +17,7 @@ from loguru import logger
 from utils import rotation_conversions as rc
 import smplx
 from utils import config, logger_tools, other_tools, metric, data_transfer
+from utils.project_paths import pretrained_vq_path
 from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
@@ -70,25 +71,25 @@ class CustomTrainer(train.BaseTrainer):
         self.args.vae_test_dim = 106 # face
         self.vq_model_face = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
 
-        other_tools.load_checkpoints(self.vq_model_face, "./weights/pretrained_vq/rvq_face_600.bin", args.e_name)
+        other_tools.load_checkpoints(self.vq_model_face, str(pretrained_vq_path("face")), args.e_name)
 
         self.args.vae_test_dim = 78 # upper body
         self.vq_model_upper = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_upper, "./weights/pretrained_vq/rvq_upper_500.bin", args.e_name)
+        other_tools.load_checkpoints(self.vq_model_upper, str(pretrained_vq_path("upper")), args.e_name)
 
         self.args.vae_test_dim = 180 # hands
         self.vq_model_hands = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_hands, "./weights/pretrained_vq/rvq_hands_500.bin", args.e_name)
+        other_tools.load_checkpoints(self.vq_model_hands, str(pretrained_vq_path("hands")), args.e_name)
         
         self.args.vae_test_dim = 61 # lower body
         self.args.vae_layer = 4
         self.vq_model_lower = getattr(rvq_model_module, "RVQVAE")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.vq_model_lower, "./weights/pretrained_vq/rvq_lower_600.bin", args.e_name)
+        other_tools.load_checkpoints(self.vq_model_lower, str(pretrained_vq_path("lower")), args.e_name)
 
         self.args.vae_test_dim = 61 #global motion
         self.args.vae_layer = 4
         self.global_motion = getattr(vq_model_module, "VAEConvZero")(self.args).to(self.rank)
-        other_tools.load_checkpoints(self.global_motion, "./weights/pretrained_vq/last_1700_foot.bin", args.e_name)
+        other_tools.load_checkpoints(self.global_motion, str(pretrained_vq_path("global_motion")), args.e_name)
 
         self.args.vae_test_dim = 330
         self.args.vae_layer = 4
@@ -1075,4 +1076,3 @@ class CustomTrainer(train.BaseTrainer):
 
         return clip_model
         
-
