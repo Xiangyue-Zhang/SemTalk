@@ -78,7 +78,7 @@ def parse_args():
     parser.add("--mean_pose_path", default="./datasets/trinity/train/", type=str)
     parser.add("--std_pose_path", default="./datasets/trinity/train/", type=str)
     # for pretrian weights
-    parser.add("--data_path_1", default="./BEAT2/pretrained/", type=str)
+    parser.add("--data_path_1", default="./weights/", type=str)
     # ------------------- evaluation ----------------------- #
     parser.add("--test_ckpt", default="./weights/best_semtalk_sparse.bin")
     parser.add("--eval_model", default="vae", type=str)

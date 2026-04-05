@@ -73,6 +73,7 @@ def main() -> int:
     check_equal("sparse config test_path", sparse_cfg.get("test_path"), "datasets/beat2_semtalk_test.pkl", failures)
     check_equal("sparse config cache_path", sparse_cfg.get("cache_path"), "datasets/beat2_cache_2", failures)
     check_equal("sparse config base_ckpt", sparse_cfg.get("base_ckpt"), "./weights/best_semtalk_base.bin", failures)
+    check_equal("sparse config data_path_1", sparse_cfg.get("data_path_1"), "./weights/", failures)
 
     if failures:
         print("\nCommand contract check failed:")

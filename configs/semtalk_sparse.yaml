@@ -10,7 +10,7 @@ data_path: ./BEAT2/beat_english_v2.0.0/
 e_path:  weights/AESKConv_240_100.bin
 eval_model: motion_representation
 e_name: VAESKConv
-data_path_1: ./BEAT2/pretrained/
+data_path_1: ./weights/
 vae_test_len: 32
 vae_test_dim: 330
 vae_test_stride: 20
