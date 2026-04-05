@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils import rotation_conversions as rc
 import clip
 from utils import other_tools
+from utils.project_paths import pretrained_vq_path
 from dataloaders.data_tools import joints_list
 from dataloaders.build_vocab import Vocab
 # -------------------------
@@ -56,19 +57,19 @@ class Processor:
         rvq_model_module = __import__(f"models.rvq", fromlist=["something"])
         self.args.vae_test_dim = 106 # face
         self.vq_model_face = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_face, "./weights/pretrained_vq/rvq_face_600.bin", "vq_face")
+        other_tools.load_checkpoints(self.vq_model_face, str(pretrained_vq_path("face")), "vq_face")
 
         self.args.vae_test_dim = 78 # upper body
         self.vq_model_upper = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_upper, "./weights/pretrained_vq/rvq_upper_500.bin", "vq_upper")
+        other_tools.load_checkpoints(self.vq_model_upper, str(pretrained_vq_path("upper")), "vq_upper")
 
         self.args.vae_test_dim = 180 # hands
         self.vq_model_hands = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_hands, "./weights/pretrained_vq/rvq_hands_500.bin", "vq_hands")
+        other_tools.load_checkpoints(self.vq_model_hands, str(pretrained_vq_path("hands")), "vq_hands")
         
         self.args.vae_test_dim = 61 # lower body
         self.vq_model_lower = getattr(rvq_model_module, "RVQVAE")(self.args).to(args.device)
-        other_tools.load_checkpoints(self.vq_model_lower, "./weights/pretrained_vq/rvq_lower_600.bin", "vq_lower")
+        other_tools.load_checkpoints(self.vq_model_lower, str(pretrained_vq_path("lower")), "vq_lower")
         
         self.ori_joint_list = joints_list[self.args.ori_joints]
         self.tar_joint_list_face = joints_list["beat_smplx_face"]

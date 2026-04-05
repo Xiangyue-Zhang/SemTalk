@@ -21,25 +21,13 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 import matplotlib.pyplot as plt
 from utils import config, logger_tools, other_tools, metric
+from utils.project_paths import configure_runtime_env, smplx_model_dir
 from dataloaders import data_tools
 from dataloaders.build_vocab import Vocab
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
-
-def _configure_runtime_env():
-    repo_root = Path(__file__).resolve().parent
-    default_cache_root = Path(os.environ.get("SEMTALK_CACHE_ROOT", repo_root / ".cache"))
-    default_tmp_root = Path(os.environ.get("SEMTALK_TMPDIR", repo_root / ".tmp"))
-
-    os.environ.setdefault("HF_HOME", str(default_cache_root / "huggingface"))
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(default_cache_root / "huggingface" / "hub"))
-    os.environ.setdefault("TRANSFORMERS_CACHE", str(default_cache_root / "huggingface" / "transformers"))
-    os.environ.setdefault("XDG_CACHE_HOME", str(default_cache_root))
-    os.environ.setdefault("TMPDIR", str(default_tmp_root))
-
-
-_configure_runtime_env()
+configure_runtime_env()
 
 
 class BaseTrainer(object):
@@ -153,7 +141,7 @@ class BaseTrainer(object):
         self.opt = create_optimizer(args, self.model)
         self.opt_s = create_scheduler(args, self.opt)
         self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
+            str(smplx_model_dir(self.args)),
             model_type='smplx',
             gender='NEUTRAL_2020', 
             use_face_contour=False,

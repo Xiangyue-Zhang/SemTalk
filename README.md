@@ -225,6 +225,7 @@ If you are opening the codebase for the first time, these folders are the import
 - `train.py`: original training entrypoint
 
 The original research code structure is still preserved. The new `tools/` scripts are only a cleaner wrapper around the existing workflow.
+Common repository paths are now centralized in `utils/project_paths.py`, so preprocessing, training, and checkpoints use the same path conventions.
 
 # 📺 Visualize
 

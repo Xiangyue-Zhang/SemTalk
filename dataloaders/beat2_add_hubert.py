@@ -24,6 +24,7 @@ from .utils.audio_features import Wav2Vec2Model
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
 from .utils import other_tools
+from utils.project_paths import smplx_model_dir
 from funasr import AutoModel
 import torch.distributed as dist
 
@@ -205,7 +206,7 @@ class CustomDataset(Dataset):
                     self.joint_mask[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
         # select trainable joints
         self.smplx = smplx.create(
-            model_path=self.args.data_path_1+"smplx_models/", 
+            model_path=str(smplx_model_dir(self.args)), 
             model_type='smplx',
             gender='NEUTRAL_2020', 
             use_face_contour=False,
@@ -257,7 +258,7 @@ class CustomDataset(Dataset):
     
     def calculate_mean_velocity(self, save_path):
         self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
+            str(smplx_model_dir(self.args)),
             model_type='smplx',
             gender='NEUTRAL_2020', 
             use_face_contour=False,

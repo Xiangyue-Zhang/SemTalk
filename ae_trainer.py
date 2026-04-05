@@ -19,6 +19,7 @@ from loguru import logger
 import smplx
 
 from utils import config, logger_tools, other_tools, metric
+from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
 from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
@@ -35,7 +36,7 @@ class CustomTrainer(train.BaseTrainer):
         super().__init__(args)
         self.joints = self.train_data.joints
         self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
+            str(smplx_model_dir(self.args)),
             model_type='smplx',
             gender='NEUTRAL_2020', 
             use_face_contour=False,
