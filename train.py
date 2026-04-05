@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 import numpy as np
 import time
 import pprint
+from pathlib import Path
 from loguru import logger
 import smplx
 from torch.utils.tensorboard import SummaryWriter
@@ -25,12 +26,20 @@ from dataloaders.build_vocab import Vocab
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
-# import os
-os.environ["HF_HOME"] = "/mnt/disk2T/hfcache"
-os.environ["HUGGINGFACE_HUB_CACHE"] = "/mnt/disk2T/hfcache/hub"
-os.environ["TRANSFORMERS_CACHE"] = "/mnt/disk2T/hfcache/transformers"
-os.environ["XDG_CACHE_HOME"] = "/mnt/disk2T/hfcache"
-os.environ["TMPDIR"] = "/mnt/disk2T/tmp"
+
+def _configure_runtime_env():
+    repo_root = Path(__file__).resolve().parent
+    default_cache_root = Path(os.environ.get("SEMTALK_CACHE_ROOT", repo_root / ".cache"))
+    default_tmp_root = Path(os.environ.get("SEMTALK_TMPDIR", repo_root / ".tmp"))
+
+    os.environ.setdefault("HF_HOME", str(default_cache_root / "huggingface"))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(default_cache_root / "huggingface" / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(default_cache_root / "huggingface" / "transformers"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(default_cache_root))
+    os.environ.setdefault("TMPDIR", str(default_tmp_root))
+
+
+_configure_runtime_env()
 
 
 class BaseTrainer(object):
