@@ -22,7 +22,7 @@ variational: False
 # ckpt
 # load_ckpt: None  # ./weights/best_semtalk_sparse.bin
 load_ckpt: ./weights/best_semtalk_sparse.bin
-# base_ckpt: ./weights/best_semtalk_base.bin
+base_ckpt: ./weights/best_semtalk_base.bin
 
 
 # data config
