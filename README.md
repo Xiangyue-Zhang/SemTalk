@@ -227,6 +227,38 @@ If you are opening the codebase for the first time, these folders are the import
 The original research code structure is still preserved. The new `tools/` scripts are only a cleaner wrapper around the existing workflow.
 Common repository paths are now centralized in `utils/project_paths.py`, so preprocessing, training, and checkpoints use the same path conventions.
 
+# ✅ Reproducibility Check
+
+The clean baseline version cloned for this repository cleanup is commit `45180aa`.
+
+For code-level verification of the most critical runtime paths, you can first run:
+
+```shell
+python tools/check_runtime_equivalence.py
+```
+
+This static checker compares the baseline and current AST for the runtime-critical methods in `semtalk_base_trainer.py` and `semtalk_sparse_trainer.py`, covering the main training, testing, and inference flows.
+
+If you want to verify that the refactored code still reproduces the same outputs, prepare:
+
+1. one checkout at the original baseline commit
+2. one checkout at the current commit
+3. the same environment, data, and weights for both
+
+Then compare outputs with:
+
+```shell
+python tools/validate_against_baseline.py \
+  --baseline-repo /path/to/SemTalk-baseline \
+  --current-repo /path/to/SemTalk \
+  --mode check-env \
+  --baseline-output /path/to/baseline/output \
+  --current-output /path/to/current/output \
+  --skip-run
+```
+
+For full validation, run the same inference or test command in both repos and compare the produced files with the same script.
+
 # 📺 Visualize
 
 Following [EMAGE](https://github.com/PantoMatrix/PantoMatrix), you can download [SMPLX blender addon](https://huggingface.co/datasets/H-Liu1997/BEAT2_Tools/blob/main/smplx_blender_addon_20230921.zip), and install it in your blender 3.x or 4.x. Click the button Add Animation to visualize the generated smplx file (like xxx.npz).
