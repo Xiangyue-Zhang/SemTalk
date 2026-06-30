@@ -42,7 +42,7 @@ model: motion_representation
 g_name: VAEConvZero
 #eval_model: motion_autoencoder
 #e_name: HalfEmbeddingNet
-trainer: aelower
+trainer: aelowerfoot
 decay_epochs: 780
 # audio_f: 256
 # a_pre_encoder: tcn_camn
