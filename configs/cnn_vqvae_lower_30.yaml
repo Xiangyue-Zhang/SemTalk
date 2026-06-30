@@ -42,7 +42,7 @@ model: rvq
 g_name: RVQVAE
 #eval_model: motion_autoencoder
 #e_name: HalfEmbeddingNet
-trainer: aelowerfoot
+trainer: aelower
 decay_epochs: 780
 # audio_f: 256
 # a_pre_encoder: tcn_camn
