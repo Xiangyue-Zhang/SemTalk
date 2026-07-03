@@ -284,10 +284,15 @@ def main_worker(rank, world_size, args):
                 if is_best:
                     trainer.best_fid = fid
                     ckpt_name = f"best_{epoch}.bin"
+                elif fid is None:
+                    ckpt_name = f"last_{epoch}.bin"
+                else:
+                    ckpt_name = None
+                if ckpt_name is not None:
                     other_tools.save_checkpoints(
-                    os.path.join(trainer.checkpoint_path, ckpt_name),
-                    trainer.model, opt=None, epoch=None, lrs=None
-                )
+                        os.path.join(trainer.checkpoint_path, ckpt_name),
+                        trainer.model, opt=None, epoch=None, lrs=None
+                    )
                 # else:
                 #     ckpt_name = f"last_{epoch}.bin"
 
