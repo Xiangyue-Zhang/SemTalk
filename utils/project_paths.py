@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from typing import Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +18,7 @@ def repo_path(*parts) -> Path:
     return REPO_ROOT.joinpath(*parts)
 
 
-def resolve_path(path_like, base: Path | None = None) -> Path:
+def resolve_path(path_like, base: Optional[Path] = None) -> Path:
     path = Path(path_like)
     if path.is_absolute():
         return path
@@ -32,6 +33,9 @@ def smplx_model_dir(args) -> Path:
 
 
 def pretrained_vq_dir() -> Path:
+    configured = os.environ.get("SEMTALK_PRETRAINED_VQ_DIR")
+    if configured:
+        return resolve_path(configured)
     return repo_path("weights", "pretrained_vq")
 
 

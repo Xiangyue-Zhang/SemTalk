@@ -15,11 +15,34 @@
 
 # 📣 Updates
 
+- **[2026.07.27]** 🔥 Added the 25-speaker BEAT2 release: all five motion
+  representation models, Base and Sparse checkpoints, paired inference NPZ
+  files, metrics, and a separate training workflow.
 - **[2025.09.11]** 🔥 Release: - [✔] Inference code - [✔] Training code
-- 
+
 # 💖 Inference Data
 
-If you would like to compare your paper’s results with SemTalk but find it too difficult to run the repository, you can simply download the test `.npz` file from [Google Drive](https://drive.google.com/file/d/1hm812R7QOIoLK9mxbDIKqNGF8xEuRzf9/view?usp=sharing).
+The two releases use different training protocols and are provided separately:
+
+- **Speaker 2 (paper protocol):** download the original test `.npz` files from
+  [Google Drive](https://drive.google.com/file/d/1hm812R7QOIoLK9mxbDIKqNGF8xEuRzf9/view?usp=sharing).
+- **All Speakers (25 English BEAT2 speakers):** download the paired test
+  `.npz` files from
+  [Google Drive](https://drive.google.com/file/d/1mZF-oRygHMjUpx7lsmTPkjzfLgL_yS0V/view?usp=sharing).
+
+# 📊 Results
+
+| Training protocol | Speakers | FGD ↓ (×10<sup>-1</sup>) | BC ↑ (×10<sup>-1</sup>) | DIV ↑ | MSE ↓ (×10<sup>-8</sup>) | LVD ↓ (×10<sup>-5</sup>) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Speaker 2 (paper) | 1 | 4.278 | 7.770 | 12.910 | 6.153 | 6.938 |
+| All Speakers (released checkpoint) | 25 | **3.556** | 5.097 | 8.409 | **4.439** | **1.435** |
+
+The Speaker 2 row is copied from Table 1 of the paper. The All-Speaker row
+uses the lowest-FGD Sparse checkpoint selected by a coarse 10-epoch search
+followed by a local 1-epoch search. Raw metrics and checkpoint metadata are in
+[`results/all_speakers`](results/all_speakers). The two rows use different
+training protocols and should not be interpreted as a controlled
+single-speaker versus multi-speaker ablation.
 
 # ⚡ Quick Start
 
@@ -76,7 +99,25 @@ huggingface-cli download --resume-download facebook/hubert-large-ls960-ft --loca
 huggingface-cli download --resume-download Systran/faster-whisper-large-v3 --local-dir Systran/faster-whisper-large-v3
 ```
 
-Download [pretrained models and weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing) from google drive, unzip and place it in the SemTalk folder, i.e. `path-to-SemTalk/weights`.
+Choose the weights that match the intended protocol:
+
+- **Speaker 2 (paper protocol):** download the
+  [original pretrained models and weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing).
+- **All Speakers (25 English BEAT2 speakers):** download the
+  [all-speaker representation models and weights](https://drive.google.com/file/d/1j4Bem3_ZRCVGGiiyn6hFpc6_960cNphA/view?usp=sharing).
+  This archive contains all five representation models and the selected Base
+  and Sparse checkpoints.
+
+Keep the original Speaker 2 archive in its documented locations. Install the
+All-Speaker archive without overwriting those files:
+
+```shell
+unzip SemTalk_all_speakers_weights_25spk.zip
+cp -R SemTalk_all_speakers_weights/weights/all_speakers ./weights/
+```
+
+The All-Speaker files use a separate subdirectory, so the original Speaker 2
+paths and default configs remain unchanged.
 
 Finally, these SemTalk folder should be orgnized as follows:
 
@@ -102,7 +143,11 @@ Finally, these SemTalk folder should be orgnized as follows:
 │   ├── pretrained_vq
 │   ├── smplx_models
 │   ├── best_semtalk_base.bin
-│   └── best_semtalk_sparse.bin
+│   ├── best_semtalk_sparse.bin
+│   └── all_speakers
+│       ├── pretrained_vq
+│       ├── best_semtalk_base.bin
+│       └── best_semtalk_sparse.bin
 ├── ae_trainer.py
 ├── aelower_trainer.py
 ├── aelowerfoot_trainer.py
@@ -135,9 +180,27 @@ python dataloaders/save_test_dataset.py
 
 ## Training of SemTalk
 
+The commands below preserve the original Speaker 2 protocol. For the separate
+25-speaker preprocessing, representation-model training, Base training, Sparse
+training, and evaluation commands, see
+[`scripts/all_speakers/README.md`](scripts/all_speakers/README.md).
+
 ### Train RVQ-VAE
 
-You can either train your own RVQ-VAE weights and place them under `path-to-SemTalk/weights` using the commands below, or simply use our [pretrained weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing).
+The commands below reproduce the original **Speaker 2** RVQ-VAE protocol. You
+can either train the models yourself and place the weights under
+`path-to-SemTalk/weights`, or download the pretrained weights that match your
+training protocol:
+
+- **Speaker 2 (paper protocol):** use the
+  [original pretrained weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing).
+- **All Speakers (25 English BEAT2 speakers):** use the
+  [all-speaker weights](https://drive.google.com/file/d/1j4Bem3_ZRCVGGiiyn6hFpc6_960cNphA/view?usp=sharing).
+  The archive contains the five all-speaker representation models under
+  `weights/all_speakers/pretrained_vq`, together with the selected Base and
+  Sparse checkpoints. Follow
+  [`scripts/all_speakers/README.md`](scripts/all_speakers/README.md) when
+  training or evaluating this protocol.
 
 ```shell
 python train.py --config configs/cnn_vqvae_face_30.yaml --train_rvq # face
