@@ -51,6 +51,22 @@ LOWER_TARGET_CACHE_GATE_FORMAT = (
     "semtalk_show_lower_target_cache_formal_gate_v1"
 )
 LOWER_TARGET_CACHE_GATE_MIN_SPEEDUP = 1.05
+LOWER_TARGET_BACKEND_RECEIPT_KEY = "lower_target_backend"
+LOWER_TARGET_BACKEND_FORMAT = "semtalk_show_lower_target_backend_v1"
+LOWER_TARGET_BACKEND_RECEIPT_KEYS = {
+    "format",
+    "backend",
+    "formal_stage",
+    "cache_enabled",
+    "target_forward",
+    "target_forward_sha256",
+    "target_batch_contract",
+    "torch_no_grad",
+    "return_shaped",
+    "source_binding",
+    "smplx_asset_sha256",
+    "receipt_sha256",
+}
 BASE_CANDIDATE_INTERVAL_EPOCHS = 10
 BASE_CANDIDATE_TRANSACTION_FILENAME = "base_candidate_transaction.json"
 BASE_CANDIDATE_STAGING_FILENAME = ".base_candidate_checkpoint.staging"
@@ -256,6 +272,163 @@ def _source_receipt() -> dict[str, str]:
         "entrypoint": str(Path(__file__).resolve()),
         "entrypoint_sha256": _sha256(Path(__file__).resolve()),
     }
+
+
+def _validate_lower_target_backend_receipt(
+    receipt: dict[str, Any] | None,
+    *,
+    formal_stage: str,
+    current_source: dict[str, str],
+    smplx_asset_receipt: dict[str, Any] | None,
+) -> None:
+    if formal_stage != "lower":
+        if receipt is not None:
+            raise RuntimeError(
+                "lower target backend receipt is forbidden outside lower"
+            )
+        return
+    if type(receipt) is not dict:
+        raise RuntimeError("formal lower requires one live SMPL-X backend receipt")
+    receipt_without_sha = dict(receipt)
+    receipt_sha = receipt_without_sha.pop("receipt_sha256", None)
+    source_binding = receipt.get("source_binding")
+    target_forward_source = (
+        Path(__file__).resolve().parent / "utils" / "smplx_training.py"
+    )
+    target_forward_sha = (
+        _sha256(target_forward_source)
+        if (
+            not target_forward_source.is_symlink()
+            and target_forward_source.is_file()
+        )
+        else None
+    )
+    if (
+        set(receipt) != LOWER_TARGET_BACKEND_RECEIPT_KEYS
+        or receipt.get("format") != LOWER_TARGET_BACKEND_FORMAT
+        or receipt.get("backend") != "live_smplx"
+        or receipt.get("formal_stage") != "lower"
+        or receipt.get("cache_enabled") is not False
+        or receipt.get("target_forward")
+        != "utils.smplx_training.smplx_target_forward"
+        or type(receipt.get("target_forward_sha256")) is not str
+        or len(receipt["target_forward_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in receipt["target_forward_sha256"]
+        )
+        or receipt.get("target_forward_sha256") != target_forward_sha
+        or receipt.get("target_batch_contract")
+        != "current_mixed_dataloader_batch"
+        or receipt.get("torch_no_grad") is not True
+        or receipt.get("return_shaped") is not False
+        or type(source_binding) is not dict
+        or set(source_binding) != {"origin", "commit", "tree"}
+        or source_binding
+        != {
+            key: current_source[key]
+            for key in ("origin", "commit", "tree")
+        }
+        or type(smplx_asset_receipt) is not dict
+        or smplx_asset_receipt.get("format")
+        != "semtalk_show_smplx_asset_v1"
+        or smplx_asset_receipt.get("filename") != FORMAL_SMPLX_FILENAME
+        or smplx_asset_receipt.get("sha256") != FORMAL_SMPLX_SHA256
+        or receipt.get("smplx_asset_sha256")
+        != FORMAL_SMPLX_SHA256
+        or type(receipt_sha) is not str
+        or receipt_sha != _payload_sha256(receipt_without_sha)
+    ):
+        raise RuntimeError("invalid formal lower live SMPL-X backend receipt")
+
+
+def _formal_lower_target_backend_receipt(
+    args: Any,
+    *,
+    current_source: dict[str, str],
+    smplx_asset_receipt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    cache_enabled = validate_lower_target_cache_activation(args)
+    if args.formal_stage != "lower":
+        return None
+    if cache_enabled:
+        raise RuntimeError(
+            "formal lower uses live SMPL-X targets; cache activation is forbidden"
+        )
+    target_forward_input = (
+        Path(__file__).resolve().parent / "utils" / "smplx_training.py"
+    )
+    if (
+        target_forward_input.is_symlink()
+        or not target_forward_input.is_file()
+    ):
+        raise RuntimeError(
+            "live lower target implementation must be a regular non-symlink "
+            f"file: {target_forward_input}"
+        )
+    receipt: dict[str, Any] = {
+        "format": LOWER_TARGET_BACKEND_FORMAT,
+        "backend": "live_smplx",
+        "formal_stage": "lower",
+        "cache_enabled": False,
+        "target_forward": "utils.smplx_training.smplx_target_forward",
+        "target_forward_sha256": _sha256(target_forward_input),
+        "target_batch_contract": "current_mixed_dataloader_batch",
+        "torch_no_grad": True,
+        "return_shaped": False,
+        "source_binding": {
+            key: current_source[key]
+            for key in ("origin", "commit", "tree")
+        },
+        "smplx_asset_sha256": (
+            smplx_asset_receipt.get("sha256")
+            if isinstance(smplx_asset_receipt, dict)
+            else None
+        ),
+    }
+    receipt["receipt_sha256"] = _payload_sha256(receipt)
+    _validate_lower_target_backend_receipt(
+        receipt,
+        formal_stage=args.formal_stage,
+        current_source=current_source,
+        smplx_asset_receipt=smplx_asset_receipt,
+    )
+    return receipt
+
+
+def _attach_lower_target_backend_receipt(
+    payload: dict[str, Any],
+    receipt: dict[str, Any] | None,
+) -> None:
+    if LOWER_TARGET_BACKEND_RECEIPT_KEY in payload:
+        raise RuntimeError("duplicate lower target backend receipt")
+    if receipt is not None:
+        payload[LOWER_TARGET_BACKEND_RECEIPT_KEY] = copy.deepcopy(receipt)
+
+
+def _lower_target_backend_overlay(
+    receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if receipt is None:
+        return {}
+    return {LOWER_TARGET_BACKEND_RECEIPT_KEY: copy.deepcopy(receipt)}
+
+
+def _verify_lower_target_backend_resume_receipt(
+    payload: dict[str, Any],
+    expected_receipt: dict[str, Any] | None,
+) -> None:
+    observed_present = LOWER_TARGET_BACKEND_RECEIPT_KEY in payload
+    expected_present = expected_receipt is not None
+    if (
+        observed_present != expected_present
+        or (
+            expected_present
+            and payload.get(LOWER_TARGET_BACKEND_RECEIPT_KEY)
+            != expected_receipt
+        )
+    ):
+        raise RuntimeError("resume lower target backend receipt does not match")
 
 
 def _config_fingerprint(args: Any) -> str:
@@ -733,6 +906,7 @@ def _dataset_receipt(
     train_samples: int,
     current_source: dict[str, str],
     lower_target_cache_receipt: dict[str, Any] | None = None,
+    lower_target_backend_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     smplx_asset_receipt = _formal_smplx_asset_receipt(args)
     if not args.dataset_summary:
@@ -1257,6 +1431,13 @@ def _dataset_receipt(
         raise RuntimeError(
             "formal lower target cache activation and trainer receipt disagree"
         )
+    if (
+        lower_target_cache_receipt is not None
+        and lower_target_backend_receipt is not None
+    ):
+        raise RuntimeError(
+            "lower target cache and live backend receipts are mutually exclusive"
+        )
     if cache_enabled:
         assert lower_target_cache_receipt is not None
         cache_source = lower_target_cache_receipt.get("source_receipt")
@@ -1291,6 +1472,12 @@ def _dataset_receipt(
                 "formal lower target cache receipt is not bound to the "
                 "current dataset/source/SMPL-X inputs"
             )
+    _validate_lower_target_backend_receipt(
+        lower_target_backend_receipt,
+        formal_stage=args.formal_stage,
+        current_source=current_source,
+        smplx_asset_receipt=smplx_asset_receipt,
+    )
     receipt = {
         "summary": str(summary_path),
         "summary_sha256": _sha256(summary_path),
@@ -1310,6 +1497,10 @@ def _dataset_receipt(
     attach_lower_target_cache_receipt(
         receipt,
         lower_target_cache_receipt,
+    )
+    _attach_lower_target_backend_receipt(
+        receipt,
+        lower_target_backend_receipt,
     )
     return receipt
 
@@ -1584,7 +1775,7 @@ def _validate_formal_stage(args: Any) -> None:
             "lr_base": 3e-4,
             "decay_epochs": 780,
             "final_ckpt_name": "rvq_lower_600.bin",
-            "use_lower_target_joints_cache": True,
+            "use_lower_target_joints_cache": False,
         },
         "global": {
             "model": "motion_representation",
@@ -1743,6 +1934,10 @@ def _load_resume(
     verify_lower_target_cache_resume_receipt(
         payload,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
+    _verify_lower_target_backend_resume_receipt(
+        payload,
+        dataset_receipt.get(LOWER_TARGET_BACKEND_RECEIPT_KEY),
     )
     expected_optimizer_updates = completed_epochs * trainer.train_length
     if optimizer_updates != expected_optimizer_updates:
@@ -2028,6 +2223,10 @@ def _save_resume(
         payload,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
     )
+    _attach_lower_target_backend_receipt(
+        payload,
+        dataset_receipt.get(LOWER_TARGET_BACKEND_RECEIPT_KEY),
+    )
     _atomic_torch_save(
         path,
         payload,
@@ -2072,6 +2271,10 @@ def _model_payload(
     attach_lower_target_cache_receipt(
         audit,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
+    _attach_lower_target_backend_receipt(
+        audit,
+        dataset_receipt.get(LOWER_TARGET_BACKEND_RECEIPT_KEY),
     )
     return {
         "model_state": trainer.model.state_dict(),
@@ -3409,6 +3612,13 @@ def main() -> None:
     source_receipt = _source_receipt()
     source_receipt_sha = _payload_sha256(source_receipt)
     initial_smplx_asset_receipt = _formal_smplx_asset_receipt(args)
+    lower_target_backend_receipt = (
+        _formal_lower_target_backend_receipt(
+            args,
+            current_source=source_receipt,
+            smplx_asset_receipt=initial_smplx_asset_receipt,
+        )
+    )
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", init_method="env://")
     logger_tools.set_args_and_logger(args, rank)
@@ -3429,6 +3639,14 @@ def main() -> None:
             "formal lower target cache activation did not produce exactly "
             "one trainer receipt"
         )
+    if (
+        args.formal_stage == "lower"
+        and getattr(trainer, "lower_target_joints_cache", None) is not None
+    ):
+        raise RuntimeError(
+            "formal lower initialized a cache despite its live backend contract"
+        )
+    trainer.lower_target_backend_receipt = lower_target_backend_receipt
     lower_target_cache_gate_receipt = (
         _formal_lower_target_cache_gate_receipt(
             args,
@@ -3488,6 +3706,7 @@ def main() -> None:
         train_samples=train_samples,
         current_source=source_receipt,
         lower_target_cache_receipt=lower_target_cache_receipt,
+        lower_target_backend_receipt=lower_target_backend_receipt,
     )
     if dataset_receipt.get("smplx_asset") != initial_smplx_asset_receipt:
         raise RuntimeError("formal SMPL-X asset changed while initializing trainer")
@@ -3633,6 +3852,9 @@ def main() -> None:
                     }
                     if lower_target_cache_receipt is not None
                     else {}
+                ),
+                **_lower_target_backend_overlay(
+                    lower_target_backend_receipt
                 ),
                 "base_candidate_manifest": candidate_manifest_receipt,
                 "source_receipt": source_receipt,
@@ -3827,6 +4049,9 @@ def main() -> None:
                                 if lower_target_cache_receipt is not None
                                 else {}
                             ),
+                            **_lower_target_backend_overlay(
+                                lower_target_backend_receipt
+                            ),
                             "base_candidate_manifest": (
                                 candidate_manifest_receipt
                             ),
@@ -3859,6 +4084,9 @@ def main() -> None:
                 train_samples=train_samples,
                 current_source=final_source_receipt,
                 lower_target_cache_receipt=lower_target_cache_receipt,
+                lower_target_backend_receipt=(
+                    lower_target_backend_receipt
+                ),
             )
             if final_dataset_receipt != dataset_receipt:
                 raise RuntimeError(
@@ -3946,6 +4174,9 @@ def main() -> None:
                         if lower_target_cache_receipt is not None
                         else {}
                     ),
+                    **_lower_target_backend_overlay(
+                        lower_target_backend_receipt
+                    ),
                     "base_candidate_manifest": candidate_manifest_receipt,
                     "source_receipt": source_receipt,
                     "source_receipt_sha256": source_receipt_sha,
@@ -3987,6 +4218,9 @@ def main() -> None:
                         }
                         if lower_target_cache_receipt is not None
                         else {}
+                    ),
+                    **_lower_target_backend_overlay(
+                        lower_target_backend_receipt
                     ),
                     "base_candidate_manifest": candidate_manifest_receipt,
                     "source_receipt": source_receipt,

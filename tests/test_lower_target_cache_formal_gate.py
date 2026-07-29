@@ -167,7 +167,7 @@ class StaticProtocolTests(unittest.TestCase):
             source,
         )
 
-    def test_formal_training_cannot_bypass_gate(self) -> None:
+    def test_cache_gate_remains_optional_but_formal_lower_is_live(self) -> None:
         launcher = (
             REPOSITORY
             / "scripts"
@@ -186,11 +186,17 @@ class StaticProtocolTests(unittest.TestCase):
             "--lower_target_cache_builder_process_receipt",
             "--expected_lower_target_cache_builder_process_receipt_sha256",
         ):
-            self.assertIn(option, launcher)
+            self.assertNotIn(option, launcher)
             self.assertIn(option, config)
-        self.assertIn("LOWER_TARGET_GATE", launcher)
+        self.assertNotIn("LOWER_TARGET_GATE", launcher)
+        self.assertIn("--use_lower_target_joints_cache false", launcher)
+        self.assertNotIn("--use_lower_target_joints_cache true", launcher)
         self.assertIn(
             "_formal_lower_target_cache_gate_receipt(",
+            formal,
+        )
+        self.assertIn(
+            "_formal_lower_target_backend_receipt(",
             formal,
         )
         self.assertIn(

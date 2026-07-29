@@ -691,6 +691,34 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
         )
 
     @staticmethod
+    def lower_target_backend_receipt(
+        *,
+        source: dict[str, object],
+        smplx_sha: str,
+    ) -> dict[str, object]:
+        receipt: dict[str, object] = {
+            "format": "semtalk_show_lower_target_backend_v1",
+            "backend": "live_smplx",
+            "formal_stage": "lower",
+            "cache_enabled": False,
+            "target_forward": "utils.smplx_training.smplx_target_forward",
+            "target_forward_sha256": MODULE.sha256_file(
+                Path(__file__).resolve().parents[1]
+                / "utils"
+                / "smplx_training.py"
+            ),
+            "target_batch_contract": "current_mixed_dataloader_batch",
+            "torch_no_grad": True,
+            "return_shaped": False,
+            "source_binding": {
+                key: source[key] for key in ("origin", "commit", "tree")
+            },
+            "smplx_asset_sha256": smplx_sha,
+        }
+        receipt["receipt_sha256"] = MODULE.compact_json_sha256(receipt)
+        return receipt
+
+    @staticmethod
     def write_json(path: Path, payload: dict[str, object]) -> None:
         path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -711,7 +739,8 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             config_sha = "7" * 64
             smplx_asset = {
                 "format": "semtalk_show_smplx_asset_v1",
-                "sha256": "8" * 64,
+                "filename": MODULE.FORMAL_SMPLX_FILENAME,
+                "sha256": MODULE.FORMAL_SMPLX_SHA256,
             }
             dataset = self.dataset_receipt(
                 summary_sha=summary_sha,
@@ -929,7 +958,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                     expected_data_mdb_sha256=data_sha,
                 )
 
-    def test_lower_cache_receipt_is_required_and_strictly_consumed(
+    def test_lower_live_receipt_is_required_and_strictly_consumed(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -943,13 +972,11 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             config_sha = "7" * 64
             smplx_asset = {
                 "format": "semtalk_show_smplx_asset_v1",
-                "sha256": "8" * 64,
+                "filename": MODULE.FORMAL_SMPLX_FILENAME,
+                "sha256": MODULE.FORMAL_SMPLX_SHA256,
             }
-            cache_receipt = self.lower_target_cache_receipt(
+            backend_receipt = self.lower_target_backend_receipt(
                 source=source,
-                summary_sha=summary_sha,
-                lineage_sha=lineage_sha,
-                data_sha=data_sha,
                 smplx_sha=smplx_asset["sha256"],
             )
             dataset = self.dataset_receipt(
@@ -958,7 +985,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 data_sha=data_sha,
                 smplx_asset=smplx_asset,
             )
-            dataset["lower_target_joints_cache"] = cache_receipt
+            dataset["lower_target_backend"] = backend_receipt
             trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
             optimizer_updates = 600 * 1_988
             payload = FORMAL._model_payload(
@@ -984,7 +1011,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 "config_sha256": config_sha,
                 "dataset_receipt": dataset,
                 "smplx_asset_receipt": smplx_asset,
-                "lower_target_joints_cache": cache_receipt,
+                "lower_target_backend": backend_receipt,
                 "base_candidate_manifest": None,
                 "source_receipt": source,
                 "source_receipt_sha256": MODULE.compact_json_sha256(
@@ -1013,9 +1040,9 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             )
             self.assertEqual(
                 builder_receipt["audit"][
-                    "lower_target_joints_cache"
+                    "lower_target_backend"
                 ],
-                cache_receipt,
+                backend_receipt,
             )
             _, inference_receipt = MODULE._checkpoint_payload_and_receipt(
                 checkpoint,
@@ -1029,14 +1056,14 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             )
             self.assertEqual(
                 inference_receipt["audit"][
-                    "lower_target_joints_cache"
+                    "lower_target_backend"
                 ],
-                cache_receipt,
+                backend_receipt,
             )
 
             tampered_payload = copy.deepcopy(payload)
             tampered_payload["audit"].pop(
-                "lower_target_joints_cache"
+                "lower_target_backend"
             )
             tampered_sha = write_current(tampered_payload, status)
             with self.assertRaises(RuntimeError):
@@ -1060,9 +1087,9 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 )
 
             tampered_payload = copy.deepcopy(payload)
-            tampered_payload["audit"]["lower_target_joints_cache"][
-                "data_mdb_sha256"
-            ] = "e" * 64
+            tampered_payload["audit"]["lower_target_backend"][
+                "target_batch_contract"
+            ] = "static_dataset_index"
             tampered_sha = write_current(tampered_payload, status)
             with self.assertRaises(RuntimeError):
                 BUILDER.checkpoint_record(
@@ -1085,7 +1112,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 )
 
             missing_status_receipt = copy.deepcopy(status)
-            missing_status_receipt.pop("lower_target_joints_cache")
+            missing_status_receipt.pop("lower_target_backend")
             checkpoint_sha = write_current(payload, missing_status_receipt)
             with self.assertRaises(RuntimeError):
                 BUILDER.checkpoint_record(

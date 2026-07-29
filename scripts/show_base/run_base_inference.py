@@ -97,6 +97,10 @@ RVQ_DIMS = {
 }
 CHECKPOINT_STAGES = ("base", "face", "upper", "hands", "lower", "global")
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+FORMAL_SMPLX_FILENAME = "SMPLX_NEUTRAL_2020.npz"
+FORMAL_SMPLX_SHA256 = (
+    "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
+)
 MODEL_V2_AUDIT_KEYS = {
     "format",
     "formal_stage",
@@ -151,6 +155,22 @@ LOWER_TARGET_CACHE_FORMAL_GATE_KEYS = {
     "source_binding",
     "cache_manifest_sha256",
     "cache_checker_sha256",
+}
+LOWER_TARGET_BACKEND_RECEIPT_KEY = "lower_target_backend"
+LOWER_TARGET_BACKEND_FORMAT = "semtalk_show_lower_target_backend_v1"
+LOWER_TARGET_BACKEND_RECEIPT_KEYS = {
+    "format",
+    "backend",
+    "formal_stage",
+    "cache_enabled",
+    "target_forward",
+    "target_forward_sha256",
+    "target_batch_contract",
+    "torch_no_grad",
+    "return_shaped",
+    "source_binding",
+    "smplx_asset_sha256",
+    "receipt_sha256",
 }
 BASE_CANDIDATE_AUDIT_KEYS = {
     "format",
@@ -448,6 +468,114 @@ def _validate_lower_target_cache_binding(
     ):
         raise InferenceContractError(
             f"{path}: invalid lower target cache receipt contract"
+        )
+
+
+def _validate_lower_target_backend_binding(
+    *,
+    formal_stage: str,
+    audit: Mapping[str, Any],
+    dataset_receipt: Mapping[str, Any],
+    status: Mapping[str, Any] | None,
+    path: Path,
+) -> None:
+    """Require formal lower's live SMPL-X receipt and reject cache/live mixing."""
+
+    backend_key = LOWER_TARGET_BACKEND_RECEIPT_KEY
+    cache_key = LOWER_TARGET_CACHE_RECEIPT_KEY
+    payloads = (
+        (audit, dataset_receipt)
+        if status is None
+        else (audit, dataset_receipt, status)
+    )
+    if formal_stage != "lower":
+        if any(
+            key in payload
+            for key in (backend_key, cache_key)
+            for payload in payloads
+        ):
+            raise InferenceContractError(
+                f"{path}: non-lower stage carries a lower target receipt"
+            )
+        return
+
+    if any(cache_key in payload for payload in payloads):
+        raise InferenceContractError(
+            f"{path}: formal lower cannot mix cache and live backend receipts"
+        )
+    audit_receipt = audit.get(backend_key)
+    dataset_backend_receipt = dataset_receipt.get(backend_key)
+    status_receipt = (
+        status.get(backend_key) if status is not None else audit_receipt
+    )
+    if (
+        type(audit_receipt) is not dict
+        or audit_receipt != dataset_backend_receipt
+        or audit_receipt != status_receipt
+        or set(audit_receipt) != LOWER_TARGET_BACKEND_RECEIPT_KEYS
+    ):
+        raise InferenceContractError(
+            f"{path}: lower live backend receipt is missing or inconsistent"
+        )
+
+    receipt_without_sha = dict(audit_receipt)
+    receipt_sha = receipt_without_sha.pop("receipt_sha256", None)
+    source_binding = audit_receipt.get("source_binding")
+    audit_source = audit.get("source_receipt")
+    smplx_asset = dataset_receipt.get("smplx_asset")
+    target_forward_source = (
+        Path(__file__).resolve().parents[2] / "utils" / "smplx_training.py"
+    )
+    if (
+        audit_receipt.get("format") != LOWER_TARGET_BACKEND_FORMAT
+        or audit_receipt.get("backend") != "live_smplx"
+        or audit_receipt.get("formal_stage") != "lower"
+        or audit_receipt.get("cache_enabled") is not False
+        or audit_receipt.get("target_forward")
+        != "utils.smplx_training.smplx_target_forward"
+        or type(audit_receipt.get("target_forward_sha256")) is not str
+        or len(audit_receipt["target_forward_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in audit_receipt["target_forward_sha256"]
+        )
+        or target_forward_source.is_symlink()
+        or not target_forward_source.is_file()
+        or audit_receipt.get("target_forward_sha256")
+        != sha256_file(target_forward_source)
+        or audit_receipt.get("target_batch_contract")
+        != "current_mixed_dataloader_batch"
+        or audit_receipt.get("torch_no_grad") is not True
+        or audit_receipt.get("return_shaped") is not False
+        or type(source_binding) is not dict
+        or set(source_binding) != {"origin", "commit", "tree"}
+        or type(audit_source) is not dict
+        or source_binding
+        != {
+            key: audit_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+        or source_binding.get("origin") != EXPECTED_ORIGIN
+        or any(
+            type(source_binding.get(field)) is not str
+            or len(source_binding[field]) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in source_binding[field]
+            )
+            for field in ("commit", "tree")
+        )
+        or type(smplx_asset) is not dict
+        or smplx_asset.get("format") != "semtalk_show_smplx_asset_v1"
+        or smplx_asset.get("filename") != FORMAL_SMPLX_FILENAME
+        or smplx_asset.get("sha256") != FORMAL_SMPLX_SHA256
+        or audit_receipt.get("smplx_asset_sha256")
+        != FORMAL_SMPLX_SHA256
+        or type(receipt_sha) is not str
+        or receipt_sha != compact_json_sha256(receipt_without_sha)
+    ):
+        raise InferenceContractError(
+            f"{path}: invalid lower live SMPL-X backend receipt contract"
         )
 
 
@@ -1857,7 +1985,7 @@ def _validate_model_v2_audit(
 ) -> None:
     expected_audit_keys = set(MODEL_V2_AUDIT_KEYS)
     if formal_stage == "lower":
-        expected_audit_keys.add(LOWER_TARGET_CACHE_RECEIPT_KEY)
+        expected_audit_keys.add(LOWER_TARGET_BACKEND_RECEIPT_KEY)
     if (
         set(audit) != expected_audit_keys
         or audit.get("format") != "semtalk_show_model_v2"
@@ -1885,7 +2013,7 @@ def _validate_model_v2_audit(
         raise InferenceContractError(
             f"{path}: invalid model_v2 formal audit for {formal_stage}"
         )
-    _validate_lower_target_cache_binding(
+    _validate_lower_target_backend_binding(
         formal_stage=formal_stage,
         audit=audit,
         dataset_receipt=dataset_receipt,
@@ -2614,7 +2742,7 @@ def _checkpoint_payload_and_receipt(
             raise InferenceContractError(
                 f"{resolved_status}: model_v2 SMPL-X receipt mismatch"
             )
-        _validate_lower_target_cache_binding(
+        _validate_lower_target_backend_binding(
             formal_stage=formal_stage,
             audit=audit,
             dataset_receipt=dataset_receipt,

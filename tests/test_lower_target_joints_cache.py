@@ -1283,7 +1283,7 @@ class StaticIntegrationContractTests(unittest.TestCase):
         )
         self.assertIn("--expected_smplx_asset_sha256", config_source)
 
-    def test_formal_launcher_and_artifacts_bind_cache_for_lower_only(self) -> None:
+    def test_formal_launcher_uses_audited_live_lower_backend(self) -> None:
         launcher = (
             REPOSITORY
             / "scripts"
@@ -1296,27 +1296,23 @@ class StaticIntegrationContractTests(unittest.TestCase):
         config_source = (
             REPOSITORY / "utils" / "config.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("LOWER_TARGET_CACHE", launcher)
-        self.assertIn('if [[ "$stage" == lower ]]', launcher)
-        self.assertIn("--use_lower_target_joints_cache true", launcher)
+        self.assertNotIn("LOWER_TARGET_CACHE", launcher)
+        self.assertNotIn("lower_target_manifest", launcher)
+        self.assertNotIn("lower_target_checker", launcher)
+        self.assertNotIn("lower_target_gate", launcher)
+        self.assertNotIn("lower_target_builder_process", launcher)
+        self.assertIn("--use_lower_target_joints_cache false", launcher)
+        self.assertNotIn("--use_lower_target_joints_cache true", launcher)
         self.assertIn(
-            "--expected_lower_target_joints_cache_manifest_sha256",
-            launcher,
-        )
-        self.assertIn(
-            "--expected_lower_target_joints_cache_checker_sha256",
-            launcher,
-        )
-        self.assertIn(
-            "LOWER_TARGET_CACHE_RECEIPT_KEY:",
+            'LOWER_TARGET_BACKEND_RECEIPT_KEY = "lower_target_backend"',
             formal,
         )
         self.assertIn(
-            "verify_lower_target_cache_resume_receipt(",
+            "_verify_lower_target_backend_resume_receipt(",
             formal,
         )
         self.assertGreaterEqual(
-            formal.count("attach_lower_target_cache_receipt("),
+            formal.count("_attach_lower_target_backend_receipt("),
             3,
         )
         self.assertEqual(
@@ -1331,11 +1327,11 @@ class StaticIntegrationContractTests(unittest.TestCase):
         ):
             consumer = (REPOSITORY / relative).read_text(encoding="utf-8")
             self.assertIn(
-                "LOWER_TARGET_CACHE_RECEIPT_KEY",
+                "LOWER_TARGET_BACKEND_RECEIPT_KEY",
                 consumer,
             )
             self.assertIn(
-                "lower target cache receipt is missing or inconsistent",
+                "lower live backend receipt is missing or inconsistent",
                 consumer,
             )
 

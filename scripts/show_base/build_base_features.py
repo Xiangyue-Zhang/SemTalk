@@ -60,6 +60,10 @@ SPEAKER_MAP = {
     "conan": 3,
 }
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+FORMAL_SMPLX_FILENAME = "SMPLX_NEUTRAL_2020.npz"
+FORMAL_SMPLX_SHA256 = (
+    "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
+)
 MODEL_V2_AUDIT_KEYS = {
     "format",
     "formal_stage",
@@ -114,6 +118,22 @@ LOWER_TARGET_CACHE_FORMAL_GATE_KEYS = {
     "source_binding",
     "cache_manifest_sha256",
     "cache_checker_sha256",
+}
+LOWER_TARGET_BACKEND_RECEIPT_KEY = "lower_target_backend"
+LOWER_TARGET_BACKEND_FORMAT = "semtalk_show_lower_target_backend_v1"
+LOWER_TARGET_BACKEND_RECEIPT_KEYS = {
+    "format",
+    "backend",
+    "formal_stage",
+    "cache_enabled",
+    "target_forward",
+    "target_forward_sha256",
+    "target_batch_contract",
+    "torch_no_grad",
+    "return_shaped",
+    "source_binding",
+    "smplx_asset_sha256",
+    "receipt_sha256",
 }
 CANONICAL_SOURCE_AUDIO_RATE = 22_000
 CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH = 2
@@ -376,6 +396,110 @@ def validate_lower_target_cache_binding(
     ):
         raise RuntimeError(
             f"{path}: invalid lower target cache receipt contract"
+        )
+
+
+def validate_lower_target_backend_binding(
+    *,
+    formal_stage: str,
+    audit: Mapping[str, Any],
+    dataset_receipt: Mapping[str, Any],
+    status: Mapping[str, Any],
+    path: Path,
+) -> None:
+    """Require formal lower's live SMPL-X receipt and reject cache/live mixing."""
+
+    backend_key = LOWER_TARGET_BACKEND_RECEIPT_KEY
+    cache_key = LOWER_TARGET_CACHE_RECEIPT_KEY
+    if formal_stage != "lower":
+        if any(
+            key in payload
+            for key in (backend_key, cache_key)
+            for payload in (audit, dataset_receipt, status)
+        ):
+            raise RuntimeError(
+                f"{path}: non-lower stage carries a lower target receipt"
+            )
+        return
+
+    if any(
+        cache_key in payload
+        for payload in (audit, dataset_receipt, status)
+    ):
+        raise RuntimeError(
+            f"{path}: formal lower cannot mix cache and live backend receipts"
+        )
+    audit_receipt = audit.get(backend_key)
+    dataset_backend_receipt = dataset_receipt.get(backend_key)
+    status_receipt = status.get(backend_key)
+    if (
+        type(audit_receipt) is not dict
+        or audit_receipt != dataset_backend_receipt
+        or audit_receipt != status_receipt
+        or set(audit_receipt) != LOWER_TARGET_BACKEND_RECEIPT_KEYS
+    ):
+        raise RuntimeError(
+            f"{path}: lower live backend receipt is missing or inconsistent"
+        )
+
+    receipt_without_sha = dict(audit_receipt)
+    receipt_sha = receipt_without_sha.pop("receipt_sha256", None)
+    source_binding = audit_receipt.get("source_binding")
+    audit_source = audit.get("source_receipt")
+    smplx_asset = dataset_receipt.get("smplx_asset")
+    target_forward_source = (
+        Path(__file__).resolve().parents[2] / "utils" / "smplx_training.py"
+    )
+    if (
+        audit_receipt.get("format") != LOWER_TARGET_BACKEND_FORMAT
+        or audit_receipt.get("backend") != "live_smplx"
+        or audit_receipt.get("formal_stage") != "lower"
+        or audit_receipt.get("cache_enabled") is not False
+        or audit_receipt.get("target_forward")
+        != "utils.smplx_training.smplx_target_forward"
+        or type(audit_receipt.get("target_forward_sha256")) is not str
+        or len(audit_receipt["target_forward_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in audit_receipt["target_forward_sha256"]
+        )
+        or target_forward_source.is_symlink()
+        or not target_forward_source.is_file()
+        or audit_receipt.get("target_forward_sha256")
+        != sha256(target_forward_source)
+        or audit_receipt.get("target_batch_contract")
+        != "current_mixed_dataloader_batch"
+        or audit_receipt.get("torch_no_grad") is not True
+        or audit_receipt.get("return_shaped") is not False
+        or type(source_binding) is not dict
+        or set(source_binding) != {"origin", "commit", "tree"}
+        or type(audit_source) is not dict
+        or source_binding
+        != {
+            key: audit_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+        or source_binding.get("origin") != EXPECTED_ORIGIN
+        or any(
+            type(source_binding.get(field)) is not str
+            or len(source_binding[field]) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in source_binding[field]
+            )
+            for field in ("commit", "tree")
+        )
+        or type(smplx_asset) is not dict
+        or smplx_asset.get("format") != "semtalk_show_smplx_asset_v1"
+        or smplx_asset.get("filename") != FORMAL_SMPLX_FILENAME
+        or smplx_asset.get("sha256") != FORMAL_SMPLX_SHA256
+        or audit_receipt.get("smplx_asset_sha256")
+        != FORMAL_SMPLX_SHA256
+        or type(receipt_sha) is not str
+        or receipt_sha != compact_payload_sha256(receipt_without_sha)
+    ):
+        raise RuntimeError(
+            f"{path}: invalid lower live SMPL-X backend receipt contract"
         )
 
 
@@ -2007,7 +2131,7 @@ def checkpoint_record(
         )
     dataset_receipt = status_dataset_receipt
     audit_optimizer_updates = audit.get("optimizer_updates")
-    validate_lower_target_cache_binding(
+    validate_lower_target_backend_binding(
         formal_stage=formal_stage,
         audit=audit,
         dataset_receipt=dataset_receipt,
@@ -2016,7 +2140,7 @@ def checkpoint_record(
     )
     expected_audit_keys = set(MODEL_V2_AUDIT_KEYS)
     if formal_stage == "lower":
-        expected_audit_keys.add(LOWER_TARGET_CACHE_RECEIPT_KEY)
+        expected_audit_keys.add(LOWER_TARGET_BACKEND_RECEIPT_KEY)
     if (
         set(audit) != expected_audit_keys
         or not isinstance(dataset_receipt, dict)
