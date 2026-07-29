@@ -51,6 +51,66 @@ BUILDER = importlib.util.module_from_spec(BUILDER_SPEC)
 BUILDER_SPEC.loader.exec_module(BUILDER)
 
 
+def lower_target_cache_receipt_fixture(
+    *,
+    source: dict[str, object],
+    summary_sha: str,
+    lineage_sha: str,
+    data_sha: str,
+    smplx_sha: str,
+) -> dict[str, object]:
+    source_binding = {
+        key: source[key] for key in ("origin", "commit", "tree")
+    }
+    receipt: dict[str, object] = {
+        "format": "semtalk_show_lower_target_joints_raw_lmdb_v1",
+        "cache_version": 1,
+        "cache_path": "/frozen/lower-target.lmdb",
+        "manifest_path": "/frozen/lower-target-manifest.json",
+        "manifest_sha256": "9" * 64,
+        "checker_receipt_path": "/frozen/lower-target-checker.json",
+        "checker_receipt_sha256": "a" * 64,
+        "data_mdb_sha256": "b" * 64,
+        "lock_mdb_sha256": "c" * 64,
+        "entry_aggregate_sha256": "d" * 64,
+        "entries": 127_309,
+        "entry_shape": [64, 127, 3],
+        "dtype": "<f4",
+        "speaker_scope": "All",
+        "speaker_ids": [0, 1, 2, 3],
+        "source_receipt": source_binding,
+        "current_inputs": {
+            "representation_summary_sha256": summary_sha,
+            "representation_lineage_sha256": lineage_sha,
+            "data_mdb_sha256": data_sha,
+            "smplx_asset_sha256": smplx_sha,
+        },
+        "exact_once": True,
+        "finite": True,
+        "torch_equal_checked": True,
+        "target_requires_grad": False,
+        "target_optimizer_excluded": True,
+        "formal_gate": {
+            "format": "semtalk_show_lower_target_cache_formal_gate_v1",
+            "status": "pass",
+            "path": "/frozen/lower-target-gate/formal_gate_report.json",
+            "sha256": "e" * 64,
+            "pooled_wall_speedup": 1.20,
+            "pooled_cuda_event_speedup": 1.20,
+            "builder_amortized_wall_speedup": 1.10,
+            "builder_process_receipt_path": (
+                "/frozen/lower-target-builder-process.json"
+            ),
+            "builder_process_receipt_sha256": "f" * 64,
+            "source_binding": source_binding,
+            "cache_manifest_sha256": "9" * 64,
+            "cache_checker_sha256": "a" * 64,
+        },
+    }
+    receipt["receipt_sha256"] = MODULE.canonical_json_sha256(receipt)
+    return receipt
+
+
 class OutputNpzValidationTest(unittest.TestCase):
     def arrays(self, *, frames: int = 88) -> dict[str, np.ndarray]:
         return MODULE._output_arrays(
@@ -409,6 +469,181 @@ class ExactIntegerBoundaryTest(unittest.TestCase):
             self.assertIn("type(value) is not int", source)
 
 
+class LowerTargetFormalGateReceiptContractTest(unittest.TestCase):
+    @staticmethod
+    def fixture() -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
+        source = {
+            "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "entrypoint": "/immutable/show_base_train.py",
+            "entrypoint_sha256": "3" * 64,
+        }
+        summary_sha = "4" * 64
+        lineage_sha = "5" * 64
+        data_sha = "6" * 64
+        smplx_sha = "7" * 64
+        receipt = lower_target_cache_receipt_fixture(
+            source=source,
+            summary_sha=summary_sha,
+            lineage_sha=lineage_sha,
+            data_sha=data_sha,
+            smplx_sha=smplx_sha,
+        )
+        audit = {
+            "source_receipt": source,
+            "lower_target_joints_cache": receipt,
+        }
+        dataset = {
+            "summary_sha256": summary_sha,
+            "lineage_sha256": lineage_sha,
+            "data_mdb_sha256": data_sha,
+            "smplx_asset": {"sha256": smplx_sha},
+            "lower_target_joints_cache": receipt,
+        }
+        status = {"lower_target_joints_cache": receipt}
+        return receipt, audit, dataset, status
+
+    @staticmethod
+    def validate_both(
+        *,
+        audit: dict[str, object],
+        dataset: dict[str, object],
+        status: dict[str, object],
+    ) -> None:
+        path = Path("/frozen/rvq_lower_600.bin")
+        BUILDER.validate_lower_target_cache_binding(
+            formal_stage="lower",
+            audit=audit,
+            dataset_receipt=dataset,
+            status=status,
+            path=path,
+        )
+        MODULE._validate_lower_target_cache_binding(
+            formal_stage="lower",
+            audit=audit,
+            dataset_receipt=dataset,
+            status=status,
+            path=path,
+        )
+
+    @staticmethod
+    def replace_receipt(
+        receipt: dict[str, object],
+        audit: dict[str, object],
+        dataset: dict[str, object],
+        status: dict[str, object],
+    ) -> None:
+        audit["lower_target_joints_cache"] = receipt
+        dataset["lower_target_joints_cache"] = receipt
+        status["lower_target_joints_cache"] = receipt
+
+    def assert_rejected_by_both(
+        self,
+        *,
+        audit: dict[str, object],
+        dataset: dict[str, object],
+        status: dict[str, object],
+    ) -> None:
+        path = Path("/frozen/rvq_lower_600.bin")
+        with self.assertRaises(RuntimeError):
+            BUILDER.validate_lower_target_cache_binding(
+                formal_stage="lower",
+                audit=audit,
+                dataset_receipt=dataset,
+                status=status,
+                path=path,
+            )
+        with self.assertRaises(MODULE.InferenceContractError):
+            MODULE._validate_lower_target_cache_binding(
+                formal_stage="lower",
+                audit=audit,
+                dataset_receipt=dataset,
+                status=status,
+                path=path,
+            )
+
+    def test_augmented_receipt_is_strictly_accepted_by_both(self) -> None:
+        receipt, audit, dataset, status = self.fixture()
+        self.assertEqual(
+            set(receipt),
+            MODULE.LOWER_TARGET_CACHE_RECEIPT_KEYS,
+        )
+        self.assertEqual(
+            set(receipt["formal_gate"]),
+            MODULE.LOWER_TARGET_CACHE_FORMAL_GATE_KEYS,
+        )
+        self.assertEqual(
+            MODULE.LOWER_TARGET_CACHE_RECEIPT_KEYS,
+            BUILDER.LOWER_TARGET_CACHE_RECEIPT_KEYS,
+        )
+        self.assertEqual(
+            MODULE.LOWER_TARGET_CACHE_FORMAL_GATE_KEYS,
+            BUILDER.LOWER_TARGET_CACHE_FORMAL_GATE_KEYS,
+        )
+        self.validate_both(
+            audit=audit,
+            dataset=dataset,
+            status=status,
+        )
+
+    def test_missing_or_tampered_formal_gate_is_rejected_by_both(
+        self,
+    ) -> None:
+        for mutation in ("missing", "tampered"):
+            with self.subTest(mutation=mutation):
+                receipt, audit, dataset, status = self.fixture()
+                mutated = copy.deepcopy(receipt)
+                if mutation == "missing":
+                    mutated.pop("formal_gate")
+                else:
+                    mutated["formal_gate"]["pooled_wall_speedup"] = 1.0
+                    mutated["receipt_sha256"] = (
+                        MODULE.canonical_json_sha256(
+                            {
+                                key: value
+                                for key, value in mutated.items()
+                                if key != "receipt_sha256"
+                            }
+                        )
+                    )
+                self.replace_receipt(
+                    mutated,
+                    audit,
+                    dataset,
+                    status,
+                )
+                self.assert_rejected_by_both(
+                    audit=audit,
+                    dataset=dataset,
+                    status=status,
+                )
+
+    def test_gate_added_with_old_receipt_hash_is_rejected_by_both(
+        self,
+    ) -> None:
+        receipt, audit, dataset, status = self.fixture()
+        old_payload = {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"formal_gate", "receipt_sha256"}
+        }
+        receipt["receipt_sha256"] = MODULE.canonical_json_sha256(
+            old_payload
+        )
+        self.replace_receipt(receipt, audit, dataset, status)
+        self.assert_rejected_by_both(
+            audit=audit,
+            dataset=dataset,
+            status=status,
+        )
+
+
 @unittest.skipIf(torch is None, "torch/formal runtime is unavailable")
 class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
     @staticmethod
@@ -447,39 +682,13 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
         data_sha: str,
         smplx_sha: str,
     ) -> dict[str, object]:
-        receipt: dict[str, object] = {
-            "format": "semtalk_show_lower_target_joints_raw_lmdb_v1",
-            "cache_version": 1,
-            "cache_path": "/frozen/lower-target.lmdb",
-            "manifest_path": "/frozen/lower-target-manifest.json",
-            "manifest_sha256": "9" * 64,
-            "checker_receipt_path": "/frozen/lower-target-checker.json",
-            "checker_receipt_sha256": "a" * 64,
-            "data_mdb_sha256": "b" * 64,
-            "lock_mdb_sha256": "c" * 64,
-            "entry_aggregate_sha256": "d" * 64,
-            "entries": 127_309,
-            "entry_shape": [64, 127, 3],
-            "dtype": "<f4",
-            "speaker_scope": "All",
-            "speaker_ids": [0, 1, 2, 3],
-            "source_receipt": {
-                key: source[key] for key in ("origin", "commit", "tree")
-            },
-            "current_inputs": {
-                "representation_summary_sha256": summary_sha,
-                "representation_lineage_sha256": lineage_sha,
-                "data_mdb_sha256": data_sha,
-                "smplx_asset_sha256": smplx_sha,
-            },
-            "exact_once": True,
-            "finite": True,
-            "torch_equal_checked": True,
-            "target_requires_grad": False,
-            "target_optimizer_excluded": True,
-        }
-        receipt["receipt_sha256"] = MODULE.canonical_json_sha256(receipt)
-        return receipt
+        return lower_target_cache_receipt_fixture(
+            source=source,
+            summary_sha=summary_sha,
+            lineage_sha=lineage_sha,
+            data_sha=data_sha,
+            smplx_sha=smplx_sha,
+        )
 
     @staticmethod
     def write_json(path: Path, payload: dict[str, object]) -> None:

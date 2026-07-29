@@ -36,6 +36,7 @@ from utils import config, logger_tools, other_tools
 from utils.lower_target_cache import (
     RECEIPT_KEY as LOWER_TARGET_CACHE_RECEIPT_KEY,
     attach_lower_target_cache_receipt,
+    canonical_json_sha256 as lower_target_cache_receipt_sha256,
     validate_activation_args as validate_lower_target_cache_activation,
     verify_lower_target_cache_resume_receipt,
 )
@@ -3443,8 +3444,27 @@ def main() -> None:
         lower_target_cache_receipt = copy.deepcopy(
             lower_target_cache_receipt
         )
+        previous_receipt_sha = lower_target_cache_receipt.pop(
+            "receipt_sha256",
+            None,
+        )
+        if (
+            type(previous_receipt_sha) is not str
+            or previous_receipt_sha
+            != lower_target_cache_receipt_sha256(
+                lower_target_cache_receipt
+            )
+        ):
+            raise RuntimeError(
+                "lower target cache receipt changed before gate attachment"
+            )
         lower_target_cache_receipt["formal_gate"] = (
             lower_target_cache_gate_receipt
+        )
+        lower_target_cache_receipt["receipt_sha256"] = (
+            lower_target_cache_receipt_sha256(
+                lower_target_cache_receipt
+            )
         )
         trainer.lower_target_cache_receipt = lower_target_cache_receipt
     train_samples = len(trainer.train_data)

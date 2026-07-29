@@ -135,7 +135,22 @@ LOWER_TARGET_CACHE_RECEIPT_KEYS = {
     "torch_equal_checked",
     "target_requires_grad",
     "target_optimizer_excluded",
+    "formal_gate",
     "receipt_sha256",
+}
+LOWER_TARGET_CACHE_FORMAL_GATE_KEYS = {
+    "format",
+    "status",
+    "path",
+    "sha256",
+    "pooled_wall_speedup",
+    "pooled_cuda_event_speedup",
+    "builder_amortized_wall_speedup",
+    "builder_process_receipt_path",
+    "builder_process_receipt_sha256",
+    "source_binding",
+    "cache_manifest_sha256",
+    "cache_checker_sha256",
 }
 BASE_CANDIDATE_AUDIT_KEYS = {
     "format",
@@ -330,6 +345,7 @@ def _validate_lower_target_cache_binding(
     source = audit_receipt.get("source_receipt")
     audit_source = audit.get("source_receipt")
     smplx_asset = dataset_receipt.get("smplx_asset")
+    formal_gate = audit_receipt.get("formal_gate")
     digest_fields = (
         "manifest_sha256",
         "checker_receipt_sha256",
@@ -353,6 +369,40 @@ def _validate_lower_target_cache_binding(
         or audit_receipt.get("torch_equal_checked") is not True
         or audit_receipt.get("target_requires_grad") is not False
         or audit_receipt.get("target_optimizer_excluded") is not True
+        or type(formal_gate) is not dict
+        or set(formal_gate) != LOWER_TARGET_CACHE_FORMAL_GATE_KEYS
+        or formal_gate.get("format")
+        != "semtalk_show_lower_target_cache_formal_gate_v1"
+        or formal_gate.get("status") != "pass"
+        or type(formal_gate.get("path")) is not str
+        or not formal_gate["path"]
+        or type(formal_gate.get("builder_process_receipt_path")) is not str
+        or not formal_gate["builder_process_receipt_path"]
+        or formal_gate.get("cache_manifest_sha256")
+        != audit_receipt.get("manifest_sha256")
+        or formal_gate.get("cache_checker_sha256")
+        != audit_receipt.get("checker_receipt_sha256")
+        or formal_gate.get("source_binding") != source
+        or any(
+            type(formal_gate.get(field)) is not str
+            or len(formal_gate[field]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in formal_gate[field]
+            )
+            for field in ("sha256", "builder_process_receipt_sha256")
+        )
+        or any(
+            type(formal_gate.get(field)) not in (int, float)
+            or type(formal_gate[field]) is bool
+            or not math.isfinite(float(formal_gate[field]))
+            or float(formal_gate[field]) < 1.05
+            for field in (
+                "pooled_wall_speedup",
+                "pooled_cuda_event_speedup",
+                "builder_amortized_wall_speedup",
+            )
+        )
         or any(
             type(audit_receipt.get(field)) is not str
             or len(audit_receipt[field]) != 64
