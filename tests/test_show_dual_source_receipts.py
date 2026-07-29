@@ -76,6 +76,35 @@ def producer_args() -> list[str]:
     ]
 
 
+def frozen_canonical_cli_args() -> list[str]:
+    return [
+        "--expected-canonical-manifest-sha256",
+        SHA256,
+        "--expected-canonical-summary-sha256",
+        SHA256,
+        "--expected-canonical-lineage-sha256",
+        SHA256,
+    ]
+
+
+def frozen_canonical_sha_kwargs(
+    manifest: Path,
+    summary: Path,
+    lineage: Path,
+) -> dict[str, str]:
+    return {
+        "expected_manifest_sha256": hashlib.sha256(
+            manifest.read_bytes()
+        ).hexdigest(),
+        "expected_summary_sha256": hashlib.sha256(
+            summary.read_bytes()
+        ).hexdigest(),
+        "expected_lineage_sha256": hashlib.sha256(
+            lineage.read_bytes()
+        ).hexdigest(),
+    }
+
+
 class FrozenRepresentationLedgerTest(unittest.TestCase):
     def test_public_loader_window_ledger_is_exact(self) -> None:
         self.assertEqual(
@@ -268,6 +297,7 @@ class DualSourceCliTest(unittest.TestCase):
                 "--expected-hubert-tree-sha256",
                 SHA256,
                 *producer_args(),
+                *frozen_canonical_cli_args(),
             ],
         )
 
@@ -309,6 +339,7 @@ class DualSourceCliTest(unittest.TestCase):
                 "--expected-hubert-tree-sha256",
                 SHA256,
                 *producer_args(),
+                *frozen_canonical_cli_args(),
             ]
         )
         self.assert_each_source_root_is_required(FEATURES, argv)
@@ -317,7 +348,7 @@ class DualSourceCliTest(unittest.TestCase):
         source = (
             ROOT / "scripts/show_base/run_audio_cache_8shard.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn('if [[ $# -ne 14 ]]', source)
+        self.assertIn('if [[ $# -ne 17 ]]', source)
         self.assertIn(
             '--expected-source-commit "$source_commit"',
             source,
@@ -334,6 +365,33 @@ class DualSourceCliTest(unittest.TestCase):
             '--expected-canonical-source-tree "$canonical_source_tree"',
             source,
         )
+        self.assertIn(
+            '--expected-canonical-manifest-sha256 '
+            '"$canonical_manifest_sha256"',
+            source,
+        )
+        self.assertIn(
+            '--expected-canonical-summary-sha256 '
+            '"$canonical_summary_sha256"',
+            source,
+        )
+        self.assertIn(
+            '--expected-canonical-lineage-sha256 '
+            '"$canonical_lineage_sha256"',
+            source,
+        )
+
+    def test_audio_path_is_feature_extractor_only(self) -> None:
+        source = (
+            ROOT / "scripts/show_base/build_base_features.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Wav2Vec2FeatureExtractor", source)
+        self.assertNotIn("Wav2Vec2Processor", source)
+        self.assertIn(
+            "native_to_true_16000hz_before_feature_extractor",
+            source,
+        )
+        self.assertIn("feature_extractor_sampling_rate", source)
 
 
 class CanonicalReceiptIsolationTest(unittest.TestCase):
@@ -423,6 +481,11 @@ class CanonicalReceiptIsolationTest(unittest.TestCase):
                 },
                 summary_path=summary,
                 lineage_path=lineage,
+                **frozen_canonical_sha_kwargs(
+                    manifest,
+                    summary,
+                    lineage,
+                ),
                 expected_canonical_source_commit=CANONICAL_COMMIT,
                 expected_canonical_source_tree=CANONICAL_TREE,
             )
@@ -430,6 +493,29 @@ class CanonicalReceiptIsolationTest(unittest.TestCase):
                 receipt["source_receipt"]["commit"],
                 CANONICAL_COMMIT,
             )
+            wrong_hashes = frozen_canonical_sha_kwargs(
+                manifest,
+                summary,
+                lineage,
+            )
+            wrong_hashes["expected_summary_sha256"] = "0" * 64
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "canonical summary SHA",
+            ):
+                FEATURES.load_canonical_receipt(
+                    manifest_paths=[manifest],
+                    manifest_hashes={
+                        str(manifest.resolve()): hashlib.sha256(
+                            manifest.read_bytes()
+                        ).hexdigest()
+                    },
+                    summary_path=summary,
+                    lineage_path=lineage,
+                    **wrong_hashes,
+                    expected_canonical_source_commit=CANONICAL_COMMIT,
+                    expected_canonical_source_tree=CANONICAL_TREE,
+                )
             representation_receipt = (
                 REPRESENTATION.load_canonical_receipts(
                     manifest=manifest,
@@ -460,6 +546,11 @@ class CanonicalReceiptIsolationTest(unittest.TestCase):
                     },
                     summary_path=summary,
                     lineage_path=lineage,
+                    **frozen_canonical_sha_kwargs(
+                        manifest,
+                        summary,
+                        lineage,
+                    ),
                     expected_canonical_source_commit=PRODUCER_COMMIT,
                     expected_canonical_source_tree=PRODUCER_TREE,
                 )
@@ -493,6 +584,11 @@ class CanonicalReceiptIsolationTest(unittest.TestCase):
                         },
                         summary_path=summary,
                         lineage_path=lineage,
+                        **frozen_canonical_sha_kwargs(
+                            manifest,
+                            summary,
+                            lineage,
+                        ),
                         expected_canonical_source_commit=CANONICAL_COMMIT,
                         expected_canonical_source_tree=CANONICAL_TREE,
                     )

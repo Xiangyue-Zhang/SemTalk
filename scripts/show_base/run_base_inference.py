@@ -1399,12 +1399,12 @@ def _validate_audio_receipts(
             "label": "corrected_true_16khz",
             "source_decode": "librosa.load(sr=None,mono=True)",
             "channel_mix": "librosa_to_mono_arithmetic_mean",
-            "resample": "native_to_true_16000hz_before_processor",
-            "processor_sampling_rate": 16000,
+            "resample": "native_to_true_16000hz_before_feature_extractor",
+            "feature_extractor_sampling_rate": 16000,
             "released_code_difference": (
                 "The public loader decodes with librosa's 22050 Hz default "
-                "and passes that waveform to a processor declared as 16000 Hz. "
-                "This run corrects that sample-rate mismatch."
+                "and passes that waveform to a feature extractor declared as "
+                "16000 Hz. This run corrects that sample-rate mismatch."
             ),
             "claim": "adapted_reconstruction_not_official_input_exact",
         }

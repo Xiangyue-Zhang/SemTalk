@@ -429,6 +429,9 @@ def load_canonical_receipt(
     manifest_hashes: dict[str, str],
     summary_path: Path,
     lineage_path: Path,
+    expected_manifest_sha256: str,
+    expected_summary_sha256: str,
+    expected_lineage_sha256: str,
     expected_canonical_source_commit: str,
     expected_canonical_source_tree: str,
 ) -> dict[str, Any]:
@@ -444,8 +447,27 @@ def load_canonical_receipt(
     summary_path = summary_path.resolve()
     lineage_path = lineage_path.resolve()
     manifest_sha = manifest_hashes[str(manifest)]
-    summary = json.loads(summary_path.read_text())
-    lineage = json.loads(lineage_path.read_text())
+    if manifest_sha != expected_manifest_sha256:
+        raise RuntimeError(
+            f"canonical manifest SHA {manifest_sha} "
+            f"!= {expected_manifest_sha256}"
+        )
+    summary_bytes = summary_path.read_bytes()
+    lineage_bytes = lineage_path.read_bytes()
+    summary_sha = hashlib.sha256(summary_bytes).hexdigest()
+    lineage_sha = hashlib.sha256(lineage_bytes).hexdigest()
+    if summary_sha != expected_summary_sha256:
+        raise RuntimeError(
+            f"canonical summary SHA {summary_sha} "
+            f"!= {expected_summary_sha256}"
+        )
+    if lineage_sha != expected_lineage_sha256:
+        raise RuntimeError(
+            f"canonical lineage SHA {lineage_sha} "
+            f"!= {expected_lineage_sha256}"
+        )
+    summary = json.loads(summary_bytes.decode("utf-8"))
+    lineage = json.loads(lineage_bytes.decode("utf-8"))
     if (
         not isinstance(summary, dict)
         or summary.get("status") != "complete"
@@ -513,9 +535,9 @@ def load_canonical_receipt(
         "manifest": str(manifest),
         "manifest_sha256": manifest_sha,
         "summary": str(summary_path),
-        "summary_sha256": sha256(summary_path),
+        "summary_sha256": summary_sha,
         "lineage": str(lineage_path),
-        "lineage_sha256": sha256(lineage_path),
+        "lineage_sha256": lineage_sha,
         "lineage_contract_sha256": summary["lineage_contract_sha256"],
         "source_receipt": canonical_source,
     }
@@ -708,7 +730,15 @@ def runtime_record() -> dict[str, Any]:
     return record
 
 
-def load_jsonl(paths: list[Path]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def load_jsonl(
+    paths: list[Path],
+    *,
+    expected_single_sha256: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    if expected_single_sha256 is not None and len(paths) != 1:
+        raise RuntimeError(
+            "a frozen canonical manifest SHA requires exactly one manifest"
+        )
     rows: list[dict[str, Any]] = []
     hashes: dict[str, str] = {}
     for path in paths:
@@ -717,27 +747,42 @@ def load_jsonl(paths: list[Path]) -> tuple[list[dict[str, Any]], dict[str, str]]
         if not path.is_file():
             raise FileNotFoundError(path)
         resolved = path.resolve()
-        hashes[str(resolved)] = sha256(resolved)
-        with resolved.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise TypeError(
-                        f"{resolved}:{line_number}: expected JSON object"
-                    )
-                rows.append(row)
+        payload = resolved.read_bytes()
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        if (
+            expected_single_sha256 is not None
+            and payload_sha256 != expected_single_sha256
+        ):
+            raise RuntimeError(
+                f"canonical manifest SHA {payload_sha256} "
+                f"!= {expected_single_sha256}"
+            )
+        hashes[str(resolved)] = payload_sha256
+        text = payload.decode("utf-8")
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise TypeError(
+                    f"{resolved}:{line_number}: expected JSON object"
+                )
+            rows.append(row)
     return rows, hashes
 
 
 def canonical_split_rows(
     paths: list[Path],
     split: str,
+    *,
+    expected_manifest_sha256: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     if split not in {"train", "test"}:
         raise ValueError(f"unsupported canonical split {split!r}")
-    rows, hashes = load_jsonl(paths)
+    rows, hashes = load_jsonl(
+        paths,
+        expected_single_sha256=expected_manifest_sha256,
+    )
     split_rows = [row for row in rows if row.get("split") == split]
     required = {
         "clip_id",
@@ -971,7 +1016,7 @@ def semtalk_rhythm_features(
 
 def hubert_long(
     model: Any,
-    processor: Any,
+    feature_extractor: Any,
     speech_16k: np.ndarray,
     *,
     device: str,
@@ -979,7 +1024,7 @@ def hubert_long(
     """Repository ``get_hubert_from_16k_speech_long`` on actual 16 kHz input."""
     import torch
 
-    values = processor(
+    values = feature_extractor(
         speech_16k,
         return_tensors="pt",
         sampling_rate=16000,
@@ -1053,7 +1098,7 @@ def _safe_clip_filename(clip_id: str) -> str:
 def audio_mode(args: argparse.Namespace) -> None:
     import librosa
     import torch
-    from transformers import HubertModel, Wav2Vec2Processor
+    from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
     if args.num_shards <= 0:
         raise ValueError("--num-shards must be positive")
@@ -1093,12 +1138,20 @@ def audio_mode(args: argparse.Namespace) -> None:
     rows, canonical_hashes = canonical_split_rows(
         canonical_paths,
         args.split,
+        expected_manifest_sha256=(
+            args.expected_canonical_manifest_sha256
+        ),
     )
     canonical_receipt = load_canonical_receipt(
         manifest_paths=canonical_paths,
         manifest_hashes=canonical_hashes,
         summary_path=canonical_summary_path,
         lineage_path=canonical_lineage_path,
+        expected_manifest_sha256=(
+            args.expected_canonical_manifest_sha256
+        ),
+        expected_summary_sha256=args.expected_canonical_summary_sha256,
+        expected_lineage_sha256=args.expected_canonical_lineage_sha256,
         expected_canonical_source_commit=(
             args.expected_canonical_source_commit
         ),
@@ -1132,7 +1185,7 @@ def audio_mode(args: argparse.Namespace) -> None:
             f"HuBERT tree {model_tree_sha} "
             f"!= {args.expected_hubert_tree_sha256}"
         )
-    processor = Wav2Vec2Processor.from_pretrained(
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
         str(hubert_dir),
         local_files_only=True,
     )
@@ -1145,7 +1198,9 @@ def audio_mode(args: argparse.Namespace) -> None:
         loaded_tree_sha != model_tree_sha
         or loaded_model_files != model_files
     ):
-        raise RuntimeError("HuBERT tree changed while loading processor/model")
+        raise RuntimeError(
+            "HuBERT tree changed while loading feature extractor/model"
+        )
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -1161,12 +1216,12 @@ def audio_mode(args: argparse.Namespace) -> None:
             "label": "corrected_true_16khz",
             "source_decode": "librosa.load(sr=None,mono=True)",
             "channel_mix": "librosa_to_mono_arithmetic_mean",
-            "resample": "native_to_true_16000hz_before_processor",
-            "processor_sampling_rate": 16000,
+            "resample": "native_to_true_16000hz_before_feature_extractor",
+            "feature_extractor_sampling_rate": 16000,
             "released_code_difference": (
                 "The public loader decodes with librosa's 22050 Hz default "
-                "and passes that waveform to a processor declared as 16000 Hz. "
-                "This run corrects that sample-rate mismatch."
+                "and passes that waveform to a feature extractor declared as "
+                "16000 Hz. This run corrects that sample-rate mismatch."
             ),
             "claim": "adapted_reconstruction_not_official_input_exact",
         },
@@ -1242,7 +1297,7 @@ def audio_mode(args: argparse.Namespace) -> None:
                 )
                 native_hubert = hubert_long(
                     model,
-                    processor,
+                    feature_extractor,
                     speech,
                     device=args.device,
                 )
@@ -1313,12 +1368,24 @@ def audio_mode(args: argparse.Namespace) -> None:
         final_rows, final_canonical_hashes = canonical_split_rows(
             canonical_paths,
             args.split,
+            expected_manifest_sha256=(
+                args.expected_canonical_manifest_sha256
+            ),
         )
         final_canonical_receipt = load_canonical_receipt(
             manifest_paths=canonical_paths,
             manifest_hashes=final_canonical_hashes,
             summary_path=canonical_summary_path,
             lineage_path=canonical_lineage_path,
+            expected_manifest_sha256=(
+                args.expected_canonical_manifest_sha256
+            ),
+            expected_summary_sha256=(
+                args.expected_canonical_summary_sha256
+            ),
+            expected_lineage_sha256=(
+                args.expected_canonical_lineage_sha256
+            ),
             expected_canonical_source_commit=(
                 args.expected_canonical_source_commit
             ),
@@ -1578,12 +1645,12 @@ def load_audio_lineages(
             "label": "corrected_true_16khz",
             "source_decode": "librosa.load(sr=None,mono=True)",
             "channel_mix": "librosa_to_mono_arithmetic_mean",
-            "resample": "native_to_true_16000hz_before_processor",
-            "processor_sampling_rate": 16000,
+            "resample": "native_to_true_16000hz_before_feature_extractor",
+            "feature_extractor_sampling_rate": 16000,
             "released_code_difference": (
                 "The public loader decodes with librosa's 22050 Hz default "
-                "and passes that waveform to a processor declared as 16000 Hz. "
-                "This run corrects that sample-rate mismatch."
+                "and passes that waveform to a feature extractor declared as "
+                "16000 Hz. This run corrects that sample-rate mismatch."
             ),
             "claim": "adapted_reconstruction_not_official_input_exact",
         }
@@ -2379,12 +2446,20 @@ def base_mode(args: argparse.Namespace) -> None:
     canonical_rows, canonical_hashes = canonical_split_rows(
         canonical_paths,
         "train",
+        expected_manifest_sha256=(
+            args.expected_canonical_manifest_sha256
+        ),
     )
     canonical_receipt = load_canonical_receipt(
         manifest_paths=canonical_paths,
         manifest_hashes=canonical_hashes,
         summary_path=canonical_summary_path,
         lineage_path=canonical_lineage_path,
+        expected_manifest_sha256=(
+            args.expected_canonical_manifest_sha256
+        ),
+        expected_summary_sha256=args.expected_canonical_summary_sha256,
+        expected_lineage_sha256=args.expected_canonical_lineage_sha256,
         expected_canonical_source_commit=(
             args.expected_canonical_source_commit
         ),
@@ -2677,12 +2752,24 @@ def base_mode(args: argparse.Namespace) -> None:
         final_canonical_rows, final_canonical_hashes = canonical_split_rows(
             canonical_paths,
             "train",
+            expected_manifest_sha256=(
+                args.expected_canonical_manifest_sha256
+            ),
         )
         final_canonical_receipt = load_canonical_receipt(
             manifest_paths=canonical_paths,
             manifest_hashes=final_canonical_hashes,
             summary_path=canonical_summary_path,
             lineage_path=canonical_lineage_path,
+            expected_manifest_sha256=(
+                args.expected_canonical_manifest_sha256
+            ),
+            expected_summary_sha256=(
+                args.expected_canonical_summary_sha256
+            ),
+            expected_lineage_sha256=(
+                args.expected_canonical_lineage_sha256
+            ),
             expected_canonical_source_commit=(
                 args.expected_canonical_source_commit
             ),
@@ -2873,6 +2960,9 @@ def parse_args() -> argparse.Namespace:
     audio.add_argument("--expected-source-tree", required=True)
     audio.add_argument("--expected-canonical-source-commit", required=True)
     audio.add_argument("--expected-canonical-source-tree", required=True)
+    audio.add_argument("--expected-canonical-manifest-sha256", required=True)
+    audio.add_argument("--expected-canonical-summary-sha256", required=True)
+    audio.add_argument("--expected-canonical-lineage-sha256", required=True)
     audio.add_argument("--max-frame-mismatch", type=int, default=1)
 
     base = subparsers.add_parser("base", allow_abbrev=False)
@@ -2916,6 +3006,9 @@ def parse_args() -> argparse.Namespace:
     base.add_argument("--expected-source-tree", required=True)
     base.add_argument("--expected-canonical-source-commit", required=True)
     base.add_argument("--expected-canonical-source-tree", required=True)
+    base.add_argument("--expected-canonical-manifest-sha256", required=True)
+    base.add_argument("--expected-canonical-summary-sha256", required=True)
+    base.add_argument("--expected-canonical-lineage-sha256", required=True)
     return parser.parse_args()
 
 
@@ -2940,6 +3033,18 @@ def main() -> None:
     args.expected_canonical_source_tree = require_git_oid(
         args.expected_canonical_source_tree,
         "--expected-canonical-source-tree",
+    )
+    args.expected_canonical_manifest_sha256 = require_sha256(
+        args.expected_canonical_manifest_sha256,
+        "--expected-canonical-manifest-sha256",
+    )
+    args.expected_canonical_summary_sha256 = require_sha256(
+        args.expected_canonical_summary_sha256,
+        "--expected-canonical-summary-sha256",
+    )
+    args.expected_canonical_lineage_sha256 = require_sha256(
+        args.expected_canonical_lineage_sha256,
+        "--expected-canonical-lineage-sha256",
     )
     if args.mode == "audio":
         audio_mode(args)
