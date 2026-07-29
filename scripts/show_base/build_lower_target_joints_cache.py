@@ -765,7 +765,6 @@ def main() -> None:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
-    os.replace(temporary, output)
     manifest = {
         "format": CACHE_FORMAT,
         "cache_version": CACHE_VERSION,
@@ -779,8 +778,8 @@ def main() -> None:
             "path": str(output),
             "map_size_bytes": 16 * 1024**3,
             "entries": EXPECTED_ENTRIES,
-            "data_mdb_sha256": sha256_file(output / "data.mdb"),
-            "lock_mdb_sha256": sha256_file(output / "lock.mdb"),
+            "data_mdb_sha256": sha256_file(temporary / "data.mdb"),
+            "lock_mdb_sha256": sha256_file(temporary / "lock.mdb"),
         },
         "entries": EXPECTED_ENTRIES,
         "entry_shape": list(ENTRY_SHAPE),
@@ -796,7 +795,15 @@ def main() -> None:
         "argv": sys.argv,
     }
     validate_manifest_payload(manifest)
-    atomic_json(manifest_path, manifest)
+    try:
+        os.replace(temporary, output)
+        atomic_json(manifest_path, manifest)
+    except BaseException:
+        if output.exists():
+            shutil.rmtree(output, ignore_errors=True)
+        if manifest_path.exists():
+            manifest_path.unlink()
+        raise
     print(
         json.dumps(
             {

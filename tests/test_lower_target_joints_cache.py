@@ -5,6 +5,7 @@ import copy
 import hashlib
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -376,6 +377,47 @@ class RawValueContractTests(unittest.TestCase):
 
 
 class ReceiptContractTests(unittest.TestCase):
+    def test_runtime_receipt_normalizes_version_string_subclasses(self) -> None:
+        class VersionString(str):
+            pass
+
+        class FakeDevice:
+            type = "cuda"
+
+            def __str__(self) -> str:
+                return "cuda:0"
+
+        fake_torch = SimpleNamespace(
+            __version__=VersionString("2.5.1"),
+            version=SimpleNamespace(cuda=VersionString("12.4")),
+            device=lambda _device: FakeDevice(),
+            cuda=SimpleNamespace(
+                get_device_name=lambda _device: "NVIDIA H200",
+                get_device_capability=lambda _device: (9, 0),
+            ),
+            get_default_dtype=lambda: "torch.float32",
+        )
+        fake_rotation_conversions = SimpleNamespace(__file__=__file__)
+        with (
+            mock.patch.object(
+                contract,
+                "_require_torch",
+                return_value=fake_torch,
+            ),
+            mock.patch(
+                "importlib.metadata.version",
+                return_value=VersionString("0.1.28"),
+            ),
+            mock.patch.dict(
+                sys.modules,
+                {"utils.rotation_conversions": fake_rotation_conversions},
+            ),
+        ):
+            runtime = contract.current_runtime_receipt("cuda:0")
+        for key in ("numpy", "torch", "torch_cuda", "smplx"):
+            with self.subTest(key=key):
+                self.assertIs(type(runtime[key]), str)
+
     def test_canonical_and_current_producer_sources_are_independent(self) -> None:
         manifest, _ = receipts()
         representation = manifest["representation_receipt"]
@@ -950,6 +992,13 @@ class FrozenTensorTests(unittest.TestCase):
 
 
 class StaticIntegrationContractTests(unittest.TestCase):
+    def test_builder_validates_manifest_before_publishing_lmdb(self) -> None:
+        source = BUILDER.read_text(encoding="utf-8")
+        validation = source.index("validate_manifest_payload(manifest)")
+        publication = source.index("os.replace(temporary, output)")
+        self.assertLess(validation, publication)
+        self.assertIn("shutil.rmtree(output, ignore_errors=True)", source)
+
     def test_producer_checker_protocol_and_raw_payload_are_compatible(self) -> None:
         builder = load_script(BUILDER, "lower_target_builder_under_test")
         checker = load_script(CHECKER, "lower_target_checker_under_test")

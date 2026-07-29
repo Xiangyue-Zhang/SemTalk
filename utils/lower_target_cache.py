@@ -1270,10 +1270,10 @@ def current_runtime_receipt(device: Any) -> dict[str, Any]:
         raise LowerTargetCacheError("lower target cache runtime requires CUDA")
     return {
         "python": sys.version,
-        "numpy": np.__version__,
-        "torch": torch_module.__version__,
-        "torch_cuda": torch_module.version.cuda,
-        "smplx": importlib.metadata.version("smplx"),
+        "numpy": str(np.__version__),
+        "torch": str(torch_module.__version__),
+        "torch_cuda": str(torch_module.version.cuda),
+        "smplx": str(importlib.metadata.version("smplx")),
         "device": str(resolved_device),
         "device_name": torch_module.cuda.get_device_name(resolved_device),
         "device_capability": list(
