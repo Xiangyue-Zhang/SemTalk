@@ -48,6 +48,7 @@ class BaseTrainer(object):
         self.args = args
         self._formal_train_metric_sums = {}
         self._formal_train_metric_counts = {}
+        self._formal_optimizer_updates = 0
         self.rank = dist.get_rank()
         if args.ddp:
             # DDP 模式下 rank 对应 GPU id
@@ -176,7 +177,23 @@ class BaseTrainer(object):
             ) if self.rank == 0 else None
             self.align_mask = 60
             self.l1_calculator = metric.L1div() if self.rank == 0 else None
-       
+
+    @property
+    def formal_optimizer_updates(self):
+        return int(self._formal_optimizer_updates)
+
+    def _restore_formal_optimizer_updates(self, updates):
+        updates = int(updates)
+        if updates < 0:
+            raise ValueError("formal optimizer update count cannot be negative")
+        self._formal_optimizer_updates = updates
+
+    def _formal_optimizer_step(self):
+        """Run the optimizer and count only successfully completed formal steps."""
+        result = self.opt.step()
+        if getattr(self.args, "train_only", False):
+            self._formal_optimizer_updates += 1
+        return result
     
     def _track_train(self, name, value, scale=1.0):
         """Accumulate formal train-only metrics without a per-step D2H sync."""

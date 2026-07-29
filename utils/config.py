@@ -62,6 +62,7 @@ def parse_args():
     parser.add("--final_ckpt_name", default=None, type=str)
     parser.add("--lineage_manifest", default=None, type=str)
     parser.add("--dataset_summary", default=None, type=str)
+    parser.add("--expected_smplx_asset_sha256", default=None, type=str)
     parser.add("--global_fastpath_parity_bundle", default=None, type=str)
     parser.add(
         "--expected_global_fastpath_parity_sha256",

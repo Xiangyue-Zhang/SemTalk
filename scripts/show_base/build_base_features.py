@@ -60,6 +60,20 @@ SPEAKER_MAP = {
     "conan": 3,
 }
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+MODEL_V2_AUDIT_KEYS = {
+    "format",
+    "formal_stage",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_summary_sha256",
+    "data_mdb_sha256",
+    "dataset_receipt_sha256",
+    "smplx_asset_receipt",
+    "source_receipt",
+    "source_receipt_sha256",
+    "optimizer_updates",
+    "base_candidate_manifest",
+}
 CANONICAL_SOURCE_AUDIO_RATE = 22_000
 CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH = 2
 CANONICAL_HUBERT_TARGET_RATE = 16_000
@@ -154,6 +168,12 @@ def require_git_oid(value: str, label: str) -> str:
     return normalized
 
 
+def require_exact_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise RuntimeError(f"{label} must be an exact integer")
+    return value
+
+
 def source_receipt(
     expected_commit: str,
     expected_tree: str,
@@ -225,11 +245,19 @@ def load_canonical_receipt(
         not isinstance(summary, dict)
         or summary.get("status") != "complete"
         or summary.get("schema_name") != "semtalk-show-canonical-motion"
-        or int(summary.get("schema_version", -1)) != 1
+        or require_exact_int(
+            summary.get("schema_version"),
+            "canonical summary schema_version",
+        )
+        != 1
         or summary.get("manifest_sha256") != manifest_sha
         or summary.get("split_counts")
         != {"train": 13_687, "val": 1_715, "test": 1_708}
-        or int(summary.get("clip_count", -1)) != 17_110
+        or require_exact_int(
+            summary.get("clip_count"),
+            "canonical summary clip_count",
+        )
+        != 17_110
         or summary.get("exact_once") is not True
         or summary.get("finite") is not True
         or summary.get("split_disjoint") is not True
@@ -588,7 +616,11 @@ def canonical_frames(row: dict[str, Any]) -> int:
             raise RuntimeError(f"{path}: pose is non-finite or non-floating")
     if frames <= 0:
         raise RuntimeError(f"{path}: empty canonical clip")
-    if row.get("frames") is not None and int(row["frames"]) != frames:
+    if (
+        row.get("frames") is not None
+        and require_exact_int(row["frames"], "canonical row frames")
+        != frames
+    ):
         raise RuntimeError(f"{path}: frame count disagrees with manifest")
     return frames
 
@@ -1165,7 +1197,11 @@ def load_canonical_clip(
         raise RuntimeError(f"{path}: SHOW speaker ID outside [0,3]")
     if np.unique(speaker).size != 1:
         raise RuntimeError(f"{path}: speaker ID changes within clip")
-    if row.get("frames") is not None and int(row["frames"]) != frames:
+    if (
+        row.get("frames") is not None
+        and require_exact_int(row["frames"], "canonical row frames")
+        != frames
+    ):
         raise RuntimeError(f"{path}: manifest frame mismatch")
     return arrays, frames
 
@@ -1273,7 +1309,13 @@ def load_audio_lineages(
             != expected_hubert_tree_sha256
         ):
             raise RuntimeError(f"{resolved}: pinned HuBERT tree mismatch")
-        if int(record.get("full_split_clips", -1)) != expected_train_clips:
+        if (
+            require_exact_int(
+                record.get("full_split_clips"),
+                "audio lineage full_split_clips",
+            )
+            != expected_train_clips
+        ):
             raise RuntimeError(f"{resolved}: train clip count mismatch")
         protocol = record.get("protocol")
         expected_hubert_preprocessing = {
@@ -1350,20 +1392,36 @@ def load_audio_lineages(
     if bound_manifests != manifest_paths:
         raise RuntimeError("not every audio manifest has exactly one lineage")
 
-    shard_counts = {int(record["num_shards"]) for record in records}
+    shard_counts = {
+        require_exact_int(
+            record.get("num_shards"),
+            "audio lineage num_shards",
+        )
+        for record in records
+    }
     if len(shard_counts) != 1:
         raise RuntimeError("audio lineages disagree on num_shards")
     num_shards = shard_counts.pop()
-    shard_ids = sorted(int(record["shard_id"]) for record in records)
+    shard_ids = sorted(
+        require_exact_int(
+            record.get("shard_id"),
+            "audio lineage shard_id",
+        )
+        for record in records
+    )
     if shard_ids != list(range(num_shards)):
         raise RuntimeError(
             f"audio lineage shards {shard_ids} do not cover 0..{num_shards - 1}"
         )
     if len(records) != num_shards:
         raise RuntimeError("audio lineage file count differs from num_shards")
-    if sum(int(record["shard_clips"]) for record in records) != (
-        expected_train_clips
-    ):
+    if sum(
+        require_exact_int(
+            record.get("shard_clips"),
+            "audio lineage shard_clips",
+        )
+        for record in records
+    ) != expected_train_clips:
         raise RuntimeError("audio lineage shard counts do not exactly cover train")
     model_hashes = {
         str(record["hubert_model_tree_sha256"]) for record in records
@@ -1414,18 +1472,20 @@ def load_audio_clip(
             raise RuntimeError(
                 f"{path}: invalid {name} {array.shape}/{array.dtype}"
             )
-    if int(row["frames"]) != expected_frames:
+    if require_exact_int(row.get("frames"), "audio manifest frames") != expected_frames:
         raise RuntimeError(f"{path}: audio manifest frame mismatch")
     return arrays
 
 
-def _torch_load(path: Path) -> dict[str, Any]:
+def _torch_load(payload_bytes: bytes, path: Path) -> dict[str, Any]:
     import torch
 
+    buffer = io.BytesIO(payload_bytes)
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload = torch.load(buffer, map_location="cpu", weights_only=True)
     except TypeError:  # older supported PyTorch
-        payload = torch.load(path, map_location="cpu")
+        buffer.seek(0)
+        payload = torch.load(buffer, map_location="cpu")
     if not isinstance(payload, dict) or "model_state" not in payload:
         raise RuntimeError(f"{path}: checkpoint lacks model_state")
     if not isinstance(payload["model_state"], dict):
@@ -1455,13 +1515,18 @@ def checkpoint_record(
     resolved = path.resolve()
     if path.is_symlink() or not resolved.is_file():
         raise FileNotFoundError(resolved)
-    payload = _torch_load(resolved)
+    checkpoint_bytes = resolved.read_bytes()
+    checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+    payload = _torch_load(checkpoint_bytes, resolved)
     _finite_state_dict(payload["model_state"], resolved)
     audit = payload.get("audit")
     if not isinstance(audit, dict):
         raise RuntimeError(f"{resolved}: formal checkpoint audit is missing")
-    if audit.get("format") != "semtalk_show_model_v1":
-        raise RuntimeError(f"{resolved}: unexpected checkpoint audit format")
+    audit_format = audit.get("format")
+    if audit_format != "semtalk_show_model_v2":
+        raise RuntimeError(
+            f"{resolved}: formal checkpoint must use semtalk_show_model_v2"
+        )
     if audit.get("formal_stage") != formal_stage:
         raise RuntimeError(
             f"{resolved}: formal_stage={audit.get('formal_stage')!r}, "
@@ -1497,6 +1562,22 @@ def checkpoint_record(
         raise FileNotFoundError(resolved_status)
     with resolved_status.open(encoding="utf-8") as handle:
         status = json.load(handle)
+    status_final_input = Path(
+        str(status.get("final_checkpoint", ""))
+        if isinstance(status, dict)
+        else ""
+    )
+    if status_final_input.is_symlink() or not status_final_input.is_file():
+        raise RuntimeError(
+            "formal status final_checkpoint must be a regular non-symlink "
+            f"file: {status_final_input}"
+        )
+    status_final_checkpoint = status_final_input.resolve()
+    status_dataset_receipt = (
+        status.get("dataset_receipt")
+        if isinstance(status, dict)
+        else None
+    )
     expected_epochs = {
         "face": 600,
         "hands": 500,
@@ -1508,29 +1589,43 @@ def checkpoint_record(
         not isinstance(status, dict)
         or status.get("status") != "complete"
         or status.get("formal_stage") != formal_stage
-        or int(status.get("world_size", -1)) != 1
-        or int(status.get("epochs", -1)) != expected_epochs
-        or int(status.get("completed_epochs", -1)) != expected_epochs
+        or require_exact_int(status.get("world_size"), "world_size") != 1
+        or require_exact_int(status.get("epochs"), "epochs")
+        != expected_epochs
+        or require_exact_int(
+            status.get("completed_epochs"),
+            "completed_epochs",
+        )
+        != expected_epochs
         or status.get("lineage_manifest_sha256")
         != expected_lineage_sha256
         or status.get("config_sha256") != audit.get("config_sha256")
-        or status.get("dataset_receipt", {}).get("summary_sha256")
+        or not isinstance(status_dataset_receipt, dict)
+        or status_dataset_receipt.get("summary_sha256")
         != audit.get("dataset_summary_sha256")
-        or status.get("dataset_receipt", {}).get("data_mdb_sha256")
+        or status_dataset_receipt.get("data_mdb_sha256")
         != audit.get("data_mdb_sha256")
+        or require_exact_int(
+            status_dataset_receipt.get("entries"),
+            "dataset receipt entries",
+        )
+        != 127_309
+        or require_exact_int(
+            status_dataset_receipt.get("train_clips"),
+            "dataset receipt train_clips",
+        )
+        != 13_687
         or status.get("source_receipt") != audit.get("source_receipt")
         or status.get("source_receipt_sha256")
         != audit.get("source_receipt_sha256")
-        or Path(status.get("final_checkpoint", "")).resolve() != resolved
-        or status.get("final_checkpoint_sha256") != sha256(resolved)
+        or status_final_checkpoint != resolved
+        or status.get("final_checkpoint_sha256") != checkpoint_sha256
     ):
         raise RuntimeError(
             f"{resolved_status}: incomplete or inconsistent formal "
             f"{formal_stage} training receipt"
         )
-    parity_receipt = status.get("dataset_receipt", {}).get(
-        "global_fastpath_parity"
-    )
+    parity_receipt = status_dataset_receipt.get("global_fastpath_parity")
     parity_artifact_receipt: dict[str, str] | None = None
     if formal_stage == "global":
         if (
@@ -1562,9 +1657,18 @@ def checkpoint_record(
         raise RuntimeError(
             f"{resolved_status}: non-Global stage has a parity receipt"
         )
-    updates_per_epoch = int(status.get("updates_per_epoch", -1))
-    train_samples = int(status.get("train_samples", -1))
-    optimizer_updates = int(status.get("optimizer_updates", -1))
+    updates_per_epoch = require_exact_int(
+        status.get("updates_per_epoch"),
+        "updates_per_epoch",
+    )
+    train_samples = require_exact_int(
+        status.get("train_samples"),
+        "train_samples",
+    )
+    optimizer_updates = require_exact_int(
+        status.get("optimizer_updates"),
+        "optimizer_updates",
+    )
     if (
         train_samples != 127_309
         or updates_per_epoch != 1_989
@@ -1573,9 +1677,28 @@ def checkpoint_record(
         raise RuntimeError(
             f"{resolved_status}: invalid sample/update accounting"
         )
+    dataset_receipt = status_dataset_receipt
+    audit_optimizer_updates = audit.get("optimizer_updates")
+    if (
+        set(audit) != MODEL_V2_AUDIT_KEYS
+        or not isinstance(dataset_receipt, dict)
+        or audit.get("dataset_receipt_sha256")
+        != compact_payload_sha256(dataset_receipt)
+        or audit.get("smplx_asset_receipt")
+        != dataset_receipt.get("smplx_asset")
+        or status.get("smplx_asset_receipt")
+        != dataset_receipt.get("smplx_asset")
+        or type(audit_optimizer_updates) is not int
+        or audit_optimizer_updates != optimizer_updates
+        or audit.get("base_candidate_manifest") is not None
+        or status.get("base_candidate_manifest") is not None
+    ):
+        raise RuntimeError(
+            f"{resolved}: invalid model_v2 dataset/SMPL-X/update audit"
+        )
     record = {
         "path": str(resolved),
-        "sha256": sha256(resolved),
+        "sha256": checkpoint_sha256,
         "formal_stage": formal_stage,
         "audit": audit,
         "formal_training_status": str(resolved_status),
@@ -2016,9 +2139,15 @@ def base_mode(args: argparse.Namespace) -> None:
             f"audio/canonical exact-cover mismatch: missing={missing[:10]}, "
             f"extra={extra[:10]}"
         )
-    audio_num_shards = int(audio_lineage_records[0]["num_shards"])
+    audio_num_shards = require_exact_int(
+        audio_lineage_records[0].get("num_shards"),
+        "audio lineage num_shards",
+    )
     audio_contract_by_shard = {
-        int(record["shard_id"]): str(
+        require_exact_int(
+            record.get("shard_id"),
+            "audio lineage shard_id",
+        ): str(
             record["audio_lineage_contract_sha256"]
         )
         for record in audio_lineage_records
@@ -2026,9 +2155,21 @@ def base_mode(args: argparse.Namespace) -> None:
     for index, clip_id in enumerate(canonical_ids):
         row = audio_rows[clip_id]
         expected_shard = index % audio_num_shards
-        if int(row.get("num_shards", -1)) != audio_num_shards:
+        if (
+            require_exact_int(
+                row.get("num_shards"),
+                f"{clip_id} audio row num_shards",
+            )
+            != audio_num_shards
+        ):
             raise RuntimeError(f"{clip_id}: audio row num_shards mismatch")
-        if int(row.get("shard_id", -1)) != expected_shard:
+        if (
+            require_exact_int(
+                row.get("shard_id"),
+                f"{clip_id} audio row shard_id",
+            )
+            != expected_shard
+        ):
             raise RuntimeError(
                 f"{clip_id}: audio row shard_id={row.get('shard_id')} "
                 f"expected {expected_shard}"
@@ -2069,7 +2210,10 @@ def base_mode(args: argparse.Namespace) -> None:
         or training_lineage.get("status") != "complete"
         or training_lineage.get("format")
         != "semtalk_show_representation_lmdb_v2_global_foot"
-        or int(training_lineage.get("train_clips", -1))
+        or require_exact_int(
+            training_lineage.get("train_clips"),
+            "representation lineage train_clips",
+        )
         != len(canonical_rows)
         or training_lineage.get("canonical_receipt")
         != canonical_receipt
@@ -2086,19 +2230,28 @@ def base_mode(args: argparse.Namespace) -> None:
         or set(training_lineage.get("speaker_window_counts", {}))
         != set(SPEAKER_MAP)
         or sum(
-            int(value)
+            require_exact_int(
+                value,
+                "representation lineage speaker_clip_counts value",
+            )
             for value in training_lineage.get(
                 "speaker_clip_counts", {}
             ).values()
         )
         != len(canonical_rows)
         or sum(
-            int(value)
+            require_exact_int(
+                value,
+                "representation lineage speaker_window_counts value",
+            )
             for value in training_lineage.get(
                 "speaker_window_counts", {}
             ).values()
         )
-        != int(training_lineage.get("entries", -1))
+        != require_exact_int(
+            training_lineage.get("entries"),
+            "representation lineage entries",
+        )
     ):
         raise RuntimeError(
             "invalid representation training lineage manifest"
@@ -2218,7 +2371,10 @@ def base_mode(args: argparse.Namespace) -> None:
                     "usable_frames": usable_frames,
                     "dropped_tail_frames": dropped_tail_frames,
                     "windows": window_count,
-                    "speaker_id": int(canonical["speaker_id"][0, 0]),
+                    "speaker_id": require_exact_int(
+                        canonical["speaker_id"][0, 0].item(),
+                        f"{clip_id} canonical speaker_id",
+                    ),
                 }
             )
         transaction.commit()

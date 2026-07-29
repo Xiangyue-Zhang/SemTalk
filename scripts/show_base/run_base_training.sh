@@ -51,6 +51,11 @@ import json
 from pathlib import Path
 import sys
 
+def require_exact_int(value, label):
+    if type(value) is not int:
+        raise SystemExit(f"{label} must be an exact integer")
+    return value
+
 summary_path = Path(sys.argv[1]).resolve()
 lmdb_path = Path(sys.argv[2]).resolve()
 lineage_path = Path(sys.argv[3]).resolve()
@@ -79,7 +84,7 @@ with (lmdb_path / "data.mdb").open("rb") as handle:
 digest = digest_state.hexdigest()
 if digest != summary["data_mdb_sha256"]:
     raise SystemExit("Base data.mdb SHA mismatch")
-entries = int(summary["entries"])
+entries = require_exact_int(summary.get("entries"), "Base entries")
 updates = entries // 64
 if entries != 127_309 or updates != 1_989:
     raise SystemExit(f"formal Base accounting mismatch: {entries=} {updates=}")

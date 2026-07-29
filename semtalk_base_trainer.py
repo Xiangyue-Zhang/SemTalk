@@ -427,7 +427,7 @@ class CustomTrainer(train.BaseTrainer):
             g_loss_final.backward()
             if self.args.grad_norm != 0: 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm)
-            self.opt.step()
+            self._formal_optimizer_step()
             
             mem_cost = torch.cuda.memory_cached() / 1E9
             lr_g = self.opt.param_groups[0]['lr']

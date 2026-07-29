@@ -27,6 +27,7 @@ run_id=$8
 parity_bundle=$9
 parity_sha256=${10}
 resume_mode=false
+formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
 if [[ $# -eq 11 ]]; then
     if [[ ${11} != "--resume" ]]; then
         usage
@@ -58,6 +59,11 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+
+def require_exact_int(value, label):
+    if type(value) is not int:
+        raise SystemExit(f"{label} must be an exact integer")
+    return value
 
 summary_path = Path(sys.argv[1]).resolve()
 lmdb_path = Path(sys.argv[2]).resolve()
@@ -165,7 +171,7 @@ with (lmdb_path / "data.mdb").open("rb") as handle:
 digest = digest_state.hexdigest()
 if digest != summary["data_mdb_sha256"]:
     raise SystemExit("representation data.mdb SHA mismatch")
-entries = int(summary["entries"])
+entries = require_exact_int(summary.get("entries"), "representation entries")
 updates = entries // 64
 if entries != 127_309 or updates != 1_989:
     raise SystemExit(
@@ -419,6 +425,7 @@ launch_stage() {
     local stage_dir="$stage_out/custom/$stage_run"
     local resume_args=()
     local parity_args=()
+    local smplx_args=()
     local log_path="$output_root/logs/$run_id/$stage.log"
     mkdir -p "$stage_out"
 
@@ -435,6 +442,10 @@ launch_stage() {
         parity_args=(
             --global_fastpath_parity_bundle "$parity_bundle"
             --expected_global_fastpath_parity_sha256 "$parity_sha256"
+        )
+    else
+        smplx_args=(
+            --expected_smplx_asset_sha256 "$formal_smplx_sha256"
         )
     fi
 
@@ -493,6 +504,7 @@ launch_stage() {
             --base_ckpt "" \
             --test_ckpt "" \
             --load_ckpt "" \
+            "${smplx_args[@]}" \
             "${parity_args[@]}" \
             "${resume_args[@]}"
     ) >"$log_path" 2>&1 &

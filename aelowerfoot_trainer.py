@@ -25,6 +25,7 @@ from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
 from scipy.spatial.transform import Rotation
+from utils.show_base_tensor_ops import assert_all_finite_async
 
 
 GLOBAL_FOOT_FIELD = "lower_foot_local"
@@ -59,8 +60,10 @@ def global_foot_fastpath_losses(
         )
     if lower_foot_local.device != rec_xyz_trans.device:
         raise RuntimeError(f"{GLOBAL_FOOT_FIELD} must be on the training device")
-    if not torch.isfinite(lower_foot_local).all():
-        raise RuntimeError(f"{GLOBAL_FOOT_FIELD} contains non-finite values")
+    assert_all_finite_async(
+        lower_foot_local,
+        field_name=GLOBAL_FOOT_FIELD,
+    )
 
     # V_rec = V0 + rec_trans and V_tar = V0 + tar_trans, repeated over every
     # vertex.  Their mean vertex MSE is exactly the translation MSE.
@@ -350,7 +353,7 @@ class CustomTrainer(train.BaseTrainer):
             g_loss_final.backward()
             if self.args.grad_norm != 0: 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm)
-            self.opt.step()
+            self._formal_optimizer_step()
             t_train = time.time() - t_start - t_data
             t_start = time.time()
             mem_cost = torch.cuda.memory_cached() / 1E9

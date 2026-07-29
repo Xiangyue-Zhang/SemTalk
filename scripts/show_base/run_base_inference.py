@@ -96,6 +96,75 @@ RVQ_DIMS = {
     "lower": 61,
 }
 CHECKPOINT_STAGES = ("base", "face", "upper", "hands", "lower", "global")
+MODEL_V2_AUDIT_KEYS = {
+    "format",
+    "formal_stage",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_summary_sha256",
+    "data_mdb_sha256",
+    "dataset_receipt_sha256",
+    "smplx_asset_receipt",
+    "source_receipt",
+    "source_receipt_sha256",
+    "optimizer_updates",
+    "base_candidate_manifest",
+}
+BASE_CANDIDATE_AUDIT_KEYS = {
+    "format",
+    "formal_stage",
+    "candidate_epoch",
+    "optimizer_updates",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_receipt_sha256",
+    "smplx_asset_receipt",
+    "source_receipt",
+    "source_receipt_sha256",
+}
+BASE_CANDIDATE_MANIFEST_KEYS = {
+    "format",
+    "formal_stage",
+    "interval_epochs",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_receipt_sha256",
+    "smplx_asset_receipt",
+    "source_receipt",
+    "source_receipt_sha256",
+    "entries",
+}
+BASE_CANDIDATE_RECORD_KEYS = {
+    "epoch",
+    "optimizer_updates",
+    "checkpoint",
+    "checkpoint_sha256",
+    "model_audit_sha256",
+    "transaction_core",
+    "transaction_core_sha256",
+}
+BASE_CANDIDATE_CORE_KEYS = {
+    "format",
+    "formal_stage",
+    "candidate_epoch",
+    "optimizer_updates",
+    "checkpoint",
+    "staging_checkpoint",
+    "previous_manifest_sha256",
+    "previous_entry_count",
+    "previous_entries_sha256",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_receipt_sha256",
+    "smplx_asset_receipt",
+    "source_receipt",
+    "source_receipt_sha256",
+    "model_audit_sha256",
+}
+BASE_CANDIDATE_INTERVAL_EPOCHS = 10
+BASE_CANDIDATE_COUNT = 40
+BASE_EPOCHS = 400
+FORMAL_UPDATES_PER_EPOCH = 1_989
 SHOW_SPEAKER_IDS = {
     "oliver": 0,
     "chemistry": 1,
@@ -161,7 +230,7 @@ def _require_git_oid(value: str, label: str) -> str:
 
 
 def _require_exact_int(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise InferenceContractError(f"{label} must be an exact integer, got {value!r}")
     return value
 
@@ -190,6 +259,20 @@ def compact_json_sha256(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
         default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def training_json_document_sha256(value: Any) -> str:
+    """Match show_base_train._json_document_sha256 exactly."""
+    encoded = (
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n"
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -595,6 +678,23 @@ def _verify_file_sha(path: Path, expected: str, label: str) -> str:
     return observed
 
 
+def _read_verified_checkpoint_snapshot(
+    path: str | Path,
+    expected: str,
+    label: str,
+) -> tuple[Path, bytes, str]:
+    """Read, hash, and later deserialize one immutable byte snapshot."""
+    resolved = _resolved_regular_file(path, label)
+    expected = _require_sha256(expected, f"{label} expected SHA")
+    payload = resolved.read_bytes()
+    observed = hashlib.sha256(payload).hexdigest()
+    if observed != expected:
+        raise InferenceContractError(
+            f"{label} SHA mismatch: {observed} != {expected} ({resolved})"
+        )
+    return resolved, payload, observed
+
+
 def _validate_canonical_root_receipts(
     manifest: Path,
     summary_path: Path,
@@ -613,7 +713,11 @@ def _validate_canonical_root_receipts(
     if (
         summary.get("status") != "complete"
         or summary.get("schema_name") != "semtalk-show-canonical-motion"
-        or int(summary.get("schema_version", -1)) != 1
+        or _require_exact_int(
+            summary.get("schema_version"),
+            "canonical summary schema_version",
+        )
+        != 1
         or summary.get("manifest_sha256") != manifest_sha
         or summary.get("finite") is not True
         or summary.get("exact_once") is not True
@@ -623,11 +727,32 @@ def _validate_canonical_root_receipts(
     split_counts = summary.get("split_counts")
     if (
         not isinstance(split_counts, dict)
-        or int(split_counts.get("test", -1)) != EXPECTED_TEST_CLIPS
-        or int(summary.get("num_shards", -1)) != EXPECTED_NUM_SHARDS
-        or int(summary.get("clip_count", -1))
-        != sum(int(value) for value in split_counts.values())
-        or int(summary.get("frame_count", -1)) <= 0
+        or _require_exact_int(
+            split_counts.get("test"),
+            "canonical summary test split count",
+        )
+        != EXPECTED_TEST_CLIPS
+        or _require_exact_int(
+            summary.get("num_shards"),
+            "canonical summary num_shards",
+        )
+        != EXPECTED_NUM_SHARDS
+        or _require_exact_int(
+            summary.get("clip_count"),
+            "canonical summary clip_count",
+        )
+        != sum(
+            _require_exact_int(
+                value,
+                f"canonical summary split_counts[{key!r}]",
+            )
+            for key, value in split_counts.items()
+        )
+        or _require_exact_int(
+            summary.get("frame_count"),
+            "canonical summary frame_count",
+        )
+        <= 0
     ):
         raise InferenceContractError(
             "canonical cache root counts/shards are inconsistent"
@@ -644,7 +769,10 @@ def _validate_canonical_root_receipts(
         "schema_name": "semtalk-show-canonical-motion",
         "schema_version": 1,
         "split_counts": {
-            key: int(value)
+            key: _require_exact_int(
+                value,
+                f"canonical summary split_counts[{key!r}]",
+            )
             for key, value in split_counts.items()
         },
         "speaker_mapping": SHOW_SPEAKER_IDS,
@@ -771,11 +899,21 @@ def _canonical_test_rows(
         if clip_id.split("/", 1)[0] != speaker:
             raise InferenceContractError(f"{clip_id}: speaker field mismatch")
         expected_speaker_id = SHOW_SPEAKER_IDS.get(speaker)
-        if expected_speaker_id is None or int(row["speaker_id"]) != expected_speaker_id:
+        if (
+            expected_speaker_id is None
+            or _require_exact_int(
+                row.get("speaker_id"),
+                f"{clip_id} speaker_id",
+            )
+            != expected_speaker_id
+        ):
             raise InferenceContractError(f"{clip_id}: invalid SHOW speaker ID")
-        if int(row["pose_fps"]) != POSE_FPS:
+        if _require_exact_int(row.get("pose_fps"), f"{clip_id} pose_fps") != POSE_FPS:
             raise InferenceContractError(f"{clip_id}: pose_fps must be 30")
-        if int(row["frames"]) < DIFFSHEG_WINDOW:
+        if (
+            _require_exact_int(row.get("frames"), f"{clip_id} frames")
+            < DIFFSHEG_WINDOW
+        ):
             raise InferenceContractError(
                 f"{clip_id}: fewer than {DIFFSHEG_WINDOW} DiffSHEG frames"
             )
@@ -791,7 +929,12 @@ def _canonical_test_rows(
             )
         canonical_clip_id(clip_id)
         test_rows.append(row)
-    test_rows.sort(key=lambda row: int(row["global_index"]))
+    test_rows.sort(
+        key=lambda row: _require_exact_int(
+            row.get("global_index"),
+            "canonical row global_index",
+        )
+    )
     if len(test_rows) != EXPECTED_TEST_CLIPS:
         raise InferenceContractError(
             f"canonical test rows {len(test_rows)} != {EXPECTED_TEST_CLIPS}"
@@ -877,7 +1020,10 @@ def _audio_feature_rows(
                 "source_wav": str(
                     Path(str(canonical["source_wav"])).expanduser().resolve()
                 ),
-                "frames": int(canonical["frames"]),
+                "frames": _require_exact_int(
+                    canonical.get("frames"),
+                    f"{clip_id} canonical frames",
+                ),
                 "lineage_contract_sha256": canonical[
                     "lineage_contract_sha256"
                 ],
@@ -892,9 +1038,15 @@ def _audio_feature_rows(
                 "source_wav": str(
                     Path(str(row["source_wav"])).expanduser().resolve()
                 ),
-                "frames": int(row["frames"]),
+                "frames": _require_exact_int(
+                    row.get("frames"),
+                    f"{clip_id} audio frames",
+                ),
                 "lineage_contract_sha256": row["lineage_contract_sha256"],
-                "num_shards": int(row["num_shards"]),
+                "num_shards": _require_exact_int(
+                    row.get("num_shards"),
+                    f"{clip_id} audio num_shards",
+                ),
             }
             if observed_values != expected_values:
                 raise InferenceContractError(
@@ -951,7 +1103,13 @@ def _validate_audio_receipts(
             )
         if summary.get("output_manifest_sha256") != manifest_hashes[manifest]:
             raise InferenceContractError(f"{resolved}: manifest SHA mismatch")
-        if int(summary.get("num_shards", -1)) != EXPECTED_NUM_SHARDS:
+        if (
+            _require_exact_int(
+                summary.get("num_shards"),
+                "audio summary num_shards",
+            )
+            != EXPECTED_NUM_SHARDS
+        ):
             raise InferenceContractError(f"{resolved}: expected eight audio shards")
         summary_hashes[str(resolved)] = sha256_file(resolved)
         summaries_by_manifest[manifest] = summary
@@ -1063,8 +1221,16 @@ def _validate_audio_receipts(
         if (
             not isinstance(protocol, dict)
             or protocol.get("split") != "test"
-            or int(protocol.get("sample_rate", -1)) != 16000
-            or int(protocol.get("fps", -1)) != POSE_FPS
+            or _require_exact_int(
+                protocol.get("sample_rate"),
+                "audio protocol sample_rate",
+            )
+            != 16000
+            or _require_exact_int(
+                protocol.get("fps"),
+                "audio protocol fps",
+            )
+            != POSE_FPS
             or hubert_preprocessing != expected_hubert_preprocessing
         ):
             raise InferenceContractError(
@@ -1085,8 +1251,15 @@ def _validate_audio_receipts(
         ):
             raise InferenceContractError(f"{resolved}: summary lineage SHA mismatch")
         if (
-            int(lineage.get("num_shards", -1)) != EXPECTED_NUM_SHARDS
-            or int(lineage.get("full_split_clips", -1))
+            _require_exact_int(
+                lineage.get("num_shards"),
+                "audio lineage num_shards",
+            )
+            != EXPECTED_NUM_SHARDS
+            or _require_exact_int(
+                lineage.get("full_split_clips"),
+                "audio lineage full_split_clips",
+            )
             != EXPECTED_TEST_CLIPS
         ):
             raise InferenceContractError(f"{resolved}: expected eight audio shards")
@@ -1105,7 +1278,13 @@ def _validate_audio_receipts(
                     f"{resolved}: audio summary/lineage {key} mismatch"
                 )
         manifest_rows = rows_by_manifest[manifest]
-        if int(lineage.get("shard_clips", -1)) != len(manifest_rows):
+        if (
+            _require_exact_int(
+                lineage.get("shard_clips"),
+                "audio lineage shard_clips",
+            )
+            != len(manifest_rows)
+        ):
             raise InferenceContractError(
                 f"{resolved}: audio shard row count mismatch"
             )
@@ -1136,8 +1315,19 @@ def _validate_audio_receipts(
         artifact_aggregate = hashlib.sha256()
         for row in manifest_rows:
             if (
-                int(row["shard_id"]) != int(lineage["shard_id"])
-                or int(row["num_shards"]) != EXPECTED_NUM_SHARDS
+                _require_exact_int(
+                    row.get("shard_id"),
+                    f"{row.get('clip_id')} audio row shard_id",
+                )
+                != _require_exact_int(
+                    lineage.get("shard_id"),
+                    "audio lineage shard_id",
+                )
+                or _require_exact_int(
+                    row.get("num_shards"),
+                    f"{row.get('clip_id')} audio row num_shards",
+                )
+                != EXPECTED_NUM_SHARDS
                 or row["audio_lineage_contract_sha256"]
                 != lineage["audio_lineage_contract_sha256"]
                 or row["lineage_contract_sha256"]
@@ -1170,7 +1360,10 @@ def _validate_audio_receipts(
             f"expected {EXPECTED_NUM_SHARDS} audio manifests, got {len(manifest_set)}"
         )
     shard_ids = sorted(
-        int(lineage["shard_id"])
+        _require_exact_int(
+            lineage.get("shard_id"),
+            "audio lineage shard_id",
+        )
         for lineage in lineages_by_manifest.values()
     )
     if shard_ids != list(range(EXPECTED_NUM_SHARDS)):
@@ -1178,7 +1371,10 @@ def _validate_audio_receipts(
             f"audio lineage shard IDs are not 0..7: {shard_ids}"
         )
     if sum(
-        int(lineage["shard_clips"])
+        _require_exact_int(
+            lineage.get("shard_clips"),
+            "audio lineage shard_clips",
+        )
         for lineage in lineages_by_manifest.values()
     ) != EXPECTED_TEST_CLIPS:
         raise InferenceContractError("audio shard counts do not sum to 1708")
@@ -1234,7 +1430,7 @@ def _load_canonical_clip(
             }
     except (OSError, ValueError) as exc:
         raise InferenceContractError(f"cannot read canonical NPZ {path}: {exc}") from exc
-    frames = int(row["frames"])
+    frames = _require_exact_int(row.get("frames"), "canonical row frames")
     expected = {
         "pose": ((frames, POSE_DIM), np.float32),
         "contact": ((frames, 4), np.float32),
@@ -1307,18 +1503,26 @@ def _load_audio_features(
             raise InferenceContractError(
                 f"{path}: invalid {name} {array.shape}/{array.dtype}"
             )
-    if int(row["frames"]) != expected_frames:
+    if (
+        _require_exact_int(row.get("frames"), "audio feature row frames")
+        != expected_frames
+    ):
         raise InferenceContractError(f"{path}: feature frame count mismatch")
     return arrays
 
 
-def _torch_load_checkpoint(path: Path) -> dict[str, Any]:
+def _torch_load_checkpoint(
+    payload_bytes: bytes,
+    path: Path,
+) -> dict[str, Any]:
     import torch
 
+    buffer = io.BytesIO(payload_bytes)
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload = torch.load(buffer, map_location="cpu", weights_only=True)
     except TypeError:
-        payload = torch.load(path, map_location="cpu")
+        buffer.seek(0)
+        payload = torch.load(buffer, map_location="cpu")
     if not isinstance(payload, dict) or not isinstance(
         payload.get("model_state"), dict
     ):
@@ -1343,9 +1547,17 @@ def _normalize_data_parallel_state(
     state: Mapping[str, Any],
     path: Path,
 ) -> dict[str, Any]:
+    import torch
+
     keys = list(state)
     if not keys:
         raise InferenceContractError(f"{path}: empty model_state")
+    if any(not isinstance(key, str) for key in keys):
+        raise InferenceContractError(f"{path}: model_state keys must be strings")
+    if any(not torch.is_tensor(value) for value in state.values()):
+        raise InferenceContractError(
+            f"{path}: every model_state value must be a tensor"
+        )
     prefixed = [key.startswith("module.") for key in keys]
     if any(prefixed) and not all(prefixed):
         raise InferenceContractError(
@@ -1367,6 +1579,608 @@ def _normalize_data_parallel_state(
     return normalized
 
 
+def _validate_base_state_schema_pair(
+    candidate_state: Mapping[str, Any],
+    candidate_path: Path,
+    final_state: Mapping[str, Any],
+    final_path: Path,
+) -> None:
+    candidate = _normalize_data_parallel_state(
+        candidate_state,
+        candidate_path,
+    )
+    final = _normalize_data_parallel_state(final_state, final_path)
+    if set(candidate) != set(final):
+        raise InferenceContractError(
+            f"{final_path}: completed Base model_state keys differ from the "
+            "selected Base candidate schema"
+        )
+    for key, candidate_value in candidate.items():
+        final_value = final[key]
+        if (
+            candidate_value.dtype != final_value.dtype
+            or tuple(candidate_value.shape) != tuple(final_value.shape)
+        ):
+            raise InferenceContractError(
+                f"{final_path}: completed Base model_state schema mismatch "
+                f"for {key!r}"
+            )
+
+
+_BASE_MODEL_STATE_SCHEMA: dict[str, tuple[Any, tuple[int, ...]]] | None = None
+
+
+def _expected_base_model_state_schema(
+) -> dict[str, tuple[Any, tuple[int, ...]]]:
+    global _BASE_MODEL_STATE_SCHEMA
+    if _BASE_MODEL_STATE_SCHEMA is None:
+        import torch
+        from models.semtalk import semtalk_base
+
+        try:
+            with torch.device("meta"):
+                reference = semtalk_base(_model_args())
+        except Exception as exc:
+            raise InferenceContractError(
+                "cannot construct the strict SemTalk Base schema on the "
+                "PyTorch meta device"
+            ) from exc
+        _BASE_MODEL_STATE_SCHEMA = {
+            key: (value.dtype, tuple(value.shape))
+            for key, value in reference.state_dict().items()
+        }
+        del reference
+    return _BASE_MODEL_STATE_SCHEMA
+
+
+def _validate_base_model_state_schema(
+    state: Mapping[str, Any],
+    path: Path,
+) -> None:
+    normalized = _normalize_data_parallel_state(state, path)
+    expected = _expected_base_model_state_schema()
+    if set(normalized) != set(expected):
+        raise InferenceContractError(
+            f"{path}: model_state keys are not the exact SemTalk Base schema"
+        )
+    for key, value in normalized.items():
+        expected_dtype, expected_shape = expected[key]
+        if value.dtype != expected_dtype or tuple(value.shape) != expected_shape:
+            raise InferenceContractError(
+                f"{path}: model_state tensor schema mismatch for {key!r}"
+            )
+
+
+def _validate_model_v2_audit(
+    audit: Mapping[str, Any],
+    *,
+    formal_stage: str,
+    config_sha256: str,
+    lineage_sha256: str,
+    dataset_receipt: Mapping[str, Any],
+    expected_dataset_summary_sha256: str,
+    expected_data_mdb_sha256: str,
+    source_receipt: Mapping[str, Any],
+    optimizer_updates: int,
+    base_candidate_manifest: Mapping[str, Any] | None,
+    path: Path,
+) -> None:
+    if (
+        set(audit) != MODEL_V2_AUDIT_KEYS
+        or audit.get("format") != "semtalk_show_model_v2"
+        or audit.get("formal_stage") != formal_stage
+        or audit.get("config_sha256") != config_sha256
+        or audit.get("lineage_manifest_sha256") != lineage_sha256
+        or audit.get("dataset_summary_sha256")
+        != expected_dataset_summary_sha256
+        or audit.get("data_mdb_sha256") != expected_data_mdb_sha256
+        or audit.get("dataset_receipt_sha256")
+        != compact_json_sha256(dataset_receipt)
+        or audit.get("smplx_asset_receipt")
+        != dataset_receipt.get("smplx_asset")
+        or audit.get("source_receipt") != source_receipt
+        or audit.get("source_receipt_sha256")
+        != compact_json_sha256(source_receipt)
+        or _require_exact_int(
+            audit.get("optimizer_updates"),
+            f"{formal_stage} audit optimizer_updates",
+        )
+        != optimizer_updates
+        or audit.get("base_candidate_manifest")
+        != base_candidate_manifest
+    ):
+        raise InferenceContractError(
+            f"{path}: invalid model_v2 formal audit for {formal_stage}"
+        )
+
+
+def _base_candidate_relative_path(epoch: int, optimizer_updates: int) -> str:
+    return (
+        "base_candidates/"
+        f"semtalk_base_candidate_epoch_{epoch:04d}"
+        f"_step_{optimizer_updates:09d}.bin"
+    )
+
+
+def _base_candidate_audit(
+    *,
+    epoch: int,
+    optimizer_updates: int,
+    config_sha256: str,
+    lineage_sha256: str,
+    dataset_receipt_sha256: str,
+    source_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "format": "semtalk_show_base_candidate_model_v1",
+        "formal_stage": "base",
+        "candidate_epoch": epoch,
+        "optimizer_updates": optimizer_updates,
+        "config_sha256": config_sha256,
+        "lineage_manifest_sha256": lineage_sha256,
+        "dataset_receipt_sha256": dataset_receipt_sha256,
+        "smplx_asset_receipt": None,
+        "source_receipt": dict(source_receipt),
+        "source_receipt_sha256": compact_json_sha256(source_receipt),
+    }
+
+
+def _base_candidate_payload_and_receipt(
+    *,
+    payload: dict[str, Any],
+    audit: Mapping[str, Any],
+    resolved: Path,
+    observed_sha: str,
+    observed_bytes: int,
+    expected_training_lineage_sha256: str,
+    status_path: Path,
+    expected_source_receipt: Mapping[str, Any],
+    expected_dataset_summary_sha256: str,
+    expected_data_mdb_sha256: str,
+    manifest_path: Path | None,
+    expected_manifest_sha256: str | None,
+    expected_formal_status_sha256: str | None,
+    expected_final_checkpoint_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if (
+        manifest_path is None
+        or expected_manifest_sha256 is None
+        or expected_formal_status_sha256 is None
+        or expected_final_checkpoint_sha256 is None
+    ):
+        raise InferenceContractError(
+            "Base candidate inference requires the immutable candidate "
+            "manifest, expected manifest SHA-256, expected formal-status "
+            "SHA-256, and expected completed-final-checkpoint SHA-256"
+        )
+    if set(payload) != {"model_state", "audit"}:
+        raise InferenceContractError(
+            f"{resolved}: invalid Base candidate checkpoint envelope"
+        )
+    _validate_base_model_state_schema(payload["model_state"], resolved)
+    expected_training_lineage_sha256 = _require_sha256(
+        expected_training_lineage_sha256,
+        "Base expected training lineage SHA",
+    )
+    expected_dataset_summary_sha256 = _require_sha256(
+        expected_dataset_summary_sha256,
+        "Base expected dataset summary SHA",
+    )
+    expected_data_mdb_sha256 = _require_sha256(
+        expected_data_mdb_sha256,
+        "Base expected data.mdb SHA",
+    )
+    expected_manifest_sha256 = _require_sha256(
+        expected_manifest_sha256,
+        "Base candidate manifest SHA",
+    )
+    expected_formal_status_sha256 = _require_sha256(
+        expected_formal_status_sha256,
+        "Base formal training status SHA",
+    )
+    expected_final_checkpoint_sha256 = _require_sha256(
+        expected_final_checkpoint_sha256,
+        "Base completed final checkpoint SHA",
+    )
+    manifest_resolved = _resolved_regular_file(
+        manifest_path,
+        "Base candidate manifest",
+    )
+    if manifest_resolved.name != "base_candidate_manifest.json":
+        raise InferenceContractError(
+            "Base candidate manifest basename must be "
+            "base_candidate_manifest.json"
+        )
+    _verify_file_sha(
+        manifest_resolved,
+        expected_manifest_sha256,
+        "Base candidate manifest",
+    )
+    manifest = load_json(manifest_resolved)
+    resolved_status = _resolved_regular_file(
+        status_path,
+        "base formal training status",
+    )
+    observed_status_sha256 = _verify_file_sha(
+        resolved_status,
+        expected_formal_status_sha256,
+        "Base formal training status",
+    )
+    status = load_json(resolved_status)
+    dataset_receipt = status.get("dataset_receipt")
+    source_receipt = status.get("source_receipt")
+    expected_source_triplet = {
+        key: expected_source_receipt[key]
+        for key in ("origin", "commit", "tree")
+    }
+    expected_optimizer_updates = BASE_EPOCHS * FORMAL_UPDATES_PER_EPOCH
+    manifest_receipt = {
+        "path": manifest_resolved.name,
+        "sha256": expected_manifest_sha256,
+        "entries": BASE_CANDIDATE_COUNT,
+        "last_epoch": BASE_EPOCHS,
+        "last_optimizer_updates": expected_optimizer_updates,
+    }
+    if (
+        status.get("status") != "complete"
+        or status.get("formal_stage") != "base"
+        or _require_exact_int(status.get("world_size"), "world_size") != 1
+        or _require_exact_int(status.get("epochs"), "epochs") != BASE_EPOCHS
+        or _require_exact_int(
+            status.get("completed_epochs"),
+            "completed_epochs",
+        )
+        != BASE_EPOCHS
+        or _require_exact_int(
+            status.get("train_samples"),
+            "train_samples",
+        )
+        != 127_309
+        or _require_exact_int(
+            status.get("updates_per_epoch"),
+            "updates_per_epoch",
+        )
+        != FORMAL_UPDATES_PER_EPOCH
+        or _require_exact_int(
+            status.get("optimizer_updates"),
+            "optimizer_updates",
+        )
+        != expected_optimizer_updates
+        or status.get("lineage_manifest_sha256")
+        != expected_training_lineage_sha256
+        or not isinstance(dataset_receipt, dict)
+        or dataset_receipt.get("summary_sha256")
+        != expected_dataset_summary_sha256
+        or dataset_receipt.get("lineage_sha256")
+        != expected_training_lineage_sha256
+        or dataset_receipt.get("data_mdb_sha256")
+        != expected_data_mdb_sha256
+        or _require_exact_int(dataset_receipt.get("entries"), "entries")
+        != 127_309
+        or _require_exact_int(
+            dataset_receipt.get("train_clips"),
+            "train_clips",
+        )
+        != 13_687
+        or dataset_receipt.get("smplx_asset") is not None
+        or status.get("smplx_asset_receipt") is not None
+        or not isinstance(source_receipt, dict)
+        or {
+            key: source_receipt.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+        != expected_source_triplet
+        or status.get("source_receipt_sha256")
+        != compact_json_sha256(source_receipt)
+        or status.get("base_candidate_manifest") != manifest_receipt
+        or status.get("final_checkpoint_sha256")
+        != expected_final_checkpoint_sha256
+    ):
+        raise InferenceContractError(
+            f"{resolved_status}: invalid complete Base candidate training receipt"
+        )
+    config_sha256 = _require_sha256(
+        str(status.get("config_sha256", "")),
+        "Base config SHA",
+    )
+    if status.get("config_sha256") != config_sha256:
+        raise InferenceContractError(
+            f"{resolved_status}: Base config SHA is not canonical lowercase"
+        )
+    dataset_receipt_sha256 = compact_json_sha256(dataset_receipt)
+
+    if (
+        set(manifest) != BASE_CANDIDATE_MANIFEST_KEYS
+        or manifest.get("format")
+        != "semtalk_show_base_candidate_manifest_v2"
+        or manifest.get("formal_stage") != "base"
+        or _require_exact_int(
+            manifest.get("interval_epochs"),
+            "candidate interval_epochs",
+        )
+        != BASE_CANDIDATE_INTERVAL_EPOCHS
+        or manifest.get("config_sha256") != config_sha256
+        or manifest.get("lineage_manifest_sha256")
+        != expected_training_lineage_sha256
+        or manifest.get("dataset_receipt_sha256")
+        != dataset_receipt_sha256
+        or manifest.get("smplx_asset_receipt") is not None
+        or manifest.get("source_receipt") != source_receipt
+        or manifest.get("source_receipt_sha256")
+        != compact_json_sha256(source_receipt)
+        or not isinstance(manifest.get("entries"), list)
+        or len(manifest["entries"]) != BASE_CANDIDATE_COUNT
+    ):
+        raise InferenceContractError(
+            f"{manifest_resolved}: invalid Base candidate manifest binding"
+        )
+    if manifest_resolved.parent != resolved_status.parent:
+        raise InferenceContractError(
+            "Base candidate manifest and training status must share the "
+            "immutable checkpoint directory"
+        )
+
+    selected_record: Mapping[str, Any] | None = None
+    expected_candidate_paths: set[Path] = set()
+    candidate_checkpoint_receipts: list[dict[str, str]] = []
+    entries = manifest["entries"]
+    for index, record in enumerate(entries):
+        epoch = (index + 1) * BASE_CANDIDATE_INTERVAL_EPOCHS
+        optimizer_updates = epoch * FORMAL_UPDATES_PER_EPOCH
+        relative_path = _base_candidate_relative_path(
+            epoch,
+            optimizer_updates,
+        )
+        expected_audit = _base_candidate_audit(
+            epoch=epoch,
+            optimizer_updates=optimizer_updates,
+            config_sha256=config_sha256,
+            lineage_sha256=expected_training_lineage_sha256,
+            dataset_receipt_sha256=dataset_receipt_sha256,
+            source_receipt=source_receipt,
+        )
+        previous_entries = entries[:index]
+        previous_manifest_sha256 = (
+            training_json_document_sha256(
+                {**manifest, "entries": previous_entries}
+            )
+            if previous_entries
+            else None
+        )
+        expected_core = {
+            "format": "semtalk_show_base_candidate_transaction_core_v1",
+            "formal_stage": "base",
+            "candidate_epoch": epoch,
+            "optimizer_updates": optimizer_updates,
+            "checkpoint": relative_path,
+            "staging_checkpoint": ".base_candidate_checkpoint.staging",
+            "previous_manifest_sha256": previous_manifest_sha256,
+            "previous_entry_count": index,
+            "previous_entries_sha256": compact_json_sha256(
+                previous_entries
+            ),
+            "config_sha256": config_sha256,
+            "lineage_manifest_sha256": expected_training_lineage_sha256,
+            "dataset_receipt_sha256": dataset_receipt_sha256,
+            "smplx_asset_receipt": None,
+            "source_receipt": source_receipt,
+            "source_receipt_sha256": compact_json_sha256(source_receipt),
+            "model_audit_sha256": compact_json_sha256(expected_audit),
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record) != BASE_CANDIDATE_RECORD_KEYS
+            or _require_exact_int(
+                record.get("epoch"),
+                "candidate epoch",
+            )
+            != epoch
+            or _require_exact_int(
+                record.get("optimizer_updates"),
+                "candidate optimizer_updates",
+            )
+            != optimizer_updates
+            or record.get("checkpoint") != relative_path
+            or _require_sha256(
+                str(record.get("checkpoint_sha256", "")),
+                "candidate checkpoint SHA",
+            )
+            != record.get("checkpoint_sha256")
+            or record.get("model_audit_sha256")
+            != compact_json_sha256(expected_audit)
+            or not isinstance(record.get("transaction_core"), dict)
+            or set(record["transaction_core"]) != BASE_CANDIDATE_CORE_KEYS
+            or _require_exact_int(
+                record["transaction_core"].get("candidate_epoch"),
+                "candidate transaction candidate_epoch",
+            )
+            != epoch
+            or _require_exact_int(
+                record["transaction_core"].get("optimizer_updates"),
+                "candidate transaction optimizer_updates",
+            )
+            != optimizer_updates
+            or _require_exact_int(
+                record["transaction_core"].get("previous_entry_count"),
+                "candidate transaction previous_entry_count",
+            )
+            != index
+            or record["transaction_core"] != expected_core
+            or record.get("transaction_core_sha256")
+            != compact_json_sha256(expected_core)
+        ):
+            raise InferenceContractError(
+                f"{manifest_resolved}: invalid candidate record at epoch {epoch}"
+            )
+        candidate_input = manifest_resolved.parent / relative_path
+        if candidate_input.is_symlink() or not candidate_input.is_file():
+            raise InferenceContractError(
+                f"Base candidate must be a regular non-symlink file: "
+                f"{candidate_input}"
+            )
+        candidate_resolved = candidate_input.resolve()
+        candidate_sha256 = (
+            observed_sha
+            if candidate_resolved == resolved
+            else sha256_file(candidate_resolved)
+        )
+        if candidate_sha256 != record["checkpoint_sha256"]:
+            raise InferenceContractError(
+                f"{candidate_resolved}: candidate checkpoint SHA differs "
+                "from the Base candidate manifest"
+            )
+        candidate_checkpoint_receipts.append(
+            {
+                "path": str(candidate_resolved),
+                "sha256": candidate_sha256,
+            }
+        )
+        expected_candidate_paths.add(candidate_resolved)
+        if candidate_resolved == resolved:
+            if selected_record is not None:
+                raise InferenceContractError(
+                    "selected Base candidate appears more than once"
+                )
+            selected_record = record
+
+    candidate_dir = manifest_resolved.parent / "base_candidates"
+    if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+        raise InferenceContractError("invalid Base candidate directory")
+    actual_candidate_paths = {
+        child.resolve()
+        for child in candidate_dir.iterdir()
+        if child.is_file() and not child.is_symlink()
+    }
+    if (
+        len(list(candidate_dir.iterdir())) != BASE_CANDIDATE_COUNT
+        or actual_candidate_paths != expected_candidate_paths
+    ):
+        raise InferenceContractError(
+            "Base candidate directory is not the manifest exact cover"
+        )
+    if selected_record is None:
+        raise InferenceContractError(
+            f"{resolved}: selected checkpoint is absent from the "
+            "Base candidate manifest"
+        )
+    if selected_record.get("checkpoint_sha256") != observed_sha:
+        raise InferenceContractError(
+            f"{resolved}: selected candidate SHA differs from its manifest"
+        )
+    selected_epoch = _require_exact_int(
+        selected_record.get("epoch"),
+        "selected candidate epoch",
+    )
+    selected_updates = _require_exact_int(
+        selected_record.get("optimizer_updates"),
+        "selected candidate optimizer_updates",
+    )
+    expected_selected_audit = _base_candidate_audit(
+        epoch=selected_epoch,
+        optimizer_updates=selected_updates,
+        config_sha256=config_sha256,
+        lineage_sha256=expected_training_lineage_sha256,
+        dataset_receipt_sha256=dataset_receipt_sha256,
+        source_receipt=source_receipt,
+    )
+    if set(audit) != BASE_CANDIDATE_AUDIT_KEYS or audit != expected_selected_audit:
+        raise InferenceContractError(
+            f"{resolved}: candidate checkpoint audit/manifest mismatch"
+        )
+
+    final_path = _resolved_regular_file(
+        Path(str(status.get("final_checkpoint", ""))),
+        "Base final checkpoint",
+    )
+    if (
+        final_path.parent != resolved_status.parent
+        or final_path.name != "semtalk_base_epoch_400.bin"
+    ):
+        raise InferenceContractError(
+            "Base completed final checkpoint is outside the exact formal "
+            "checkpoint directory/name"
+        )
+    final_path, final_snapshot, final_sha = _read_verified_checkpoint_snapshot(
+        final_path,
+        expected_final_checkpoint_sha256,
+        "Base final checkpoint",
+    )
+    final_payload = _torch_load_checkpoint(final_snapshot, final_path)
+    if set(final_payload) != {"model_state", "audit"}:
+        raise InferenceContractError(
+            f"{final_path}: invalid completed Base checkpoint envelope"
+        )
+    _finite_state_dict(final_payload["model_state"], final_path)
+    _validate_base_model_state_schema(
+        final_payload["model_state"],
+        final_path,
+    )
+    _validate_base_state_schema_pair(
+        payload["model_state"],
+        resolved,
+        final_payload["model_state"],
+        final_path,
+    )
+    final_audit = final_payload.get("audit")
+    if not isinstance(final_audit, dict):
+        raise InferenceContractError(
+            f"{final_path}: missing Base final model_v2 audit"
+        )
+    _validate_model_v2_audit(
+        final_audit,
+        formal_stage="base",
+        config_sha256=config_sha256,
+        lineage_sha256=expected_training_lineage_sha256,
+        dataset_receipt=dataset_receipt,
+        expected_dataset_summary_sha256=expected_dataset_summary_sha256,
+        expected_data_mdb_sha256=expected_data_mdb_sha256,
+        source_receipt=source_receipt,
+        optimizer_updates=expected_optimizer_updates,
+        base_candidate_manifest=manifest_receipt,
+        path=final_path,
+    )
+    if (
+        final_path == resolved
+        or final_sha != expected_final_checkpoint_sha256
+        or final_sha != status["final_checkpoint_sha256"]
+    ):
+        raise InferenceContractError(
+            "Base candidate must remain distinct from the completed final model"
+        )
+
+    return payload, {
+        "path": str(resolved),
+        "bytes": observed_bytes,
+        "sha256": observed_sha,
+        "formal_stage": "base",
+        "checkpoint_kind": "immutable_candidate",
+        "candidate_epoch": selected_epoch,
+        "candidate_optimizer_updates": selected_updates,
+        "training_lineage_sha256": expected_training_lineage_sha256,
+        "audit": dict(audit),
+        "base_candidate_manifest": {
+            **manifest_receipt,
+            "path": str(manifest_resolved),
+        },
+        "candidate_checkpoints": candidate_checkpoint_receipts,
+        "candidate_transaction_core_sha256": selected_record[
+            "transaction_core_sha256"
+        ],
+        "formal_training_status": str(resolved_status),
+        "formal_training_status_sha256": observed_status_sha256,
+        "completed_final_checkpoint": {
+            "path": str(final_path),
+            "sha256": final_sha,
+        },
+        "training_accounting": {
+            "epochs": BASE_EPOCHS,
+            "train_samples": 127_309,
+            "updates_per_epoch": FORMAL_UPDATES_PER_EPOCH,
+            "optimizer_updates": expected_optimizer_updates,
+        },
+    }
+
+
 def _checkpoint_payload_and_receipt(
     path: Path,
     *,
@@ -1377,23 +2191,78 @@ def _checkpoint_payload_and_receipt(
     expected_source_receipt: Mapping[str, Any],
     expected_dataset_summary_sha256: str,
     expected_data_mdb_sha256: str,
+    base_candidate_manifest_path: Path | None = None,
+    expected_base_candidate_manifest_sha256: str | None = None,
+    expected_base_formal_status_sha256: str | None = None,
+    expected_base_final_checkpoint_sha256: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    resolved = _resolved_regular_file(path, f"{formal_stage} checkpoint")
-    observed_sha = _verify_file_sha(
-        resolved,
-        expected_sha256,
-        f"{formal_stage} checkpoint",
+    resolved, checkpoint_snapshot, observed_sha = (
+        _read_verified_checkpoint_snapshot(
+            path,
+            expected_sha256,
+            f"{formal_stage} checkpoint",
+        )
     )
-    payload = _torch_load_checkpoint(resolved)
+    payload = _torch_load_checkpoint(checkpoint_snapshot, resolved)
     _finite_state_dict(payload["model_state"], resolved)
     audit = payload.get("audit")
     if (
+        isinstance(audit, dict)
+        and audit.get("format")
+        == "semtalk_show_base_candidate_model_v1"
+    ):
+        if formal_stage != "base":
+            raise InferenceContractError(
+                f"{resolved}: candidate checkpoint is restricted to Base"
+            )
+        return _base_candidate_payload_and_receipt(
+            payload=payload,
+            audit=audit,
+            resolved=resolved,
+            observed_sha=observed_sha,
+            observed_bytes=len(checkpoint_snapshot),
+            expected_training_lineage_sha256=(
+                expected_training_lineage_sha256
+            ),
+            status_path=status_path,
+            expected_source_receipt=expected_source_receipt,
+            expected_dataset_summary_sha256=(
+                expected_dataset_summary_sha256
+            ),
+            expected_data_mdb_sha256=expected_data_mdb_sha256,
+            manifest_path=base_candidate_manifest_path,
+            expected_manifest_sha256=(
+                expected_base_candidate_manifest_sha256
+            ),
+            expected_formal_status_sha256=(
+                expected_base_formal_status_sha256
+            ),
+            expected_final_checkpoint_sha256=(
+                expected_base_final_checkpoint_sha256
+            ),
+        )
+    if formal_stage == "base":
+        raise InferenceContractError(
+            "formal Base inference must select one immutable checkpoint from "
+            "the complete 40-candidate manifest"
+        )
+    if (
+        base_candidate_manifest_path is not None
+        or expected_base_candidate_manifest_sha256 is not None
+        or expected_base_formal_status_sha256 is not None
+        or expected_base_final_checkpoint_sha256 is not None
+    ):
+        raise InferenceContractError(
+            "Base candidate trust-root arguments are only valid for Base"
+        )
+    if (
         not isinstance(audit, dict)
-        or audit.get("format") != "semtalk_show_model_v1"
+        or audit.get("format") != "semtalk_show_model_v2"
         or audit.get("formal_stage") != formal_stage
     ):
         raise InferenceContractError(
-            f"{resolved}: invalid formal checkpoint audit for {formal_stage}"
+            f"{resolved}: formal checkpoint must use semtalk_show_model_v2 "
+            f"for {formal_stage}"
         )
     config_sha = audit.get("config_sha256")
     lineage_sha = audit.get("lineage_manifest_sha256")
@@ -1451,6 +2320,10 @@ def _checkpoint_payload_and_receipt(
         "global": 1700,
     }[formal_stage]
     dataset_receipt = status.get("dataset_receipt")
+    status_final_path = _resolved_regular_file(
+        Path(str(status.get("final_checkpoint", ""))),
+        f"{formal_stage} status final checkpoint",
+    )
     if (
         status.get("status") != "complete"
         or status.get("formal_stage") != formal_stage
@@ -1494,13 +2367,71 @@ def _checkpoint_payload_and_receipt(
         or status.get("source_receipt") != audit_source
         or status.get("source_receipt_sha256")
         != audit.get("source_receipt_sha256")
-        or Path(str(status.get("final_checkpoint", ""))).resolve()
-        != resolved
+        or status_final_path != resolved
         or status.get("final_checkpoint_sha256") != observed_sha
     ):
         raise InferenceContractError(
             f"{resolved_status}: incomplete or inconsistent formal "
             f"{formal_stage} training receipt"
+        )
+    if audit.get("format") == "semtalk_show_model_v2":
+        candidate_manifest_receipt = status.get("base_candidate_manifest")
+        if formal_stage == "base":
+            expected_candidate_receipt = {
+                "path": "base_candidate_manifest.json",
+                "sha256": (
+                    candidate_manifest_receipt.get("sha256")
+                    if isinstance(candidate_manifest_receipt, dict)
+                    else None
+                ),
+                "entries": BASE_CANDIDATE_COUNT,
+                "last_epoch": BASE_EPOCHS,
+                "last_optimizer_updates": (
+                    BASE_EPOCHS * FORMAL_UPDATES_PER_EPOCH
+                ),
+            }
+            if candidate_manifest_receipt != expected_candidate_receipt:
+                raise InferenceContractError(
+                    f"{resolved_status}: invalid Base candidate manifest receipt"
+                )
+            candidate_manifest_path = _resolved_regular_file(
+                resolved_status.parent
+                / str(candidate_manifest_receipt["path"]),
+                "Base candidate manifest",
+            )
+            _verify_file_sha(
+                candidate_manifest_path,
+                str(candidate_manifest_receipt["sha256"]),
+                "Base candidate manifest",
+            )
+        elif candidate_manifest_receipt is not None:
+            raise InferenceContractError(
+                f"{resolved_status}: non-Base model has a candidate manifest"
+            )
+        if status.get("smplx_asset_receipt") != dataset_receipt.get(
+            "smplx_asset"
+        ):
+            raise InferenceContractError(
+                f"{resolved_status}: model_v2 SMPL-X receipt mismatch"
+            )
+        _validate_model_v2_audit(
+            audit,
+            formal_stage=formal_stage,
+            config_sha256=str(config_sha),
+            lineage_sha256=expected_training_lineage_sha256,
+            dataset_receipt=dataset_receipt,
+            expected_dataset_summary_sha256=(
+                expected_dataset_summary_sha256
+            ),
+            expected_data_mdb_sha256=expected_data_mdb_sha256,
+            source_receipt=audit_source,
+            optimizer_updates=expected_epochs * FORMAL_UPDATES_PER_EPOCH,
+            base_candidate_manifest=(
+                candidate_manifest_receipt
+                if formal_stage == "base"
+                else None
+            ),
+            path=resolved,
         )
     parity = dataset_receipt.get("global_fastpath_parity")
     if formal_stage == "global":
@@ -1529,7 +2460,7 @@ def _checkpoint_payload_and_receipt(
         )
     return payload, {
         "path": str(resolved),
-        "bytes": resolved.stat().st_size,
+        "bytes": len(checkpoint_snapshot),
         "sha256": observed_sha,
         "formal_stage": formal_stage,
         "training_lineage_sha256": expected_training_lineage_sha256,
@@ -2247,7 +3178,10 @@ def _input_contract(
         )
     )
     audio_contract_by_shard = {
-        int(lineage["shard_id"]): str(
+        _require_exact_int(
+            lineage.get("shard_id"),
+            "audio lineage shard_id",
+        ): str(
             lineage["audio_lineage_contract_sha256"]
         )
         for lineage in audio_lineages
@@ -2256,8 +3190,16 @@ def _input_contract(
         row = audio_by_id[clip_id]
         expected_shard = evaluation_index % EXPECTED_NUM_SHARDS
         if (
-            int(row["shard_id"]) != expected_shard
-            or int(row["num_shards"]) != EXPECTED_NUM_SHARDS
+            _require_exact_int(
+                row.get("shard_id"),
+                f"{clip_id} audio row shard_id",
+            )
+            != expected_shard
+            or _require_exact_int(
+                row.get("num_shards"),
+                f"{clip_id} audio row num_shards",
+            )
+            != EXPECTED_NUM_SHARDS
             or row["lineage_contract_sha256"] != canonical_contract_sha
             or row["audio_lineage_contract_sha256"]
             != audio_contract_by_shard[expected_shard]
@@ -2512,6 +3454,20 @@ def _input_contract(
         }
         for stage in CHECKPOINT_STAGES
     }
+    checkpoint_validation["base"].update(
+        {
+            "base_candidate_manifest_path": args.base_candidate_manifest,
+            "expected_base_candidate_manifest_sha256": (
+                args.expected_base_candidate_manifest_sha256
+            ),
+            "expected_base_formal_status_sha256": (
+                args.expected_base_formal_status_sha256
+            ),
+            "expected_base_final_checkpoint_sha256": (
+                args.expected_base_final_checkpoint_sha256
+            ),
+        }
+    )
     return {
         "canonical_manifest": canonical_manifest,
         "canonical_manifest_sha256": canonical_sha,
@@ -2690,6 +3646,48 @@ def _revalidate_frozen_inputs(
             str(receipt["formal_training_status_sha256"]),
             f"{stage} formal training status",
         )
+        candidate_manifest = receipt.get("base_candidate_manifest")
+        if candidate_manifest is not None:
+            _verify_file_sha(
+                _resolved_regular_file(
+                    candidate_manifest["path"],
+                    "Base candidate manifest",
+                ),
+                str(candidate_manifest["sha256"]),
+                "Base candidate manifest",
+            )
+        completed_final = receipt.get("completed_final_checkpoint")
+        if completed_final is not None:
+            _verify_file_sha(
+                _resolved_regular_file(
+                    completed_final["path"],
+                    "Base completed final checkpoint",
+                ),
+                str(completed_final["sha256"]),
+                "Base completed final checkpoint",
+            )
+        candidate_checkpoints = receipt.get("candidate_checkpoints")
+        if candidate_checkpoints is not None:
+            if (
+                not isinstance(candidate_checkpoints, list)
+                or len(candidate_checkpoints) != BASE_CANDIDATE_COUNT
+            ):
+                raise InferenceContractError(
+                    "Base candidate receipt lost its exact checkpoint cover"
+                )
+            for candidate in candidate_checkpoints:
+                if not isinstance(candidate, dict):
+                    raise InferenceContractError(
+                        "invalid Base candidate checkpoint receipt"
+                    )
+                _verify_file_sha(
+                    _resolved_regular_file(
+                        candidate.get("path", ""),
+                        "Base candidate checkpoint",
+                    ),
+                    str(candidate.get("sha256", "")),
+                    "Base candidate checkpoint",
+                )
     for row in output_rows:
         clip_id = str(row["source_clip_id"])
         canonical = inputs["canonical_by_id"].get(clip_id)
@@ -2740,7 +3738,12 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
     selected = [
         row
         for row in inputs["canonical_rows"]
-        if int(row["global_index"]) % args.num_shards == args.shard_id
+        if _require_exact_int(
+            row.get("global_index"),
+            "canonical row global_index",
+        )
+        % args.num_shards
+        == args.shard_id
     ]
     output_rows: list[dict[str, Any]] = []
     with torch.inference_mode():
@@ -2791,7 +3794,10 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
                 raise InferenceContractError(f"{clip_id}: post-write SHA mismatch")
             output_rows.append(
                 {
-                    "global_index": int(row["global_index"]),
+                    "global_index": _require_exact_int(
+                        row.get("global_index"),
+                        f"{clip_id} global_index",
+                    ),
                     "source_clip_id": clip_id,
                     "canonical_clip_id": output_id,
                     "speaker": str(row["speaker"]),
@@ -2830,7 +3836,12 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
                     flush=True,
                 )
 
-    output_rows.sort(key=lambda row: int(row["global_index"]))
+    output_rows.sort(
+        key=lambda row: _require_exact_int(
+            row.get("global_index"),
+            "output row global_index",
+        )
+    )
     expected_files = {
         f"{prefix}_{row['canonical_clip_id']}.npz"
         for row in output_rows
@@ -2871,7 +3882,7 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoints": checkpoint_receipts,
     }
     for row in output_rows:
-        frames = int(row["frames"])
+        frames = _require_exact_int(row.get("frames"), "output row frames")
         prediction_path = Path(row["prediction"]["path"])
         target_path = Path(row["ground_truth"]["path"])
         _load_and_validate_output_npz(
@@ -2973,8 +3984,16 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             summary.get("format")
             != "semtalk_show_base_inference_shard_summary_v1"
             or summary.get("status") != "complete"
-            or int(summary.get("shard_id", -1)) != shard_id
-            or int(summary.get("num_shards", -1)) != args.num_shards
+            or _require_exact_int(
+                summary.get("shard_id"),
+                f"{shard_name} summary shard_id",
+            )
+            != shard_id
+            or _require_exact_int(
+                summary.get("num_shards"),
+                f"{shard_name} summary num_shards",
+            )
+            != args.num_shards
             or summary.get("manifest_sha256") != manifest_sha
             or summary.get("contract_sha256") != expected_contract_sha
             or summary.get("finite") is not True
@@ -2985,8 +4004,16 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             lineage.get("format")
             != "semtalk_show_base_inference_shard_lineage_v1"
             or lineage.get("status") != "complete"
-            or int(lineage.get("shard_id", -1)) != shard_id
-            or int(lineage.get("num_shards", -1)) != args.num_shards
+            or _require_exact_int(
+                lineage.get("shard_id"),
+                f"{shard_name} lineage shard_id",
+            )
+            != shard_id
+            or _require_exact_int(
+                lineage.get("num_shards"),
+                f"{shard_name} lineage num_shards",
+            )
+            != args.num_shards
             or lineage.get("manifest_sha256") != manifest_sha
             or lineage.get("contract") != expected_contract
             or lineage.get("contract_sha256") != expected_contract_sha
@@ -3007,7 +4034,13 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             raise InferenceContractError("inference shards used different runtimes")
 
         rows = load_jsonl(manifest_path)
-        if int(summary["selected_clips"]) != len(rows):
+        if (
+            _require_exact_int(
+                summary.get("selected_clips"),
+                f"{shard_name} summary selected_clips",
+            )
+            != len(rows)
+        ):
             raise InferenceContractError(f"{shard_name}: row count mismatch")
         expected_files: set[str] = set()
         for row in rows:
@@ -3025,7 +4058,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                     f"duplicate inference global_index {index}"
                 )
             canonical = inputs["canonical_by_id"].get(row.get("source_clip_id"))
-            if canonical is None or int(canonical["global_index"]) != index:
+            if canonical is None or _require_exact_int(
+                canonical.get("global_index"),
+                f"{shard_name} canonical global_index",
+            ) != index:
                 raise InferenceContractError(
                     f"{shard_name}: row does not bind canonical input"
                 )
@@ -3043,8 +4079,14 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             expected_row_bindings = {
                 "source_clip_id": source_clip_id,
                 "speaker": str(canonical["speaker"]),
-                "speaker_id": int(canonical["speaker_id"]),
-                "frames": int(canonical["frames"]),
+                "speaker_id": _require_exact_int(
+                    canonical.get("speaker_id"),
+                    f"{source_clip_id} canonical speaker_id",
+                ),
+                "frames": _require_exact_int(
+                    canonical.get("frames"),
+                    f"{source_clip_id} canonical frames",
+                ),
                 "canonical_npz": str(
                     Path(str(canonical["canonical_npz"])).expanduser().resolve()
                 ),
@@ -3099,13 +4141,24 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                 "shard ground truth",
             )
             if (
-                prediction.stat().st_size != int(row["prediction"]["bytes"])
-                or target.stat().st_size != int(row["ground_truth"]["bytes"])
+                prediction.stat().st_size
+                != _require_exact_int(
+                    row["prediction"].get("bytes"),
+                    f"{expected_id} prediction bytes",
+                )
+                or target.stat().st_size
+                != _require_exact_int(
+                    row["ground_truth"].get("bytes"),
+                    f"{expected_id} ground-truth bytes",
+                )
             ):
                 raise InferenceContractError(
                     f"{expected_id}: shard output byte count mismatch"
                 )
-            frames = int(canonical["frames"])
+            frames = _require_exact_int(
+                canonical.get("frames"),
+                f"{expected_id} canonical frames",
+            )
             _load_and_validate_output_npz(
                 prediction,
                 frames=frames,
@@ -3135,7 +4188,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                 or hashlib.sha256(expected_target_payload).hexdigest()
                 != row["ground_truth"]["sha256"]
                 or len(expected_target_payload)
-                != int(row["ground_truth"]["bytes"])
+                != _require_exact_int(
+                    row["ground_truth"].get("bytes"),
+                    f"{expected_id} ground-truth bytes",
+                )
             ):
                 raise InferenceContractError(
                     f"{expected_id}: ground truth does not rebuild from canonical input"
@@ -3164,7 +4220,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     expected_indices = {
-        int(row["global_index"])
+        _require_exact_int(
+            row.get("global_index"),
+            "canonical row global_index",
+        )
         for row in inputs["canonical_rows"]
     }
     if set(rows_by_index) != expected_indices or len(rows_by_index) != EXPECTED_TEST_CLIPS:
@@ -3217,7 +4276,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         try:
             for evaluation_index, row in enumerate(ordered_rows):
                 output_id = str(row["canonical_clip_id"])
-                frames = int(row["frames"])
+                frames = _require_exact_int(
+                    row.get("frames"),
+                    f"{output_id} finalized frames",
+                )
                 prediction_source = Path(row["prediction"]["path"]).resolve()
                 target_source = Path(row["ground_truth"]["path"]).resolve()
                 prediction_destination = (
@@ -3228,13 +4290,19 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                     prediction_source,
                     prediction_destination,
                     expected_sha256=str(row["prediction"]["sha256"]),
-                    expected_bytes=int(row["prediction"]["bytes"]),
+                    expected_bytes=_require_exact_int(
+                        row["prediction"].get("bytes"),
+                        f"{output_id} prediction bytes",
+                    ),
                 )
                 _copy_file_fsync_new(
                     target_source,
                     target_destination,
                     expected_sha256=str(row["ground_truth"]["sha256"]),
-                    expected_bytes=int(row["ground_truth"]["bytes"]),
+                    expected_bytes=_require_exact_int(
+                        row["ground_truth"].get("bytes"),
+                        f"{output_id} ground-truth bytes",
+                    ),
                 )
                 _load_and_validate_output_npz(
                     prediction_destination,
@@ -3277,14 +4345,20 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                             "path": str(
                                 (final_test / prediction_destination.name).resolve()
                             ),
-                            "bytes": int(row["prediction"]["bytes"]),
+                            "bytes": _require_exact_int(
+                                row["prediction"].get("bytes"),
+                                f"{output_id} prediction bytes",
+                            ),
                             "sha256": str(row["prediction"]["sha256"]),
                         },
                         "ground_truth": {
                             "path": str(
                                 (final_test / target_destination.name).resolve()
                             ),
-                            "bytes": int(row["ground_truth"]["bytes"]),
+                            "bytes": _require_exact_int(
+                                row["ground_truth"].get("bytes"),
+                                f"{output_id} ground-truth bytes",
+                            ),
                             "sha256": str(row["ground_truth"]["sha256"]),
                         },
                     }
@@ -3402,7 +4476,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--canonical-manifest", type=Path, required=True)
     parser.add_argument("--canonical-summary-json", type=Path, required=True)
     parser.add_argument("--canonical-lineage-json", type=Path, required=True)
@@ -3483,6 +4557,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             type=Path,
             required=True,
         )
+    parser.add_argument(
+        "--base-candidate-manifest",
+        type=Path,
+        required=True,
+        help=(
+            "Immutable manifest v2 proving that --base-checkpoint is one of "
+            "the 40 formal Base candidates."
+        ),
+    )
+    parser.add_argument(
+        "--expected-base-candidate-manifest-sha256",
+        required=True,
+        help="Expected SHA-256 for --base-candidate-manifest.",
+    )
+    parser.add_argument(
+        "--expected-base-formal-status-sha256",
+        required=True,
+        help=(
+            "External expected SHA-256 for the complete Base formal-status "
+            "JSON."
+        ),
+    )
+    parser.add_argument(
+        "--expected-base-final-checkpoint-sha256",
+        required=True,
+        help=(
+            "External expected SHA-256 for the completed final Base "
+            "checkpoint."
+        ),
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=1001)
@@ -3528,6 +4632,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.expected_hubert_tree_sha256 = _require_sha256(
         args.expected_hubert_tree_sha256,
         "--expected-hubert-tree-sha256",
+    )
+    args.expected_base_candidate_manifest_sha256 = _require_sha256(
+        args.expected_base_candidate_manifest_sha256,
+        "--expected-base-candidate-manifest-sha256",
+    )
+    args.expected_base_formal_status_sha256 = _require_sha256(
+        args.expected_base_formal_status_sha256,
+        "--expected-base-formal-status-sha256",
+    )
+    args.expected_base_final_checkpoint_sha256 = _require_sha256(
+        args.expected_base_final_checkpoint_sha256,
+        "--expected-base-final-checkpoint-sha256",
     )
     for stage in CHECKPOINT_STAGES:
         setattr(

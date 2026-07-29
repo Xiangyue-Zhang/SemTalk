@@ -6,6 +6,25 @@ import numpy as np
 import torch
 
 
+def assert_all_finite_async(
+    tensor: torch.Tensor,
+    *,
+    field_name: str,
+) -> None:
+    """Enqueue a finite-value assertion without synchronizing CUDA to host.
+
+    ``torch._assert_async`` is available in the pinned Torch 2.6 runtime.  On
+    CUDA it checks the scalar condition on the current stream; on CPU it
+    raises ``RuntimeError`` immediately, which keeps the contract directly
+    testable without a GPU.
+    """
+
+    torch._assert_async(
+        torch.isfinite(tensor).all(),
+        f"{field_name} contains non-finite values",
+    )
+
+
 def inverse_selection_tensor(
     filtered: torch.Tensor,
     selection: np.ndarray,

@@ -21,6 +21,10 @@ import smplx
 from utils import config, logger_tools, other_tools, metric
 from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
+from utils.smplx_training import (
+    freeze_smplx_for_training,
+    smplx_target_forward,
+)
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
@@ -35,7 +39,7 @@ class CustomTrainer(train.BaseTrainer):
         super().__init__(args)
         self.joints = self.train_data.joints
         if getattr(args, "train_only", False):
-            self.smplx = smplx.create(
+            self.smplx = freeze_smplx_for_training(smplx.create(
                 str(smplx_model_dir(self.args)),
                 model_type="smplx",
                 gender="NEUTRAL_2020",
@@ -44,7 +48,7 @@ class CustomTrainer(train.BaseTrainer):
                 num_expression_coeffs=100,
                 ext="npz",
                 use_pca=False,
-            ).cuda().eval()
+            ).cuda())
         self.tracker = other_tools.EpochTracker(["rec", "vel", "acc", "com", "face", "face_vel", "face_acc", "ver", "ver_vel", "ver_acc"], [False, False, False, False, False, False, False, False, False, False])
         self.rec_loss = get_loss_func("GeodesicLoss")
         self.mse_loss = torch.nn.MSELoss(reduction='mean')
@@ -128,11 +132,13 @@ class CustomTrainer(train.BaseTrainer):
                     left_hand_pose=torch.zeros(bs*n, 15*3).cuda(), 
                     right_hand_pose=torch.zeros(bs*n, 15*3).cuda(), 
                     return_verts=True,
+                    return_shaped=False,
                     # return_joints=True,
                     leye_pose=torch.zeros(bs*n, 3).cuda(), 
                     reye_pose=torch.zeros(bs*n, 3).cuda(),
                 )
-                vertices_tar = self.smplx(
+                vertices_tar = smplx_target_forward(
+                    self.smplx,
                     betas=tar_beta.reshape(bs*n, 300), 
                     transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3), 
                     expression=tar_exps.reshape(bs*n, 100), 
@@ -178,7 +184,7 @@ class CustomTrainer(train.BaseTrainer):
             g_loss_final.backward()
             if self.args.grad_norm != 0: 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm)
-            self.opt.step()
+            self._formal_optimizer_step()
             t_train = time.time() - t_start - t_data
             t_start = time.time()
             mem_cost = torch.cuda.memory_cached() / 1E9
@@ -251,11 +257,13 @@ class CustomTrainer(train.BaseTrainer):
                         left_hand_pose=torch.zeros(bs*n, 15*3).cuda(), 
                         right_hand_pose=torch.zeros(bs*n, 15*3).cuda(), 
                         return_verts=True,
+                        return_shaped=False,
                         # return_joints=True,
                         leye_pose=torch.zeros(bs*n, 3).cuda(), 
                         reye_pose=torch.zeros(bs*n, 3).cuda(),
                     )
-                    vertices_tar = self.smplx(
+                    vertices_tar = smplx_target_forward(
+                        self.smplx,
                         betas=tar_beta.reshape(bs*n, 300), 
                         transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3), 
                         expression=rec_exps.reshape(bs*n, 100), 
