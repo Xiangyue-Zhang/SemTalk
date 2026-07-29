@@ -8,10 +8,10 @@ export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 [--resume]"
+        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 LOWER_TARGET_CACHE LOWER_TARGET_MANIFEST LOWER_TARGET_MANIFEST_SHA256 LOWER_TARGET_CHECKER LOWER_TARGET_CHECKER_SHA256 [--resume]"
 }
 
-if [[ $# -ne 10 && $# -ne 11 ]]; then
+if [[ $# -ne 15 && $# -ne 16 ]]; then
     usage
     exit 2
 fi
@@ -26,10 +26,15 @@ output_root=$7
 run_id=$8
 parity_bundle=$9
 parity_sha256=${10}
+lower_target_cache=${11}
+lower_target_manifest=${12}
+lower_target_manifest_sha256=${13}
+lower_target_checker=${14}
+lower_target_checker_sha256=${15}
 resume_mode=false
 formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
-if [[ $# -eq 11 ]]; then
-    if [[ ${11} != "--resume" ]]; then
+if [[ $# -eq 16 ]]; then
+    if [[ ${16} != "--resume" ]]; then
         usage
         exit 2
     fi
@@ -37,7 +42,8 @@ if [[ $# -eq 11 ]]; then
 fi
 
 for required in "$repo_root/show_base_train.py" "$python_bin" "$rep_summary" \
-    "$lineage" "$parity_bundle"; do
+    "$lineage" "$parity_bundle" "$lower_target_manifest" \
+    "$lower_target_checker"; do
     if [[ ! -e "$required" ]]; then
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
@@ -47,6 +53,11 @@ if [[ ! -d "$rep_lmdb" ]]; then
     printf 'missing representation LMDB: %s\n' "$rep_lmdb" >&2
     exit 1
 fi
+if [[ ! -d "$lower_target_cache" ]]; then
+    printf 'missing lower target cache LMDB: %s\n' \
+        "$lower_target_cache" >&2
+    exit 1
+fi
 if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf 'unsafe run id: %s\n' "$run_id" >&2
     exit 1
@@ -54,7 +65,10 @@ fi
 
 read -r train_samples updates_per_epoch global_foot_fastpath < <(
     "$python_bin" - "$rep_summary" "$rep_lmdb" "$lineage" \
-        "$parity_bundle" "$parity_sha256" "$asset_root" <<'PY'
+        "$parity_bundle" "$parity_sha256" "$asset_root" \
+        "$lower_target_cache" "$lower_target_manifest" \
+        "$lower_target_manifest_sha256" "$lower_target_checker" \
+        "$lower_target_checker_sha256" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -71,6 +85,11 @@ lineage_path = Path(sys.argv[3]).resolve()
 parity_path = Path(sys.argv[4]).resolve()
 expected_parity_sha = sys.argv[5]
 asset_root = Path(sys.argv[6]).resolve()
+lower_cache_input = Path(sys.argv[7])
+lower_manifest_input = Path(sys.argv[8])
+expected_lower_manifest_sha = sys.argv[9]
+lower_checker_input = Path(sys.argv[10])
+expected_lower_checker_sha = sys.argv[11]
 if summary_path != lineage_path:
     raise SystemExit(
         "representation lineage must be the exact representation summary"
@@ -186,6 +205,84 @@ with (lmdb_path / "data.mdb").open("rb") as handle:
 digest = digest_state.hexdigest()
 if digest != summary["data_mdb_sha256"]:
     raise SystemExit("representation data.mdb SHA mismatch")
+
+def require_sha256(value, label):
+    if (
+        len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise SystemExit(f"{label} must be a lowercase SHA-256")
+    return value
+
+def sha256_file(path):
+    state = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            state.update(chunk)
+    return state.hexdigest()
+
+if lower_cache_input.is_symlink():
+    raise SystemExit("lower target cache LMDB must not be a symlink")
+lower_cache = lower_cache_input.resolve()
+if not lower_cache.is_dir():
+    raise SystemExit("lower target cache LMDB is missing")
+lower_data = lower_cache / "data.mdb"
+lower_lock = lower_cache / "lock.mdb"
+for artifact in (lower_data, lower_lock):
+    if artifact.is_symlink() or not artifact.is_file():
+        raise SystemExit(f"invalid lower target cache artifact: {artifact}")
+for receipt_path, expected_sha, label in (
+    (
+        lower_manifest_input,
+        expected_lower_manifest_sha,
+        "lower target cache manifest",
+    ),
+    (
+        lower_checker_input,
+        expected_lower_checker_sha,
+        "lower target cache checker",
+    ),
+):
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SystemExit(f"{label} must be a regular non-symlink file")
+    actual_sha = sha256_file(receipt_path)
+    if actual_sha != require_sha256(expected_sha, f"{label} SHA-256"):
+        raise SystemExit(f"{label} SHA mismatch")
+lower_manifest = json.loads(lower_manifest_input.read_text())
+lower_checker = json.loads(lower_checker_input.read_text())
+if not isinstance(lower_manifest, dict) or not isinstance(lower_checker, dict):
+    raise SystemExit("lower target cache receipts must be JSON objects")
+lower_manifest_lmdb = lower_manifest.get("lmdb")
+if (
+    lower_manifest.get("format")
+    != "semtalk_show_lower_target_joints_raw_lmdb_v1"
+    or lower_manifest.get("status") != "complete"
+    or not isinstance(lower_manifest_lmdb, dict)
+    or Path(str(lower_manifest_lmdb.get("path", ""))).resolve()
+    != lower_cache
+    or lower_manifest_lmdb.get("data_mdb_sha256")
+    != sha256_file(lower_data)
+    or lower_manifest_lmdb.get("lock_mdb_sha256")
+    != sha256_file(lower_lock)
+):
+    raise SystemExit("lower target cache manifest/LMDB binding is invalid")
+if (
+    lower_checker.get("format")
+    != "semtalk_show_lower_target_joints_checker_v1"
+    or lower_checker.get("status") != "complete"
+    or lower_checker.get("cache_manifest_sha256")
+    != expected_lower_manifest_sha
+    or Path(str(lower_checker.get("cache_path", ""))).resolve()
+    != lower_cache
+    or lower_checker.get("cache_data_mdb_sha256")
+    != lower_manifest_lmdb["data_mdb_sha256"]
+    or lower_checker.get("entry_aggregate_sha256")
+    != lower_manifest.get("entry_aggregate_sha256")
+    or lower_checker.get("torch_equal_all") is not True
+    or lower_checker.get("exact_once") is not True
+    or lower_checker.get("finite") is not True
+):
+    raise SystemExit("lower target cache checker binding is invalid")
 entries = require_exact_int(summary.get("entries"), "representation entries")
 updates = entries // 64
 if entries != 127_309 or updates != 1_989:
@@ -441,6 +538,7 @@ launch_stage() {
     local resume_args=()
     local parity_args=()
     local smplx_args=()
+    local lower_cache_args=()
     local log_path="$output_root/logs/$run_id/$stage.log"
     mkdir -p "$stage_out"
 
@@ -461,6 +559,19 @@ launch_stage() {
     else
         smplx_args=(
             --expected_smplx_asset_sha256 "$formal_smplx_sha256"
+        )
+    fi
+    if [[ "$stage" == lower ]]; then
+        lower_cache_args=(
+            --use_lower_target_joints_cache true
+            --lower_target_joints_cache "$lower_target_cache"
+            --lower_target_joints_cache_manifest "$lower_target_manifest"
+            --expected_lower_target_joints_cache_manifest_sha256 \
+                "$lower_target_manifest_sha256"
+            --lower_target_joints_cache_checker_receipt \
+                "$lower_target_checker"
+            --expected_lower_target_joints_cache_checker_sha256 \
+                "$lower_target_checker_sha256"
         )
     fi
 
@@ -521,6 +632,7 @@ launch_stage() {
             --load_ckpt "" \
             "${smplx_args[@]}" \
             "${parity_args[@]}" \
+            "${lower_cache_args[@]}" \
             "${resume_args[@]}"
     ) >"$log_path" 2>&1 &
     local child_pid=$!

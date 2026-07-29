@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import io
@@ -438,6 +439,49 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
         }
 
     @staticmethod
+    def lower_target_cache_receipt(
+        *,
+        source: dict[str, object],
+        summary_sha: str,
+        lineage_sha: str,
+        data_sha: str,
+        smplx_sha: str,
+    ) -> dict[str, object]:
+        receipt: dict[str, object] = {
+            "format": "semtalk_show_lower_target_joints_raw_lmdb_v1",
+            "cache_version": 1,
+            "cache_path": "/frozen/lower-target.lmdb",
+            "manifest_path": "/frozen/lower-target-manifest.json",
+            "manifest_sha256": "9" * 64,
+            "checker_receipt_path": "/frozen/lower-target-checker.json",
+            "checker_receipt_sha256": "a" * 64,
+            "data_mdb_sha256": "b" * 64,
+            "lock_mdb_sha256": "c" * 64,
+            "entry_aggregate_sha256": "d" * 64,
+            "entries": 127_309,
+            "entry_shape": [64, 127, 3],
+            "dtype": "<f4",
+            "speaker_scope": "All",
+            "speaker_ids": [0, 1, 2, 3],
+            "source_receipt": {
+                key: source[key] for key in ("origin", "commit", "tree")
+            },
+            "current_inputs": {
+                "representation_summary_sha256": summary_sha,
+                "representation_lineage_sha256": lineage_sha,
+                "data_mdb_sha256": data_sha,
+                "smplx_asset_sha256": smplx_sha,
+            },
+            "exact_once": True,
+            "finite": True,
+            "torch_equal_checked": True,
+            "target_requires_grad": False,
+            "target_optimizer_excluded": True,
+        }
+        receipt["receipt_sha256"] = MODULE.canonical_json_sha256(receipt)
+        return receipt
+
+    @staticmethod
     def write_json(path: Path, payload: dict[str, object]) -> None:
         path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -528,6 +572,52 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 inference_receipt["audit"]["format"],
                 "semtalk_show_model_v2",
             )
+
+            injected_cache = self.lower_target_cache_receipt(
+                source=source,
+                summary_sha=summary_sha,
+                lineage_sha=lineage_sha,
+                data_sha=data_sha,
+                smplx_sha=smplx_asset["sha256"],
+            )
+            injected_dataset = copy.deepcopy(dataset)
+            injected_dataset["lower_target_joints_cache"] = injected_cache
+            injected_payload = FORMAL._model_payload(
+                trainer,
+                formal_stage="face",
+                config_sha256=config_sha,
+                lineage_sha256=lineage_sha,
+                dataset_receipt=injected_dataset,
+                source_receipt=source,
+                optimizer_updates=optimizer_updates,
+                candidate_manifest_receipt=None,
+            )
+            injected_status = copy.deepcopy(status)
+            injected_status["dataset_receipt"] = injected_dataset
+            injected_status["lower_target_joints_cache"] = injected_cache
+            torch.save(injected_payload, checkpoint)
+            injected_sha = MODULE.sha256_file(checkpoint)
+            injected_status["final_checkpoint_sha256"] = injected_sha
+            self.write_json(status_path, injected_status)
+            with self.assertRaises(RuntimeError):
+                BUILDER.checkpoint_record(
+                    checkpoint,
+                    formal_stage="face",
+                    expected_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                )
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._checkpoint_payload_and_receipt(
+                    checkpoint,
+                    formal_stage="face",
+                    expected_sha256=injected_sha,
+                    expected_training_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                    expected_dataset_summary_sha256=summary_sha,
+                    expected_data_mdb_sha256=data_sha,
+                )
 
             for invalid_updates in (
                 optimizer_updates - 1,
@@ -622,6 +712,184 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 MODULE._checkpoint_payload_and_receipt(
                     checkpoint,
                     formal_stage="face",
+                    expected_sha256=checkpoint_sha,
+                    expected_training_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                    expected_dataset_summary_sha256=summary_sha,
+                    expected_data_mdb_sha256=data_sha,
+                )
+
+    def test_lower_cache_receipt_is_required_and_strictly_consumed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "rvq_lower_600.bin"
+            status_path = root / "formal_status.json"
+            source = self.source_receipt()
+            lineage_sha = "4" * 64
+            summary_sha = "5" * 64
+            data_sha = "6" * 64
+            config_sha = "7" * 64
+            smplx_asset = {
+                "format": "semtalk_show_smplx_asset_v1",
+                "sha256": "8" * 64,
+            }
+            cache_receipt = self.lower_target_cache_receipt(
+                source=source,
+                summary_sha=summary_sha,
+                lineage_sha=lineage_sha,
+                data_sha=data_sha,
+                smplx_sha=smplx_asset["sha256"],
+            )
+            dataset = self.dataset_receipt(
+                summary_sha=summary_sha,
+                lineage_sha=lineage_sha,
+                data_sha=data_sha,
+                smplx_asset=smplx_asset,
+            )
+            dataset["lower_target_joints_cache"] = cache_receipt
+            trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
+            optimizer_updates = 600 * 1_989
+            payload = FORMAL._model_payload(
+                trainer,
+                formal_stage="lower",
+                config_sha256=config_sha,
+                lineage_sha256=lineage_sha,
+                dataset_receipt=dataset,
+                source_receipt=source,
+                optimizer_updates=optimizer_updates,
+                candidate_manifest_receipt=None,
+            )
+            status = {
+                "status": "complete",
+                "formal_stage": "lower",
+                "world_size": 1,
+                "epochs": 600,
+                "completed_epochs": 600,
+                "train_samples": 127_309,
+                "updates_per_epoch": 1_989,
+                "optimizer_updates": optimizer_updates,
+                "lineage_manifest_sha256": lineage_sha,
+                "config_sha256": config_sha,
+                "dataset_receipt": dataset,
+                "smplx_asset_receipt": smplx_asset,
+                "lower_target_joints_cache": cache_receipt,
+                "base_candidate_manifest": None,
+                "source_receipt": source,
+                "source_receipt_sha256": MODULE.compact_json_sha256(
+                    source
+                ),
+                "final_checkpoint": str(checkpoint),
+            }
+
+            def write_current(
+                checkpoint_payload: dict[str, object],
+                status_payload: dict[str, object],
+            ) -> str:
+                torch.save(checkpoint_payload, checkpoint)
+                digest = MODULE.sha256_file(checkpoint)
+                status_payload["final_checkpoint_sha256"] = digest
+                self.write_json(status_path, status_payload)
+                return digest
+
+            checkpoint_sha = write_current(payload, status)
+            _, builder_receipt = BUILDER.checkpoint_record(
+                checkpoint,
+                formal_stage="lower",
+                expected_lineage_sha256=lineage_sha,
+                status_path=status_path,
+                expected_source_receipt=source,
+            )
+            self.assertEqual(
+                builder_receipt["audit"][
+                    "lower_target_joints_cache"
+                ],
+                cache_receipt,
+            )
+            _, inference_receipt = MODULE._checkpoint_payload_and_receipt(
+                checkpoint,
+                formal_stage="lower",
+                expected_sha256=checkpoint_sha,
+                expected_training_lineage_sha256=lineage_sha,
+                status_path=status_path,
+                expected_source_receipt=source,
+                expected_dataset_summary_sha256=summary_sha,
+                expected_data_mdb_sha256=data_sha,
+            )
+            self.assertEqual(
+                inference_receipt["audit"][
+                    "lower_target_joints_cache"
+                ],
+                cache_receipt,
+            )
+
+            tampered_payload = copy.deepcopy(payload)
+            tampered_payload["audit"].pop(
+                "lower_target_joints_cache"
+            )
+            tampered_sha = write_current(tampered_payload, status)
+            with self.assertRaises(RuntimeError):
+                BUILDER.checkpoint_record(
+                    checkpoint,
+                    formal_stage="lower",
+                    expected_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                )
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._checkpoint_payload_and_receipt(
+                    checkpoint,
+                    formal_stage="lower",
+                    expected_sha256=tampered_sha,
+                    expected_training_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                    expected_dataset_summary_sha256=summary_sha,
+                    expected_data_mdb_sha256=data_sha,
+                )
+
+            tampered_payload = copy.deepcopy(payload)
+            tampered_payload["audit"]["lower_target_joints_cache"][
+                "data_mdb_sha256"
+            ] = "e" * 64
+            tampered_sha = write_current(tampered_payload, status)
+            with self.assertRaises(RuntimeError):
+                BUILDER.checkpoint_record(
+                    checkpoint,
+                    formal_stage="lower",
+                    expected_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                )
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._checkpoint_payload_and_receipt(
+                    checkpoint,
+                    formal_stage="lower",
+                    expected_sha256=tampered_sha,
+                    expected_training_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                    expected_dataset_summary_sha256=summary_sha,
+                    expected_data_mdb_sha256=data_sha,
+                )
+
+            missing_status_receipt = copy.deepcopy(status)
+            missing_status_receipt.pop("lower_target_joints_cache")
+            checkpoint_sha = write_current(payload, missing_status_receipt)
+            with self.assertRaises(RuntimeError):
+                BUILDER.checkpoint_record(
+                    checkpoint,
+                    formal_stage="lower",
+                    expected_lineage_sha256=lineage_sha,
+                    status_path=status_path,
+                    expected_source_receipt=source,
+                )
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._checkpoint_payload_and_receipt(
+                    checkpoint,
+                    formal_stage="lower",
                     expected_sha256=checkpoint_sha,
                     expected_training_lineage_sha256=lineage_sha,
                     status_path=status_path,

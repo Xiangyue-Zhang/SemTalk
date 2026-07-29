@@ -69,6 +69,32 @@ def parse_args():
         default=None,
         type=str,
     )
+    parser.add(
+        "--use_lower_target_joints_cache",
+        default=False,
+        type=str2bool,
+    )
+    parser.add("--lower_target_joints_cache", default=None, type=str)
+    parser.add(
+        "--lower_target_joints_cache_manifest",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--expected_lower_target_joints_cache_manifest_sha256",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--lower_target_joints_cache_checker_receipt",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--expected_lower_target_joints_cache_checker_sha256",
+        default=None,
+        type=str,
+    )
     parser.add("--expected_train_samples", default=0, type=int)
     parser.add("--expected_updates_per_epoch", default=0, type=int)
     parser.add("--strict_finite", default=True, type=str2bool)
