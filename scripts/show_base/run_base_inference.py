@@ -80,6 +80,17 @@ CANONICAL_FIELDS = (
     "speaker_id",
 )
 AUDIO_FIELDS = ("beat", "hubert")
+AUDIO_ALIGNMENT_PROTOCOL = {
+    "feature_extraction": "full_source_waveform_before_alignment",
+    "native_30fps_alignment": "linear_align_corners_true",
+    "canonical_alignment": "leading_prefix",
+    "long_audio": "discard_source_feature_tail_after_canonical_frames",
+    "short_audio": (
+        "edge_pad_only_within_one_frame_and_without_losing_a_whole_second"
+    ),
+    "max_shortfall_frames": 1,
+    "reference": "public_loader_shortest_whole_second_leading_prefix",
+}
 OUTPUT_FIELDS = (
     "betas",
     "poses",
@@ -1298,6 +1309,15 @@ def _audio_feature_rows(
         "shard_id",
         "num_shards",
         "source_audio_field",
+        "audio_samples_16k",
+        "native_30fps_frames",
+        "canonical_usable_frames",
+        "discarded_source_30fps_frames",
+        "edge_padded_tail_frames",
+        "source_sample_rate",
+        "hubert_native_frames",
+        "beat_shape",
+        "hubert_shape",
     }
     result: dict[str, dict[str, Any]] = {}
     hashes: dict[str, str] = {}
@@ -1373,6 +1393,56 @@ def _audio_feature_rows(
             if row["source_audio_field"] != "source_wav":
                 raise InferenceContractError(
                     f"{clip_id}: audio feature did not use canonical source_wav"
+                )
+            frames = observed_values["frames"]
+            native_frames = _require_exact_int(
+                row.get("native_30fps_frames"),
+                f"{clip_id} native audio frames",
+            )
+            canonical_usable = _require_exact_int(
+                row.get("canonical_usable_frames"),
+                f"{clip_id} canonical usable frames",
+            )
+            discarded = _require_exact_int(
+                row.get("discarded_source_30fps_frames"),
+                f"{clip_id} discarded audio frames",
+            )
+            edge_padded = _require_exact_int(
+                row.get("edge_padded_tail_frames"),
+                f"{clip_id} edge-padded audio frames",
+            )
+            audio_samples = _require_exact_int(
+                row.get("audio_samples_16k"),
+                f"{clip_id} 16 kHz audio samples",
+            )
+            source_sample_rate = _require_exact_int(
+                row.get("source_sample_rate"),
+                f"{clip_id} source sample rate",
+            )
+            hubert_native_frames = _require_exact_int(
+                row.get("hubert_native_frames"),
+                f"{clip_id} native HuBERT frames",
+            )
+            if (
+                frames <= 0
+                or native_frames <= 0
+                or audio_samples <= 0
+                or source_sample_rate <= 0
+                or hubert_native_frames <= 0
+                or native_frames != (audio_samples * POSE_FPS) // 16000
+                or row.get("beat_shape") != [frames, 3]
+                or row.get("hubert_shape") != [frames, 1024]
+                or canonical_usable != (frames // POSE_FPS) * POSE_FPS
+                or discarded != max(native_frames - frames, 0)
+                or edge_padded != max(frames - native_frames, 0)
+                or edge_padded > 1
+                or (
+                    native_frames < frames
+                    and native_frames < canonical_usable
+                )
+            ):
+                raise InferenceContractError(
+                    f"{clip_id}: invalid public-prefix timing receipt"
                 )
             result[clip_id] = row
             manifest_rows.append(row)
@@ -1550,6 +1620,7 @@ def _validate_audio_receipts(
             )
             != POSE_FPS
             or hubert_preprocessing != expected_hubert_preprocessing
+            or protocol.get("alignment") != AUDIO_ALIGNMENT_PROTOCOL
         ):
             raise InferenceContractError(
                 f"{resolved}: audio protocol is not corrected SHOW test audio"

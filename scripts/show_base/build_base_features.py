@@ -44,6 +44,17 @@ import numpy as np
 
 
 AUDIO_FIELDS = ("beat", "hubert")
+AUDIO_ALIGNMENT_PROTOCOL = {
+    "feature_extraction": "full_source_waveform_before_alignment",
+    "native_30fps_alignment": "linear_align_corners_true",
+    "canonical_alignment": "leading_prefix",
+    "long_audio": "discard_source_feature_tail_after_canonical_frames",
+    "short_audio": (
+        "edge_pad_only_within_one_frame_and_without_losing_a_whole_second"
+    ),
+    "max_shortfall_frames": 1,
+    "reference": "public_loader_shortest_whole_second_leading_prefix",
+}
 CANONICAL_FIELDS = (
     "pose",
     "contact",
@@ -1047,6 +1058,74 @@ def _forward_rolling_max(values: np.ndarray, width: int) -> np.ndarray:
     return np.maximum(suffix[:count], prefix[width - 1 : width - 1 + count])
 
 
+def align_public_audio_prefix(
+    native: np.ndarray,
+    *,
+    target_frames: int,
+    max_frame_mismatch: int,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Match the public loader's shortest-whole-second leading prefix.
+
+    Public SemTalk extracts audio features from the complete source waveform,
+    computes the shortest whole-second duration across modalities, and samples
+    all modalities from frame zero.  Consequently, a longer audio container is
+    prefix-truncated after feature extraction; it must never be time-compressed
+    to the shorter pose duration.
+
+    A sub-frame boundary can leave audio one frame short.  Such a shortfall is
+    edge-padded only when it cannot remove a whole second that the canonical
+    motion would otherwise contribute to training.
+    """
+    values = np.asarray(native)
+    if values.ndim != 2 or values.shape[0] <= 0:
+        raise RuntimeError("native audio feature must be non-empty [T,D]")
+    if target_frames <= 0:
+        raise RuntimeError("canonical audio target must be positive")
+    if max_frame_mismatch < 0:
+        raise RuntimeError("audio mismatch allowance must be non-negative")
+    if values.dtype.kind in "fc" and not np.isfinite(values).all():
+        raise RuntimeError("native audio feature contains non-finite values")
+
+    native_frames = int(values.shape[0])
+    canonical_usable_frames = (target_frames // 30) * 30
+    if native_frames >= target_frames:
+        aligned = values[:target_frames].copy()
+    else:
+        shortfall = target_frames - native_frames
+        if (
+            shortfall > max_frame_mismatch
+            or native_frames < canonical_usable_frames
+        ):
+            raise RuntimeError(
+                "audio/canonical prefix mismatch exceeds public-loader gate: "
+                f"audio={native_frames}, canonical={target_frames}, "
+                f"allowed_shortfall={max_frame_mismatch}, "
+                f"canonical_usable={canonical_usable_frames}"
+            )
+        aligned = np.concatenate(
+            [
+                values,
+                np.repeat(values[-1:], shortfall, axis=0),
+            ],
+            axis=0,
+        )
+    if aligned.shape != (target_frames, values.shape[1]):
+        raise AssertionError("internal public audio-prefix alignment mismatch")
+    return aligned, {
+        "canonical_frames": int(target_frames),
+        "canonical_usable_frames": canonical_usable_frames,
+        "native_30fps_frames": native_frames,
+        "discarded_source_30fps_frames": max(
+            native_frames - target_frames,
+            0,
+        ),
+        "edge_padded_tail_frames": max(
+            target_frames - native_frames,
+            0,
+        ),
+    }
+
+
 def semtalk_rhythm_features(
     speech_16k: np.ndarray,
     *,
@@ -1096,17 +1175,9 @@ def semtalk_rhythm_features(
     native_30fps = int((speech.size / target_sr) * 30)
     if native_30fps <= 0:
         raise RuntimeError("audio duration yields no 30 fps feature frames")
-    if abs(native_30fps - target_frames) > max_frame_mismatch:
-        raise RuntimeError(
-            "audio/canonical frame mismatch exceeds gate: "
-            f"audio={native_30fps}, canonical={target_frames}, "
-            f"allowed={max_frame_mismatch}"
-        )
-
-    # The stock implementation first resamples to floor(duration*30).  For the
-    # usual exact-length SHOW clips this is already target_frames.  A tolerated
-    # one-frame boundary mismatch receives the same linear alignment used for
-    # HuBERT, and the mismatch is recorded in the manifest.
+    # The stock implementation first resamples the complete source feature to
+    # floor(duration*30).  The public loader later samples the leading prefix
+    # shared with pose/facial data; it does not compress a longer audio track.
     native = np.empty((native_30fps, 3), dtype=np.float64)
     native_x = np.linspace(0, features.shape[0] - 1, native_30fps)
     source_x = np.arange(features.shape[0])
@@ -1116,25 +1187,17 @@ def semtalk_rhythm_features(
             source_x,
             features[:, channel],
         )
-    if native_30fps == target_frames:
-        aligned = native
-    else:
-        aligned = np.empty((target_frames, 3), dtype=np.float64)
-        target_x = np.linspace(0, native_30fps - 1, target_frames)
-        native_axis = np.arange(native_30fps)
-        for channel in range(3):
-            aligned[:, channel] = np.interp(
-                target_x,
-                native_axis,
-                native[:, channel],
-            )
-    aligned = aligned.astype(np.float32)
+    aligned, timing = align_public_audio_prefix(
+        native,
+        target_frames=target_frames,
+        max_frame_mismatch=max_frame_mismatch,
+    )
+    aligned = aligned.astype(np.float32, copy=False)
     if aligned.shape != (target_frames, 3) or not np.isfinite(aligned).all():
         raise RuntimeError("invalid aligned rhythm feature")
     return aligned, {
         "audio_samples_16k": int(speech.size),
-        "native_30fps_frames": native_30fps,
-        "canonical_frames": target_frames,
+        **timing,
     }
 
 
@@ -1228,8 +1291,8 @@ def audio_mode(args: argparse.Namespace) -> None:
         raise ValueError("--num-shards must be positive")
     if not 0 <= args.shard_id < args.num_shards:
         raise ValueError("--shard-id must be in [0,num-shards)")
-    if args.max_frame_mismatch < 0:
-        raise ValueError("--max-frame-mismatch must be non-negative")
+    if args.max_frame_mismatch != 1:
+        raise ValueError("--max-frame-mismatch must be exactly one")
     formal_expected = {"train": 13_687, "test": 1_708}[args.split]
     if args.expected_total_clips != formal_expected:
         raise RuntimeError(
@@ -1354,7 +1417,7 @@ def audio_mode(args: argparse.Namespace) -> None:
             "stride": 320,
             "clip_length": 320000,
         },
-        "alignment": "linear_align_corners_true",
+        "alignment": AUDIO_ALIGNMENT_PROTOCOL,
         "beat": "SemTalk amplitude_energy_onset",
         "forbidden_components": [
             "ASR",
@@ -1425,7 +1488,22 @@ def audio_mode(args: argparse.Namespace) -> None:
                     speech,
                     device=args.device,
                 )
-                hubert = align_hubert(native_hubert, frames)
+                hubert_native_30fps = align_hubert(
+                    native_hubert,
+                    timing["native_30fps_frames"],
+                )
+                hubert, hubert_timing = align_public_audio_prefix(
+                    hubert_native_30fps,
+                    target_frames=frames,
+                    max_frame_mismatch=args.max_frame_mismatch,
+                )
+                if hubert_timing != {
+                    key: timing[key]
+                    for key in hubert_timing
+                }:
+                    raise AssertionError(
+                        f"{clip_id}: beat/HuBERT prefix timing mismatch"
+                    )
                 arrays = {
                     "beat": beat,
                     "hubert": hubert,
@@ -1476,6 +1554,15 @@ def audio_mode(args: argparse.Namespace) -> None:
                     "audio_samples_16k": timing["audio_samples_16k"],
                     "source_sample_rate": int(sample_rate),
                     "native_30fps_frames": timing["native_30fps_frames"],
+                    "canonical_usable_frames": timing[
+                        "canonical_usable_frames"
+                    ],
+                    "discarded_source_30fps_frames": timing[
+                        "discarded_source_30fps_frames"
+                    ],
+                    "edge_padded_tail_frames": timing[
+                        "edge_padded_tail_frames"
+                    ],
                     "shard_id": args.shard_id,
                     "num_shards": args.num_shards,
                     "source_audio_field": "source_wav",
@@ -1659,6 +1746,7 @@ def load_audio_rows(
     rows, hashes = load_jsonl(paths)
     mapping: dict[str, dict[str, Any]] = {}
     required = {
+        "format",
         "clip_id",
         "audio_feature_npz",
         "audio_feature_npz_sha256",
@@ -1667,6 +1755,15 @@ def load_audio_rows(
         "lineage_contract_sha256",
         "audio_lineage_contract_sha256",
         "frames",
+        "audio_samples_16k",
+        "native_30fps_frames",
+        "canonical_usable_frames",
+        "discarded_source_30fps_frames",
+        "edge_padded_tail_frames",
+        "source_sample_rate",
+        "hubert_native_frames",
+        "beat_shape",
+        "hubert_shape",
     }
     for row in rows:
         if row.get("split") != "train":
@@ -1677,6 +1774,56 @@ def load_audio_rows(
                 f"audio row {row.get('clip_id')!r} missing {missing}"
             )
         clip_id = str(row["clip_id"])
+        if row.get("format") != "semtalk_show_audio_clip_v1":
+            raise RuntimeError(f"{clip_id}: unexpected audio row format")
+        frames = require_exact_int(row.get("frames"), f"{clip_id} frames")
+        native_frames = require_exact_int(
+            row.get("native_30fps_frames"),
+            f"{clip_id} native audio frames",
+        )
+        canonical_usable = require_exact_int(
+            row.get("canonical_usable_frames"),
+            f"{clip_id} canonical usable frames",
+        )
+        discarded = require_exact_int(
+            row.get("discarded_source_30fps_frames"),
+            f"{clip_id} discarded audio frames",
+        )
+        edge_padded = require_exact_int(
+            row.get("edge_padded_tail_frames"),
+            f"{clip_id} edge-padded audio frames",
+        )
+        audio_samples = require_exact_int(
+            row.get("audio_samples_16k"),
+            f"{clip_id} 16 kHz audio samples",
+        )
+        source_sample_rate = require_exact_int(
+            row.get("source_sample_rate"),
+            f"{clip_id} source sample rate",
+        )
+        hubert_native_frames = require_exact_int(
+            row.get("hubert_native_frames"),
+            f"{clip_id} native HuBERT frames",
+        )
+        if (
+            frames <= 0
+            or native_frames <= 0
+            or audio_samples <= 0
+            or source_sample_rate <= 0
+            or hubert_native_frames <= 0
+            or native_frames != (audio_samples * 30) // 16000
+            or row.get("beat_shape") != [frames, 3]
+            or row.get("hubert_shape") != [frames, 1024]
+            or canonical_usable != (frames // 30) * 30
+            or discarded != max(native_frames - frames, 0)
+            or edge_padded != max(frames - native_frames, 0)
+            or edge_padded > 1
+            or (
+                native_frames < frames
+                and native_frames < canonical_usable
+            )
+        ):
+            raise RuntimeError(f"{clip_id}: invalid public-prefix timing receipt")
         if clip_id in mapping:
             raise RuntimeError(f"duplicate audio clip_id {clip_id}")
         mapping[clip_id] = row
@@ -1784,6 +1931,7 @@ def load_audio_lineages(
             or protocol.get("sample_rate") != 16000
             or protocol.get("hubert_preprocessing")
             != expected_hubert_preprocessing
+            or protocol.get("alignment") != AUDIO_ALIGNMENT_PROTOCOL
         ):
             raise RuntimeError(
                 f"{resolved}: unsupported HuBERT preprocessing protocol"
@@ -1802,6 +1950,7 @@ def load_audio_lineages(
                 f"{resolved}: invalid audio lineage contract hash"
             )
         contract_expectations = {
+            "format": "semtalk_show_audio_lineage_contract_v1",
             "protocol": record.get("protocol"),
             "canonical_manifest_sha256": canonical_manifest_hashes,
             "canonical_receipt": canonical_receipt,
