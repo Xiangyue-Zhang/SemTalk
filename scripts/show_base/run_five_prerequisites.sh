@@ -8,10 +8,10 @@ export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 LOWER_TARGET_CACHE LOWER_TARGET_MANIFEST LOWER_TARGET_MANIFEST_SHA256 LOWER_TARGET_CHECKER LOWER_TARGET_CHECKER_SHA256 [--resume]"
+        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 LOWER_TARGET_CACHE LOWER_TARGET_MANIFEST LOWER_TARGET_MANIFEST_SHA256 LOWER_TARGET_CHECKER LOWER_TARGET_CHECKER_SHA256 LOWER_TARGET_GATE LOWER_TARGET_GATE_SHA256 LOWER_TARGET_BUILDER_PROCESS LOWER_TARGET_BUILDER_PROCESS_SHA256 [--resume]"
 }
 
-if [[ $# -ne 15 && $# -ne 16 ]]; then
+if [[ $# -ne 19 && $# -ne 20 ]]; then
     usage
     exit 2
 fi
@@ -31,10 +31,14 @@ lower_target_manifest=${12}
 lower_target_manifest_sha256=${13}
 lower_target_checker=${14}
 lower_target_checker_sha256=${15}
+lower_target_gate=${16}
+lower_target_gate_sha256=${17}
+lower_target_builder_process=${18}
+lower_target_builder_process_sha256=${19}
 resume_mode=false
 formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
-if [[ $# -eq 16 ]]; then
-    if [[ ${16} != "--resume" ]]; then
+if [[ $# -eq 20 ]]; then
+    if [[ ${20} != "--resume" ]]; then
         usage
         exit 2
     fi
@@ -43,7 +47,8 @@ fi
 
 for required in "$repo_root/show_base_train.py" "$python_bin" "$rep_summary" \
     "$lineage" "$parity_bundle" "$lower_target_manifest" \
-    "$lower_target_checker"; do
+    "$lower_target_checker" "$lower_target_gate" \
+    "$lower_target_builder_process"; do
     if [[ ! -e "$required" ]]; then
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
@@ -68,7 +73,9 @@ read -r train_samples updates_per_epoch global_foot_fastpath < <(
         "$parity_bundle" "$parity_sha256" "$asset_root" \
         "$lower_target_cache" "$lower_target_manifest" \
         "$lower_target_manifest_sha256" "$lower_target_checker" \
-        "$lower_target_checker_sha256" <<'PY'
+        "$lower_target_checker_sha256" "$lower_target_gate" \
+        "$lower_target_gate_sha256" "$lower_target_builder_process" \
+        "$lower_target_builder_process_sha256" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -90,6 +97,10 @@ lower_manifest_input = Path(sys.argv[8])
 expected_lower_manifest_sha = sys.argv[9]
 lower_checker_input = Path(sys.argv[10])
 expected_lower_checker_sha = sys.argv[11]
+lower_gate_input = Path(sys.argv[12])
+expected_lower_gate_sha = sys.argv[13]
+lower_builder_process_input = Path(sys.argv[14])
+expected_lower_builder_process_sha = sys.argv[15]
 if summary_path != lineage_path:
     raise SystemExit(
         "representation lineage must be the exact representation summary"
@@ -242,6 +253,16 @@ for receipt_path, expected_sha, label in (
         expected_lower_checker_sha,
         "lower target cache checker",
     ),
+    (
+        lower_gate_input,
+        expected_lower_gate_sha,
+        "lower target cache formal gate",
+    ),
+    (
+        lower_builder_process_input,
+        expected_lower_builder_process_sha,
+        "lower target cache builder process receipt",
+    ),
 ):
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise SystemExit(f"{label} must be a regular non-symlink file")
@@ -250,7 +271,17 @@ for receipt_path, expected_sha, label in (
         raise SystemExit(f"{label} SHA mismatch")
 lower_manifest = json.loads(lower_manifest_input.read_text())
 lower_checker = json.loads(lower_checker_input.read_text())
-if not isinstance(lower_manifest, dict) or not isinstance(lower_checker, dict):
+lower_gate = json.loads(lower_gate_input.read_text())
+lower_builder_process = json.loads(lower_builder_process_input.read_text())
+if not all(
+    isinstance(value, dict)
+    for value in (
+        lower_manifest,
+        lower_checker,
+        lower_gate,
+        lower_builder_process,
+    )
+):
     raise SystemExit("lower target cache receipts must be JSON objects")
 lower_manifest_lmdb = lower_manifest.get("lmdb")
 if (
@@ -283,6 +314,62 @@ if (
     or lower_checker.get("finite") is not True
 ):
     raise SystemExit("lower target cache checker binding is invalid")
+builder_process_manifest = lower_builder_process.get("manifest")
+builder_process_child = lower_builder_process.get("builder_process")
+if (
+    lower_builder_process.get("format")
+    != "semtalk_show_lower_target_cache_builder_process_v1"
+    or lower_builder_process.get("status") != "complete"
+    or not isinstance(builder_process_manifest, dict)
+    or builder_process_manifest.get("sha256")
+    != expected_lower_manifest_sha
+    or not isinstance(builder_process_child, dict)
+    or builder_process_child.get("return_code") != 0
+    or builder_process_child.get("timing_scope")
+    != "immediately_before_popen_through_complete_child_exit"
+    or not isinstance(builder_process_child.get("elapsed_monotonic_ns"), int)
+    or builder_process_child["elapsed_monotonic_ns"] <= 0
+):
+    raise SystemExit("lower target cache builder process binding is invalid")
+gate_preflight = lower_gate.get("preflight")
+gate_performance = lower_gate.get("performance")
+gate_equivalence = lower_gate.get("equivalence")
+gate_builder_process = (
+    gate_preflight.get("builder_process_receipt")
+    if isinstance(gate_preflight, dict)
+    else None
+)
+if (
+    lower_gate.get("format")
+    != "semtalk_show_lower_target_cache_formal_gate_v1"
+    or lower_gate.get("status") != "pass"
+    or not isinstance(gate_preflight, dict)
+    or gate_preflight.get("cache_manifest", {}).get("sha256")
+    != expected_lower_manifest_sha
+    or gate_preflight.get("checker_receipt", {}).get("sha256")
+    != expected_lower_checker_sha
+    or not isinstance(gate_builder_process, dict)
+    or gate_builder_process.get("sha256") != expected_lower_builder_process_sha
+    or gate_builder_process.get("payload") != lower_builder_process
+    or gate_builder_process.get("validation", {}).get("return_code") != 0
+    or gate_preflight.get("representation", {}).get("data_mdb_sha256")
+    != summary.get("data_mdb_sha256")
+    or gate_preflight.get("smplx", {}).get("asset_sha256")
+    != smplx_sha
+    or not isinstance(gate_equivalence, dict)
+    or gate_equivalence.get("status") != "pass"
+    or gate_equivalence.get(
+        "initial_and_two_complete_updates_and_final_byte_exact"
+    ) is not True
+    or gate_equivalence.get("repeat_controls_exact") is not True
+    or gate_equivalence.get("fresh_processes") != 4
+    or not isinstance(gate_performance, dict)
+    or gate_performance.get("status") != "pass"
+    or gate_performance.get("fresh_processes") != 4
+    or gate_performance.get("builder_process_receipt_sha256")
+    != expected_lower_builder_process_sha
+):
+    raise SystemExit("lower target cache formal gate binding is invalid")
 entries = require_exact_int(summary.get("entries"), "representation entries")
 updates = entries // 64
 if entries != 127_309 or updates != 1_989:
@@ -572,6 +659,13 @@ launch_stage() {
                 "$lower_target_checker"
             --expected_lower_target_joints_cache_checker_sha256 \
                 "$lower_target_checker_sha256"
+            --lower_target_cache_gate_report "$lower_target_gate"
+            --expected_lower_target_cache_gate_sha256 \
+                "$lower_target_gate_sha256"
+            --lower_target_cache_builder_process_receipt \
+                "$lower_target_builder_process"
+            --expected_lower_target_cache_builder_process_receipt_sha256 \
+                "$lower_target_builder_process_sha256"
         )
     fi
 

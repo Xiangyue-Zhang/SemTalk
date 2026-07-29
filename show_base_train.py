@@ -9,6 +9,7 @@ while adding resumable checkpoints and finite-value audits.  Launch it with
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -45,6 +46,10 @@ FORMAL_SMPLX_SHA256 = (
     "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
 )
 FORMAL_SMPLX_STAGES = frozenset({"face", "hands", "upper", "lower"})
+LOWER_TARGET_CACHE_GATE_FORMAT = (
+    "semtalk_show_lower_target_cache_formal_gate_v1"
+)
+LOWER_TARGET_CACHE_GATE_MIN_SPEEDUP = 1.05
 BASE_CANDIDATE_INTERVAL_EPOCHS = 10
 BASE_CANDIDATE_TRANSACTION_FILENAME = "base_candidate_transaction.json"
 BASE_CANDIDATE_STAGING_FILENAME = ".base_candidate_checkpoint.staging"
@@ -265,6 +270,460 @@ def _config_fingerprint(args: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _formal_lower_target_cache_gate_receipt(
+    args: Any,
+    *,
+    lower_target_cache_receipt: dict[str, Any] | None,
+    current_source: dict[str, str],
+) -> dict[str, Any] | None:
+    """Require and bind the lossless/performance gate before lower training."""
+
+    report_value = getattr(args, "lower_target_cache_gate_report", None)
+    expected_value = getattr(
+        args,
+        "expected_lower_target_cache_gate_sha256",
+        None,
+    )
+    builder_process_value = getattr(
+        args,
+        "lower_target_cache_builder_process_receipt",
+        None,
+    )
+    expected_builder_process_value = getattr(
+        args,
+        "expected_lower_target_cache_builder_process_receipt_sha256",
+        None,
+    )
+    cache_enabled = lower_target_cache_receipt is not None
+    if not cache_enabled:
+        if any(
+            value not in {None, ""}
+            for value in (
+                report_value,
+                expected_value,
+                builder_process_value,
+                expected_builder_process_value,
+            )
+        ):
+            raise RuntimeError(
+                "lower target cache gate arguments are forbidden when the "
+                "cache is disabled"
+            )
+        return None
+    if args.formal_stage != "lower":
+        raise RuntimeError("lower target cache gate is restricted to lower")
+    if (
+        type(report_value) is not str
+        or not report_value
+        or type(expected_value) is not str
+        or len(expected_value) != 64
+        or any(character not in "0123456789abcdef" for character in expected_value)
+        or type(builder_process_value) is not str
+        or not builder_process_value
+        or type(expected_builder_process_value) is not str
+        or len(expected_builder_process_value) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_builder_process_value
+        )
+    ):
+        raise RuntimeError(
+            "formal lower training requires an explicit gate report and SHA-256"
+        )
+    builder_process_input = Path(builder_process_value)
+    if (
+        builder_process_input.is_symlink()
+        or not builder_process_input.is_file()
+    ):
+        raise RuntimeError(
+            "lower target cache builder process receipt must be a regular file"
+        )
+    builder_process_path = builder_process_input.resolve()
+    builder_process_sha = _sha256(builder_process_path)
+    if builder_process_sha != expected_builder_process_value:
+        raise RuntimeError("lower target cache builder process SHA mismatch")
+    with builder_process_path.open(encoding="utf-8") as handle:
+        builder_process_payload = json.load(handle)
+    if not isinstance(builder_process_payload, dict):
+        raise RuntimeError(
+            "lower target cache builder process receipt must be an object"
+        )
+    report_input = Path(report_value)
+    if report_input.is_symlink() or not report_input.is_file():
+        raise RuntimeError(
+            f"lower target cache gate must be a regular file: {report_input}"
+        )
+    report_path = report_input.resolve()
+    report_sha = _sha256(report_path)
+    if report_sha != expected_value:
+        raise RuntimeError("lower target cache gate report SHA mismatch")
+    with report_path.open(encoding="utf-8") as handle:
+        report = json.load(handle)
+    if not isinstance(report, dict):
+        raise RuntimeError("lower target cache gate report must be an object")
+    expected_speakers = {
+        "oliver": 0,
+        "chemistry": 1,
+        "seth": 2,
+        "conan": 3,
+    }
+    scope = report.get("scope")
+    protocol = report.get("protocol")
+    equivalence = report.get("equivalence")
+    performance = report.get("performance")
+    preflight = report.get("preflight")
+    child_commands = report.get("child_commands")
+    if (
+        report.get("format") != LOWER_TARGET_CACHE_GATE_FORMAT
+        or report.get("status") != "pass"
+        or not isinstance(scope, dict)
+        or scope.get("dataset") != "show_base"
+        or scope.get("formal_stage") != "lower"
+        or scope.get("speaker_scope") != "All"
+        or scope.get("speaker_ids") != [0, 1, 2, 3]
+        or _require_exact_audit_int_mapping(
+            scope.get("speaker_map"),
+            expected_speakers,
+            "lower cache gate speaker_map",
+        )
+        != expected_speakers
+        or not isinstance(protocol, dict)
+        or protocol.get("speaker_scope") != "All"
+        or _require_exact_audit_int_mapping(
+            protocol.get("speakers"),
+            expected_speakers,
+            "lower cache gate protocol speakers",
+        )
+        != expected_speakers
+        or _require_exact_audit_int(
+            protocol.get("equivalence_updates"),
+            "lower cache gate equivalence_updates",
+        )
+        != 2
+        or _require_exact_audit_int(
+            protocol.get("equivalence_fresh_processes"),
+            "lower cache gate equivalence fresh processes",
+        )
+        != 4
+        or _require_exact_audit_int(
+            protocol.get("equivalence_repeats_per_mode"),
+            "lower cache gate equivalence repeats",
+        )
+        != 2
+        or protocol.get("abba_order")
+        != ["legacy", "cache", "cache", "legacy"]
+        or _require_exact_audit_int(
+            protocol.get("benchmark_fresh_processes"),
+            "lower cache gate benchmark fresh processes",
+        )
+        != 4
+        or _require_exact_audit_int(
+            protocol.get("warmup_updates_per_block"),
+            "lower cache gate warmup updates",
+        )
+        != 5
+        or _require_exact_audit_int(
+            protocol.get("measured_updates_per_block"),
+            "lower cache gate measured updates",
+        )
+        != 25
+        or float(protocol.get("minimum_speedup", float("nan")))
+        != LOWER_TARGET_CACHE_GATE_MIN_SPEEDUP
+        or _require_exact_audit_int(
+            protocol.get("training_updates"),
+            "lower cache gate training updates",
+        )
+        != 600 * 1_989
+        or not isinstance(equivalence, dict)
+        or equivalence.get("status") != "pass"
+        or equivalence.get(
+            "initial_and_two_complete_updates_and_final_byte_exact"
+        )
+        is not True
+        or equivalence.get("repeat_controls_exact") is not True
+        or equivalence.get("semantic_receipts_exact") is not True
+        or _require_exact_audit_int(
+            equivalence.get("fresh_processes"),
+            "lower cache gate equivalence fresh processes report",
+        )
+        != 4
+        or set(equivalence.get("states", {}))
+        != {"initial", "step_1", "step_2", "final"}
+        or len(equivalence.get("target_joints", [])) != 2
+        or any(
+            item.get("byte_exact") is not True
+            for item in equivalence.get("target_joints", [])
+        )
+        or not isinstance(performance, dict)
+        or performance.get("status") != "pass"
+        or _require_exact_audit_int(
+            performance.get("fresh_processes"),
+            "lower cache gate benchmark fresh processes report",
+        )
+        != 4
+        or performance.get("semantic_receipts_exact") is not True
+        or performance.get("real_batch_receipts_exact") is not True
+        or performance.get("initial_whole_state_exact") is not True
+        or not isinstance(performance.get("initial_state_sha256"), str)
+        or len(performance["initial_state_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in performance["initial_state_sha256"]
+        )
+        or not isinstance(preflight, dict)
+        or not isinstance(child_commands, list)
+        or len(child_commands) != 8
+    ):
+        raise RuntimeError("lower target cache gate protocol is incomplete")
+    repeat_controls = equivalence.get("repeat_controls")
+    cross_mode_pairs = equivalence.get("cross_mode_pairs")
+    if (
+        not isinstance(repeat_controls, dict)
+        or set(repeat_controls) != {"legacy_a_a", "cache_b_b"}
+        or not isinstance(cross_mode_pairs, list)
+        or len(cross_mode_pairs) != 2
+    ):
+        raise RuntimeError("lower target cache repeat controls are incomplete")
+    for label, proof in [
+        *repeat_controls.items(),
+        *[
+            (f"cross_mode_{index}", proof)
+            for index, proof in enumerate(cross_mode_pairs)
+        ],
+    ]:
+        if (
+            not isinstance(proof, dict)
+            or proof.get("status") != "pass"
+            or proof.get("semantic_receipts_exact") is not True
+            or proof.get(
+                "initial_and_two_complete_updates_and_final_byte_exact"
+            )
+            is not True
+            or set(proof.get("states", {}))
+            != {"initial", "step_1", "step_2", "final"}
+            or len(proof.get("target_joints", [])) != 2
+            or any(
+                item.get("byte_exact") is not True
+                for item in proof.get("target_joints", [])
+            )
+        ):
+            raise RuntimeError(
+                f"lower target cache equivalence proof {label} is incomplete"
+            )
+    expected_child_modes = [
+        "equivalence-legacy-0",
+        "equivalence-legacy-1",
+        "equivalence-cache-0",
+        "equivalence-cache-1",
+        "benchmark-0-legacy",
+        "benchmark-1-cache",
+        "benchmark-2-cache",
+        "benchmark-3-legacy",
+    ]
+    for index, (command, expected_mode) in enumerate(
+        zip(child_commands, expected_child_modes)
+    ):
+        argv = command.get("argv") if isinstance(command, dict) else None
+        if (
+            not isinstance(command, dict)
+            or command.get("sequence_index") != index
+            or command.get("mode") != expected_mode
+            or command.get("return_code") != 0
+            or command.get("exact_argv_and_rc") is not True
+            or command.get("cuda_visible_devices") != "0"
+            or not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(item, str) for item in argv)
+            or command.get("argv_sha256")
+            != hashlib.sha256(
+                b"\0".join(os.fsencode(item) for item in argv) + b"\0"
+            ).hexdigest()
+            or command.get("reported_argv_sha256")
+            != command.get("argv_sha256")
+        ):
+            raise RuntimeError(
+                f"lower target cache child command {index} is invalid"
+            )
+
+    def require_speedup(item: Any, label: str) -> float:
+        if (
+            not isinstance(item, dict)
+            or item.get("pass") is not True
+            or float(item.get("threshold", float("nan")))
+            != LOWER_TARGET_CACHE_GATE_MIN_SPEEDUP
+        ):
+            raise RuntimeError(f"{label} gate receipt is incomplete")
+        value = float(item.get("speedup", float("nan")))
+        if (
+            not np.isfinite(value)
+            or value < LOWER_TARGET_CACHE_GATE_MIN_SPEEDUP
+        ):
+            raise RuntimeError(f"{label} speedup is below 1.05")
+        return value
+
+    pooled = performance.get("pooled")
+    pairs = performance.get("block_pairs")
+    amortization = performance.get("amortization")
+    if (
+        not isinstance(pooled, dict)
+        or not isinstance(pairs, list)
+        or len(pairs) != 2
+        or not isinstance(amortization, dict)
+    ):
+        raise RuntimeError("lower target cache benchmark evidence is incomplete")
+    pooled_wall = require_speedup(pooled.get("wall"), "pooled wall")
+    pooled_cuda = require_speedup(
+        pooled.get("cuda_event"),
+        "pooled CUDA-event",
+    )
+    for pair_index, pair in enumerate(pairs):
+        if (
+            not isinstance(pair, dict)
+            or _require_exact_audit_int(
+                pair.get("pair_index"),
+                f"lower cache gate pair {pair_index} index",
+            )
+            != pair_index
+        ):
+            raise RuntimeError("lower target cache block pair is invalid")
+        require_speedup(pair.get("wall"), f"pair {pair_index} wall")
+        require_speedup(
+            pair.get("cuda_event"),
+            f"pair {pair_index} CUDA-event",
+        )
+    amortized = require_speedup(amortization, "builder-amortized wall")
+    if (
+        _require_exact_audit_int(
+            amortization.get("epochs"),
+            "lower cache gate amortization epochs",
+        )
+        != 600
+        or _require_exact_audit_int(
+            amortization.get("updates_per_epoch"),
+            "lower cache gate amortization updates_per_epoch",
+        )
+        != 1_989
+        or _require_exact_audit_int(
+            amortization.get("training_updates"),
+            "lower cache gate amortization training_updates",
+        )
+        != 600 * 1_989
+        or not np.isfinite(
+            float(amortization.get("full_builder_seconds", float("nan")))
+        )
+        or float(amortization["full_builder_seconds"]) <= 0.0
+    ):
+        raise RuntimeError("lower target cache amortization receipt is invalid")
+
+    cache_manifest = preflight.get("cache_manifest")
+    checker = preflight.get("checker_receipt")
+    representation = preflight.get("representation")
+    smplx = preflight.get("smplx")
+    gate_source = preflight.get("source")
+    builder_process = preflight.get("builder_process_receipt")
+    builder_timing = preflight.get("builder_timing")
+    current_inputs = lower_target_cache_receipt.get("current_inputs")
+    embedded_builder_payload = (
+        builder_process.get("payload")
+        if isinstance(builder_process, dict)
+        else None
+    )
+    builder_validation = (
+        builder_process.get("validation")
+        if isinstance(builder_process, dict)
+        else None
+    )
+    if (
+        not all(
+            isinstance(item, dict)
+            for item in (
+                cache_manifest,
+                checker,
+                representation,
+                smplx,
+                gate_source,
+                builder_process,
+                builder_timing,
+                current_inputs,
+            )
+        )
+        or cache_manifest.get("sha256")
+        != lower_target_cache_receipt.get("manifest_sha256")
+        or checker.get("sha256")
+        != lower_target_cache_receipt.get("checker_receipt_sha256")
+        or builder_process.get("path") != str(builder_process_path)
+        or builder_process.get("sha256") != builder_process_sha
+        or not isinstance(embedded_builder_payload, dict)
+        or embedded_builder_payload != builder_process_payload
+        or embedded_builder_payload.get("format")
+        != "semtalk_show_lower_target_cache_builder_process_v1"
+        or embedded_builder_payload.get("status") != "complete"
+        or not isinstance(builder_validation, dict)
+        or builder_validation.get("return_code") != 0
+        or builder_timing.get("source")
+        != "external_full_child_process_receipt"
+        or builder_timing.get("receipt_sha256") != builder_process_sha
+        or performance.get("builder_process_receipt_sha256")
+        != builder_process_sha
+        or float(builder_timing.get("full_builder_seconds", float("nan")))
+        != float(amortization["full_builder_seconds"])
+        or representation.get("data_mdb_sha256")
+        != current_inputs.get("data_mdb_sha256")
+        or representation.get("summary_sha256")
+        != current_inputs.get("representation_summary_sha256")
+        or representation.get("lineage_sha256")
+        != current_inputs.get("representation_lineage_sha256")
+        or smplx.get("asset_sha256")
+        != current_inputs.get("smplx_asset_sha256")
+        or {
+            key: gate_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+        != {
+            key: current_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+    ):
+        raise RuntimeError(
+            "lower target cache gate is not bound to current cache/data/source"
+        )
+    gate_entrypoint = Path(str(gate_source.get("entrypoint", "")))
+    expected_entrypoint = (
+        Path(__file__).resolve().parent
+        / "scripts"
+        / "show_base"
+        / "run_lower_target_cache_formal_gate.py"
+    )
+    if (
+        gate_entrypoint.is_symlink()
+        or not gate_entrypoint.is_file()
+        or gate_entrypoint.resolve() != expected_entrypoint
+        or _sha256(gate_entrypoint.resolve())
+        != gate_source.get("entrypoint_sha256")
+    ):
+        raise RuntimeError("lower target cache gate source entrypoint changed")
+    return {
+        "format": LOWER_TARGET_CACHE_GATE_FORMAT,
+        "status": "pass",
+        "path": str(report_path),
+        "sha256": report_sha,
+        "pooled_wall_speedup": pooled_wall,
+        "pooled_cuda_event_speedup": pooled_cuda,
+        "builder_amortized_wall_speedup": amortized,
+        "builder_process_receipt_path": str(builder_process_path),
+        "builder_process_receipt_sha256": builder_process_sha,
+        "source_binding": {
+            key: current_source[key] for key in ("origin", "commit", "tree")
+        },
+        "cache_manifest_sha256": lower_target_cache_receipt[
+            "manifest_sha256"
+        ],
+        "cache_checker_sha256": lower_target_cache_receipt[
+            "checker_receipt_sha256"
+        ],
+    }
 
 
 def _dataset_receipt(
@@ -2969,6 +3428,25 @@ def main() -> None:
             "formal lower target cache activation did not produce exactly "
             "one trainer receipt"
         )
+    lower_target_cache_gate_receipt = (
+        _formal_lower_target_cache_gate_receipt(
+            args,
+            lower_target_cache_receipt=lower_target_cache_receipt,
+            current_source=source_receipt,
+        )
+    )
+    if lower_target_cache_receipt is not None:
+        if lower_target_cache_gate_receipt is None:
+            raise RuntimeError(
+                "enabled lower target cache lacks its formal gate receipt"
+            )
+        lower_target_cache_receipt = copy.deepcopy(
+            lower_target_cache_receipt
+        )
+        lower_target_cache_receipt["formal_gate"] = (
+            lower_target_cache_gate_receipt
+        )
+        trainer.lower_target_cache_receipt = lower_target_cache_receipt
     train_samples = len(trainer.train_data)
     if args.expected_train_samples and train_samples != args.expected_train_samples:
         raise RuntimeError(

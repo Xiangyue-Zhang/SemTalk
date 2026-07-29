@@ -95,6 +95,26 @@ def parse_args():
         default=None,
         type=str,
     )
+    parser.add(
+        "--lower_target_cache_gate_report",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--expected_lower_target_cache_gate_sha256",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--lower_target_cache_builder_process_receipt",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--expected_lower_target_cache_builder_process_receipt_sha256",
+        default=None,
+        type=str,
+    )
     parser.add("--expected_train_samples", default=0, type=int)
     parser.add("--expected_updates_per_epoch", default=0, type=int)
     parser.add("--strict_finite", default=True, type=str2bool)
