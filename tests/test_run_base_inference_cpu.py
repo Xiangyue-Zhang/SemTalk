@@ -147,6 +147,47 @@ class CrossStageReceiptTest(unittest.TestCase):
         )
 
 
+class CanonicalAudioMetadataTest(unittest.TestCase):
+    @staticmethod
+    def valid_row() -> dict[str, object]:
+        return {
+            "wav_channels": 2,
+            "wav_sample_width": 2,
+            "wav_sample_rate": 22_000,
+            "wav_frames": 132_000,
+            "wav_mono_policy": (
+                "librosa.load(sr=None,mono=True):arithmetic_channel_mean"
+            ),
+        }
+
+    def test_feature_and_inference_consumers_accept_exact_protocol(self) -> None:
+        row = self.valid_row()
+        BUILDER.validate_canonical_audio_metadata(row, "builder")
+        MODULE._validate_canonical_audio_metadata(row, "inference")
+
+    def test_feature_and_inference_consumers_reject_tampering(self) -> None:
+        for key, value in (
+            ("wav_channels", 3),
+            ("wav_sample_width", 3),
+            ("wav_sample_rate", 16_000),
+            ("wav_mono_policy", "different"),
+        ):
+            row = self.valid_row()
+            row[key] = value
+            with self.subTest(consumer="builder", key=key):
+                with self.assertRaises(RuntimeError):
+                    BUILDER.validate_canonical_audio_metadata(
+                        row,
+                        "builder",
+                    )
+            with self.subTest(consumer="inference", key=key):
+                with self.assertRaises(MODULE.InferenceContractError):
+                    MODULE._validate_canonical_audio_metadata(
+                        row,
+                        "inference",
+                    )
+
+
 class VerifiedInputSnapshotTest(unittest.TestCase):
     @staticmethod
     def canonical_payload(frames: int = 8) -> bytes:

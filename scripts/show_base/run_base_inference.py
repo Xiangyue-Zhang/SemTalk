@@ -112,6 +112,20 @@ FORBIDDEN_COMPONENTS = {
     "SemGate",
     "Sparse",
 }
+CANONICAL_SOURCE_AUDIO_RATE = 22_000
+CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH = 2
+CANONICAL_HUBERT_TARGET_RATE = 16_000
+CANONICAL_WAV_MONO_POLICY = (
+    "librosa.load(sr=None,mono=True):arithmetic_channel_mean"
+)
+CANONICAL_AUDIO_CHANNEL_PROTOCOL = {
+    "accepted_source_channels": [1, 2],
+    "source_sample_width_bytes": CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH,
+    "source_compression": "NONE",
+    "decode": "librosa.load(BytesIO(wav_payload),sr=None,mono=True)",
+    "multichannel_mix": "arithmetic_mean_across_channels",
+    "manifest_policy": CANONICAL_WAV_MONO_POLICY,
+}
 
 
 class InferenceContractError(RuntimeError):
@@ -635,6 +649,9 @@ def _validate_canonical_root_receipts(
         },
         "speaker_mapping": SHOW_SPEAKER_IDS,
         "pose_fps": POSE_FPS,
+        "source_audio_sample_rate": CANONICAL_SOURCE_AUDIO_RATE,
+        "hubert_target_sample_rate": CANONICAL_HUBERT_TARGET_RATE,
+        "audio_channel_protocol": CANONICAL_AUDIO_CHANNEL_PROTOCOL,
         "npz_fields": {
             "pose": ["frames", POSE_DIM],
             "contact": ["frames", 4],
@@ -675,6 +692,34 @@ def _validate_canonical_root_receipts(
     return summary, lineage, manifest_sha, str(contract_sha)
 
 
+def _validate_canonical_audio_metadata(
+    row: Mapping[str, Any],
+    context: str,
+) -> None:
+    channels = row.get("wav_channels")
+    sample_width = row.get("wav_sample_width")
+    sample_rate = row.get("wav_sample_rate")
+    frames = row.get("wav_frames")
+    if (
+        isinstance(channels, bool)
+        or not isinstance(channels, int)
+        or channels not in {1, 2}
+        or isinstance(sample_width, bool)
+        or not isinstance(sample_width, int)
+        or sample_width != CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH
+        or isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or sample_rate != CANONICAL_SOURCE_AUDIO_RATE
+        or isinstance(frames, bool)
+        or not isinstance(frames, int)
+        or frames < 1
+        or row.get("wav_mono_policy") != CANONICAL_WAV_MONO_POLICY
+    ):
+        raise InferenceContractError(
+            f"{context}: invalid canonical WAV metadata"
+        )
+
+
 def _canonical_test_rows(
     manifest: Path,
     *,
@@ -698,6 +743,11 @@ def _canonical_test_rows(
         "source_wav_sha256",
         "canonical_npz_sha256",
         "lineage_contract_sha256",
+        "wav_channels",
+        "wav_sample_width",
+        "wav_sample_rate",
+        "wav_frames",
+        "wav_mono_policy",
     }
     test_rows: list[dict[str, Any]] = []
     all_indices: set[int] = set()
@@ -716,6 +766,7 @@ def _canonical_test_rows(
                 f"canonical row {row.get('clip_id')!r} misses {missing}"
             )
         clip_id = str(row["clip_id"])
+        _validate_canonical_audio_metadata(row, clip_id)
         speaker = str(row["speaker"])
         if clip_id.split("/", 1)[0] != speaker:
             raise InferenceContractError(f"{clip_id}: speaker field mismatch")
@@ -998,7 +1049,8 @@ def _validate_audio_receipts(
         )
         expected_hubert_preprocessing = {
             "label": "corrected_true_16khz",
-            "source_decode": "native_sample_rate_mono",
+            "source_decode": "librosa.load(sr=None,mono=True)",
+            "channel_mix": "librosa_to_mono_arithmetic_mean",
             "resample": "native_to_true_16000hz_before_processor",
             "processor_sampling_rate": 16000,
             "released_code_difference": (

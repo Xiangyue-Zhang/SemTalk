@@ -62,7 +62,11 @@ SHOW_SPEAKER_ID = {
 }
 SPEAKERS = tuple(SHOW_SPEAKER_ID)
 POSE_FPS = 30
-AUDIO_SAMPLE_RATE = 16_000
+SOURCE_AUDIO_SAMPLE_RATE = 22_000
+SOURCE_AUDIO_SAMPLE_WIDTH = 2
+HUBERT_AUDIO_SAMPLE_RATE = 16_000
+ACCEPTED_AUDIO_CHANNELS = (1, 2)
+AUDIO_MONO_POLICY = "librosa.load(sr=None,mono=True):arithmetic_channel_mean"
 FOOT_JOINTS = (7, 8, 10, 11)
 CONTACT_THRESHOLD = 0.01
 NPZ_FIELDS = ("pose", "contact", "facial", "beta", "trans", "speaker_id")
@@ -624,7 +628,10 @@ def load_canonical_motion(
     return arrays
 
 
-def inspect_wav(path: str | Path, expected_rate: int) -> dict[str, int]:
+def inspect_wav(
+    path: str | Path,
+    expected_rate: int,
+) -> dict[str, int | str]:
     source = Path(path)
     try:
         with wave.open(str(source), "rb") as handle:
@@ -635,13 +642,20 @@ def inspect_wav(path: str | Path, expected_rate: int) -> dict[str, int]:
             compression = handle.getcomptype()
     except (OSError, EOFError, wave.Error) as exc:
         raise ShowCacheError(f"cannot parse SHOW WAV {source}: {exc}") from exc
-    if channels != 1:
-        raise ShowCacheError(f"{source}: expected mono WAV, got {channels} channels")
+    if channels not in ACCEPTED_AUDIO_CHANNELS:
+        raise ShowCacheError(
+            f"{source}: expected one of {ACCEPTED_AUDIO_CHANNELS} source "
+            f"channels, got {channels}"
+        )
     if rate != expected_rate:
         raise ShowCacheError(
             f"{source}: sample rate {rate} does not match required {expected_rate}"
         )
-    if sample_width < 1 or frames < 1 or compression != "NONE":
+    if (
+        sample_width != SOURCE_AUDIO_SAMPLE_WIDTH
+        or frames < 1
+        or compression != "NONE"
+    ):
         raise ShowCacheError(
             f"{source}: unsupported WAV metadata: width={sample_width}, "
             f"frames={frames}, compression={compression!r}"
@@ -651,7 +665,22 @@ def inspect_wav(path: str | Path, expected_rate: int) -> dict[str, int]:
         "wav_sample_width": sample_width,
         "wav_sample_rate": rate,
         "wav_frames": frames,
+        "wav_mono_policy": AUDIO_MONO_POLICY,
     }
+
+
+def validate_wav_manifest_metadata(
+    row: Mapping[str, Any],
+    observed: Mapping[str, int | str],
+    context: str,
+) -> None:
+    """Require the manifest to preserve every inspected source WAV property."""
+
+    for key, value in observed.items():
+        if row.get(key) != value:
+            raise ShowCacheError(
+                f"{context} {key} mismatch: {row.get(key)!r} != {value!r}"
+            )
 
 
 def resolve_smplx_asset(path: str | Path) -> tuple[Path, Path, str]:
@@ -923,7 +952,7 @@ def lineage_contract(
     hand_component_sha256: str,
     smplx_asset_path: Path,
     smplx_sha256: str,
-    expected_audio_rate: int,
+    expected_source_audio_rate: int,
     source: Mapping[str, str],
 ) -> dict[str, Any]:
     script_path = Path(__file__).resolve()
@@ -945,7 +974,16 @@ def lineage_contract(
         "smplx_asset_sha256": smplx_sha256,
         "speaker_mapping": dict(SHOW_SPEAKER_ID),
         "pose_fps": POSE_FPS,
-        "audio_sample_rate": int(expected_audio_rate),
+        "source_audio_sample_rate": int(expected_source_audio_rate),
+        "hubert_target_sample_rate": HUBERT_AUDIO_SAMPLE_RATE,
+        "audio_channel_protocol": {
+            "accepted_source_channels": list(ACCEPTED_AUDIO_CHANNELS),
+            "source_sample_width_bytes": SOURCE_AUDIO_SAMPLE_WIDTH,
+            "source_compression": "NONE",
+            "decode": "librosa.load(BytesIO(wav_payload),sr=None,mono=True)",
+            "multichannel_mix": "arithmetic_mean_across_channels",
+            "manifest_policy": AUDIO_MONO_POLICY,
+        },
         "pose_protocol": (
             "root3+body63+jaw3+leye3+reye3+left_hand45+right_hand45"
         ),
@@ -1040,7 +1078,7 @@ def build_shard(args: argparse.Namespace) -> dict[str, Any]:
         hand_component_sha256=hand_sha,
         smplx_asset_path=smplx_asset,
         smplx_sha256=smplx_sha,
-        expected_audio_rate=args.expected_audio_rate,
+        expected_source_audio_rate=args.expected_source_audio_rate,
         source=source,
     )
     lineage_sha = canonical_json_sha256(lineage)
@@ -1082,7 +1120,10 @@ def build_shard(args: argparse.Namespace) -> dict[str, Any]:
             speaker_id=speaker_id,
             context=clip.clip_id,
         )
-        wav_info = inspect_wav(clip.wav_path, args.expected_audio_rate)
+        wav_info = inspect_wav(
+            clip.wav_path,
+            args.expected_source_audio_rate,
+        )
         pkl_sha = sha256_file(clip.pkl_path)
         wav_sha = sha256_file(clip.wav_path)
         npz_payload = deterministic_npz_bytes(arrays)
@@ -1264,7 +1305,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         hand_component_sha256=hand_sha,
         smplx_asset_path=smplx_asset,
         smplx_sha256=smplx_sha,
-        expected_audio_rate=args.expected_audio_rate,
+        expected_source_audio_rate=args.expected_source_audio_rate,
         source=source,
     )
     lineage_sha = canonical_json_sha256(lineage)
@@ -1363,6 +1404,11 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         "source_pkl_sha256",
         "source_wav_sha256",
         "canonical_npz_sha256",
+        "wav_channels",
+        "wav_sample_width",
+        "wav_sample_rate",
+        "wav_frames",
+        "wav_mono_policy",
         "global_foot_fastpath_contract",
         GLOBAL_FOOT_FIELD,
         f"{GLOBAL_FOOT_FIELD}_sha256",
@@ -1422,7 +1468,15 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                     f"manifest index {index} {key} mismatch: "
                     f"{row.get(key)!r} != {observed!r}"
                 )
-        inspect_wav(source_wav, args.expected_audio_rate)
+        observed_wav_info = inspect_wav(
+            source_wav,
+            args.expected_source_audio_rate,
+        )
+        validate_wav_manifest_metadata(
+            row,
+            observed_wav_info,
+            f"manifest index {index}",
+        )
         _verify_npz(canonical_npz, row)
         try:
             lower_foot_local = np.load(lower_foot_path, allow_pickle=False)
@@ -1507,7 +1561,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--smplx-chunk-frames", type=int, default=128)
-    parser.add_argument("--expected-audio-rate", type=int, default=AUDIO_SAMPLE_RATE)
+    parser.add_argument(
+        "--expected-source-audio-rate",
+        type=int,
+        default=SOURCE_AUDIO_SAMPLE_RATE,
+    )
     parser.add_argument(
         "--expected-split-sha256",
         default=OFFICIAL_SPLIT_SHA256,
@@ -1529,8 +1587,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--shard-id must be in [0, --num-shards)")
     if args.smplx_chunk_frames < 1:
         parser.error("--smplx-chunk-frames must be positive")
-    if args.expected_audio_rate < 1:
-        parser.error("--expected-audio-rate must be positive")
+    if args.expected_source_audio_rate < 1:
+        parser.error("--expected-source-audio-rate must be positive")
     if args.progress_every < 1:
         parser.error("--progress-every must be positive")
     args.expected_split_sha256 = _require_sha256(

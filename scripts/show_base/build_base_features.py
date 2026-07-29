@@ -60,6 +60,20 @@ SPEAKER_MAP = {
     "conan": 3,
 }
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+CANONICAL_SOURCE_AUDIO_RATE = 22_000
+CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH = 2
+CANONICAL_HUBERT_TARGET_RATE = 16_000
+CANONICAL_WAV_MONO_POLICY = (
+    "librosa.load(sr=None,mono=True):arithmetic_channel_mean"
+)
+CANONICAL_AUDIO_CHANNEL_PROTOCOL = {
+    "accepted_source_channels": [1, 2],
+    "source_sample_width_bytes": CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH,
+    "source_compression": "NONE",
+    "decode": "librosa.load(BytesIO(wav_payload),sr=None,mono=True)",
+    "multichannel_mix": "arithmetic_mean_across_channels",
+    "manifest_policy": CANONICAL_WAV_MONO_POLICY,
+}
 
 # SMPL-X joint order in ``beat_smplx_joints``.  Keeping these explicit avoids
 # importing dataloaders.data_tools, whose module-level imports pull unrelated
@@ -221,6 +235,11 @@ def load_canonical_receipt(
         or summary.get("split_disjoint") is not True
     ):
         raise RuntimeError("canonical summary is not a complete formal receipt")
+    canonical_contract = (
+        lineage.get("lineage_contract")
+        if isinstance(lineage, dict)
+        else None
+    )
     if (
         not isinstance(lineage, dict)
         or lineage.get("final_manifest_sha256") != manifest_sha
@@ -228,11 +247,21 @@ def load_canonical_receipt(
         != summary.get("lineage_sha256")
         or lineage.get("lineage_contract_sha256")
         != summary.get("lineage_contract_sha256")
+        or not isinstance(canonical_contract, dict)
+        or canonical_file_payload_sha256(canonical_contract)
+        != lineage.get("lineage_contract_sha256")
     ):
         raise RuntimeError("canonical summary/lineage binding mismatch")
-    canonical_source = lineage.get(
-        "lineage_contract", {}
-    ).get("source_receipt")
+    if (
+        canonical_contract.get("source_audio_sample_rate")
+        != CANONICAL_SOURCE_AUDIO_RATE
+        or canonical_contract.get("hubert_target_sample_rate")
+        != CANONICAL_HUBERT_TARGET_RATE
+        or canonical_contract.get("audio_channel_protocol")
+        != CANONICAL_AUDIO_CHANNEL_PROTOCOL
+    ):
+        raise RuntimeError("canonical audio channel/rate protocol mismatch")
+    canonical_source = canonical_contract.get("source_receipt")
     if (
         not isinstance(canonical_source, dict)
         or canonical_source.get("origin") != EXPECTED_ORIGIN
@@ -479,6 +508,11 @@ def canonical_split_rows(
         "source_wav",
         "source_wav_sha256",
         "lineage_contract_sha256",
+        "wav_channels",
+        "wav_sample_width",
+        "wav_sample_rate",
+        "wav_frames",
+        "wav_mono_policy",
     }
     for row in split_rows:
         missing = sorted(required - set(row))
@@ -486,6 +520,10 @@ def canonical_split_rows(
             raise RuntimeError(
                 f"canonical row {row.get('clip_id')!r} missing {missing}"
             )
+        validate_canonical_audio_metadata(
+            row,
+            f"canonical row {row.get('clip_id')!r}",
+        )
     split_rows.sort(key=lambda row: (row["clip_id"], row["canonical_npz"]))
     ids = [str(row["clip_id"]) for row in split_rows]
     if len(ids) != len(set(ids)):
@@ -505,6 +543,32 @@ def canonical_split_rows(
             "lineage_contract_sha256"
         )
     return split_rows, hashes
+
+
+def validate_canonical_audio_metadata(
+    row: dict[str, Any],
+    context: str,
+) -> None:
+    channels = row.get("wav_channels")
+    sample_width = row.get("wav_sample_width")
+    sample_rate = row.get("wav_sample_rate")
+    frames = row.get("wav_frames")
+    if (
+        isinstance(channels, bool)
+        or not isinstance(channels, int)
+        or channels not in {1, 2}
+        or isinstance(sample_width, bool)
+        or not isinstance(sample_width, int)
+        or sample_width != CANONICAL_SOURCE_AUDIO_SAMPLE_WIDTH
+        or isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or sample_rate != CANONICAL_SOURCE_AUDIO_RATE
+        or isinstance(frames, bool)
+        or not isinstance(frames, int)
+        or frames < 1
+        or row.get("wav_mono_policy") != CANONICAL_WAV_MONO_POLICY
+    ):
+        raise RuntimeError(f"{context}: invalid canonical WAV metadata")
 
 
 def canonical_frames(row: dict[str, Any]) -> int:
@@ -825,7 +889,8 @@ def audio_mode(args: argparse.Namespace) -> None:
         "hubert": "HubertModel frozen float32 inference",
         "hubert_preprocessing": {
             "label": "corrected_true_16khz",
-            "source_decode": "native_sample_rate_mono",
+            "source_decode": "librosa.load(sr=None,mono=True)",
+            "channel_mix": "librosa_to_mono_arithmetic_mean",
             "resample": "native_to_true_16000hz_before_processor",
             "processor_sampling_rate": 16000,
             "released_code_difference": (
@@ -1213,7 +1278,8 @@ def load_audio_lineages(
         protocol = record.get("protocol")
         expected_hubert_preprocessing = {
             "label": "corrected_true_16khz",
-            "source_decode": "native_sample_rate_mono",
+            "source_decode": "librosa.load(sr=None,mono=True)",
+            "channel_mix": "librosa_to_mono_arithmetic_mean",
             "resample": "native_to_true_16000hz_before_processor",
             "processor_sampling_rate": 16000,
             "released_code_difference": (
