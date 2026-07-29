@@ -548,7 +548,7 @@ def main() -> None:
                         "windows": windows,
                     }
                 )
-        env.sync(force=True)
+        env.sync(True)
     except BaseException:
         env.close()
         shutil.rmtree(temp, ignore_errors=True)

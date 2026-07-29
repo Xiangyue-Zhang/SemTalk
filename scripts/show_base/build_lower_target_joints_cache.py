@@ -700,7 +700,7 @@ def main() -> None:
                     != TAIL_PADDING_WINDOWS
                 ):
                     raise RuntimeError("tail 13+51 padding contract changed")
-        output_env.sync(force=True)
+        output_env.sync(True)
     except BaseException:
         output_env.close()
         representation_env.close()

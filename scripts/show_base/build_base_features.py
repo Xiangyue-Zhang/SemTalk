@@ -2652,7 +2652,7 @@ def base_mode(args: argparse.Namespace) -> None:
             )
         transaction.commit()
         transaction = None
-        env.sync(force=True)
+        env.sync(True)
     except BaseException:
         if transaction is not None:
             transaction.abort()
