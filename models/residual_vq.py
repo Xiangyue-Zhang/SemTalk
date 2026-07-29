@@ -124,7 +124,7 @@ class ResidualVQ(nn.Module):
             #     all_indices.append(null_indices)
             #     continue
             quantized, *rest = layer(residual, return_idx=True, temperature=sample_codebook_temp)
-            residual -= quantized.detach()
+            residual = residual - quantized.detach()
             quantized_out += quantized
             embed_indices, loss, perplexity = rest
 
