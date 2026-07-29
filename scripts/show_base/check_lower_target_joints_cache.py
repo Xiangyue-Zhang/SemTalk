@@ -2,9 +2,17 @@
 """Independently recompute every frozen SHOW lower target-joints entry.
 
 The checker intentionally does not import the producer.  It traverses a seeded
-permutation of all 127,309 representation indices exactly once, independently
-reconstructs the trainer's SMPL-X arguments, and requires bitwise
-``torch.equal`` equality for every cached float.
+permutation of the 1,989 producer batches while preserving each batch's exact
+64-window layout, independently reconstructs the trainer's SMPL-X arguments,
+and requires equality of every little-endian ``<f4`` C-order payload for all
+127,286 cached entries.  ``torch.equal`` is retained as an additional
+value-level sanity check.
+
+Preserving the producer batch layout is required for a meaningful bitwise
+check under the frozen runtime contract.  Moving one sample to a different
+batch offset can change a few float32 rounding bits even when the mathematical
+inputs are identical, so a differently composed batch is not valid byte-level
+evidence about the producer output.
 """
 
 from __future__ import annotations
@@ -495,6 +503,67 @@ def _protocol() -> dict[str, Any]:
     }
 
 
+def _producer_batch_permutation() -> np.ndarray:
+    permutation = np.random.default_rng(PERMUTATION_SEED).permutation(
+        TOTAL_COMPUTE_BATCHES
+    )
+    if (
+        permutation.shape != (TOTAL_COMPUTE_BATCHES,)
+        or np.unique(permutation).size != TOTAL_COMPUTE_BATCHES
+        or int(permutation.min()) != 0
+        or int(permutation.max()) != TOTAL_COMPUTE_BATCHES - 1
+    ):
+        raise RuntimeError("checker producer-batch permutation is not exact")
+    return permutation
+
+
+def _producer_batch_read_permutation(
+    batch_index: int,
+    real_windows: int,
+) -> np.ndarray:
+    if (
+        type(batch_index) is not int
+        or batch_index < 0
+        or batch_index >= TOTAL_COMPUTE_BATCHES
+        or type(real_windows) is not int
+        or real_windows <= 0
+        or real_windows > COMPUTE_BATCH_WINDOWS
+    ):
+        raise ValueError("invalid producer batch read-permutation request")
+    permutation = np.random.default_rng(
+        PERMUTATION_SEED ^ (batch_index + 1)
+    ).permutation(real_windows)
+    if (
+        permutation.shape != (real_windows,)
+        or np.unique(permutation).size != real_windows
+        or int(permutation.min()) != 0
+        or int(permutation.max()) != real_windows - 1
+    ):
+        raise RuntimeError("checker within-batch read permutation is not exact")
+    return permutation
+
+
+def _canonical_batch_offset(
+    *,
+    batch_start: int,
+    index: int,
+    real_windows: int,
+) -> int:
+    if (
+        type(batch_start) is not int
+        or batch_start < 0
+        or batch_start % COMPUTE_BATCH_WINDOWS != 0
+        or type(index) is not int
+        or type(real_windows) is not int
+        or real_windows <= 0
+        or real_windows > COMPUTE_BATCH_WINDOWS
+        or index < batch_start
+        or index >= batch_start + real_windows
+    ):
+        raise ValueError("index is outside its canonical producer batch")
+    return index - batch_start
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--representation-lmdb", required=True)
@@ -661,25 +730,26 @@ def main() -> None:
         cache_env.close()
         raise
 
-    permutation = np.random.default_rng(PERMUTATION_SEED).permutation(
-        EXPECTED_ENTRIES
-    )
-    if (
-        permutation.shape != (EXPECTED_ENTRIES,)
-        or np.unique(permutation).size != EXPECTED_ENTRIES
-        or int(permutation.min()) != 0
-        or int(permutation.max()) != EXPECTED_ENTRIES - 1
-    ):
-        raise RuntimeError("checker permutation is not an exact cover")
+    batch_permutation = _producer_batch_permutation()
     visited = np.zeros(EXPECTED_ENTRIES, dtype=np.bool_)
+    visited_batches = np.zeros(TOTAL_COMPUTE_BATCHES, dtype=np.bool_)
     per_index_digest = np.empty((EXPECTED_ENTRIES, 32), dtype=np.uint8)
     observed_speakers: set[int] = set()
     mismatch_count = 0
+    tail_batches_seen = 0
     started = time.time()
     try:
-        for start in range(0, EXPECTED_ENTRIES, COMPUTE_BATCH_WINDOWS):
-            batch_indices = permutation[start : start + COMPUTE_BATCH_WINDOWS]
-            real_windows = int(batch_indices.size)
+        for raw_batch_index in batch_permutation:
+            batch_index = int(raw_batch_index)
+            if visited_batches[batch_index]:
+                raise RuntimeError(
+                    f"checker revisited producer batch {batch_index}"
+                )
+            visited_batches[batch_index] = True
+            start = batch_index * COMPUTE_BATCH_WINDOWS
+            stop = min(start + COMPUTE_BATCH_WINDOWS, EXPECTED_ENTRIES)
+            batch_indices = range(start, stop)
+            real_windows = stop - start
             pose = np.zeros(
                 (COMPUTE_BATCH_WINDOWS, WINDOW_LENGTH, 165),
                 dtype=np.float32,
@@ -692,11 +762,21 @@ def main() -> None:
                 (COMPUTE_BATCH_WINDOWS, WINDOW_LENGTH, 3),
                 dtype=np.float32,
             )
-            cached_entries: list[np.ndarray] = []
+            cached_entries: list[np.ndarray | None] = [None] * real_windows
+            cached_payloads: list[bytes | None] = [None] * real_windows
+            read_permutation = _producer_batch_read_permutation(
+                batch_index,
+                real_windows,
+            )
             with representation_env.begin(buffers=True) as source_transaction:
                 with cache_env.begin(buffers=True) as cache_transaction:
-                    for offset, raw_index in enumerate(batch_indices):
-                        index = int(raw_index)
+                    for raw_offset in read_permutation:
+                        index = start + int(raw_offset)
+                        offset = _canonical_batch_offset(
+                            batch_start=start,
+                            index=index,
+                            real_windows=real_windows,
+                        )
                         if visited[index]:
                             raise RuntimeError(f"checker revisited index {index}")
                         (
@@ -710,7 +790,8 @@ def main() -> None:
                         if value is None:
                             raise RuntimeError(f"cache LMDB misses index {index}")
                         payload = bytes(value)
-                        cached_entries.append(_decode_raw(payload))
+                        cached_entries[offset] = _decode_raw(payload)
+                        cached_payloads[offset] = payload
                         per_index_digest[index] = np.frombuffer(
                             hashlib.sha256(payload).digest(),
                             dtype=np.uint8,
@@ -725,16 +806,32 @@ def main() -> None:
                 device=device,
                 rotation_conversions=rotation_conversions,
             )
-            for offset, cached in enumerate(cached_entries):
-                if not torch.equal(live[offset], torch.from_numpy(cached)):
+            for offset in range(real_windows):
+                cached = cached_entries[offset]
+                cached_payload = cached_payloads[offset]
+                if cached is None or cached_payload is None:
+                    raise RuntimeError(
+                        f"checker did not read representation index {start + offset}"
+                    )
+                live_entry = live[offset]
+                live_payload = np.ascontiguousarray(
+                    live_entry.numpy(),
+                    dtype=np.dtype("<f4"),
+                ).tobytes(order="C")
+                if (
+                    live_payload != cached_payload
+                    or not torch.equal(live_entry, torch.from_numpy(cached))
+                ):
                     mismatch_count += 1
                     raise RuntimeError(
-                        "bitwise target mismatch at representation index "
-                        f"{int(batch_indices[offset])}"
+                        "raw-byte target mismatch at representation index "
+                        f"{start + offset}"
                     )
-            if start + COMPUTE_BATCH_WINDOWS >= EXPECTED_ENTRIES:
+            if real_windows != COMPUTE_BATCH_WINDOWS:
+                tail_batches_seen += 1
                 if (
-                    real_windows != TAIL_REAL_WINDOWS
+                    batch_index != TOTAL_COMPUTE_BATCHES - 1
+                    or real_windows != TAIL_REAL_WINDOWS
                     or COMPUTE_BATCH_WINDOWS - real_windows
                     != TAIL_PADDING_WINDOWS
                 ):
@@ -747,6 +844,9 @@ def main() -> None:
         mismatch_count != 0
         or int(visited.sum()) != EXPECTED_ENTRIES
         or not bool(visited.all())
+        or int(visited_batches.sum()) != TOTAL_COMPUTE_BATCHES
+        or not bool(visited_batches.all())
+        or tail_batches_seen != 1
         or observed_speakers != set(EXPECTED_SPEAKER_IDS)
     ):
         raise RuntimeError("checker failed exact-once SHOW-All verification")
@@ -792,12 +892,22 @@ def main() -> None:
         "cache_data_mdb_sha256": cache_data_sha,
         "entry_aggregate_sha256": aggregate_sha,
         "traversal": {
-            "method": "numpy_default_rng_permutation",
+            "method": "numpy_default_rng_producer_batch_permutation",
             "seed": PERMUTATION_SEED,
             "entries": EXPECTED_ENTRIES,
             "covers_all_entries": True,
             "duplicates": 0,
             "missing": 0,
+            "batches": TOTAL_COMPUTE_BATCHES,
+            "covers_all_batches": True,
+            "batch_duplicates": 0,
+            "batch_missing": 0,
+            "producer_batch_layout_preserved": True,
+            "within_batch_read_order": (
+                "numpy_default_rng_permutation_then_canonical_slot"
+            ),
+            "within_batch_compute_layout": "canonical_contiguous",
+            "slot_mapping": "index_mod_64",
             "batch_windows": COMPUTE_BATCH_WINDOWS,
             "tail_real_windows": TAIL_REAL_WINDOWS,
             "tail_padding_windows": TAIL_PADDING_WINDOWS,
@@ -806,6 +916,7 @@ def main() -> None:
         "checked_entries": EXPECTED_ENTRIES,
         "mismatch_count": 0,
         "torch_equal_all": True,
+        "raw_bytes_equal_all": True,
         "exact_once": True,
         "finite": True,
         "observed_speaker_ids": sorted(observed_speakers),

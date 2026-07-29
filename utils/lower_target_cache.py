@@ -1191,6 +1191,7 @@ def validate_checker_payload(
         or checker.get("finite") is not True
         or checker.get("exact_once") is not True
         or checker.get("torch_equal_all") is not True
+        or checker.get("raw_bytes_equal_all") is not True
     ):
         raise LowerTargetCacheError("lower target checker receipt is incomplete")
     _require_protocol(checker.get("protocol"), "checker")
@@ -1206,16 +1207,28 @@ def validate_checker_payload(
     traversal = checker.get("traversal")
     if (
         type(traversal) is not dict
-        or traversal.get("method") != "numpy_default_rng_permutation"
+        or traversal.get("method")
+        != "numpy_default_rng_producer_batch_permutation"
         or traversal.get("covers_all_entries") is not True
+        or traversal.get("covers_all_batches") is not True
+        or traversal.get("producer_batch_layout_preserved") is not True
+        or traversal.get("within_batch_read_order")
+        != "numpy_default_rng_permutation_then_canonical_slot"
+        or traversal.get("within_batch_compute_layout")
+        != "canonical_contiguous"
+        or traversal.get("slot_mapping") != "index_mod_64"
     ):
         raise LowerTargetCacheError(
-            "checker did not traverse all cache entries once in randomized order"
+            "checker did not preserve producer batches while traversing every "
+            "cache entry once in randomized batch order"
         )
     for key, expected in (
         ("duplicates", 0),
         ("missing", 0),
+        ("batch_duplicates", 0),
+        ("batch_missing", 0),
         ("entries", EXPECTED_ENTRIES),
+        ("batches", TOTAL_COMPUTE_BATCHES),
         ("seed", CHECKER_PERMUTATION_SEED),
         ("batch_windows", COMPUTE_BATCH_WINDOWS),
         ("tail_real_windows", TAIL_REAL_WINDOWS),

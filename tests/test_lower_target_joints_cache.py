@@ -210,12 +210,22 @@ def receipts() -> tuple[dict[str, object], dict[str, object]]:
         "cache_data_mdb_sha256": "2" * 64,
         "entry_aggregate_sha256": "4" * 64,
         "traversal": {
-            "method": "numpy_default_rng_permutation",
+            "method": "numpy_default_rng_producer_batch_permutation",
             "seed": 20_260_729,
             "entries": contract.EXPECTED_ENTRIES,
             "covers_all_entries": True,
             "duplicates": 0,
             "missing": 0,
+            "batches": contract.TOTAL_COMPUTE_BATCHES,
+            "covers_all_batches": True,
+            "batch_duplicates": 0,
+            "batch_missing": 0,
+            "producer_batch_layout_preserved": True,
+            "within_batch_read_order": (
+                "numpy_default_rng_permutation_then_canonical_slot"
+            ),
+            "within_batch_compute_layout": "canonical_contiguous",
+            "slot_mapping": "index_mod_64",
             "batch_windows": contract.COMPUTE_BATCH_WINDOWS,
             "tail_real_windows": contract.TAIL_REAL_WINDOWS,
             "tail_padding_windows": contract.TAIL_PADDING_WINDOWS,
@@ -224,6 +234,7 @@ def receipts() -> tuple[dict[str, object], dict[str, object]]:
         "checked_entries": contract.EXPECTED_ENTRIES,
         "mismatch_count": 0,
         "torch_equal_all": True,
+        "raw_bytes_equal_all": True,
         "exact_once": True,
         "finite": True,
         "observed_speaker_ids": [0, 1, 2, 3],
@@ -481,6 +492,23 @@ class ReceiptContractTests(unittest.TestCase):
                 manifest_sha256="6" * 64,
                 manifest=manifest,
             )
+        for key, value in (
+            ("method", "numpy_default_rng_permutation"),
+            ("covers_all_batches", False),
+            ("producer_batch_layout_preserved", False),
+            ("within_batch_read_order", "canonical"),
+            ("within_batch_compute_layout", "permuted"),
+            ("slot_mapping", "permutation_offset"),
+        ):
+            with self.subTest(checker_traversal_key=key):
+                manifest, checker = receipts()
+                checker["traversal"][key] = value
+                with self.assertRaises(contract.LowerTargetCacheError):
+                    contract.validate_checker_payload(
+                        checker,
+                        manifest_sha256="6" * 64,
+                        manifest=manifest,
+                    )
 
     def test_every_contract_integer_rejects_bool_string_and_float(self) -> None:
         manifest_paths = (
@@ -518,6 +546,9 @@ class ReceiptContractTests(unittest.TestCase):
             ("traversal", "entries"),
             ("traversal", "duplicates"),
             ("traversal", "missing"),
+            ("traversal", "batches"),
+            ("traversal", "batch_duplicates"),
+            ("traversal", "batch_missing"),
             ("traversal", "batch_windows"),
             ("traversal", "tail_real_windows"),
             ("traversal", "tail_padding_windows"),
@@ -570,6 +601,14 @@ class ReceiptContractTests(unittest.TestCase):
             )
         manifest, checker = receipts()
         checker["torch_equal_all"] = False
+        with self.assertRaises(contract.LowerTargetCacheError):
+            contract.validate_checker_payload(
+                checker,
+                manifest_sha256="6" * 64,
+                manifest=manifest,
+            )
+        manifest, checker = receipts()
+        checker["raw_bytes_equal_all"] = False
         with self.assertRaises(contract.LowerTargetCacheError):
             contract.validate_checker_payload(
                 checker,
@@ -1010,6 +1049,123 @@ class StaticIntegrationContractTests(unittest.TestCase):
         payload = contract.encode_raw_entry(entry)
         self.assertTrue(np.array_equal(checker._decode_raw(payload), entry))
 
+    def test_checker_randomizes_only_complete_producer_batches(self) -> None:
+        checker = load_script(CHECKER, "lower_target_checker_batch_order")
+        permutation = checker._producer_batch_permutation()
+        self.assertEqual(
+            permutation.shape,
+            (contract.TOTAL_COMPUTE_BATCHES,),
+        )
+        self.assertEqual(
+            set(int(value) for value in permutation),
+            set(range(contract.TOTAL_COMPUTE_BATCHES)),
+        )
+        self.assertNotEqual(
+            [int(value) for value in permutation],
+            list(range(contract.TOTAL_COMPUTE_BATCHES)),
+        )
+        covered: list[int] = []
+        tail_layouts: list[tuple[int, int]] = []
+        for raw_batch_index in permutation:
+            batch_index = int(raw_batch_index)
+            start = batch_index * contract.COMPUTE_BATCH_WINDOWS
+            stop = min(
+                start + contract.COMPUTE_BATCH_WINDOWS,
+                contract.EXPECTED_ENTRIES,
+            )
+            for offset, index in enumerate(range(start, stop)):
+                self.assertEqual(index % contract.COMPUTE_BATCH_WINDOWS, offset)
+            read_permutation = checker._producer_batch_read_permutation(
+                batch_index,
+                stop - start,
+            )
+            self.assertEqual(
+                set(int(value) for value in read_permutation),
+                set(range(stop - start)),
+            )
+            covered.extend(range(start, stop))
+            if stop - start != contract.COMPUTE_BATCH_WINDOWS:
+                tail_layouts.append((batch_index, stop - start))
+        self.assertEqual(
+            sorted(covered),
+            list(range(contract.EXPECTED_ENTRIES)),
+        )
+        self.assertEqual(
+            tail_layouts,
+            [
+                (
+                    contract.TOTAL_COMPUTE_BATCHES - 1,
+                    contract.TAIL_REAL_WINDOWS,
+                )
+            ],
+        )
+
+    def test_checker_restores_random_reads_to_canonical_slots(self) -> None:
+        checker = load_script(CHECKER, "lower_target_checker_slot_restore")
+        batch_index = 1_056
+        start = batch_index * contract.COMPUTE_BATCH_WINDOWS
+        read_permutation = checker._producer_batch_read_permutation(
+            batch_index,
+            contract.COMPUTE_BATCH_WINDOWS,
+        )
+        restored: list[str | None] = [None] * contract.COMPUTE_BATCH_WINDOWS
+        for raw_offset in read_permutation:
+            index = start + int(raw_offset)
+            slot = checker._canonical_batch_offset(
+                batch_start=start,
+                index=index,
+                real_windows=contract.COMPUTE_BATCH_WINDOWS,
+            )
+            restored[slot] = f"sentinel-{index}"
+        self.assertEqual(
+            restored,
+            [
+                f"sentinel-{start + offset}"
+                for offset in range(contract.COMPUTE_BATCH_WINDOWS)
+            ],
+        )
+
+    def test_checker_tail_layout_keeps_ten_zero_padding_slots(self) -> None:
+        real_windows = contract.TAIL_REAL_WINDOWS
+        pose = np.zeros(
+            (contract.COMPUTE_BATCH_WINDOWS, contract.WINDOW_LENGTH, 165),
+            dtype=np.float32,
+        )
+        beta = np.zeros(
+            (contract.COMPUTE_BATCH_WINDOWS, contract.WINDOW_LENGTH, 300),
+            dtype=np.float32,
+        )
+        trans = np.zeros(
+            (contract.COMPUTE_BATCH_WINDOWS, contract.WINDOW_LENGTH, 3),
+            dtype=np.float32,
+        )
+        pose[:real_windows] = 1.0
+        beta[:real_windows] = 2.0
+        trans[:real_windows] = 3.0
+        self.assertTrue(np.all(pose[:real_windows] == 1.0))
+        self.assertTrue(np.all(beta[:real_windows] == 2.0))
+        self.assertTrue(np.all(trans[:real_windows] == 3.0))
+        self.assertTrue(np.all(pose[real_windows:] == 0.0))
+        self.assertTrue(np.all(beta[real_windows:] == 0.0))
+        self.assertTrue(np.all(trans[real_windows:] == 0.0))
+        self.assertEqual(
+            contract.COMPUTE_BATCH_WINDOWS - real_windows,
+            contract.TAIL_PADDING_WINDOWS,
+        )
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_raw_byte_check_distinguishes_signed_zero(self) -> None:
+        positive = np.asarray([0.0], dtype=np.dtype("<f4"))
+        negative = np.asarray([-0.0], dtype=np.dtype("<f4"))
+        self.assertTrue(torch.equal(
+            torch.from_numpy(positive),
+            torch.from_numpy(negative),
+        ))
+        self.assertNotEqual(
+            positive.tobytes(order="C"),
+            negative.tobytes(order="C"),
+        )
+
     def test_builder_and_checker_are_independent_and_gpu_imports_are_lazy(self) -> None:
         for path in (BUILDER, CHECKER):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -1028,6 +1184,7 @@ class StaticIntegrationContractTests(unittest.TestCase):
         self.assertNotIn("build_lower_target_joints_cache", checker_source)
         self.assertIn("np.random.default_rng", checker_source)
         self.assertIn("torch.equal", checker_source)
+        self.assertIn("live_payload != cached_payload", checker_source)
         self.assertNotIn("torch.allclose", checker_source)
         for module, function_name in (
             (load_script(BUILDER, "builder_json_snapshot_test"), "verified_json"),
