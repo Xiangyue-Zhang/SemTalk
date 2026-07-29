@@ -52,6 +52,24 @@ def _require_exact_audit_int(value: Any, label: str) -> int:
     return value
 
 
+def _require_exact_audit_int_mapping(
+    value: Any,
+    expected: dict[str, int],
+    label: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise RuntimeError(f"{label} must have exactly {sorted(expected)}")
+    for key, expected_value in expected.items():
+        if (
+            _require_exact_audit_int(value[key], f"{label}.{key}")
+            != expected_value
+        ):
+            raise RuntimeError(
+                f"{label}.{key} must equal {expected_value}"
+            )
+    return value
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
@@ -333,7 +351,12 @@ def _dataset_receipt(
             or not isinstance(protocol, dict)
             or protocol.get("scope") != "SemTalk Base only"
             or protocol.get("split") != "train"
-            or protocol.get("speakers") != expected_speakers
+            or _require_exact_audit_int_mapping(
+                protocol.get("speakers"),
+                expected_speakers,
+                "Base protocol speakers",
+            )
+            != expected_speakers
             or _require_exact_audit_int(
                 protocol.get("window_length"),
                 "Base protocol window_length",
@@ -396,7 +419,11 @@ def _dataset_receipt(
                 "representation protocol stride",
             )
             != 20
-            or representation_protocol.get("speaker_map")
+            or _require_exact_audit_int_mapping(
+                representation_protocol.get("speaker_map"),
+                expected_speakers,
+                "representation protocol speaker_map",
+            )
             != expected_speakers
         ):
             raise RuntimeError(
@@ -481,7 +508,12 @@ def _dataset_receipt(
             or parity.get("status") != "pass"
             or parity.get("contract")
             != "semtalk_show_global_foot_fastpath_v1"
-            or parity.get("speakers") != expected_speakers
+            or _require_exact_audit_int_mapping(
+                parity.get("speakers"),
+                expected_speakers,
+                "Global parity speakers",
+            )
+            != expected_speakers
             or parity.get("canonical_receipt")
             != summary.get("canonical_receipt")
             or {
@@ -520,15 +552,21 @@ def _dataset_receipt(
         if parity.get("smplx_asset_sha256") != smplx_sha:
             raise RuntimeError("Global parity/SMPL-X asset SHA mismatch")
         reports = parity.get("reports")
+        report_speakers = set()
+        if isinstance(reports, list):
+            for record in reports:
+                if not isinstance(record, dict):
+                    break
+                speaker = record.get("speaker")
+                speaker_id = _require_exact_audit_int(
+                    record.get("speaker_id"),
+                    "Global parity report speaker_id",
+                )
+                report_speakers.add((speaker, speaker_id))
         if (
             not isinstance(reports, list)
             or len(reports) != 4
-            or {
-                (record.get("speaker"), record.get("speaker_id"))
-                for record in reports
-                if isinstance(record, dict)
-            }
-            != set(expected_speakers.items())
+            or report_speakers != set(expected_speakers.items())
         ):
             raise RuntimeError(
                 "Global parity suite does not cover all four SHOW speakers"
@@ -935,6 +973,11 @@ def _validate_formal_stage(args: Any) -> None:
         "dropout_prob": 0.3,
         "pretrain": False,
         "sparse": 0,
+        "data_path": "",
+        "cache_path": "",
+        "e_path": "",
+        "e_name": None,
+        "test_path": "",
         "word_cache": False,
         "word_rep": "disabled_zero_placeholder",
         "t_pre_encoder": "disabled",

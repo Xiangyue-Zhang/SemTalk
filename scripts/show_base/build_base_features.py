@@ -174,6 +174,24 @@ def require_exact_int(value: Any, label: str) -> int:
     return value
 
 
+def require_exact_int_mapping(
+    value: Any,
+    expected: dict[str, int],
+    label: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise RuntimeError(f"{label} must have exactly {sorted(expected)}")
+    for key, expected_value in expected.items():
+        if (
+            require_exact_int(value[key], f"{label}.{key}")
+            != expected_value
+        ):
+            raise RuntimeError(
+                f"{label}.{key} must equal {expected_value}"
+            )
+    return value
+
+
 def source_receipt(
     expected_commit: str,
     expected_tree: str,
@@ -224,8 +242,8 @@ def load_canonical_receipt(
     manifest_hashes: dict[str, str],
     summary_path: Path,
     lineage_path: Path,
-    expected_source_commit: str,
-    expected_source_tree: str,
+    expected_canonical_source_commit: str,
+    expected_canonical_source_tree: str,
 ) -> dict[str, Any]:
     if len(manifest_paths) != 1:
         raise RuntimeError("formal feature build requires one final manifest")
@@ -251,7 +269,11 @@ def load_canonical_receipt(
         )
         != 1
         or summary.get("manifest_sha256") != manifest_sha
-        or summary.get("split_counts")
+        or require_exact_int_mapping(
+            summary.get("split_counts"),
+            {"train": 13_687, "val": 1_715, "test": 1_708},
+            "canonical summary split_counts",
+        )
         != {"train": 13_687, "val": 1_715, "test": 1_708}
         or require_exact_int(
             summary.get("clip_count"),
@@ -293,8 +315,9 @@ def load_canonical_receipt(
     if (
         not isinstance(canonical_source, dict)
         or canonical_source.get("origin") != EXPECTED_ORIGIN
-        or canonical_source.get("commit") != expected_source_commit
-        or canonical_source.get("tree") != expected_source_tree
+        or canonical_source.get("commit")
+        != expected_canonical_source_commit
+        or canonical_source.get("tree") != expected_canonical_source_tree
         or summary.get("source_receipt_sha256")
         != canonical_file_payload_sha256(canonical_source)
     ):
@@ -536,6 +559,9 @@ def canonical_split_rows(
         "source_wav",
         "source_wav_sha256",
         "lineage_contract_sha256",
+        "speaker",
+        "speaker_id",
+        "frames",
         "wav_channels",
         "wav_sample_width",
         "wav_sample_rate",
@@ -547,6 +573,29 @@ def canonical_split_rows(
         if missing:
             raise RuntimeError(
                 f"canonical row {row.get('clip_id')!r} missing {missing}"
+            )
+        speaker = row.get("speaker")
+        if not isinstance(speaker, str) or speaker not in SPEAKER_MAP:
+            raise RuntimeError(
+                f"canonical row {row.get('clip_id')!r} has invalid speaker"
+            )
+        speaker_id = require_exact_int(
+            row.get("speaker_id"),
+            f"canonical row {row.get('clip_id')!r} speaker_id",
+        )
+        if speaker_id != SPEAKER_MAP[speaker]:
+            raise RuntimeError(
+                f"canonical row {row.get('clip_id')!r} speaker/name mismatch"
+            )
+        if (
+            require_exact_int(
+                row.get("frames"),
+                f"canonical row {row.get('clip_id')!r} frames",
+            )
+            <= 0
+        ):
+            raise RuntimeError(
+                f"canonical row {row.get('clip_id')!r} has invalid frames"
             )
         validate_canonical_audio_metadata(
             row,
@@ -863,8 +912,10 @@ def audio_mode(args: argparse.Namespace) -> None:
         manifest_hashes=canonical_hashes,
         summary_path=canonical_summary_path,
         lineage_path=canonical_lineage_path,
-        expected_source_commit=args.expected_source_commit,
-        expected_source_tree=args.expected_source_tree,
+        expected_canonical_source_commit=(
+            args.expected_canonical_source_commit
+        ),
+        expected_canonical_source_tree=args.expected_canonical_source_tree,
     )
     selected = [
         row for index, row in enumerate(rows)
@@ -1081,8 +1132,12 @@ def audio_mode(args: argparse.Namespace) -> None:
             manifest_hashes=final_canonical_hashes,
             summary_path=canonical_summary_path,
             lineage_path=canonical_lineage_path,
-            expected_source_commit=args.expected_source_commit,
-            expected_source_tree=args.expected_source_tree,
+            expected_canonical_source_commit=(
+                args.expected_canonical_source_commit
+            ),
+            expected_canonical_source_tree=(
+                args.expected_canonical_source_tree
+            ),
         )
         final_tree_sha, final_model_files = tree_sha256(hubert_dir)
         if (
@@ -1197,6 +1252,20 @@ def load_canonical_clip(
         raise RuntimeError(f"{path}: SHOW speaker ID outside [0,3]")
     if np.unique(speaker).size != 1:
         raise RuntimeError(f"{path}: speaker ID changes within clip")
+    manifest_speaker = row.get("speaker")
+    if (
+        not isinstance(manifest_speaker, str)
+        or manifest_speaker not in SPEAKER_MAP
+    ):
+        raise RuntimeError(f"{path}: invalid manifest SHOW speaker")
+    manifest_speaker_id = require_exact_int(
+        row.get("speaker_id"),
+        f"{path}: manifest speaker_id",
+    )
+    if manifest_speaker_id != SPEAKER_MAP[manifest_speaker]:
+        raise RuntimeError(f"{path}: manifest speaker/name mismatch")
+    if not np.all(speaker == manifest_speaker_id):
+        raise RuntimeError(f"{path}: NPZ/manifest speaker ID mismatch")
     if (
         row.get("frames") is not None
         and require_exact_int(row["frames"], "canonical row frames")
@@ -1633,7 +1702,12 @@ def checkpoint_record(
             or parity_receipt.get("format")
             != "semtalk_show_global_foot_parity_suite_v1"
             or parity_receipt.get("status") != "pass"
-            or parity_receipt.get("speakers") != SPEAKER_MAP
+            or require_exact_int_mapping(
+                parity_receipt.get("speakers"),
+                SPEAKER_MAP,
+                "Global parity speakers",
+            )
+            != SPEAKER_MAP
         ):
             raise RuntimeError(
                 f"{resolved_status}: Global checkpoint lacks the required "
@@ -2114,8 +2188,10 @@ def base_mode(args: argparse.Namespace) -> None:
         manifest_hashes=canonical_hashes,
         summary_path=canonical_summary_path,
         lineage_path=canonical_lineage_path,
-        expected_source_commit=args.expected_source_commit,
-        expected_source_tree=args.expected_source_tree,
+        expected_canonical_source_commit=(
+            args.expected_canonical_source_commit
+        ),
+        expected_canonical_source_tree=args.expected_canonical_source_tree,
     )
     audio_rows, audio_hashes = load_audio_rows(audio_paths)
     audio_lineage_records, audio_lineage_hashes = load_audio_lineages(
@@ -2410,8 +2486,12 @@ def base_mode(args: argparse.Namespace) -> None:
             manifest_hashes=final_canonical_hashes,
             summary_path=canonical_summary_path,
             lineage_path=canonical_lineage_path,
-            expected_source_commit=args.expected_source_commit,
-            expected_source_tree=args.expected_source_tree,
+            expected_canonical_source_commit=(
+                args.expected_canonical_source_commit
+            ),
+            expected_canonical_source_tree=(
+                args.expected_canonical_source_tree
+            ),
         )
         final_audio_rows, final_audio_hashes = load_audio_rows(audio_paths)
         (
@@ -2565,10 +2645,11 @@ def base_mode(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build audited SHOW audio/Base features without SemGate/Sparse",
+        allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    audio = subparsers.add_parser("audio")
+    audio = subparsers.add_parser("audio", allow_abbrev=False)
     audio.add_argument(
         "--canonical-manifest",
         action="append",
@@ -2593,9 +2674,11 @@ def parse_args() -> argparse.Namespace:
     audio.add_argument("--expected-hubert-tree-sha256", required=True)
     audio.add_argument("--expected-source-commit", required=True)
     audio.add_argument("--expected-source-tree", required=True)
+    audio.add_argument("--expected-canonical-source-commit", required=True)
+    audio.add_argument("--expected-canonical-source-tree", required=True)
     audio.add_argument("--max-frame-mismatch", type=int, default=1)
 
-    base = subparsers.add_parser("base")
+    base = subparsers.add_parser("base", allow_abbrev=False)
     base.add_argument(
         "--canonical-manifest",
         action="append",
@@ -2634,6 +2717,8 @@ def parse_args() -> argparse.Namespace:
     base.add_argument("--expected-hubert-tree-sha256", required=True)
     base.add_argument("--expected-source-commit", required=True)
     base.add_argument("--expected-source-tree", required=True)
+    base.add_argument("--expected-canonical-source-commit", required=True)
+    base.add_argument("--expected-canonical-source-tree", required=True)
     return parser.parse_args()
 
 
@@ -2650,6 +2735,14 @@ def main() -> None:
     args.expected_source_tree = require_git_oid(
         args.expected_source_tree,
         "--expected-source-tree",
+    )
+    args.expected_canonical_source_commit = require_git_oid(
+        args.expected_canonical_source_commit,
+        "--expected-canonical-source-commit",
+    )
+    args.expected_canonical_source_tree = require_git_oid(
+        args.expected_canonical_source_tree,
+        "--expected-canonical-source-tree",
     )
     if args.mode == "audio":
         audio_mode(args)

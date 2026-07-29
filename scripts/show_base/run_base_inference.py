@@ -700,8 +700,8 @@ def _validate_canonical_root_receipts(
     summary_path: Path,
     lineage_path: Path,
     expected_manifest_sha: str,
-    expected_source_commit: str,
-    expected_source_tree: str,
+    expected_canonical_source_commit: str,
+    expected_canonical_source_tree: str,
 ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
     manifest_sha = _verify_file_sha(
         manifest,
@@ -799,8 +799,10 @@ def _validate_canonical_root_receipts(
         not isinstance(canonical_source, dict)
         or canonical_source.get("origin")
         != "git@github.com:Xiangyue-Zhang/SemTalk.git"
-        or canonical_source.get("commit") != expected_source_commit
-        or canonical_source.get("tree") != expected_source_tree
+        or canonical_source.get("commit")
+        != expected_canonical_source_commit
+        or canonical_source.get("tree")
+        != expected_canonical_source_tree
         or summary.get("source_receipt_sha256")
         != canonical_json_sha256(canonical_source)
     ):
@@ -3131,8 +3133,8 @@ def _input_contract(
         canonical_summary,
         canonical_lineage,
         args.expected_canonical_manifest_sha256,
-        args.expected_source_commit,
-        args.expected_source_tree,
+        args.expected_canonical_source_commit,
+        args.expected_canonical_source_tree,
     )
     canonical_receipt = {
         "manifest": str(canonical_manifest),
@@ -4539,6 +4541,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument(
+        "--expected-canonical-source-commit",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-canonical-source-tree",
+        required=True,
+    )
+    parser.add_argument(
         "--expected-hubert-tree-sha256",
         required=True,
     )
@@ -4628,6 +4638,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.expected_source_tree = _require_git_oid(
         args.expected_source_tree,
         "--expected-source-tree",
+    )
+    args.expected_canonical_source_commit = _require_git_oid(
+        args.expected_canonical_source_commit,
+        "--expected-canonical-source-commit",
+    )
+    args.expected_canonical_source_tree = _require_git_oid(
+        args.expected_canonical_source_tree,
+        "--expected-canonical-source-tree",
     )
     args.expected_hubert_tree_sha256 = _require_sha256(
         args.expected_hubert_tree_sha256,

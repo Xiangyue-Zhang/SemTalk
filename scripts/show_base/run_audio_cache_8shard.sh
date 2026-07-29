@@ -5,9 +5,9 @@ export PYTHONDONTWRITEBYTECODE=1
 # Run only as the direct workload of /tmp/globaldiff_guarded_runner.py with
 # GPUs 0..7 reserved.  Every GPU builds one immutable modulo shard.
 
-if [[ $# -ne 12 ]]; then
+if [[ $# -ne 14 ]]; then
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON CANONICAL_MANIFEST CANONICAL_SUMMARY CANONICAL_LINEAGE HUBERT_MODEL HUBERT_TREE_SHA256 OUTPUT_ROOT SPLIT EXPECTED_CLIPS SOURCE_COMMIT SOURCE_TREE"
+        "Usage: $0 REPO_ROOT PYTHON CANONICAL_MANIFEST CANONICAL_SUMMARY CANONICAL_LINEAGE HUBERT_MODEL HUBERT_TREE_SHA256 OUTPUT_ROOT SPLIT EXPECTED_CLIPS SOURCE_COMMIT SOURCE_TREE CANONICAL_SOURCE_COMMIT CANONICAL_SOURCE_TREE"
     exit 2
 fi
 
@@ -23,6 +23,8 @@ split=$9
 expected_clips=${10}
 source_commit=${11}
 source_tree=${12}
+canonical_source_commit=${13}
+canonical_source_tree=${14}
 builder="$repo_root/scripts/show_base/build_base_features.py"
 
 if [[ "$split" != train && "$split" != test ]]; then
@@ -284,6 +286,8 @@ for shard_id in 0 1 2 3 4 5 6 7; do
         --expected-total-clips "$expected_clips"
         --expected-source-commit "$source_commit"
         --expected-source-tree "$source_tree"
+        --expected-canonical-source-commit "$canonical_source_commit"
+        --expected-canonical-source-tree "$canonical_source_tree"
         --max-frame-mismatch 1
     )
     expected_cmdline_sha256=$(sha256_argv "${shard_argv[@]}")

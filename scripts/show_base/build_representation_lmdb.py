@@ -85,6 +85,30 @@ def require_git_oid(value: str, label: str) -> str:
     return normalized
 
 
+def require_exact_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise RuntimeError(f"{label} must be an exact integer")
+    return value
+
+
+def require_exact_int_mapping(
+    value: Any,
+    expected: dict[str, int],
+    label: str,
+) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise RuntimeError(f"{label} must have exactly {sorted(expected)}")
+    for key, expected_value in expected.items():
+        if (
+            require_exact_int(value[key], f"{label}.{key}")
+            != expected_value
+        ):
+            raise RuntimeError(
+                f"{label}.{key} must equal {expected_value}"
+            )
+    return value
+
+
 def source_receipt(
     expected_commit: str,
     expected_tree: str,
@@ -136,8 +160,8 @@ def load_canonical_receipts(
     manifest_sha256: str,
     summary_path: Path,
     lineage_path: Path,
-    expected_source_commit: str,
-    expected_source_tree: str,
+    expected_canonical_source_commit: str,
+    expected_canonical_source_tree: str,
     expected_train_clips: int,
 ) -> dict[str, Any]:
     for path in (manifest, summary_path, lineage_path):
@@ -154,13 +178,28 @@ def load_canonical_receipts(
         not isinstance(summary, dict)
         or summary.get("status") != "complete"
         or summary.get("schema_name") != "semtalk-show-canonical-motion"
-        or int(summary.get("schema_version", -1)) != 1
+        or require_exact_int(
+            summary.get("schema_version"),
+            "canonical summary schema_version",
+        )
+        != 1
         or summary.get("manifest_sha256") != manifest_sha256
-        or int(summary.get("split_counts", {}).get("train", -1))
+        or require_exact_int(
+            summary.get("split_counts", {}).get("train"),
+            "canonical summary train clips",
+        )
         != expected_train_clips
-        or summary.get("split_counts")
+        or require_exact_int_mapping(
+            summary.get("split_counts"),
+            {"train": 13_687, "val": 1_715, "test": 1_708},
+            "canonical summary split_counts",
+        )
         != {"train": 13_687, "val": 1_715, "test": 1_708}
-        or int(summary.get("clip_count", -1)) != 17_110
+        or require_exact_int(
+            summary.get("clip_count"),
+            "canonical summary clip_count",
+        )
+        != 17_110
         or summary.get("exact_once") is not True
         or summary.get("finite") is not True
         or summary.get("split_disjoint") is not True
@@ -178,8 +217,8 @@ def load_canonical_receipts(
     if (
         not isinstance(source, dict)
         or source.get("origin") != EXPECTED_ORIGIN
-        or source.get("commit") != expected_source_commit
-        or source.get("tree") != expected_source_tree
+        or source.get("commit") != expected_canonical_source_commit
+        or source.get("tree") != expected_canonical_source_tree
         or summary.get("source_receipt_sha256")
         != canonical_payload_sha256(source)
     ):
@@ -297,17 +336,35 @@ def validate_clip(
             raise RuntimeError(f"{path}: {name} {array.shape} != {shape}")
         if array.dtype.kind in "fc" and not np.isfinite(array).all():
             raise RuntimeError(f"{path}: non-finite {name}")
-    if arrays["speaker_id"].min() < 0 or arrays["speaker_id"].max() > 3:
+    speaker_name = row.get("speaker")
+    if not isinstance(speaker_name, str) or speaker_name not in EXPECTED_SPEAKERS:
+        raise RuntimeError(f"{path}: invalid manifest SHOW speaker")
+    manifest_speaker_id = require_exact_int(
+        row.get("speaker_id"),
+        f"{path}: manifest speaker_id",
+    )
+    if manifest_speaker_id != EXPECTED_SPEAKERS[speaker_name]:
+        raise RuntimeError(f"{path}: manifest speaker/name mismatch")
+    speaker_ids = arrays["speaker_id"]
+    if speaker_ids.dtype.kind not in "iu":
+        raise RuntimeError(f"{path}: speaker_id is not integer")
+    if speaker_ids.min() < 0 or speaker_ids.max() > 3:
         raise RuntimeError(f"{path}: invalid SHOW speaker ID")
-    if np.unique(arrays["speaker_id"]).size != 1:
+    if np.unique(speaker_ids).size != 1:
         raise RuntimeError(f"{path}: speaker ID changes within clip")
-    if row.get("frames") is not None and int(row["frames"]) != frames:
+    if not np.all(speaker_ids == manifest_speaker_id):
+        raise RuntimeError(f"{path}: NPZ/manifest speaker ID mismatch")
+    if (
+        row.get("frames") is not None
+        and require_exact_int(row["frames"], f"{path}: manifest frames")
+        != frames
+    ):
         raise RuntimeError(f"{path}: frame count disagrees with manifest")
     return arrays, frames
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--canonical-manifest", action="append", required=True)
     parser.add_argument("--canonical-summary", required=True)
     parser.add_argument("--canonical-lineage", required=True)
@@ -320,6 +377,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-entries", type=int, required=True)
     parser.add_argument("--expected-source-commit", required=True)
     parser.add_argument("--expected-source-tree", required=True)
+    parser.add_argument("--expected-canonical-source-commit", required=True)
+    parser.add_argument("--expected-canonical-source-tree", required=True)
     parser.add_argument(
         "--enable-global-foot-fastpath",
         action="store_true",
@@ -348,6 +407,14 @@ def main() -> None:
         args.expected_source_tree,
         "--expected-source-tree",
     )
+    args.expected_canonical_source_commit = require_git_oid(
+        args.expected_canonical_source_commit,
+        "--expected-canonical-source-commit",
+    )
+    args.expected_canonical_source_tree = require_git_oid(
+        args.expected_canonical_source_tree,
+        "--expected-canonical-source-tree",
+    )
     if args.expected_train_clips != 13_687:
         raise RuntimeError("formal SHOW train clip count must be exactly 13687")
     if args.expected_entries != 127_309:
@@ -373,8 +440,10 @@ def main() -> None:
         manifest_sha256=manifest_sha,
         summary_path=canonical_summary_path,
         lineage_path=canonical_lineage_path,
-        expected_source_commit=args.expected_source_commit,
-        expected_source_tree=args.expected_source_tree,
+        expected_canonical_source_commit=(
+            args.expected_canonical_source_commit
+        ),
+        expected_canonical_source_tree=args.expected_canonical_source_tree,
         expected_train_clips=args.expected_train_clips,
     )
     if len(rows) != args.expected_train_clips:
@@ -383,7 +452,13 @@ def main() -> None:
             f"!= {args.expected_train_clips}"
         )
     observed_speakers = {
-        (str(row.get("speaker")), int(row.get("speaker_id", -1)))
+        (
+            str(row.get("speaker")),
+            require_exact_int(
+                row.get("speaker_id"),
+                f"{row.get('clip_id')}: speaker_id",
+            ),
+        )
         for row in rows
     }
     if observed_speakers != set(EXPECTED_SPEAKERS.items()):
@@ -501,8 +576,12 @@ def main() -> None:
             manifest_sha256=final_manifest_sha,
             summary_path=canonical_summary_path,
             lineage_path=canonical_lineage_path,
-            expected_source_commit=args.expected_source_commit,
-            expected_source_tree=args.expected_source_tree,
+            expected_canonical_source_commit=(
+                args.expected_canonical_source_commit
+            ),
+            expected_canonical_source_tree=(
+                args.expected_canonical_source_tree
+            ),
             expected_train_clips=args.expected_train_clips,
         )
         if (

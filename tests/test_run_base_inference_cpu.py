@@ -240,6 +240,10 @@ class FormalCliContractTest(unittest.TestCase):
             "b" * 40,
             "--expected-source-tree",
             "c" * 40,
+            "--expected-canonical-source-commit",
+            "d" * 40,
+            "--expected-canonical-source-tree",
+            "e" * 40,
             "--expected-hubert-tree-sha256",
             sha,
         ]
@@ -285,6 +289,33 @@ class FormalCliContractTest(unittest.TestCase):
                 del argv[index : index + 2]
                 with self.assertRaises(SystemExit) as raised:
                     MODULE.parse_args(argv)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_canonical_and_producer_source_roots_are_independently_required(
+        self,
+    ) -> None:
+        argv = self.valid_argv()
+        parsed = MODULE.parse_args(argv)
+        self.assertNotEqual(
+            parsed.expected_source_commit,
+            parsed.expected_canonical_source_commit,
+        )
+        self.assertNotEqual(
+            parsed.expected_source_tree,
+            parsed.expected_canonical_source_tree,
+        )
+        for option in (
+            "--expected-source-commit",
+            "--expected-source-tree",
+            "--expected-canonical-source-commit",
+            "--expected-canonical-source-tree",
+        ):
+            with self.subTest(option=option):
+                incomplete = self.valid_argv()
+                index = incomplete.index(option)
+                del incomplete[index : index + 2]
+                with self.assertRaises(SystemExit) as raised:
+                    MODULE.parse_args(incomplete)
                 self.assertEqual(raised.exception.code, 2)
 
     def test_formal_launcher_owns_all_base_trust_root_arguments(self) -> None:
@@ -1134,6 +1165,9 @@ class VerifiedInputSnapshotTest(unittest.TestCase):
             path = Path(directory) / "canonical.npz"
             path.write_bytes(payload)
             row = {
+                "clip_id": "oliver/snapshot",
+                "speaker": "oliver",
+                "speaker_id": 0,
                 "canonical_npz": str(path),
                 "canonical_npz_sha256": hashlib.sha256(payload).hexdigest(),
                 "frames": 8,

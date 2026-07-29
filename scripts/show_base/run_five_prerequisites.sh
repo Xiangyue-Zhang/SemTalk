@@ -109,11 +109,21 @@ expected_speakers = {
     "seth": 2,
     "conan": 3,
 }
+def exact_speaker_map(value, label):
+    if not isinstance(value, dict) or set(value) != set(expected_speakers):
+        raise SystemExit(f"{label} has invalid keys")
+    for speaker, expected_id in expected_speakers.items():
+        speaker_id = value[speaker]
+        if type(speaker_id) is not int or speaker_id != expected_id:
+            raise SystemExit(f"{label}.{speaker} is not the exact speaker ID")
+    return value
+
 if (
     parity.get("format") != "semtalk_show_global_foot_parity_suite_v1"
     or parity.get("status") != "pass"
     or parity.get("contract") != "semtalk_show_global_foot_fastpath_v1"
-    or parity.get("speakers") != expected_speakers
+    or exact_speaker_map(parity.get("speakers"), "parity speakers")
+    != expected_speakers
     or parity.get("canonical_receipt") != summary.get("canonical_receipt")
 ):
     raise SystemExit("invalid Global-foot parity bundle")
@@ -131,14 +141,19 @@ if (
 ):
     raise SystemExit("parity/representation source receipt mismatch")
 reports = parity.get("reports")
+report_speakers = set()
+if isinstance(reports, list):
+    for record in reports:
+        if not isinstance(record, dict):
+            break
+        speaker_id = record.get("speaker_id")
+        if type(speaker_id) is not int:
+            raise SystemExit("parity report speaker_id is not an exact integer")
+        report_speakers.add((record.get("speaker"), speaker_id))
 if (
     not isinstance(reports, list)
     or len(reports) != 4
-    or {
-        (record.get("speaker"), record.get("speaker_id"))
-        for record in reports
-    }
-    != set(expected_speakers.items())
+    or report_speakers != set(expected_speakers.items())
 ):
     raise SystemExit("parity suite does not cover all four SHOW speakers")
 for record in reports:

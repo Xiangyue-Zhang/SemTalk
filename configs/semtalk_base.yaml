@@ -6,11 +6,13 @@ pre_frames: 4
 root_path: ./
 out_path: ./outputs/
 project: semtalk_base
-data_path: ./BEAT2/beat_english_v2.0.0/
-e_path:  weights/AESKConv_240_100.bin
-eval_model: motion_representation
-e_name: VAESKConv
-data_path_1: ./weights/
+data_path: ""
+e_path: ""
+data_path_1: ""
+hubert_mean_path: ""
+hubert_std_path: ""
+audio_infer_path: ""
+base_ckpt: ""
 vae_test_len: 32
 vae_test_dim: 330
 vae_test_stride: 20
@@ -20,16 +22,15 @@ vae_layer: 4
 vae_grow: [1,1,2,1]
 variational: False
 # ckpt
-load_ckpt: None  # ./weights/best_semtalk_base.bin
-# load_ckpt: outputs/custom/0828_154429_semtalk_base/best_23.bin
+load_ckpt: ""
+test_ckpt: ""
 # data config
-training_speakers: [2] 
+training_speakers: [0, 1, 2, 3]
 additional_data: False
-cache_path: datasets/beat2_cache_2
-dataset: semtalk_dataloader
-train_path: datasets/beat2_semtalk_train
-test_path: datasets/beat2_semtalk_test.pkl
-# test_path: /mnt/disk2T/mm_data/zxy/PantoMatrix-main/datasets/test_rvq_hs.pkl
+cache_path: ""
+dataset: show_base
+train_path: ""
+test_path: ""
 new_cache: False
 
 # motion config
@@ -57,12 +58,12 @@ audio_norm: False
 audio_f: 256
 
 # text config
-word_rep: textgrid
-word_index_num: 11195
-word_dims: 300
-freeze_wordembed: False
-word_f: 256
-t_pre_encoder: fasttext
+word_rep: disabled_zero_placeholder
+word_index_num: 0
+word_dims: 0
+freeze_wordembed: True
+word_f: 0
+t_pre_encoder: disabled
 t_encoder: null
 t_fix_pre: False
 
