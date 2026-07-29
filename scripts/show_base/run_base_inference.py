@@ -206,7 +206,7 @@ BASE_CANDIDATE_CORE_KEYS = {
 BASE_CANDIDATE_INTERVAL_EPOCHS = 10
 BASE_CANDIDATE_COUNT = 40
 BASE_EPOCHS = 400
-FORMAL_UPDATES_PER_EPOCH = 1_989
+FORMAL_UPDATES_PER_EPOCH = 1_988
 SHOW_SPEAKER_IDS = {
     "oliver": 0,
     "chemistry": 1,
@@ -359,7 +359,7 @@ def _validate_lower_target_cache_binding(
         or type(audit_receipt.get("cache_version")) is not int
         or audit_receipt.get("cache_version") != 1
         or type(audit_receipt.get("entries")) is not int
-        or audit_receipt.get("entries") != 127_309
+        or audit_receipt.get("entries") != 127_286
         or audit_receipt.get("entry_shape") != [64, 127, 3]
         or audit_receipt.get("dtype") != "<f4"
         or audit_receipt.get("speaker_scope") != "All"
@@ -2035,7 +2035,7 @@ def _base_candidate_payload_and_receipt(
             status.get("train_samples"),
             "train_samples",
         )
-        != 127_309
+        != 127_286
         or _require_exact_int(
             status.get("updates_per_epoch"),
             "updates_per_epoch",
@@ -2056,7 +2056,7 @@ def _base_candidate_payload_and_receipt(
         or dataset_receipt.get("data_mdb_sha256")
         != expected_data_mdb_sha256
         or _require_exact_int(dataset_receipt.get("entries"), "entries")
-        != 127_309
+        != 127_286
         or _require_exact_int(
             dataset_receipt.get("train_clips"),
             "train_clips",
@@ -2374,7 +2374,7 @@ def _base_candidate_payload_and_receipt(
         },
         "training_accounting": {
             "epochs": BASE_EPOCHS,
-            "train_samples": 127_309,
+            "train_samples": 127_286,
             "updates_per_epoch": FORMAL_UPDATES_PER_EPOCH,
             "optimizer_updates": expected_optimizer_updates,
         },
@@ -2536,17 +2536,17 @@ def _checkpoint_payload_and_receipt(
         )
         != expected_epochs
         or _require_exact_int(status.get("train_samples"), "train_samples")
-        != 127_309
+        != 127_286
         or _require_exact_int(
             status.get("updates_per_epoch"),
             "updates_per_epoch",
         )
-        != 1_989
+        != 1_988
         or _require_exact_int(
             status.get("optimizer_updates"),
             "optimizer_updates",
         )
-        != expected_epochs * 1_989
+        != expected_epochs * 1_988
         or status.get("lineage_manifest_sha256")
         != expected_training_lineage_sha256
         or status.get("config_sha256") != config_sha
@@ -2558,7 +2558,7 @@ def _checkpoint_payload_and_receipt(
         or dataset_receipt.get("data_mdb_sha256")
         != expected_data_mdb_sha256
         or _require_exact_int(dataset_receipt.get("entries"), "entries")
-        != 127_309
+        != 127_286
         or _require_exact_int(
             dataset_receipt.get("train_clips"),
             "train_clips",
@@ -2676,9 +2676,9 @@ def _checkpoint_payload_and_receipt(
         "formal_training_status_sha256": sha256_file(resolved_status),
         "training_accounting": {
             "epochs": expected_epochs,
-            "train_samples": 127_309,
-            "updates_per_epoch": 1_989,
-            "optimizer_updates": expected_epochs * 1_989,
+            "train_samples": 127_286,
+            "updates_per_epoch": 1_988,
+            "optimizer_updates": expected_epochs * 1_988,
         },
     }
 
@@ -3461,7 +3461,7 @@ def _input_contract(
             base_summary_payload.get("entries"),
             "Base entries",
         )
-        != 127_309
+        != 127_286
     ):
         raise InferenceContractError(
             "Base training dataset summary/lineage binding is invalid"
@@ -3479,7 +3479,7 @@ def _input_contract(
             representation_lineage_payload.get("entries"),
             "representation entries",
         )
-        != 127_309
+        != 127_286
     ):
         raise InferenceContractError(
             "representation training lineage is not complete"

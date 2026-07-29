@@ -32,6 +32,41 @@ EXPECTED_SPEAKERS = {
     "seth": 2,
     "conan": 3,
 }
+EXPECTED_TRAIN_CLIPS = 13_687
+EXPECTED_ENTRIES = 127_286
+EXPECTED_RAW_ENTRIES = 127_287
+EXPECTED_NON_WHOLE_SECOND_FRAME_LENGTHS = (62, 163, 230)
+EXPECTED_SPEAKER_CLIP_COUNTS = {
+    "oliver": 5_246,
+    "chemistry": 1_949,
+    "seth": 1_984,
+    "conan": 4_508,
+}
+EXPECTED_SPEAKER_WINDOW_COUNTS = {
+    "oliver": 50_285,
+    "chemistry": 14_374,
+    "seth": 19_310,
+    "conan": 43_317,
+}
+
+
+def window_count_for_frames(
+    frames: int,
+    *,
+    window_length: int = 64,
+    stride: int = 20,
+    floor_to_whole_seconds: bool,
+) -> int:
+    """Return the public-loader window count for one frozen SHOW clip."""
+
+    if type(frames) is not int or frames < 0:
+        raise ValueError("frames must be a non-negative exact integer")
+    if type(window_length) is not int or window_length <= 0:
+        raise ValueError("window_length must be a positive exact integer")
+    if type(stride) is not int or stride <= 0:
+        raise ValueError("stride must be a positive exact integer")
+    usable_frames = (frames // 30) * 30 if floor_to_whole_seconds else frames
+    return max(0, (usable_frames - window_length) // stride + 1)
 
 
 def sha256(path: Path) -> str:
@@ -415,10 +450,10 @@ def main() -> None:
         args.expected_canonical_source_tree,
         "--expected-canonical-source-tree",
     )
-    if args.expected_train_clips != 13_687:
+    if args.expected_train_clips != EXPECTED_TRAIN_CLIPS:
         raise RuntimeError("formal SHOW train clip count must be exactly 13687")
-    if args.expected_entries != 127_309:
-        raise RuntimeError("formal SHOW representation entries must be exactly 127309")
+    if args.expected_entries != EXPECTED_ENTRIES:
+        raise RuntimeError("formal SHOW representation entries must be exactly 127286")
     source = source_receipt(
         args.expected_source_commit,
         args.expected_source_tree,
@@ -490,6 +525,8 @@ def main() -> None:
     aggregate = hashlib.sha256()
     speaker_clip_counts: Counter[str] = Counter()
     speaker_window_counts: Counter[str] = Counter()
+    raw_entries = 0
+    non_whole_second_frame_lengths: list[int] = []
     started = time.time()
     try:
         with env.begin(write=True) as txn:
@@ -509,10 +546,20 @@ def main() -> None:
                 usable_frames = (frames // 30) * 30
                 dropped_tail = frames - usable_frames
                 dropped_tail_frames += dropped_tail
-                windows = max(
-                    0,
-                    (usable_frames - args.window_length) // args.stride + 1,
+                windows = window_count_for_frames(
+                    frames,
+                    window_length=args.window_length,
+                    stride=args.stride,
+                    floor_to_whole_seconds=True,
                 )
+                raw_entries += window_count_for_frames(
+                    frames,
+                    window_length=args.window_length,
+                    stride=args.stride,
+                    floor_to_whole_seconds=False,
+                )
+                if dropped_tail:
+                    non_whole_second_frame_lengths.append(frames)
                 if windows == 0:
                     skipped_short.append(row["clip_id"])
                 for window_index in range(windows):
@@ -561,6 +608,22 @@ def main() -> None:
         shutil.rmtree(temp)
         raise RuntimeError(
             f"representation entries {entries} != {args.expected_entries}"
+        )
+    if (
+        dict(speaker_clip_counts) != EXPECTED_SPEAKER_CLIP_COUNTS
+        or dict(speaker_window_counts) != EXPECTED_SPEAKER_WINDOW_COUNTS
+        or raw_entries != EXPECTED_RAW_ENTRIES
+        or tuple(sorted(non_whole_second_frame_lengths))
+        != EXPECTED_NON_WHOLE_SECOND_FRAME_LENGTHS
+    ):
+        shutil.rmtree(temp)
+        raise RuntimeError(
+            "frozen SHOW representation ledger mismatch: "
+            f"speaker_clips={dict(speaker_clip_counts)!r} "
+            f"speaker_windows={dict(speaker_window_counts)!r} "
+            f"whole={entries} raw={raw_entries} "
+            f"non_whole_second_frames="
+            f"{sorted(non_whole_second_frame_lengths)!r}"
         )
     try:
         final_source = source_receipt(
@@ -651,6 +714,13 @@ def main() -> None:
             for speaker in EXPECTED_SPEAKERS
         },
         "entries": entries,
+        "window_ledger": {
+            "whole_second_entries": entries,
+            "raw_frame_entries": raw_entries,
+            "non_whole_second_frame_lengths": list(
+                EXPECTED_NON_WHOLE_SECOND_FRAME_LENGTHS
+            ),
+        },
         "dropped_tail_frames": dropped_tail_frames,
         "skipped_short_clip_ids": skipped_short,
         "entry_aggregate_sha256": aggregate.hexdigest(),

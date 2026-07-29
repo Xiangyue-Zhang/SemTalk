@@ -436,7 +436,7 @@ def _formal_lower_target_cache_gate_receipt(
             protocol.get("training_updates"),
             "lower cache gate training updates",
         )
-        != 600 * 1_989
+        != 600 * 1_988
         or not isinstance(equivalence, dict)
         or equivalence.get("status") != "pass"
         or equivalence.get(
@@ -605,12 +605,12 @@ def _formal_lower_target_cache_gate_receipt(
             amortization.get("updates_per_epoch"),
             "lower cache gate amortization updates_per_epoch",
         )
-        != 1_989
+        != 1_988
         or _require_exact_audit_int(
             amortization.get("training_updates"),
             "lower cache gate amortization training_updates",
         )
-        != 600 * 1_989
+        != 600 * 1_988
         or not np.isfinite(
             float(amortization.get("full_builder_seconds", float("nan")))
         )
@@ -769,7 +769,7 @@ def _dataset_receipt(
             "dataset summary entries",
         )
         != train_samples
-        or train_samples != 127_309
+        or train_samples != 127_286
         or _require_exact_audit_int(
             summary.get("train_clips"),
             "dataset summary train_clips",
@@ -1504,7 +1504,7 @@ def _validate_formal_stage(args: Any) -> None:
         "deterministic": True,
         "benchmark": True,
         "cudnn_enabled": True,
-        "log_period": 1_989,
+        "log_period": 1_988,
         "save_every": 5,
         "use_lower_target_joints_cache": False,
     }
@@ -3345,12 +3345,12 @@ def main() -> None:
     if not args.strict_finite:
         raise RuntimeError("formal training requires --strict_finite true")
     if (
-        args.expected_train_samples != 127_309
-        or args.expected_updates_per_epoch != 1_989
+        args.expected_train_samples != 127_286
+        or args.expected_updates_per_epoch != 1_988
     ):
         raise RuntimeError(
-            "formal training requires exactly 127309 samples and "
-            "1989 optimizer updates per epoch"
+            "formal training requires exactly 127286 samples and "
+            "1988 optimizer updates per epoch"
         )
     if not args.lineage_manifest:
         raise RuntimeError("formal training requires --lineage_manifest")

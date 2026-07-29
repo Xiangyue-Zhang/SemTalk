@@ -542,7 +542,7 @@ def main() -> None:
         or args.permutation_seed != PERMUTATION_SEED
     ):
         raise RuntimeError(
-            "formal checker is fixed at 127309 entries, 64-window batches, "
+            "formal checker is fixed at 127286 entries, 64-window batches, "
             "and permutation seed 20260729"
         )
     output_input = Path(args.output_checker_receipt)
@@ -738,7 +738,7 @@ def main() -> None:
                     or COMPUTE_BATCH_WINDOWS - real_windows
                     != TAIL_PADDING_WINDOWS
                 ):
-                    raise RuntimeError("checker tail is not 13 real + 51 padding")
+                    raise RuntimeError("checker tail is not 54 real + 10 padding")
     finally:
         representation_env.close()
         cache_env.close()

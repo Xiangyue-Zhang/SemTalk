@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - receipt tooling can run without torch
 CACHE_FORMAT = "semtalk_show_lower_target_joints_raw_lmdb_v1"
 CHECKER_FORMAT = "semtalk_show_lower_target_joints_checker_v1"
 CACHE_VERSION = 1
-EXPECTED_ENTRIES = 127_309
+EXPECTED_ENTRIES = 127_286
 WINDOW_LENGTH = 64
 JOINT_COUNT = 127
 COORDINATE_COUNT = 3
@@ -1859,7 +1859,7 @@ class LowerTargetJointsCache:
             with env.begin(buffers=True) as txn:
                 if int(txn.stat()["entries"]) != EXPECTED_ENTRIES:
                     raise LowerTargetCacheError(
-                        "runtime cache LMDB does not have exactly 127309 entries"
+                        "runtime cache LMDB does not have exactly 127286 entries"
                     )
             with torch_module.no_grad():
                 tensor = torch_module.empty(

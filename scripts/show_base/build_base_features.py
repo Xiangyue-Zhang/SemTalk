@@ -287,7 +287,7 @@ def validate_lower_target_cache_binding(
         or type(audit_receipt.get("cache_version")) is not int
         or audit_receipt.get("cache_version") != 1
         or type(audit_receipt.get("entries")) is not int
-        or audit_receipt.get("entries") != 127_309
+        or audit_receipt.get("entries") != 127_286
         or audit_receipt.get("entry_shape") != [64, 127, 3]
         or audit_receipt.get("dtype") != "<f4"
         or audit_receipt.get("speaker_scope") != "All"
@@ -1865,7 +1865,7 @@ def checkpoint_record(
             status_dataset_receipt.get("entries"),
             "dataset receipt entries",
         )
-        != 127_309
+        != 127_286
         or require_exact_int(
             status_dataset_receipt.get("train_clips"),
             "dataset receipt train_clips",
@@ -1931,8 +1931,8 @@ def checkpoint_record(
         "optimizer_updates",
     )
     if (
-        train_samples != 127_309
-        or updates_per_epoch != 1_989
+        train_samples != 127_286
+        or updates_per_epoch != 1_988
         or optimizer_updates != expected_epochs * updates_per_epoch
     ):
         raise RuntimeError(
@@ -2355,8 +2355,8 @@ def base_mode(args: argparse.Namespace) -> None:
         raise ValueError("--commit-interval must be positive")
     if args.expected_train_clips != 13_687:
         raise RuntimeError("formal Base train clip count must be 13687")
-    if args.expected_entries != 127_309:
-        raise RuntimeError("formal Base entry count must be 127309")
+    if args.expected_entries != 127_286:
+        raise RuntimeError("formal Base entry count must be 127286")
 
     output = Path(args.output_lmdb).resolve()
     summary_path = Path(args.summary_json).resolve()

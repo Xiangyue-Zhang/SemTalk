@@ -14,7 +14,7 @@ The public mode must itself be launched through
 * benchmarks the production path with four fresh child processes in A-B-B-A
   order.  Every child has five warm-up and twenty-five measured real updates;
 * requires pooled and paired-block wall-clock and CUDA-event speedups >= 1.05;
-* amortizes the *full* recorded builder process time over 600 * 1989 updates
+* amortizes the *full* recorded builder process time over 600 * 1988 updates
   and requires that end-to-end speedup >= 1.05.
 
 No output root is reusable.  Any exception leaves only a ``failure.json`` and
@@ -60,8 +60,8 @@ EXPECTED_SPEAKERS = {
     "conan": 3,
 }
 EXPECTED_SPEAKER_IDS = (0, 1, 2, 3)
-EXPECTED_ENTRIES = 127_309
-EXPECTED_UPDATES_PER_EPOCH = 1_989
+EXPECTED_ENTRIES = 127_286
+EXPECTED_UPDATES_PER_EPOCH = 1_988
 EXPECTED_EPOCHS = 600
 EXPECTED_BATCH_SIZE = 64
 EXPECTED_FRAMES = 64
@@ -428,7 +428,7 @@ def validate_static_gate_contract() -> dict[str, Any]:
     require_exact_int(EXPECTED_EPOCHS, 600, "lower epochs")
     require_exact_int(
         EXPECTED_UPDATES_PER_EPOCH,
-        1_989,
+        1_988,
         "updates per epoch",
     )
     require_finite_positive(MIN_SPEEDUP, "minimum speedup")
@@ -1260,7 +1260,7 @@ def _select_real_indices(
     }
     # Probe the complete key range at fixed resolution.  SHOW windows are
     # emitted in sorted clip order, so this locates every large speaker region
-    # without decoding all 127309 NPZ records.  A complete fallback remains
+    # without decoding all 127286 NPZ records.  A complete fallback remains
     # fail-safe if ordering ever changes.
     probe_count = min(length, 4_096)
     probes = np.linspace(0, length - 1, probe_count, dtype=np.int64)

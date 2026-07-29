@@ -372,7 +372,7 @@ if (
     raise SystemExit("lower target cache formal gate binding is invalid")
 entries = require_exact_int(summary.get("entries"), "representation entries")
 updates = entries // 64
-if entries != 127_309 or updates != 1_989:
+if entries != 127_286 or updates != 1_988:
     raise SystemExit(
         f"formal representation accounting mismatch: {entries=} {updates=}"
     )
@@ -706,7 +706,7 @@ launch_stage() {
             --expected_updates_per_epoch "$updates_per_epoch" \
             --strict_finite true \
             --save_every 5 \
-            --log_period 1989 \
+            --log_period "$updates_per_epoch" \
             --loader_workers "${SEMTALK_LOADER_WORKERS:-4}" \
             --random_seed 2021 \
             --pretrain false \

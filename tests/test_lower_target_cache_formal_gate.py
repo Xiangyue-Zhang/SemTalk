@@ -71,7 +71,7 @@ class StaticProtocolTests(unittest.TestCase):
                 "warmup_updates_per_block": 5,
                 "measured_updates_per_block": 25,
                 "minimum_speedup": 1.05,
-                "training_updates": 600 * 1_989,
+                "training_updates": 600 * 1_988,
             },
         )
 
@@ -250,7 +250,7 @@ class SpeedupContractTests(unittest.TestCase):
         )
         self.assertEqual(
             report["amortization"]["training_updates"],
-            600 * 1_989,
+            600 * 1_988,
         )
         self.assertGreaterEqual(
             report["amortization"]["speedup"],

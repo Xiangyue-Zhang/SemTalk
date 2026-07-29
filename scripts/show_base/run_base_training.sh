@@ -86,7 +86,7 @@ if digest != summary["data_mdb_sha256"]:
     raise SystemExit("Base data.mdb SHA mismatch")
 entries = require_exact_int(summary.get("entries"), "Base entries")
 updates = entries // 64
-if entries != 127_309 or updates != 1_989:
+if entries != 127_286 or updates != 1_988:
     raise SystemExit(f"formal Base accounting mismatch: {entries=} {updates=}")
 print(entries, updates)
 PY
@@ -145,7 +145,7 @@ exec "$python_bin" -m torch.distributed.run \
     --expected_updates_per_epoch "$updates_per_epoch" \
     --strict_finite true \
     --save_every 5 \
-    --log_period 1989 \
+    --log_period "$updates_per_epoch" \
     --loader_workers "${SEMTALK_LOADER_WORKERS:-4}" \
     --random_seed 43 \
     --pretrain false \

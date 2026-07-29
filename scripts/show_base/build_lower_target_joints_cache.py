@@ -563,7 +563,7 @@ def main() -> None:
         or args.map_size_gib != 16
     ):
         raise RuntimeError(
-            "formal lower target cache is fixed at 127309 entries, "
+            "formal lower target cache is fixed at 127286 entries, "
             "64 compute windows, and a 16-GiB map"
         )
     source = source_receipt(
@@ -699,7 +699,7 @@ def main() -> None:
                     or COMPUTE_BATCH_WINDOWS - real_windows
                     != TAIL_PADDING_WINDOWS
                 ):
-                    raise RuntimeError("tail 13+51 padding contract changed")
+                    raise RuntimeError("tail 54+10 padding contract changed")
         output_env.sync(True)
     except BaseException:
         output_env.close()
@@ -717,7 +717,7 @@ def main() -> None:
     ):
         shutil.rmtree(temporary, ignore_errors=True)
         raise RuntimeError(
-            "producer did not cover 127309 SHOW-All records exactly once"
+            "producer did not cover 127286 SHOW-All records exactly once"
         )
     final_source = source_receipt(
         args.expected_source_commit,

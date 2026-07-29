@@ -249,16 +249,16 @@ def representation_summary(
         ],
         "source_receipt": representation["source_receipt"],
         "speaker_clip_counts": {
-            "oliver": 3_422,
-            "chemistry": 3_422,
-            "seth": 3_422,
-            "conan": 3_421,
+            "oliver": 5_246,
+            "chemistry": 1_949,
+            "seth": 1_984,
+            "conan": 4_508,
         },
         "speaker_window_counts": {
-            "oliver": 31_828,
-            "chemistry": 31_828,
-            "seth": 31_828,
-            "conan": 31_825,
+            "oliver": 50_285,
+            "chemistry": 14_374,
+            "seth": 19_310,
+            "conan": 43_317,
         },
         "protocol": {
             "split": "train",
@@ -348,10 +348,10 @@ class RawValueContractTests(unittest.TestCase):
             self.assertEqual(actual, digest)
 
     def test_frozen_batch_and_tail_arithmetic(self) -> None:
-        self.assertEqual(contract.FULL_COMPUTE_BATCHES, 1_989)
-        self.assertEqual(contract.TOTAL_COMPUTE_BATCHES, 1_990)
-        self.assertEqual(contract.TAIL_REAL_WINDOWS, 13)
-        self.assertEqual(contract.TAIL_PADDING_WINDOWS, 51)
+        self.assertEqual(contract.FULL_COMPUTE_BATCHES, 1_988)
+        self.assertEqual(contract.TOTAL_COMPUTE_BATCHES, 1_989)
+        self.assertEqual(contract.TAIL_REAL_WINDOWS, 54)
+        self.assertEqual(contract.TAIL_PADDING_WINDOWS, 10)
         self.assertEqual(contract.COMPUTE_ROWS, 4_096)
         self.assertEqual(
             contract.FULL_COMPUTE_BATCHES
@@ -823,16 +823,16 @@ class ReceiptContractTests(unittest.TestCase):
 
     def test_representation_counts_are_bound_to_canonical_train_rows(self) -> None:
         clip_counts = {
-            "oliver": 3_422,
-            "chemistry": 3_422,
-            "seth": 3_422,
-            "conan": 3_421,
+            "oliver": 5_246,
+            "chemistry": 1_949,
+            "seth": 1_984,
+            "conan": 4_508,
         }
         window_counts = {
-            "oliver": 31_828,
-            "chemistry": 31_828,
-            "seth": 31_828,
-            "conan": 31_825,
+            "oliver": 50_285,
+            "chemistry": 14_374,
+            "seth": 19_310,
+            "conan": 43_317,
         }
         summary = {
             "speaker_clip_counts": dict(clip_counts),
@@ -840,7 +840,7 @@ class ReceiptContractTests(unittest.TestCase):
         }
         canonical = {
             "train_clips": 13_687,
-            "train_windows": 127_309,
+            "train_windows": 127_286,
             "train_speaker_clip_counts": dict(clip_counts),
             "train_speaker_window_counts": dict(window_counts),
         }

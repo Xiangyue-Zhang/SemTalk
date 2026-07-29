@@ -76,6 +76,85 @@ def producer_args() -> list[str]:
     ]
 
 
+class FrozenRepresentationLedgerTest(unittest.TestCase):
+    def test_public_loader_window_ledger_is_exact(self) -> None:
+        self.assertEqual(
+            REPRESENTATION.EXPECTED_NON_WHOLE_SECOND_FRAME_LENGTHS,
+            (62, 163, 230),
+        )
+        self.assertEqual(
+            REPRESENTATION.EXPECTED_SPEAKER_CLIP_COUNTS,
+            {
+                "oliver": 5_246,
+                "chemistry": 1_949,
+                "seth": 1_984,
+                "conan": 4_508,
+            },
+        )
+        self.assertEqual(
+            REPRESENTATION.EXPECTED_SPEAKER_WINDOW_COUNTS,
+            {
+                "oliver": 50_285,
+                "chemistry": 14_374,
+                "seth": 19_310,
+                "conan": 43_317,
+            },
+        )
+        self.assertEqual(
+            sum(REPRESENTATION.EXPECTED_SPEAKER_CLIP_COUNTS.values()),
+            13_687,
+        )
+        self.assertEqual(
+            sum(REPRESENTATION.EXPECTED_SPEAKER_WINDOW_COUNTS.values()),
+            127_286,
+        )
+        anomalous_counts = {
+            frames: (
+                REPRESENTATION.window_count_for_frames(
+                    frames,
+                    floor_to_whole_seconds=True,
+                ),
+                REPRESENTATION.window_count_for_frames(
+                    frames,
+                    floor_to_whole_seconds=False,
+                ),
+            )
+            for frames in (62, 163, 230)
+        }
+        self.assertEqual(
+            anomalous_counts,
+            {
+                62: (0, 0),
+                163: (5, 5),
+                230: (8, 9),
+            },
+        )
+        self.assertEqual(REPRESENTATION.EXPECTED_ENTRIES, 127_286)
+        self.assertEqual(REPRESENTATION.EXPECTED_RAW_ENTRIES, 127_287)
+        self.assertEqual(127_286 // 64, 1_988)
+        self.assertEqual(127_286 % 64, 54)
+        self.assertEqual((127_286 + 63) // 64, 1_989)
+        self.assertEqual(64 - (127_286 % 64), 10)
+        self.assertEqual(
+            {
+                "face": 600 * 1_988,
+                "hands": 500 * 1_988,
+                "upper": 500 * 1_988,
+                "lower": 600 * 1_988,
+                "global": 1_700 * 1_988,
+                "base": 400 * 1_988,
+            },
+            {
+                "face": 1_192_800,
+                "hands": 994_000,
+                "upper": 994_000,
+                "lower": 1_192_800,
+                "global": 3_379_600,
+                "base": 795_200,
+            },
+        )
+
+
 class DualSourceCliTest(unittest.TestCase):
     def assert_each_source_root_is_required(
         self,
@@ -132,7 +211,7 @@ class DualSourceCliTest(unittest.TestCase):
                 "--expected-train-clips",
                 "13687",
                 "--expected-entries",
-                "127309",
+                "127286",
                 *producer_args(),
             ],
         )

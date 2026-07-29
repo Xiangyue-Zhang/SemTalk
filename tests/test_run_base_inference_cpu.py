@@ -73,7 +73,7 @@ def lower_target_cache_receipt_fixture(
         "data_mdb_sha256": "b" * 64,
         "lock_mdb_sha256": "c" * 64,
         "entry_aggregate_sha256": "d" * 64,
-        "entries": 127_309,
+        "entries": 127_286,
         "entry_shape": [64, 127, 3],
         "dtype": "<f4",
         "speaker_scope": "All",
@@ -668,7 +668,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             "summary_sha256": summary_sha,
             "lineage_sha256": lineage_sha,
             "data_mdb_sha256": data_sha,
-            "entries": 127_309,
+            "entries": 127_286,
             "train_clips": 13_687,
             "smplx_asset": smplx_asset,
         }
@@ -720,7 +720,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 smplx_asset=smplx_asset,
             )
             trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
-            optimizer_updates = 600 * 1_989
+            optimizer_updates = 600 * 1_988
             payload = FORMAL._model_payload(
                 trainer,
                 formal_stage="face",
@@ -739,8 +739,8 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 "world_size": 1,
                 "epochs": 600,
                 "completed_epochs": 600,
-                "train_samples": 127_309,
-                "updates_per_epoch": 1_989,
+                "train_samples": 127_286,
+                "updates_per_epoch": 1_988,
                 "optimizer_updates": optimizer_updates,
                 "lineage_manifest_sha256": lineage_sha,
                 "config_sha256": config_sha,
@@ -960,7 +960,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             )
             dataset["lower_target_joints_cache"] = cache_receipt
             trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
-            optimizer_updates = 600 * 1_989
+            optimizer_updates = 600 * 1_988
             payload = FORMAL._model_payload(
                 trainer,
                 formal_stage="lower",
@@ -977,8 +977,8 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 "world_size": 1,
                 "epochs": 600,
                 "completed_epochs": 600,
-                "train_samples": 127_309,
-                "updates_per_epoch": 1_989,
+                "train_samples": 127_286,
+                "updates_per_epoch": 1_988,
                 "optimizer_updates": optimizer_updates,
                 "lineage_manifest_sha256": lineage_sha,
                 "config_sha256": config_sha,
@@ -1199,7 +1199,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
         selected_sha: str | None = None
         for index in range(40):
             epoch = (index + 1) * 10
-            updates = epoch * 1_989
+            updates = epoch * 1_988
             audit = FORMAL._base_candidate_audit(
                 epoch=epoch,
                 optimizer_updates=updates,
@@ -1256,7 +1256,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             "sha256": manifest_sha,
             "entries": 40,
             "last_epoch": 400,
-            "last_optimizer_updates": 400 * 1_989,
+            "last_optimizer_updates": 400 * 1_988,
         }
         final_path = root / "semtalk_base_epoch_400.bin"
         final_payload = FORMAL._model_payload(
@@ -1266,7 +1266,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             lineage_sha256=lineage_sha,
             dataset_receipt=dataset,
             source_receipt=source,
-            optimizer_updates=400 * 1_989,
+            optimizer_updates=400 * 1_988,
             candidate_manifest_receipt=manifest_receipt,
         )
         torch.save(final_payload, final_path)
@@ -1277,9 +1277,9 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             "world_size": 1,
             "epochs": 400,
             "completed_epochs": 400,
-            "train_samples": 127_309,
-            "updates_per_epoch": 1_989,
-            "optimizer_updates": 400 * 1_989,
+            "train_samples": 127_286,
+            "updates_per_epoch": 1_988,
+            "optimizer_updates": 400 * 1_988,
             "lineage_manifest_sha256": lineage_sha,
             "config_sha256": config_sha,
             "dataset_receipt": dataset,
@@ -1377,7 +1377,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             fixture = self.build_candidate_fixture(Path(directory))
             unselected = (
                 Path(directory)
-                / FORMAL._candidate_relative_path(20, 20 * 1_989)
+                / FORMAL._candidate_relative_path(20, 20 * 1_988)
             )
             unselected.write_bytes(unselected.read_bytes() + b"tampered")
             with self.assertRaisesRegex(
