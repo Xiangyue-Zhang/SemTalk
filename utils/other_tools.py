@@ -16,7 +16,6 @@ from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 import cv2
 import utils.media
-import utils.fast_render
 
 
 def write_wav_names_to_csv(folder_path, csv_path):
@@ -685,6 +684,7 @@ def render_one_sequence(res_npz_path,
                         use_face_contour=False,
                         use_matplotlib=False,
                         args=None):
+    import utils.fast_render
     import smplx
     import matplotlib.pyplot as plt
     import imageio

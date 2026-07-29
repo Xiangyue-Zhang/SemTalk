@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import ast
 from pathlib import Path
 import tempfile
 import unittest
@@ -186,6 +187,50 @@ class CanonicalAudioMetadataTest(unittest.TestCase):
                         row,
                         "inference",
                     )
+
+
+class OptionalRenderingDependencyTest(unittest.TestCase):
+    def test_fast_render_is_lazy_in_training_utility_modules(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        expected_render_functions = {
+            "utils/other_tools.py": {"render_one_sequence"},
+            "utils/other_tools_hf.py": {
+                "render_one_sequence",
+                "render_one_sequence_no_gt",
+            },
+        }
+        for relative, function_names in expected_render_functions.items():
+            tree = ast.parse(
+                (repository / relative).read_text(encoding="utf-8"),
+                filename=relative,
+            )
+            top_level_fast_render = [
+                node
+                for node in tree.body
+                if isinstance(node, ast.Import)
+                and any(
+                    alias.name == "utils.fast_render"
+                    for alias in node.names
+                )
+            ]
+            self.assertEqual(top_level_fast_render, [], relative)
+            functions = {
+                node.name: node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+            }
+            for function_name in function_names:
+                imports = [
+                    alias.name
+                    for node in ast.walk(functions[function_name])
+                    if isinstance(node, ast.Import)
+                    for alias in node.names
+                ]
+                self.assertIn(
+                    "utils.fast_render",
+                    imports,
+                    f"{relative}:{function_name}",
+                )
 
 
 class VerifiedInputSnapshotTest(unittest.TestCase):
