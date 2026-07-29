@@ -6,8 +6,6 @@ import torch.nn as nn
 from torch.nn.utils import weight_norm
 import torch.nn.functional as F
 
-from .build_vocab import Vocab
-
 class Chomp1d(nn.Module):
     def __init__(self, chomp_size):
         super(Chomp1d, self).__init__()
@@ -236,4 +234,3 @@ class ResBlock_2D(nn.Module):
         out = self.model(x)
         out += residual
         return out
-    

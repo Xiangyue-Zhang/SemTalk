@@ -233,6 +233,29 @@ class OptionalRenderingDependencyTest(unittest.TestCase):
                 )
 
 
+class OptionalTextDependencyTest(unittest.TestCase):
+    def test_core_motion_layers_do_not_import_unused_vocab_stack(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        relative = "models/utils/layer.py"
+        tree = ast.parse(
+            (repository / relative).read_text(encoding="utf-8"),
+            filename=relative,
+        )
+        build_vocab_imports = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "build_vocab"
+        ]
+        self.assertEqual(build_vocab_imports, [])
+        vocab_references = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "Vocab"
+        ]
+        self.assertEqual(vocab_references, [])
+
+
 class VerifiedInputSnapshotTest(unittest.TestCase):
     @staticmethod
     def canonical_payload(frames: int = 8) -> bytes:
