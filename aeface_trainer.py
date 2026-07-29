@@ -19,8 +19,8 @@ from loguru import logger
 import smplx
 
 from utils import config, logger_tools, other_tools, metric
+from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
-from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
@@ -34,6 +34,17 @@ class CustomTrainer(train.BaseTrainer):
     def __init__(self, args):
         super().__init__(args)
         self.joints = self.train_data.joints
+        if getattr(args, "train_only", False):
+            self.smplx = smplx.create(
+                str(smplx_model_dir(self.args)),
+                model_type="smplx",
+                gender="NEUTRAL_2020",
+                use_face_contour=False,
+                num_betas=300,
+                num_expression_coeffs=100,
+                ext="npz",
+                use_pca=False,
+            ).cuda().eval()
         self.tracker = other_tools.EpochTracker(["rec", "vel", "acc", "com", "face", "face_vel", "face_acc", "ver", "ver_vel", "ver_acc"], [False, False, False, False, False, False, False, False, False, False])
         self.rec_loss = get_loss_func("GeodesicLoss")
         self.mse_loss = torch.nn.MSELoss(reduction='mean')
@@ -59,11 +70,14 @@ class CustomTrainer(train.BaseTrainer):
         self.tracker.reset()
         for its, dict_data in enumerate(self.train_loader):
             tar_pose = dict_data["pose"]
-            tar_beta = dict_data["beta"].cuda()
-            tar_trans = dict_data["trans"].cuda()
-            tar_pose = tar_pose.cuda()  
+            tar_beta = dict_data["beta"].cuda(non_blocking=True)
+            tar_trans = dict_data["trans"].cuda(non_blocking=True)
+            tar_pose = tar_pose.cuda(non_blocking=True)
             bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
-            tar_exps = dict_data["facial"].to(self.rank)
+            tar_exps = dict_data["facial"].to(
+                self.rank,
+                non_blocking=True,
+            )
             tar_pose = rc.axis_angle_to_matrix(tar_pose.reshape(bs, n, j, 3))
             tar_pose = rc.matrix_to_rotation_6d(tar_pose).reshape(bs, n, j*6)
             in_tar_pose = torch.cat([tar_pose, tar_exps], -1) # 103
@@ -78,25 +92,25 @@ class CustomTrainer(train.BaseTrainer):
             rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
             tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs, n, j, 6))
             loss_rec = self.rec_loss(rec_pose, tar_pose) * self.args.rec_weight * self.args.rec_pos_weight
-            self.tracker.update_meter("rec", "train", loss_rec.item())
+            self._track_train("rec", loss_rec)
             g_loss_final += loss_rec
             # jaw open 6d vel and acc loss
             velocity_loss =  self.vel_loss(rec_pose[:, 1:] - rec_pose[:, :-1], tar_pose[:, 1:] - tar_pose[:, :-1]) * self.args.rec_weight
             acceleration_loss =  self.vel_loss(rec_pose[:, 2:] + rec_pose[:, :-2] - 2 * rec_pose[:, 1:-1], tar_pose[:, 2:] + tar_pose[:, :-2] - 2 * tar_pose[:, 1:-1]) * self.args.rec_weight
-            self.tracker.update_meter("vel", "train", velocity_loss.item())
-            self.tracker.update_meter("acc", "train", acceleration_loss.item())
+            self._track_train("vel", velocity_loss)
+            self._track_train("acc", acceleration_loss)
             g_loss_final += velocity_loss 
             g_loss_final += acceleration_loss 
             # face parameter l1 loss
             rec_exps = net_out["rec_pose"][:, :, j*6:]
             loss_face = self.mse_loss(rec_exps, tar_exps) * self.args.rec_weight
-            self.tracker.update_meter("face", "train", loss_face.item())
+            self._track_train("face", loss_face)
             g_loss_final += loss_face
             # face parameter l1 vel and acc loss
             face_velocity_loss =  self.vel_loss(rec_exps[:, 1:] - rec_exps[:, :-1], tar_exps[:, 1:] - tar_exps[:, :-1]) * self.args.rec_weight
             face_acceleration_loss =  self.vel_loss(rec_exps[:, 2:] + rec_exps[:, :-2] - 2 * rec_exps[:, 1:-1], tar_exps[:, 2:] + tar_exps[:, :-2] - 2 * tar_exps[:, 1:-1]) * self.args.rec_weight
-            self.tracker.update_meter("face_vel", "train", face_velocity_loss.item())
-            self.tracker.update_meter("face_acc", "train", face_acceleration_loss.item())
+            self._track_train("face_vel", face_velocity_loss)
+            self._track_train("face_acc", face_acceleration_loss)
             g_loss_final += face_velocity_loss
             g_loss_final += face_acceleration_loss
 
@@ -133,13 +147,17 @@ class CustomTrainer(train.BaseTrainer):
                     reye_pose=torch.zeros(bs*n, 3).cuda(),
                 )  
                 vectices_loss = self.mse_loss(vertices_rec['vertices'], vertices_tar['vertices'])
-                self.tracker.update_meter("ver", "train", vectices_loss.item()*self.args.rec_weight * self.args.rec_ver_weight)
+                self._track_train(
+                    "ver",
+                    vectices_loss,
+                    scale=self.args.rec_weight * self.args.rec_ver_weight,
+                )
                 g_loss_final += vectices_loss*self.args.rec_weight*self.args.rec_ver_weight
                 # vertices vel and acc loss
                 vert_velocity_loss =  self.vel_loss(vertices_rec['vertices'][:, 1:] - vertices_rec['vertices'][:, :-1], vertices_tar['vertices'][:, 1:] - vertices_tar['vertices'][:, :-1]) * self.args.rec_weight * self.args.rec_ver_weight
                 vert_acceleration_loss =  self.vel_loss(vertices_rec['vertices'][:, 2:] + vertices_rec['vertices'][:, :-2] - 2 * vertices_rec['vertices'][:, 1:-1], vertices_tar['vertices'][:, 2:] + vertices_tar['vertices'][:, :-2] - 2 * vertices_tar['vertices'][:, 1:-1]) * self.args.rec_weight * self.args.rec_ver_weight
-                self.tracker.update_meter("ver_vel", "train", vert_velocity_loss.item())
-                self.tracker.update_meter("ver_acc", "train", vert_acceleration_loss.item())
+                self._track_train("ver_vel", vert_velocity_loss)
+                self._track_train("ver_acc", vert_acceleration_loss)
                 g_loss_final += vert_velocity_loss
                 g_loss_final += vert_acceleration_loss
             
@@ -147,7 +165,7 @@ class CustomTrainer(train.BaseTrainer):
             if "VQVAE" in self.args.g_name:
                 loss_embedding = net_out["embedding_loss"]
                 g_loss_final += loss_embedding
-                self.tracker.update_meter("com", "train", loss_embedding.item())
+                self._track_train("com", loss_embedding)
             # elif "VAE" in self.args.g_name:
             #     pose_mu, pose_logvar = net_out["pose_mu"], net_out["pose_logvar"] 
             #     KLD = -0.5 * torch.sum(1 + pose_logvar - pose_mu.pow(2) - pose_logvar.exp())
@@ -165,7 +183,7 @@ class CustomTrainer(train.BaseTrainer):
             t_start = time.time()
             mem_cost = torch.cuda.memory_cached() / 1E9
             lr_g = self.opt.param_groups[0]['lr']
-            if its % self.args.log_period == 0:
+            if self._should_log_train(its):
                 self.train_recording(epoch, its, t_data, t_train, mem_cost, lr_g)   
             if self.args.debug:
                 if its == 1: break

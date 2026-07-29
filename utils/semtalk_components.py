@@ -1,34 +1,61 @@
 import numpy as np
+from scipy import linalg
 
-from dataloaders.data_tools import joints_list
 from utils import other_tools
 from utils.project_paths import pretrained_vq_path
+from utils.show_base_joints import formal_joint_context
+
+
+def frechet_distance(samples_a, samples_b, eps=1e-6):
+    """Legacy SemTalk latent FID without importing the text-heavy data_tools."""
+    mu_a = np.mean(samples_a, axis=0)
+    sigma_a = np.cov(samples_a, rowvar=False)
+    mu_b = np.mean(samples_b, axis=0)
+    sigma_b = np.cov(samples_b, rowvar=False)
+    mu_a = np.atleast_1d(mu_a)
+    mu_b = np.atleast_1d(mu_b)
+    sigma_a = np.atleast_2d(sigma_a)
+    sigma_b = np.atleast_2d(sigma_b)
+    assert mu_a.shape == mu_b.shape, (
+        "Training and test mean vectors have different lengths"
+    )
+    assert sigma_a.shape == sigma_b.shape, (
+        "Training and test covariances have different dimensions"
+    )
+    try:
+        difference = mu_a - mu_b
+        covariance_mean, _ = linalg.sqrtm(
+            sigma_a.dot(sigma_b),
+            disp=False,
+        )
+        if not np.isfinite(covariance_mean).all():
+            offset = np.eye(sigma_a.shape[0]) * eps
+            covariance_mean = linalg.sqrtm(
+                (sigma_a + offset).dot(sigma_b + offset)
+            )
+        if np.iscomplexobj(covariance_mean):
+            if not np.allclose(
+                np.diagonal(covariance_mean).imag,
+                0,
+                atol=1e-3,
+            ):
+                raise ValueError(
+                    f"imaginary Fréchet component "
+                    f"{np.max(np.abs(covariance_mean.imag))}"
+                )
+            covariance_mean = covariance_mean.real
+        return (
+            difference.dot(difference)
+            + np.trace(sigma_a)
+            + np.trace(sigma_b)
+            - 2 * np.trace(covariance_mean)
+        )
+    except ValueError:
+        return 1e10
 
 
 def build_semtalk_joint_context(ori_joints_name: str):
-    ori_joint_list = joints_list[ori_joints_name]
-    target_joint_sets = {
-        "face": joints_list["beat_smplx_face"],
-        "upper": joints_list["beat_smplx_upper"],
-        "hands": joints_list["beat_smplx_hands"],
-        "lower": joints_list["beat_smplx_lower"],
-    }
-
-    masks = {}
-    for key, joint_names in target_joint_sets.items():
-        mask = np.zeros(len(list(ori_joint_list.keys())) * 3)
-        for joint_name in joint_names:
-            start = ori_joint_list[joint_name][1] - ori_joint_list[joint_name][0]
-            end = ori_joint_list[joint_name][1]
-            mask[start:end] = 1
-        masks[key] = mask
-
-    return {
-        "ori_joint_list": ori_joint_list,
-        "target_joint_sets": target_joint_sets,
-        "masks": masks,
-        "joints": 55,
-    }
+    return formal_joint_context(ori_joints_name)
 
 
 def load_pretrained_vq_suite(args, device, checkpoint_tag, include_global_motion=False):

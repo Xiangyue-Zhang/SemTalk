@@ -10,7 +10,6 @@ import pickle
 import numpy as np
 import torch
 import torch.nn as nn
-from dataloaders.build_vocab import Vocab
 # from .utils.layer import BasicBlock
 try:
     from .motion_encoder import *

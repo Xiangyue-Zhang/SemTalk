@@ -18,12 +18,13 @@ from pathlib import Path
 from loguru import logger
 import smplx
 from torch.utils.tensorboard import SummaryWriter
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import matplotlib.pyplot as plt
 from utils import config, logger_tools, other_tools, metric
 from utils.project_paths import configure_runtime_env, smplx_model_dir
-from dataloaders import data_tools
-from dataloaders.build_vocab import Vocab
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
@@ -45,6 +46,8 @@ def _load_model_checkpoint_or_fail(model, load_ckpt: str, load_name: str = "semt
 class BaseTrainer(object):
     def __init__(self, args):
         self.args = args
+        self._formal_train_metric_sums = {}
+        self._formal_train_metric_counts = {}
         self.rank = dist.get_rank()
         if args.ddp:
             # DDP 模式下 rank 对应 GPU id
@@ -57,6 +60,8 @@ class BaseTrainer(object):
             if self.args.stat == "ts":
                 self.writer = SummaryWriter(log_dir=args.out_path + "custom/" + args.name + args.notes + "/")
             else:
+                if wandb is None:
+                    raise RuntimeError("wandb logging requested, but wandb is not installed")
                 wandb.init(project=args.project, dir=args.out_path, name=args.name[12:] + args.notes)
                 wandb.config.update(args)
                 self.writer = None 
@@ -68,16 +73,16 @@ class BaseTrainer(object):
         self.train_loader = torch.utils.data.DataLoader(
             self.train_data, 
             batch_size=args.batch_size,  
-            shuffle=True if args.ddp else True,  
+            shuffle=False if args.ddp else True,
             num_workers=args.loader_workers,
             drop_last=True,
-
+            pin_memory=bool(getattr(args, "train_only", False)),
             sampler=torch.utils.data.distributed.DistributedSampler(self.train_data) if args.ddp else None, 
         )
         self.train_length = len(self.train_loader)
         logger.info(f"Init train dataloader success")
        
-        if self.rank == 0:
+        if self.rank == 0 and not getattr(args, "skip_test_init", False):
             if args.train_rvq:
                 self.test_data = __import__(f"dataloaders.{args.dataset}", fromlist=["something"]).CustomDataset(args, "test")
             else:
@@ -124,7 +129,7 @@ class BaseTrainer(object):
             self.opt_d = create_optimizer(args, self.d_model, lr_weight=args.d_lr_weight)
             self.opt_d_s = create_scheduler(args, self.opt_d)
            
-        if args.e_name is not None:
+        if args.e_name is not None and not getattr(args, "train_only", False):
             """
             bugs on DDP training using eval_model, using additional eval_copy for evaluation 
             """
@@ -152,21 +157,77 @@ class BaseTrainer(object):
                     wandb.watch(self.eval_model) 
         self.opt = create_optimizer(args, self.model)
         self.opt_s = create_scheduler(args, self.opt)
-        self.smplx = smplx.create(
-            str(smplx_model_dir(self.args)),
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).to(self.rank).eval()
-        self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
-        self.align_mask = 60
-        self.l1_calculator = metric.L1div() if self.rank == 0 else None
+        if not getattr(args, "train_only", False):
+            self.smplx = smplx.create(
+                str(smplx_model_dir(self.args)),
+                model_type='smplx',
+                gender='NEUTRAL_2020',
+                use_face_contour=False,
+                num_betas=300,
+                num_expression_coeffs=100,
+                ext='npz',
+                use_pca=False,
+            ).to(self.rank).eval()
+            self.alignmenter = metric.alignment(
+                0.3,
+                7,
+                self.train_data.avg_vel,
+                upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21],
+            ) if self.rank == 0 else None
+            self.align_mask = 60
+            self.l1_calculator = metric.L1div() if self.rank == 0 else None
        
     
+    def _track_train(self, name, value, scale=1.0):
+        """Accumulate formal train-only metrics without a per-step D2H sync."""
+        if not getattr(self.args, "train_only", False):
+            if torch.is_tensor(value):
+                value = float(value.detach().item())
+            self.tracker.update_meter(
+                name,
+                "train",
+                float(value) * float(scale),
+            )
+            return
+        if not torch.is_tensor(value) or value.numel() != 1:
+            raise RuntimeError(
+                f"formal training metric {name!r} must be a scalar tensor"
+            )
+        detached = value.detach().to(device=self.device, dtype=torch.float64)
+        if name not in self._formal_train_metric_sums:
+            self._formal_train_metric_sums[name] = detached.clone().mul_(
+                float(scale)
+            )
+            self._formal_train_metric_counts[name] = 1
+        else:
+            self._formal_train_metric_sums[name].add_(
+                detached,
+                alpha=float(scale),
+            )
+            self._formal_train_metric_counts[name] += 1
+
+    def _flush_train_metrics(self):
+        if not self._formal_train_metric_sums:
+            return
+        for name, total in self._formal_train_metric_sums.items():
+            count = int(self._formal_train_metric_counts[name])
+            chunk_average = float((total / count).item())
+            self.tracker.loss_meters[name]["train"].update(
+                chunk_average,
+                n=count,
+            )
+        self._formal_train_metric_sums.clear()
+        self._formal_train_metric_counts.clear()
+
+    def _should_log_train(self, iteration):
+        if getattr(self.args, "train_only", False):
+            completed = int(iteration) + 1
+            return (
+                completed == self.train_length
+                or completed % int(self.args.log_period) == 0
+            )
+        return int(iteration) % int(self.args.log_period) == 0
+
     def inverse_selection(self, filtered_t, selection_array, n):
         original_shape_t = np.zeros((n, selection_array.size))
         selected_indices = np.where(selection_array == 1)[0]
@@ -208,6 +269,7 @@ class BaseTrainer(object):
         return original_shape_t
 
     def train_recording(self, epoch, its, t_data, t_train, mem_cost, lr_g, lr_d=None):
+        self._flush_train_metrics()
         pstr = "[%03d][%03d/%03d]  "%(epoch, its, self.train_length)
         for name, states in self.tracker.loss_meters.items():
             metric = states['train']

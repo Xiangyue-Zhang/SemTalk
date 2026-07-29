@@ -49,9 +49,19 @@ def set_args_and_logger(args, rank):
         if not os.path.exists(args_name_dir): os.makedirs(args_name_dir)
         args_name = args_name_dir + "/" + args.name +".yaml"
         if os.path.exists(args_name):
-            s_add = 10
-            logger.warning(f"Already exist args, add {s_add} to ran_seed to continue training")
-            args.random_seed += s_add
+            if getattr(args, "train_only", False):
+                if not getattr(args, "resume_state", ""):
+                    raise FileExistsError(
+                        f"strict train-only run already exists: {args_name_dir}"
+                    )
+                logger.info(
+                    "Strict train-only resume keeps the original random seed "
+                    f"and existing args file: {args_name}"
+                )
+            else:
+                s_add = 10
+                logger.warning(f"Already exist args, add {s_add} to ran_seed to continue training")
+                args.random_seed += s_add
         else:
             with open(args_name, "w+") as f:
                 yaml.dump(args.__dict__, f, default_flow_style=True)

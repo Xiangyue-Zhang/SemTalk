@@ -21,7 +21,6 @@ import smplx
 from utils import config, logger_tools, other_tools, metric
 from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
-from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
@@ -86,9 +85,9 @@ class CustomTrainer(train.BaseTrainer):
         self.tracker.reset()
         for its, dict_data in enumerate(self.train_loader):
             tar_pose = dict_data["pose"]
-            tar_beta = dict_data["beta"].cuda()
-            tar_trans = dict_data["trans"].cuda()
-            tar_pose = tar_pose.cuda()  
+            tar_beta = dict_data["beta"].cuda(non_blocking=True)
+            tar_trans = dict_data["trans"].cuda(non_blocking=True)
+            tar_pose = tar_pose.cuda(non_blocking=True)
             bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
             tar_exps = torch.zeros((bs, n, 100)).cuda()
             tar_pose = rc.axis_angle_to_matrix(tar_pose.reshape(bs, n, j, 3))
@@ -103,13 +102,13 @@ class CustomTrainer(train.BaseTrainer):
             rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
             tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs, n, j, 6))
             loss_rec = self.rec_loss(rec_pose, tar_pose) * self.args.rec_weight * self.args.rec_pos_weight
-            self.tracker.update_meter("rec", "train", loss_rec.item())
+            self._track_train("rec", loss_rec)
             g_loss_final += loss_rec
 
             velocity_loss =  self.vel_loss(rec_pose[:, 1:] - rec_pose[:, :-1], tar_pose[:, 1:] - tar_pose[:, :-1]) * self.args.rec_weight
             acceleration_loss =  self.vel_loss(rec_pose[:, 2:] + rec_pose[:, :-2] - 2 * rec_pose[:, 1:-1], tar_pose[:, 2:] + tar_pose[:, :-2] - 2 * tar_pose[:, 1:-1]) * self.args.rec_weight
-            self.tracker.update_meter("vel", "train", velocity_loss.item())
-            self.tracker.update_meter("acc", "train", acceleration_loss.item())
+            self._track_train("vel", velocity_loss)
+            self._track_train("acc", acceleration_loss)
             g_loss_final += velocity_loss 
             g_loss_final += acceleration_loss 
              # vertices loss
@@ -147,7 +146,11 @@ class CustomTrainer(train.BaseTrainer):
                     reye_pose=tar_pose[:, 72:75],
                 )  
                 vectices_loss = self.vectices_loss(vertices_rec['vertices'], vertices_tar['vertices'])
-                self.tracker.update_meter("ver", "train", vectices_loss.item()*self.args.rec_weight * self.args.rec_ver_weight)
+                self._track_train(
+                    "ver",
+                    vectices_loss,
+                    scale=self.args.rec_weight * self.args.rec_ver_weight,
+                )
                 g_loss_final += vectices_loss*self.args.rec_weight*self.args.rec_ver_weight
 
                 vertices_vel_loss = self.vel_loss(vertices_rec['vertices'][:, 1:] - vertices_rec['vertices'][:, :-1], vertices_tar['vertices'][:, 1:] - vertices_tar['vertices'][:, :-1]) * self.args.rec_weight
@@ -171,7 +174,7 @@ class CustomTrainer(train.BaseTrainer):
             if "VQVAE" in self.args.g_name:
                 loss_embedding = net_out["embedding_loss"]
                 g_loss_final += loss_embedding
-                self.tracker.update_meter("com", "train", loss_embedding.item())
+                self._track_train("com", loss_embedding)
             # elif "VAE" in self.args.g_name:
             #     pose_mu, pose_logvar = net_out["pose_mu"], net_out["pose_logvar"] 
             #     KLD = -0.5 * torch.sum(1 + pose_logvar - pose_mu.pow(2) - pose_logvar.exp())
@@ -189,7 +192,7 @@ class CustomTrainer(train.BaseTrainer):
             t_start = time.time()
             mem_cost = torch.cuda.memory_cached() / 1E9
             lr_g = self.opt.param_groups[0]['lr']
-            if its % self.args.log_period == 0:
+            if self._should_log_train(its):
                 self.train_recording(epoch, its, t_data, t_train, mem_cost, lr_g)   
             if self.args.debug:
                 if its == 1: break

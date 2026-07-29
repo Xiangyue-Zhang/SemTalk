@@ -17,12 +17,14 @@ from loguru import logger
 from utils import rotation_conversions as rc
 import smplx
 from utils import config, logger_tools, other_tools, metric, data_transfer
-from utils.semtalk_components import build_semtalk_joint_context, load_pretrained_vq_suite
-from dataloaders import data_tools
+from utils.semtalk_components import (
+    build_semtalk_joint_context,
+    frechet_distance,
+    load_pretrained_vq_suite,
+)
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
-from dataloaders.data_tools import joints_list
 import librosa
 
 class CustomTrainer(train.BaseTrainer):
@@ -44,12 +46,18 @@ class CustomTrainer(train.BaseTrainer):
         self.joints = joint_context["joints"]
 
         self.tracker = other_tools.EpochTracker([ "hubert_cons","beat_cons","acc_face", "acc_hands", "acc_upper", "acc_lower", "fid", "l1div", "bc", "rec", "trans", "vel", "transv", 'dis', 'gen', 'acc', 'transa', 'exp', 'lvd', 'mse', "cls", "rec_face", "latent", "cls_full", "cls_self", "cls_word", "latent_word","latent_self"], [False,True,True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False,False,False,False,  False,False,False,False,False,False])
-        vq_suite = load_pretrained_vq_suite(self.args, self.rank, args.e_name, include_global_motion=True)
-        self.vq_model_face = vq_suite["face"]
-        self.vq_model_upper = vq_suite["upper"]
-        self.vq_model_hands = vq_suite["hands"]
-        self.vq_model_lower = vq_suite["lower"]
-        self.global_motion = vq_suite["global_motion"]
+        if not getattr(args, "train_only", False):
+            vq_suite = load_pretrained_vq_suite(
+                self.args,
+                self.rank,
+                args.e_name,
+                include_global_motion=True,
+            )
+            self.vq_model_face = vq_suite["face"]
+            self.vq_model_upper = vq_suite["upper"]
+            self.vq_model_hands = vq_suite["hands"]
+            self.vq_model_lower = vq_suite["lower"]
+            self.global_motion = vq_suite["global_motion"]
 
         self.args.vae_test_dim = 330
         self.args.vae_layer = 4
@@ -115,7 +123,7 @@ class CustomTrainer(train.BaseTrainer):
         loss_latent_hands = self.reclatent_loss(net_out_val["rec_hands"], loaded_data["zq_hands"])
         loss_latent_upper = self.reclatent_loss(net_out_val["rec_upper"], loaded_data["zq_upper"])
         loss_latent = self.args.lf*loss_latent_face + self.args.ll*loss_latent_lower + self.args.lh*loss_latent_hands + self.args.lu*loss_latent_upper
-        self.tracker.update_meter("latent", "train", loss_latent.item())
+        self._track_train("latent", loss_latent)
         g_loss_final += loss_latent/6
         
         
@@ -123,8 +131,8 @@ class CustomTrainer(train.BaseTrainer):
 
         ##### cons loss #####
         g_loss_final += net_out_val["hubert_cons_loss"] + net_out_val["beat_cons_loss"]
-        self.tracker.update_meter("hubert_cons", "train", net_out_val["hubert_cons_loss"].item())
-        self.tracker.update_meter("beat_cons", "train", net_out_val["beat_cons_loss"].item())
+        self._track_train("hubert_cons", net_out_val["hubert_cons_loss"])
+        self._track_train("beat_cons", net_out_val["beat_cons_loss"])
 
         loss_cls = 0
         tar_index_value_face_top = loaded_data["tar_index_value_face_top"].reshape(-1,6)
@@ -142,7 +150,7 @@ class CustomTrainer(train.BaseTrainer):
                 + self.args.cl*self.cls_loss(rec_index_lower_val, tar_index_value_lower_top[:,i])\
                 + self.args.ch*self.cls_loss(rec_index_hands_val, tar_index_value_hands_top[:,i])
             loss_cls = loss_cls + loss_cls_i/(i+1)
-        self.tracker.update_meter("cls_full", "train", loss_cls.item())
+        self._track_train("cls_full", loss_cls)
         g_loss_final += loss_cls 
         
         if mode == 'train':
@@ -163,7 +171,7 @@ class CustomTrainer(train.BaseTrainer):
             loss_latent_hands_self = self.reclatent_loss(net_out_self["rec_hands"], loaded_data["zq_hands"])
             loss_latent_upper_self = self.reclatent_loss(net_out_self["rec_upper"], loaded_data["zq_upper"])
             loss_latent_self = self.args.lf*loss_latent_face_self + self.args.ll*loss_latent_lower_self + self.args.lh*loss_latent_hands_self + self.args.lu*loss_latent_upper_self
-            self.tracker.update_meter("latent_self", "train", loss_latent_self.item())
+            self._track_train("latent_self", loss_latent_self)
             g_loss_final += loss_latent_self/6
             index_loss_top_self = 0 
             for j in range(6):
@@ -174,7 +182,7 @@ class CustomTrainer(train.BaseTrainer):
                 index_loss_top_self_i = self.cls_loss(rec_index_face_self, tar_index_value_face_top[:,i]) + self.cls_loss(rec_index_upper_self, tar_index_value_upper_top[:,i]) + self.cls_loss(rec_index_lower_self, tar_index_value_lower_top[:,i]) + self.cls_loss(rec_index_hands_self, tar_index_value_hands_top[:,i])                
                 index_loss_top_self = index_loss_top_self + index_loss_top_self_i/(i+1)
 
-            self.tracker.update_meter("cls_self", "train", index_loss_top_self.item())
+            self._track_train("cls_self", index_loss_top_self)
             g_loss_final += index_loss_top_self
             
             # ------ masked audio gesture moderling ------ #
@@ -188,7 +196,7 @@ class CustomTrainer(train.BaseTrainer):
             loss_latent_hands_word = self.reclatent_loss(net_out_word["rec_hands"], loaded_data["zq_hands"])
             loss_latent_upper_word = self.reclatent_loss(net_out_word["rec_upper"], loaded_data["zq_upper"])
             loss_latent_word = self.args.lf*loss_latent_face_word + self.args.ll*loss_latent_lower_word + self.args.lh*loss_latent_hands_word + self.args.lu*loss_latent_upper_word
-            self.tracker.update_meter("latent_word", "train", loss_latent_word.item())
+            self._track_train("latent_word", loss_latent_word)
             g_loss_final += loss_latent_word/6
             index_loss_top_word = 0
             for i in range(6):
@@ -199,7 +207,7 @@ class CustomTrainer(train.BaseTrainer):
                 index_loss_top_word_i = self.cls_loss(rec_index_face_word, tar_index_value_face_top[:, i]) + self.cls_loss(rec_index_upper_word, tar_index_value_upper_top[:, i]) + self.cls_loss(rec_index_lower_word, tar_index_value_lower_top[:, i]) + self.cls_loss(rec_index_hands_word, tar_index_value_hands_top[:, i])
                 index_loss_top_word = index_loss_top_word + index_loss_top_word_i/(i+1)
 
-            self.tracker.update_meter("cls_word", "train", index_loss_top_word.item())
+            self._track_train("cls_word", index_loss_top_word)
             g_loss_final += index_loss_top_word
 
         if mode == 'train':
@@ -426,7 +434,7 @@ class CustomTrainer(train.BaseTrainer):
             t_train = time.time() - t_start - t_data
             t_start = time.time()
 
-            if its % self.args.log_period == 0:
+            if self._should_log_train(its):
                 self.train_recording(epoch, its, t_data, t_train, mem_cost, lr_g)   
             if self.args.debug:
                 if its == 1: break
@@ -570,7 +578,7 @@ class CustomTrainer(train.BaseTrainer):
 
         latent_out_all = np.concatenate(latent_out, axis=0)
         latent_ori_all = np.concatenate(latent_ori, axis=0)
-        fid = data_tools.FIDCalculator.frechet_distance(latent_out_all, latent_ori_all)
+        fid = frechet_distance(latent_out_all, latent_ori_all)
         logger.info(f"fid score: {fid}")
         self.test_recording("fid", fid, epoch) 
         

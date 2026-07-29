@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import io
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+import numpy as np
+
+
+MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "show_base"
+    / "run_base_inference.py"
+)
+SPEC = importlib.util.spec_from_file_location(
+    "run_base_inference_under_test",
+    MODULE_PATH,
+)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+
+BUILDER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "show_base"
+    / "build_base_features.py"
+)
+BUILDER_SPEC = importlib.util.spec_from_file_location(
+    "build_base_features_under_test",
+    BUILDER_PATH,
+)
+assert BUILDER_SPEC is not None and BUILDER_SPEC.loader is not None
+BUILDER = importlib.util.module_from_spec(BUILDER_SPEC)
+BUILDER_SPEC.loader.exec_module(BUILDER)
+
+
+class OutputNpzValidationTest(unittest.TestCase):
+    def arrays(self, *, frames: int = 88) -> dict[str, np.ndarray]:
+        return MODULE._output_arrays(
+            betas=np.zeros((MODULE.BETA_DIM,), dtype=np.float32),
+            poses=np.zeros((frames, MODULE.POSE_DIM), dtype=np.float32),
+            expressions=np.zeros(
+                (frames, MODULE.EXPRESSION_DIM),
+                dtype=np.float32,
+            ),
+            trans=np.zeros((frames, 3), dtype=np.float32),
+        )
+
+    def test_valid_prediction_reopens_with_exact_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "res_clip.npz"
+            path.write_bytes(MODULE.deterministic_npz_bytes(self.arrays()))
+            arrays = MODULE._load_and_validate_output_npz(
+                path,
+                frames=88,
+                prediction=True,
+            )
+            self.assertEqual(tuple(arrays), MODULE.OUTPUT_FIELDS)
+
+    def test_prediction_rejects_nonzero_eye_pose(self) -> None:
+        arrays = self.arrays()
+        arrays["poses"][0, 69] = np.float32(1.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "res_clip.npz"
+            path.write_bytes(MODULE.deterministic_npz_bytes(arrays))
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._load_and_validate_output_npz(
+                    path,
+                    frames=88,
+                    prediction=True,
+                )
+
+    def test_output_rejects_wrong_float_dtype(self) -> None:
+        arrays = self.arrays()
+        arrays["poses"] = arrays["poses"].astype(np.float64)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gt_clip.npz"
+            path.write_bytes(MODULE.deterministic_npz_bytes(arrays))
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._load_and_validate_output_npz(
+                    path,
+                    frames=88,
+                    prediction=False,
+                )
+
+
+class PublicationPrimitiveTest(unittest.TestCase):
+    def test_copy_is_fsynced_independent_inode(self) -> None:
+        payload = b"frozen-shard-output" * 1024
+        expected_sha = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            destination = root / "destination.npz"
+            source.write_bytes(payload)
+            receipt = MODULE._copy_file_fsync_new(
+                source,
+                destination,
+                expected_sha256=expected_sha,
+                expected_bytes=len(payload),
+            )
+            self.assertEqual(receipt["sha256"], expected_sha)
+            self.assertNotEqual(
+                (source.stat().st_dev, source.stat().st_ino),
+                (destination.stat().st_dev, destination.stat().st_ino),
+            )
+            source.write_bytes(b"changed")
+            self.assertEqual(destination.read_bytes(), payload)
+
+    def test_finalize_lock_is_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            with MODULE._finalize_lock(output_root):
+                with self.assertRaises(MODULE.InferenceContractError):
+                    with MODULE._finalize_lock(output_root):
+                        pass
+
+
+class CrossStageReceiptTest(unittest.TestCase):
+    def test_audio_contract_hash_matches_inference_canonical_json(self) -> None:
+        payload = {
+            "format": "semtalk_show_audio_lineage_contract_v1",
+            "nested": {"speaker_map": {"oliver": 0, "conan": 3}},
+            "values": [1, 2, 3],
+        }
+        self.assertEqual(
+            BUILDER.canonical_file_payload_sha256(payload),
+            MODULE.canonical_json_sha256(payload),
+        )
+
+    def test_training_receipt_hash_matches_inference_compact_json(self) -> None:
+        payload = {
+            "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "entrypoint": "/immutable/show_base_train.py",
+        }
+        self.assertEqual(
+            BUILDER.compact_payload_sha256(payload),
+            MODULE.compact_json_sha256(payload),
+        )
+
+
+class VerifiedInputSnapshotTest(unittest.TestCase):
+    @staticmethod
+    def canonical_payload(frames: int = 8) -> bytes:
+        arrays = {
+            "pose": np.zeros((frames, 165), dtype=np.float32),
+            "contact": np.zeros((frames, 4), dtype=np.float32),
+            "facial": np.zeros((frames, 100), dtype=np.float32),
+            "beta": np.zeros((frames, 300), dtype=np.float32),
+            "trans": np.zeros((frames, 3), dtype=np.float32),
+            "speaker_id": np.zeros((frames, 1), dtype=np.int64),
+        }
+        with io.BytesIO() as handle:
+            np.savez(handle, **arrays)
+            return handle.getvalue()
+
+    def test_canonical_decode_uses_the_verified_byte_snapshot(self) -> None:
+        payload = self.canonical_payload()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "canonical.npz"
+            path.write_bytes(payload)
+            row = {
+                "canonical_npz": str(path),
+                "canonical_npz_sha256": hashlib.sha256(payload).hexdigest(),
+                "frames": 8,
+            }
+            original_read_bytes = Path.read_bytes
+
+            def read_then_replace(target: Path) -> bytes:
+                observed = original_read_bytes(target)
+                target.write_bytes(b"changed-after-the-single-read")
+                return observed
+
+            with mock.patch.object(
+                Path,
+                "read_bytes",
+                new=read_then_replace,
+            ):
+                arrays, frames = BUILDER.load_canonical_clip(row)
+            self.assertEqual(frames, 8)
+            self.assertEqual(arrays["pose"].shape, (8, 165))
+            self.assertEqual(
+                path.read_bytes(),
+                b"changed-after-the-single-read",
+            )
+
+    def test_manifest_symlink_is_rejected_before_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "manifest.jsonl"
+            target.write_text("{}\n")
+            symlink = root / "manifest-link.jsonl"
+            symlink.symlink_to(target)
+            with self.assertRaises(RuntimeError):
+                BUILDER.load_jsonl([symlink])
+
+
+if __name__ == "__main__":
+    unittest.main()

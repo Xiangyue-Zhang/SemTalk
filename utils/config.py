@@ -53,6 +53,24 @@ def parse_args():
     parser.add("--local-rank", type=int, help="local rank, will passed by ddp")
     parser.add("--num_workers", type=int, default="16")
     parser.add("--resume", type=str, default="")
+    parser.add("--resume_state", type=str, default="")
+    parser.add("--run_name", type=str, default=None)
+    parser.add("--formal_stage", type=str, default=None)
+    parser.add("--train_only", default=False, type=str2bool)
+    parser.add("--skip_test_init", default=False, type=str2bool)
+    parser.add("--save_every", default=0, type=int)
+    parser.add("--final_ckpt_name", default=None, type=str)
+    parser.add("--lineage_manifest", default=None, type=str)
+    parser.add("--dataset_summary", default=None, type=str)
+    parser.add("--global_fastpath_parity_bundle", default=None, type=str)
+    parser.add(
+        "--expected_global_fastpath_parity_sha256",
+        default=None,
+        type=str,
+    )
+    parser.add("--expected_train_samples", default=0, type=int)
+    parser.add("--expected_updates_per_epoch", default=0, type=int)
+    parser.add("--strict_finite", default=True, type=str2bool)
     parser.add("--lr", type=float, default="0.0001")
     parser.add("--sched_step", type=int, default="3000")
 
@@ -317,7 +335,9 @@ def parse_args():
     
     is_train = args.is_train
 
-    if is_train:
+    if args.run_name:
+        args.name = args.run_name
+    elif is_train:
         time_local = time.localtime()
         name_expend = "%02d%02d_%02d%02d%02d_"%(time_local[1], time_local[2],time_local[3], time_local[4], time_local[5])
         args.name = name_expend + args.name

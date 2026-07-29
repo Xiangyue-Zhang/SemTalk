@@ -21,11 +21,66 @@ import smplx
 from utils import config, logger_tools, other_tools, metric
 from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
-from dataloaders import data_tools
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
 from scipy.spatial.transform import Rotation
+
+
+GLOBAL_FOOT_FIELD = "lower_foot_local"
+GLOBAL_FOOT_FASTPATH_ENV = "SEMTALK_SHOW_GLOBAL_FOOT_FASTPATH"
+
+
+def global_foot_fastpath_losses(
+    rec_xyz_trans,
+    tar_trans,
+    lower_foot_local,
+    model_contact,
+    *,
+    mse_loss,
+    foot_loss_fn,
+):
+    """Algebraic equivalent of the Global trainer's two SMPL-X forwards.
+
+    ``lower_foot_local`` is SMPL-X J[7,8,10,11] evaluated with the exact
+    lower-only trainer pose, zero expression, and zero translation.
+    """
+
+    expected = (*rec_xyz_trans.shape[:2], 4, 3)
+    if tuple(lower_foot_local.shape) != expected:
+        raise RuntimeError(
+            f"{GLOBAL_FOOT_FIELD} has shape {tuple(lower_foot_local.shape)}, "
+            f"expected {expected}"
+        )
+    if lower_foot_local.dtype != rec_xyz_trans.dtype:
+        raise RuntimeError(
+            f"{GLOBAL_FOOT_FIELD} dtype {lower_foot_local.dtype} does not "
+            f"match translation dtype {rec_xyz_trans.dtype}"
+        )
+    if lower_foot_local.device != rec_xyz_trans.device:
+        raise RuntimeError(f"{GLOBAL_FOOT_FIELD} must be on the training device")
+    if not torch.isfinite(lower_foot_local).all():
+        raise RuntimeError(f"{GLOBAL_FOOT_FIELD} contains non-finite values")
+
+    # V_rec = V0 + rec_trans and V_tar = V0 + tar_trans, repeated over every
+    # vertex.  Their mean vertex MSE is exactly the translation MSE.
+    vertices_loss = mse_loss(rec_xyz_trans, tar_trans)
+
+    # The legacy tensors have shape [B*T, vertices, 3] and incorrectly
+    # difference dimension 1 (vertex index, not time).  Translation cancels
+    # algebraically, so preserve those two existing objectives as graph-linked
+    # zeros rather than silently "fixing" their axis.
+    graph_zero = rec_xyz_trans.sum() * 0.0
+    vertices_vel_loss = graph_zero
+    vertices_acc_loss = graph_zero
+
+    model_feet = lower_foot_local + rec_xyz_trans.unsqueeze(2)
+    model_foot_v = torch.zeros_like(model_feet)
+    model_foot_v[:, :-1] = model_feet[:, 1:] - model_feet[:, :-1]
+    static_idx = model_contact > 0.95
+    model_foot_v[~static_idx] = 0
+    foot_loss = foot_loss_fn(model_foot_v, torch.zeros_like(model_foot_v))
+    return vertices_loss, vertices_vel_loss, vertices_acc_loss, foot_loss
 
 
 class CustomTrainer(train.BaseTrainer):
@@ -35,16 +90,37 @@ class CustomTrainer(train.BaseTrainer):
     def __init__(self, args):
         super().__init__(args)
         self.joints = self.train_data.joints
-        self.smplx = smplx.create(
-            str(smplx_model_dir(self.args)),
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).cuda().eval()
+        raw_fastpath = os.environ.get(GLOBAL_FOOT_FASTPATH_ENV, "0")
+        if raw_fastpath not in {"0", "1"}:
+            raise RuntimeError(
+                f"{GLOBAL_FOOT_FASTPATH_ENV} must be exactly 0 or 1"
+            )
+        self.global_foot_fastpath = raw_fastpath == "1"
+        if self.global_foot_fastpath:
+            if getattr(args, "formal_stage", None) != "global":
+                raise RuntimeError(
+                    "Global foot fastpath is restricted to formal_stage=global"
+                )
+            if not getattr(self.train_data, "global_foot_fastpath", False):
+                raise RuntimeError(
+                    "dataset did not activate the Global foot fastpath contract"
+                )
+            self.smplx = None
+            logger.info(
+                "Global VAE formal SMPL-X-free fastpath enabled by "
+                f"{GLOBAL_FOOT_FASTPATH_ENV}=1"
+            )
+        else:
+            self.smplx = smplx.create(
+                str(smplx_model_dir(self.args)),
+                model_type='smplx',
+                gender='NEUTRAL_2020',
+                use_face_contour=False,
+                num_betas=300,
+                num_expression_coeffs=100,
+                ext='npz',
+                use_pca=False,
+            ).cuda().eval()
         self.tracker = other_tools.EpochTracker(["rec", "contact", "vel", "foot", "ver", "com", "kl", "acc", "trans", "transv"], [False,False, False, False, False, False, False, False, False, False])
         if not self.args.rot6d: #"rot6d" not in args.pose_rep:
             logger.error(f"this script is for rot6d, your pose rep. is {args.pose_rep}")
@@ -86,14 +162,24 @@ class CustomTrainer(train.BaseTrainer):
         self.tracker.reset()
         for its, dict_data in enumerate(self.train_loader):
             tar_pose_raw = dict_data["pose"]
-            tar_beta = dict_data["beta"].cuda()
-            tar_trans = dict_data["trans"].cuda()
+            tar_beta = (
+                None
+                if self.global_foot_fastpath
+                else dict_data["beta"].cuda(non_blocking=True)
+            )
+            tar_trans = dict_data["trans"].cuda(non_blocking=True)
             tar_trans_vel_x = other_tools.estimate_linear_velocity(tar_trans[:, :, 0:1], dt=1/self.args.pose_fps)
             tar_trans_vel_z = other_tools.estimate_linear_velocity(tar_trans[:, :, 2:3], dt=1/self.args.pose_fps)
-            tar_pose = tar_pose_raw[:, :, :27].cuda() 
-            tar_contact = tar_pose_raw[:, :, 27:31].cuda() 
+            tar_pose = tar_pose_raw[:, :, :27].cuda(non_blocking=True)
+            tar_contact = tar_pose_raw[:, :, 27:31].cuda(
+                non_blocking=True
+            )
             bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
-            tar_exps = torch.zeros((bs, n, 100)).cuda()
+            tar_exps = (
+                None
+                if self.global_foot_fastpath
+                else torch.zeros((bs, n, 100)).cuda()
+            )
             tar_pose = rc.axis_angle_to_matrix(tar_pose.reshape(bs, n, j, 3))
             tar_pose = rc.matrix_to_rotation_6d(tar_pose).reshape(bs, n, j*6)
             tar_trans_copy = tar_trans-tar_trans
@@ -105,17 +191,20 @@ class CustomTrainer(train.BaseTrainer):
             self.opt.zero_grad()
             g_loss_final = 0
             net_out = self.model(in_tar_pose)
-            rec_pose = tar_pose#net_out["rec_pose"][:, :, :j*6]
-            rec_pose = rec_pose.reshape(bs, n, j, 6)
-            rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
-            tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs, n, j, 6))
+            if not self.global_foot_fastpath:
+                rec_pose = tar_pose#net_out["rec_pose"][:, :, :j*6]
+                rec_pose = rec_pose.reshape(bs, n, j, 6)
+                rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
+                tar_pose = rc.rotation_6d_to_matrix(
+                    tar_pose.reshape(bs, n, j, 6)
+                )
             # loss_rec = self.rec_loss(rec_pose, tar_pose) * self.args.rec_weight * self.args.rec_pos_weight
             # self.tracker.update_meter("rec", "train", loss_rec.item())
             # g_loss_final += loss_rec
 
             rec_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
             loss_contact = self.vectices_loss(rec_contact, tar_contact) * self.args.rec_weight * self.args.rec_pos_weight
-            self.tracker.update_meter("contact", "train", loss_contact.item())
+            self._track_train("contact", loss_contact)
             g_loss_final += loss_contact 
 
             # velocity_loss =  self.vel_loss(rec_pose[:, 1:] - rec_pose[:, :-1], tar_pose[:, 1:] - tar_pose[:, :-1]) * self.args.rec_weight
@@ -142,73 +231,105 @@ class CustomTrainer(train.BaseTrainer):
             a2 =  self.vel_loss(rec_xyz_trans[:, 2:] + rec_xyz_trans[:, :-2] - 2 * rec_xyz_trans[:, 1:-1], tar_trans[:, 2:] + tar_trans[:, :-2] - 2 * tar_trans[:, 1:-1]) * self.args.rec_weight
             g_loss_final += 5*v2 
             g_loss_final += 5*a2 
-            self.tracker.update_meter("transv", "train", loss_trans_vel.item())
+            self._track_train("transv", loss_trans_vel)
             g_loss_final += loss_trans_vel
             loss_trans = self.vel_loss(rec_xyz_trans, tar_trans) * self.args.rec_weight 
-            self.tracker.update_meter("trans", "train", loss_trans.item())
+            self._track_train("trans", loss_trans)
             g_loss_final += loss_trans
 
              # vertices loss
             if self.args.rec_ver_weight > 0:
-                # print(tar_pose.shape, j)
-                tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs*n, j*3)
-                rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs*n, j*3)
-                rec_pose = self.inverse_selection_tensor(rec_pose, self.train_data.joint_mask, rec_pose.shape[0])
-                tar_pose = self.inverse_selection_tensor(tar_pose, self.train_data.joint_mask, tar_pose.shape[0])
-                vertices_rec = self.smplx(
-                    betas=tar_beta.reshape(bs*n, 300), 
-                    transl=rec_xyz_trans.reshape(bs*n, 3), 
-                    expression=tar_exps.reshape(bs*n, 100), 
-                    jaw_pose=rec_pose[:, 66:69], 
-                    global_orient=rec_pose[:,:3], 
-                    body_pose=rec_pose[:,3:21*3+3], 
-                    left_hand_pose=rec_pose[:,25*3:40*3], 
-                    right_hand_pose=rec_pose[:,40*3:55*3], 
-                    return_verts=True,
-                    return_joints=True,
-                    leye_pose=tar_pose[:, 69:72], 
-                    reye_pose=tar_pose[:, 72:75],
-                )
-                vertices_tar = self.smplx(
-                    betas=tar_beta.reshape(bs*n, 300), 
-                    transl=tar_trans.reshape(bs*n, 3), 
-                    expression=tar_exps.reshape(bs*n, 100), 
-                    jaw_pose=tar_pose[:, 66:69], 
-                    global_orient=tar_pose[:,:3], 
-                    body_pose=tar_pose[:,3:21*3+3], 
-                    left_hand_pose=tar_pose[:,25*3:40*3], 
-                    right_hand_pose=tar_pose[:,40*3:55*3], 
-                    return_verts=True,
-                    return_joints=True,
-                    leye_pose=tar_pose[:, 69:72], 
-                    reye_pose=tar_pose[:, 72:75],
-                )  
-                joints_rec = vertices_rec['joints']
-                # print(joints_rec.shape)
-                joints_rec = joints_rec.reshape(bs, n, -1, 3)
-                vectices_loss = self.vectices_loss(vertices_rec['vertices'], vertices_tar['vertices'])
-                vertices_vel_loss = self.vectices_loss(
-                    vertices_rec['vertices'][:, 1:] - vertices_rec['vertices'][:, :-1],
-                    vertices_tar['vertices'][:, 1:] - vertices_tar['vertices'][:, :-1])
-                vertices_acc_loss = self.vectices_loss(
-                    vertices_rec['vertices'][:, 2:] + vertices_rec['vertices'][:, :-2] - 2 * vertices_rec['vertices'][:, 1:-1],
-                    vertices_tar['vertices'][:, 2:] + vertices_tar['vertices'][:, :-2] - 2 * vertices_tar['vertices'][:, 1:-1])
-                foot_idx = [7, 8, 10, 11]
                 model_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
-                # find static indices consistent with model's own predictions
-                static_idx = model_contact > 0.95  # N x S x 4
-                # print(model_contact,static_idx)
-                model_feet = joints_rec[:, :, foot_idx]  # foot positions (N, S, 4, 3)
-                model_foot_v = torch.zeros_like(model_feet)
-                model_foot_v[:, :-1] = (
-                    model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
-                )  # (N, S-1, 4, 3)
-                model_foot_v[~static_idx] = 0
-                foot_loss = self.vel_loss(
-                    model_foot_v, torch.zeros_like(model_foot_v)
+                if self.global_foot_fastpath:
+                    lower_foot_local = dict_data[GLOBAL_FOOT_FIELD].cuda(
+                        non_blocking=True
+                    )
+                    (
+                        vectices_loss,
+                        vertices_vel_loss,
+                        vertices_acc_loss,
+                        foot_loss,
+                    ) = global_foot_fastpath_losses(
+                        rec_xyz_trans,
+                        tar_trans,
+                        lower_foot_local,
+                        model_contact,
+                        mse_loss=self.vectices_loss,
+                        foot_loss_fn=self.vel_loss,
+                    )
+                else:
+                    # print(tar_pose.shape, j)
+                    tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs*n, j*3)
+                    rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs*n, j*3)
+                    rec_pose = self.inverse_selection_tensor(rec_pose, self.train_data.joint_mask, rec_pose.shape[0])
+                    tar_pose = self.inverse_selection_tensor(tar_pose, self.train_data.joint_mask, tar_pose.shape[0])
+                    vertices_rec = self.smplx(
+                        betas=tar_beta.reshape(bs*n, 300),
+                        transl=rec_xyz_trans.reshape(bs*n, 3),
+                        expression=tar_exps.reshape(bs*n, 100),
+                        jaw_pose=rec_pose[:, 66:69],
+                        global_orient=rec_pose[:,:3],
+                        body_pose=rec_pose[:,3:21*3+3],
+                        left_hand_pose=rec_pose[:,25*3:40*3],
+                        right_hand_pose=rec_pose[:,40*3:55*3],
+                        return_verts=True,
+                        return_joints=True,
+                        leye_pose=tar_pose[:, 69:72],
+                        reye_pose=tar_pose[:, 72:75],
+                    )
+                    vertices_tar = self.smplx(
+                        betas=tar_beta.reshape(bs*n, 300),
+                        transl=tar_trans.reshape(bs*n, 3),
+                        expression=tar_exps.reshape(bs*n, 100),
+                        jaw_pose=tar_pose[:, 66:69],
+                        global_orient=tar_pose[:,:3],
+                        body_pose=tar_pose[:,3:21*3+3],
+                        left_hand_pose=tar_pose[:,25*3:40*3],
+                        right_hand_pose=tar_pose[:,40*3:55*3],
+                        return_verts=True,
+                        return_joints=True,
+                        leye_pose=tar_pose[:, 69:72],
+                        reye_pose=tar_pose[:, 72:75],
+                    )
+                    joints_rec = vertices_rec['joints']
+                    # print(joints_rec.shape)
+                    joints_rec = joints_rec.reshape(bs, n, -1, 3)
+                    vectices_loss = self.vectices_loss(
+                        vertices_rec['vertices'], vertices_tar['vertices']
+                    )
+                    vertices_vel_loss = self.vectices_loss(
+                        vertices_rec['vertices'][:, 1:] - vertices_rec['vertices'][:, :-1],
+                        vertices_tar['vertices'][:, 1:] - vertices_tar['vertices'][:, :-1])
+                    vertices_acc_loss = self.vectices_loss(
+                        vertices_rec['vertices'][:, 2:] + vertices_rec['vertices'][:, :-2] - 2 * vertices_rec['vertices'][:, 1:-1],
+                        vertices_tar['vertices'][:, 2:] + vertices_tar['vertices'][:, :-2] - 2 * vertices_tar['vertices'][:, 1:-1])
+                    foot_idx = [7, 8, 10, 11]
+                    # find static indices consistent with model's own predictions
+                    static_idx = model_contact > 0.95  # N x S x 4
+                    # print(model_contact,static_idx)
+                    model_feet = joints_rec[:, :, foot_idx]  # foot positions (N, S, 4, 3)
+                    model_foot_v = torch.zeros_like(model_feet)
+                    model_foot_v[:, :-1] = (
+                        model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
+                    )  # (N, S-1, 4, 3)
+                    model_foot_v[~static_idx] = 0
+                    foot_loss = self.vel_loss(
+                        model_foot_v, torch.zeros_like(model_foot_v)
+                    )
+                self._track_train(
+                    "foot",
+                    foot_loss,
+                    scale=(
+                        self.args.rec_weight
+                        * self.args.rec_ver_weight
+                        * 1000
+                    ),
                 )
-                self.tracker.update_meter("foot", "train", foot_loss.item()*self.args.rec_weight * self.args.rec_ver_weight*1000)
-                self.tracker.update_meter("ver", "train", vectices_loss.item()*self.args.rec_weight * self.args.rec_ver_weight)
+                self._track_train(
+                    "ver",
+                    vectices_loss,
+                    scale=self.args.rec_weight * self.args.rec_ver_weight,
+                )
                 g_loss_final += (vectices_loss+5*vertices_vel_loss+5*vertices_acc_loss)*self.args.rec_weight*self.args.rec_ver_weight 
                 g_loss_final += foot_loss*self.args.rec_weight*self.args.rec_ver_weight*20 
             
@@ -216,7 +337,7 @@ class CustomTrainer(train.BaseTrainer):
             if "VQVAE" in self.args.g_name:
                 loss_embedding = net_out["embedding_loss"]
                 g_loss_final += loss_embedding
-                self.tracker.update_meter("com", "train", loss_embedding.item())
+                self._track_train("com", loss_embedding)
             # elif "VAE" in self.args.g_name:
             #     pose_mu, pose_logvar = net_out["pose_mu"], net_out["pose_logvar"] 
             #     KLD = -0.5 * torch.sum(1 + pose_logvar - pose_mu.pow(2) - pose_logvar.exp())
@@ -234,7 +355,7 @@ class CustomTrainer(train.BaseTrainer):
             t_start = time.time()
             mem_cost = torch.cuda.memory_cached() / 1E9
             lr_g = self.opt.param_groups[0]['lr']
-            if its % self.args.log_period == 0:
+            if self._should_log_train(its):
                 self.train_recording(epoch, its, t_data, t_train, mem_cost, lr_g)   
             if self.args.debug:
                 if its == 1: break
@@ -246,7 +367,11 @@ class CustomTrainer(train.BaseTrainer):
         with torch.no_grad():
             for its, dict_data in enumerate(self.val_loader):
                 tar_pose_raw = dict_data["pose"]
-                tar_beta = dict_data["beta"].cuda()
+                tar_beta = (
+                    None
+                    if self.global_foot_fastpath
+                    else dict_data["beta"].cuda()
+                )
                 tar_trans = dict_data["trans"].cuda()
                 tar_trans_vel_x = other_tools.estimate_linear_velocity(tar_trans[:, :, 0:1], dt=1/self.args.pose_fps)
                 tar_trans_vel_z = other_tools.estimate_linear_velocity(tar_trans[:, :, 2:3], dt=1/self.args.pose_fps)
@@ -255,7 +380,11 @@ class CustomTrainer(train.BaseTrainer):
 
                 tar_contact = tar_pose_raw[:, :, 27:31].cuda()  
                 bs, n, j = tar_pose.shape[0], tar_pose.shape[1], self.joints
-                tar_exps = torch.zeros((bs, n, 100)).cuda()
+                tar_exps = (
+                    None
+                    if self.global_foot_fastpath
+                    else torch.zeros((bs, n, 100)).cuda()
+                )
                 tar_pose = rc.axis_angle_to_matrix(tar_pose.reshape(bs, n, j, 3))
                 tar_pose = rc.matrix_to_rotation_6d(tar_pose).reshape(bs, n, j*6)
                 tar_trans_copy = tar_trans-tar_trans
@@ -266,10 +395,13 @@ class CustomTrainer(train.BaseTrainer):
                 #self.opt.zero_grad()
                 #g_loss_final = 0
                 net_out = self.model(in_tar_pose)
-                rec_pose = tar_pose
-                rec_pose = rec_pose.reshape(bs, n, j, 6)
-                rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
-                tar_pose = rc.rotation_6d_to_matrix(tar_pose.reshape(bs, n, j, 6))
+                if not self.global_foot_fastpath:
+                    rec_pose = tar_pose
+                    rec_pose = rec_pose.reshape(bs, n, j, 6)
+                    rec_pose = rc.rotation_6d_to_matrix(rec_pose)#
+                    tar_pose = rc.rotation_6d_to_matrix(
+                        tar_pose.reshape(bs, n, j, 6)
+                    )
                 # loss_rec = self.rec_loss(rec_pose, tar_pose) * self.args.rec_weight * self.args.rec_pos_weight
                 # self.tracker.update_meter("rec", "val", loss_rec.item())
                 rec_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
@@ -308,55 +440,73 @@ class CustomTrainer(train.BaseTrainer):
 
                  # vertices loss
                 if self.args.rec_ver_weight > 0:
-                    tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs*n, j*3)
-                    rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs*n, j*3)
-                    rec_pose = self.inverse_selection_tensor(rec_pose, self.train_data.joint_mask, rec_pose.shape[0])
-                    tar_pose = self.inverse_selection_tensor(tar_pose, self.train_data.joint_mask, tar_pose.shape[0])
-                    vertices_rec = self.smplx(
-                        betas=tar_beta.reshape(bs*n, 300), 
-                        transl=rec_xyz_trans.reshape(bs*n, 3), 
-                        expression=tar_exps.reshape(bs*n, 100), 
-                        jaw_pose=rec_pose[:, 66:69], 
-                        global_orient=rec_pose[:,:3], 
-                        body_pose=rec_pose[:,3:21*3+3], 
-                        left_hand_pose=rec_pose[:,25*3:40*3], 
-                        right_hand_pose=rec_pose[:,40*3:55*3], 
-                        return_verts=False, 
-                        return_joints=True,
-                        leye_pose=tar_pose[:, 69:72], 
-                        reye_pose=tar_pose[:, 72:75],
-                    )
-                    vertices_tar = self.smplx(
-                        betas=tar_beta.reshape(bs*n, 300), 
-                        transl=tar_trans.reshape(bs*n, 3), 
-                        expression=tar_exps.reshape(bs*n, 100), 
-                        jaw_pose=tar_pose[:, 66:69], 
-                        global_orient=tar_pose[:,:3], 
-                        body_pose=tar_pose[:,3:21*3+3], 
-                        left_hand_pose=tar_pose[:,25*3:40*3], 
-                        right_hand_pose=tar_pose[:,40*3:55*3], 
-                        return_verts=False, 
-                        return_joints=True,
-                        leye_pose=tar_pose[:, 69:72], 
-                        reye_pose=tar_pose[:, 72:75],
-                    )  
-                    joints_rec = vertices_rec['joints']
-                    joints_rec = joints_rec.reshape(bs, n, -1, 3)
-                    vectices_loss = self.vectices_loss(vertices_rec['joints'], vertices_tar['joints'])
-                    foot_idx = [7, 8, 10, 11]
                     model_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
-                    # find static indices consistent with model's own predictions
-                    static_idx = model_contact > 0.95  # N x S x 4
-                    # print(model_contact)
-                    model_feet = joints_rec[:, :, foot_idx]  # foot positions (N, S, 4, 3)
-                    model_foot_v = torch.zeros_like(model_feet)
-                    model_foot_v[:, :-1] = (
-                        model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
-                    )  # (N, S-1, 4, 3)
-                    model_foot_v[~static_idx] = 0
-                    foot_loss = self.vectices_loss(
-                        model_foot_v, torch.zeros_like(model_foot_v)
-                    )
+                    if self.global_foot_fastpath:
+                        lower_foot_local = dict_data[GLOBAL_FOOT_FIELD].cuda()
+                        (
+                            vectices_loss,
+                            _,
+                            _,
+                            foot_loss,
+                        ) = global_foot_fastpath_losses(
+                            rec_xyz_trans,
+                            tar_trans,
+                            lower_foot_local,
+                            model_contact,
+                            mse_loss=self.vectices_loss,
+                            foot_loss_fn=self.vectices_loss,
+                        )
+                    else:
+                        tar_pose = rc.matrix_to_axis_angle(tar_pose).reshape(bs*n, j*3)
+                        rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs*n, j*3)
+                        rec_pose = self.inverse_selection_tensor(rec_pose, self.train_data.joint_mask, rec_pose.shape[0])
+                        tar_pose = self.inverse_selection_tensor(tar_pose, self.train_data.joint_mask, tar_pose.shape[0])
+                        vertices_rec = self.smplx(
+                            betas=tar_beta.reshape(bs*n, 300),
+                            transl=rec_xyz_trans.reshape(bs*n, 3),
+                            expression=tar_exps.reshape(bs*n, 100),
+                            jaw_pose=rec_pose[:, 66:69],
+                            global_orient=rec_pose[:,:3],
+                            body_pose=rec_pose[:,3:21*3+3],
+                            left_hand_pose=rec_pose[:,25*3:40*3],
+                            right_hand_pose=rec_pose[:,40*3:55*3],
+                            return_verts=False,
+                            return_joints=True,
+                            leye_pose=tar_pose[:, 69:72],
+                            reye_pose=tar_pose[:, 72:75],
+                        )
+                        vertices_tar = self.smplx(
+                            betas=tar_beta.reshape(bs*n, 300),
+                            transl=tar_trans.reshape(bs*n, 3),
+                            expression=tar_exps.reshape(bs*n, 100),
+                            jaw_pose=tar_pose[:, 66:69],
+                            global_orient=tar_pose[:,:3],
+                            body_pose=tar_pose[:,3:21*3+3],
+                            left_hand_pose=tar_pose[:,25*3:40*3],
+                            right_hand_pose=tar_pose[:,40*3:55*3],
+                            return_verts=False,
+                            return_joints=True,
+                            leye_pose=tar_pose[:, 69:72],
+                            reye_pose=tar_pose[:, 72:75],
+                        )
+                        joints_rec = vertices_rec['joints']
+                        joints_rec = joints_rec.reshape(bs, n, -1, 3)
+                        vectices_loss = self.vectices_loss(
+                            vertices_rec['joints'], vertices_tar['joints']
+                        )
+                        foot_idx = [7, 8, 10, 11]
+                        # find static indices consistent with model's own predictions
+                        static_idx = model_contact > 0.95  # N x S x 4
+                        # print(model_contact)
+                        model_feet = joints_rec[:, :, foot_idx]  # foot positions (N, S, 4, 3)
+                        model_foot_v = torch.zeros_like(model_feet)
+                        model_foot_v[:, :-1] = (
+                            model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
+                        )  # (N, S-1, 4, 3)
+                        model_foot_v[~static_idx] = 0
+                        foot_loss = self.vectices_loss(
+                            model_foot_v, torch.zeros_like(model_foot_v)
+                        )
                     self.tracker.update_meter("foot", "val", foot_loss.item()*self.args.rec_weight * self.args.rec_ver_weight)
                     self.tracker.update_meter("ver", "val", vectices_loss.item()*self.args.rec_weight * self.args.rec_ver_weight)
                 if "VQVAE" in self.args.g_name:
