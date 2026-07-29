@@ -51,6 +51,9 @@ EXPECTED_SPEAKER_MAP = {
     "seth": 2,
     "conan": 3,
 }
+# The frozen official split has 55 candidates whose source WAV is absent.
+# They are excluded before the complete, exact-once 17,110-row canonical set.
+EXPECTED_SPLIT_MISSING_COUNT = 55
 LOWER_JOINT_INDICES = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 LOWER_POSE_COLUMNS = tuple(
     column
@@ -671,7 +674,7 @@ def validate_canonical_files(
     require_exact_int(
         lineage_contract.get("split_missing_count"),
         "canonical lineage split_missing_count",
-        expected=0,
+        expected=EXPECTED_SPLIT_MISSING_COUNT,
     )
     require_exact_int(
         lineage_contract.get("pose_fps"),

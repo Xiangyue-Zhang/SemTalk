@@ -676,6 +676,7 @@ class ReceiptContractTests(unittest.TestCase):
     def test_canonical_lineage_deep_validation_covers_rows_and_shards(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            self.assertEqual(contract.EXPECTED_SPLIT_MISSING_COUNT, 55)
             source = {
                 "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
                 "commit": "a" * 40,
@@ -692,7 +693,7 @@ class ReceiptContractTests(unittest.TestCase):
                     "val": 1_715,
                     "test": 1_708,
                 },
-                "split_missing_count": 0,
+                "split_missing_count": 55,
                 "speaker_mapping": dict(contract.EXPECTED_SPEAKER_MAP),
                 "pose_fps": 30,
                 "source_audio_sample_rate": 22_000,
