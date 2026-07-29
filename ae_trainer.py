@@ -25,6 +25,7 @@ from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
 from scipy.spatial.transform import Rotation
+from utils.show_base_tensor_ops import inverse_selection_tensor
 
 
 class CustomTrainer(train.BaseTrainer):
@@ -66,18 +67,7 @@ class CustomTrainer(train.BaseTrainer):
         return original_shape_t
     
     def inverse_selection_tensor(self, filtered_t, selection_array, n):
-    # 创建一个全为零的数组，形状为 n*165
-        selection_array = torch.from_numpy(selection_array).cuda()
-        original_shape_t = torch.zeros((n, 165)).cuda()
-        
-        # 找到选择数组中为1的索引位置
-        selected_indices = torch.where(selection_array == 1)[0]
-        
-        # 将 filtered_t 的值填充到 original_shape_t 中相应的位置
-        for i in range(n):
-            original_shape_t[i, selected_indices] = filtered_t[i]
-            
-        return original_shape_t
+        return inverse_selection_tensor(filtered_t, selection_array, n)
 
     def train(self, epoch):
         self.model.train()
