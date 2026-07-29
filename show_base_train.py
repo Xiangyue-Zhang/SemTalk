@@ -32,6 +32,12 @@ import torch.distributed as dist
 from loguru import logger
 
 from utils import config, logger_tools, other_tools
+from utils.lower_target_cache import (
+    RECEIPT_KEY as LOWER_TARGET_CACHE_RECEIPT_KEY,
+    attach_lower_target_cache_receipt,
+    validate_activation_args as validate_lower_target_cache_activation,
+    verify_lower_target_cache_resume_receipt,
+)
 
 
 FORMAL_SMPLX_FILENAME = "SMPLX_NEUTRAL_2020.npz"
@@ -248,6 +254,7 @@ def _dataset_receipt(
     *,
     train_samples: int,
     current_source: dict[str, str],
+    lower_target_cache_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     smplx_asset_receipt = _formal_smplx_asset_receipt(args)
     if not args.dataset_summary:
@@ -747,7 +754,46 @@ def _dataset_receipt(
         raise RuntimeError(
             "Global parity arguments are forbidden outside the global stage"
         )
-    return {
+    cache_enabled = validate_lower_target_cache_activation(args)
+    if cache_enabled != (lower_target_cache_receipt is not None):
+        raise RuntimeError(
+            "formal lower target cache activation and trainer receipt disagree"
+        )
+    if cache_enabled:
+        assert lower_target_cache_receipt is not None
+        cache_source = lower_target_cache_receipt.get("source_receipt")
+        current_inputs = lower_target_cache_receipt.get("current_inputs")
+        if (
+            args.formal_stage != "lower"
+            or not isinstance(cache_source, dict)
+            or not isinstance(current_inputs, dict)
+            or {
+                key: cache_source.get(key)
+                for key in ("origin", "commit", "tree")
+            }
+            != {
+                key: current_source.get(key)
+                for key in ("origin", "commit", "tree")
+            }
+            or current_inputs.get("representation_lmdb_path")
+            != str(lmdb_path)
+            or current_inputs.get("data_mdb_sha256") != data_sha
+            or current_inputs.get("representation_summary_path")
+            != str(summary_path)
+            or current_inputs.get("representation_lineage_path")
+            != str(lineage_path)
+            or current_inputs.get("representation_summary_sha256")
+            != _sha256(summary_path)
+            or current_inputs.get("representation_lineage_sha256")
+            != _sha256(lineage_path)
+            or current_inputs.get("smplx_asset_sha256")
+            != smplx_asset_receipt["sha256"]
+        ):
+            raise RuntimeError(
+                "formal lower target cache receipt is not bound to the "
+                "current dataset/source/SMPL-X inputs"
+            )
+    receipt = {
         "summary": str(summary_path),
         "summary_sha256": _sha256(summary_path),
         "lineage": str(lineage_path),
@@ -763,6 +809,11 @@ def _dataset_receipt(
         "smplx_asset": smplx_asset_receipt,
         "global_fastpath_parity": parity_receipt,
     }
+    attach_lower_target_cache_receipt(
+        receipt,
+        lower_target_cache_receipt,
+    )
+    return receipt
 
 
 def _finite_tree(value: Any, prefix: str) -> list[str]:
@@ -952,6 +1003,7 @@ def _validate_formal_stage(args: Any) -> None:
         "cudnn_enabled": True,
         "log_period": 1_989,
         "save_every": 5,
+        "use_lower_target_joints_cache": False,
     }
     stages: dict[str, dict[str, Any]] = {
         "face": {
@@ -1029,6 +1081,7 @@ def _validate_formal_stage(args: Any) -> None:
             "lr_base": 3e-4,
             "decay_epochs": 780,
             "final_ckpt_name": "rvq_lower_600.bin",
+            "use_lower_target_joints_cache": True,
         },
         "global": {
             "model": "motion_representation",
@@ -1184,6 +1237,10 @@ def _load_resume(
         raise RuntimeError("resume SMPL-X asset receipt does not match")
     if payload.get("source_receipt_sha256") != source_receipt_sha256:
         raise RuntimeError("resume source checkout fingerprint does not match")
+    verify_lower_target_cache_resume_receipt(
+        payload,
+        dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
     expected_optimizer_updates = completed_epochs * trainer.train_length
     if optimizer_updates != expected_optimizer_updates:
         raise RuntimeError(
@@ -1436,36 +1493,41 @@ def _save_resume(
         )
     ):
         raise RuntimeError("invalid Base candidate manifest SHA binding")
+    payload = {
+        "format": "semtalk_show_train_resume_v5",
+        "completed_epochs": completed_epochs,
+        "world_size": world_size,
+        "train_samples": train_samples,
+        "updates_per_epoch": updates_per_epoch,
+        "batch_size": batch_size,
+        "config_sha256": config_sha256,
+        "lineage_manifest_sha256": lineage_sha256,
+        "dataset_summary_sha256": dataset_summary_sha256,
+        "data_mdb_sha256": data_mdb_sha256,
+        "dataset_receipt_sha256": _payload_sha256(dataset_receipt),
+        "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+        "source_receipt_sha256": source_receipt_sha256,
+        "optimizer_updates": optimizer_updates,
+        "candidate_manifest_sha256": candidate_manifest_sha256,
+        "candidate_manifest_entry_count": candidate_manifest_entry_count,
+        "candidate_manifest_entries_sha256": (
+            candidate_manifest_entries_sha256
+        ),
+        "last_metrics": last_metrics,
+        "started_unix": started_unix,
+        "model_state": trainer.model.state_dict(),
+        "rvq_ema_state": _rvq_ema_state(trainer.model),
+        "optimizer_state": trainer.opt.state_dict(),
+        "scheduler_state": trainer.opt_s.state_dict(),
+        "rng_states": rng_states,
+    }
+    attach_lower_target_cache_receipt(
+        payload,
+        dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
     _atomic_torch_save(
         path,
-        {
-            "format": "semtalk_show_train_resume_v5",
-            "completed_epochs": completed_epochs,
-            "world_size": world_size,
-            "train_samples": train_samples,
-            "updates_per_epoch": updates_per_epoch,
-            "batch_size": batch_size,
-            "config_sha256": config_sha256,
-            "lineage_manifest_sha256": lineage_sha256,
-            "dataset_summary_sha256": dataset_summary_sha256,
-            "data_mdb_sha256": data_mdb_sha256,
-            "dataset_receipt_sha256": _payload_sha256(dataset_receipt),
-            "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
-            "source_receipt_sha256": source_receipt_sha256,
-            "optimizer_updates": optimizer_updates,
-            "candidate_manifest_sha256": candidate_manifest_sha256,
-            "candidate_manifest_entry_count": candidate_manifest_entry_count,
-            "candidate_manifest_entries_sha256": (
-                candidate_manifest_entries_sha256
-            ),
-            "last_metrics": last_metrics,
-            "started_unix": started_unix,
-            "model_state": trainer.model.state_dict(),
-            "rvq_ema_state": _rvq_ema_state(trainer.model),
-            "optimizer_state": trainer.opt.state_dict(),
-            "scheduler_state": trainer.opt_s.state_dict(),
-            "rng_states": rng_states,
-        },
+        payload,
     )
 
 
@@ -1490,22 +1552,27 @@ def _model_payload(
                 candidate_manifest_receipt.get(key),
                 f"model audit Base candidate manifest {key}",
             )
+    audit = {
+        "format": "semtalk_show_model_v2",
+        "formal_stage": formal_stage,
+        "config_sha256": config_sha256,
+        "lineage_manifest_sha256": lineage_sha256,
+        "dataset_summary_sha256": dataset_receipt["summary_sha256"],
+        "data_mdb_sha256": dataset_receipt["data_mdb_sha256"],
+        "dataset_receipt_sha256": _payload_sha256(dataset_receipt),
+        "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+        "source_receipt": source_receipt,
+        "source_receipt_sha256": _payload_sha256(source_receipt),
+        "optimizer_updates": optimizer_updates,
+        "base_candidate_manifest": candidate_manifest_receipt,
+    }
+    attach_lower_target_cache_receipt(
+        audit,
+        dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
     return {
         "model_state": trainer.model.state_dict(),
-        "audit": {
-            "format": "semtalk_show_model_v2",
-            "formal_stage": formal_stage,
-            "config_sha256": config_sha256,
-            "lineage_manifest_sha256": lineage_sha256,
-            "dataset_summary_sha256": dataset_receipt["summary_sha256"],
-            "data_mdb_sha256": dataset_receipt["data_mdb_sha256"],
-            "dataset_receipt_sha256": _payload_sha256(dataset_receipt),
-            "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
-            "source_receipt": source_receipt,
-            "source_receipt_sha256": _payload_sha256(source_receipt),
-            "optimizer_updates": optimizer_updates,
-            "base_candidate_manifest": candidate_manifest_receipt,
-        },
+        "audit": audit,
     }
 
 
@@ -2830,6 +2897,7 @@ def main() -> None:
             f"and semtalk_base; received {stage_key!r}"
         )
     _validate_formal_stage(args)
+    lower_target_cache_enabled = validate_lower_target_cache_activation(args)
     if os.environ.get("PYTHONHASHSEED") != str(args.random_seed):
         raise RuntimeError(
             "PYTHONHASHSEED must be exported before launch and match random_seed"
@@ -2846,6 +2914,18 @@ def main() -> None:
     trainer = __import__(
         f"{args.trainer}_trainer", fromlist=["something"]
     ).CustomTrainer(args)
+    lower_target_cache_receipt = getattr(
+        trainer,
+        "lower_target_cache_receipt",
+        None,
+    )
+    if lower_target_cache_enabled != (
+        lower_target_cache_receipt is not None
+    ):
+        raise RuntimeError(
+            "formal lower target cache activation did not produce exactly "
+            "one trainer receipt"
+        )
     train_samples = len(trainer.train_data)
     if args.expected_train_samples and train_samples != args.expected_train_samples:
         raise RuntimeError(
@@ -2866,6 +2946,7 @@ def main() -> None:
         args,
         train_samples=train_samples,
         current_source=source_receipt,
+        lower_target_cache_receipt=lower_target_cache_receipt,
     )
     if dataset_receipt.get("smplx_asset") != initial_smplx_asset_receipt:
         raise RuntimeError("formal SMPL-X asset changed while initializing trainer")
@@ -3004,6 +3085,14 @@ def main() -> None:
                 "lineage_manifest_sha256": lineage_sha,
                 "dataset_receipt": dataset_receipt,
                 "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                **(
+                    {
+                        LOWER_TARGET_CACHE_RECEIPT_KEY:
+                        lower_target_cache_receipt
+                    }
+                    if lower_target_cache_receipt is not None
+                    else {}
+                ),
                 "base_candidate_manifest": candidate_manifest_receipt,
                 "source_receipt": source_receipt,
                 "source_receipt_sha256": source_receipt_sha,
@@ -3189,6 +3278,14 @@ def main() -> None:
                             "smplx_asset_receipt": dataset_receipt.get(
                                 "smplx_asset"
                             ),
+                            **(
+                                {
+                                    LOWER_TARGET_CACHE_RECEIPT_KEY:
+                                    lower_target_cache_receipt
+                                }
+                                if lower_target_cache_receipt is not None
+                                else {}
+                            ),
                             "base_candidate_manifest": (
                                 candidate_manifest_receipt
                             ),
@@ -3220,6 +3317,7 @@ def main() -> None:
                 args,
                 train_samples=train_samples,
                 current_source=final_source_receipt,
+                lower_target_cache_receipt=lower_target_cache_receipt,
             )
             if final_dataset_receipt != dataset_receipt:
                 raise RuntimeError(
@@ -3299,6 +3397,14 @@ def main() -> None:
                     "lineage_manifest_sha256": lineage_sha,
                     "dataset_receipt": dataset_receipt,
                     "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                    **(
+                        {
+                            LOWER_TARGET_CACHE_RECEIPT_KEY:
+                            lower_target_cache_receipt
+                        }
+                        if lower_target_cache_receipt is not None
+                        else {}
+                    ),
                     "base_candidate_manifest": candidate_manifest_receipt,
                     "source_receipt": source_receipt,
                     "source_receipt_sha256": source_receipt_sha,
@@ -3333,6 +3439,14 @@ def main() -> None:
                     "lineage_manifest_sha256": lineage_sha,
                     "dataset_receipt": dataset_receipt,
                     "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                    **(
+                        {
+                            LOWER_TARGET_CACHE_RECEIPT_KEY:
+                            lower_target_cache_receipt
+                        }
+                        if lower_target_cache_receipt is not None
+                        else {}
+                    ),
                     "base_candidate_manifest": candidate_manifest_receipt,
                     "source_receipt": source_receipt,
                     "source_receipt_sha256": source_receipt_sha,

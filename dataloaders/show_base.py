@@ -289,6 +289,9 @@ class CustomDataset(_NPZLMDB):
         if self.args.tar_joints == "beat_smplx_lower":
             pose = np.concatenate([pose, sample["contact"]], axis=-1)
         result = {
+            # Immutable LMDB key index requested by DataLoader.  Cache lookup
+            # must never infer identity from mutable sample payload fields.
+            "sample_index": np.int64(index),
             "pose": pose.astype(np.float32, copy=False),
             "trans": sample["trans"].astype(np.float32, copy=False),
         }

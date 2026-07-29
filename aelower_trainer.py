@@ -25,6 +25,10 @@ from utils.smplx_training import (
     freeze_smplx_for_training,
     smplx_target_forward,
 )
+from utils.lower_target_cache import (
+    LowerTargetJointsCache,
+    validate_activation_args,
+)
 from optimizers.optim_factory import create_optimizer
 from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
@@ -38,6 +42,7 @@ class CustomTrainer(train.BaseTrainer):
     """
     def __init__(self, args):
         super().__init__(args)
+        lower_target_cache_enabled = validate_activation_args(args)
         self.joints = self.train_data.joints
         self.smplx = smplx.create(
             str(smplx_model_dir(self.args)),
@@ -51,6 +56,18 @@ class CustomTrainer(train.BaseTrainer):
         ).cuda().eval()
         if getattr(args, "train_only", False):
             self.smplx = freeze_smplx_for_training(self.smplx)
+        self.lower_target_joints_cache = None
+        self.lower_target_cache_receipt = None
+        if lower_target_cache_enabled:
+            self.lower_target_joints_cache = (
+                LowerTargetJointsCache.from_formal_args(
+                    self.args,
+                    optimizer=self.opt,
+                )
+            )
+            self.lower_target_cache_receipt = (
+                self.lower_target_joints_cache.receipt
+            )
         self.tracker = other_tools.EpochTracker(["rec", "contact", "vel", "foot", "ver", "com", "kl", "acc", "trans", "transv"], [False,False, False, False, False, False, False, False, False, False])
         if not self.args.rot6d: #"rot6d" not in args.pose_rep:
             logger.error(f"this script is for rot6d, your pose rep. is {args.pose_rep}")
@@ -167,25 +184,36 @@ class CustomTrainer(train.BaseTrainer):
                     leye_pose=tar_pose[:, 69:72], 
                     reye_pose=tar_pose[:, 72:75],
                 )
-                vertices_tar = smplx_target_forward(
-                    self.smplx,
-                    betas=tar_beta.reshape(bs*n, 300), 
-                    transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3), 
-                    expression=tar_exps.reshape(bs*n, 100), 
-                    jaw_pose=tar_pose[:, 66:69], 
-                    global_orient=tar_pose[:,:3], 
-                    body_pose=tar_pose[:,3:21*3+3], 
-                    left_hand_pose=tar_pose[:,25*3:40*3], 
-                    right_hand_pose=tar_pose[:,40*3:55*3], 
-                    return_verts=False,
-                    return_joints=True,
-                    leye_pose=tar_pose[:, 69:72], 
-                    reye_pose=tar_pose[:, 72:75],
-                )  
+                if self.lower_target_joints_cache is None:
+                    vertices_tar = smplx_target_forward(
+                        self.smplx,
+                        betas=tar_beta.reshape(bs*n, 300),
+                        transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3),
+                        expression=tar_exps.reshape(bs*n, 100),
+                        jaw_pose=tar_pose[:, 66:69],
+                        global_orient=tar_pose[:,:3],
+                        body_pose=tar_pose[:,3:21*3+3],
+                        left_hand_pose=tar_pose[:,25*3:40*3],
+                        right_hand_pose=tar_pose[:,40*3:55*3],
+                        return_verts=False,
+                        return_joints=True,
+                        leye_pose=tar_pose[:, 69:72],
+                        reye_pose=tar_pose[:, 72:75],
+                    )
+                    target_joints = vertices_tar["joints"]
+                else:
+                    target_joints = (
+                        self.lower_target_joints_cache.index_select(
+                            dict_data["sample_index"]
+                        ).reshape(bs*n, 127, 3)
+                    )
                 joints_rec = vertices_rec['joints']
                 # print(joints_rec.shape)
                 joints_rec = joints_rec.reshape(bs, n, -1, 3)
-                vectices_loss = self.vectices_loss(vertices_rec['joints'], vertices_tar['joints'])
+                vectices_loss = self.vectices_loss(
+                    vertices_rec["joints"],
+                    target_joints,
+                )
                 foot_idx = [7, 8, 10, 11]
                 model_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
                 # find static indices consistent with model's own predictions

@@ -914,5 +914,148 @@ class BaseCandidateAuditTests(unittest.TestCase):
         )
 
 
+@unittest.skipIf(torch is None, "torch/formal runtime is unavailable")
+class LowerTargetCacheFormalBindingTests(unittest.TestCase):
+    def cache_receipt(self):
+        return {
+            "format": "semtalk_show_lower_target_joints_raw_lmdb_v1",
+            "receipt_sha256": "7" * 64,
+            "speaker_scope": "All",
+        }
+
+    def lower_dataset_receipt(self):
+        receipt = dataset_receipt()
+        receipt["lower_target_joints_cache"] = self.cache_receipt()
+        return receipt
+
+    def save_lower_resume(self, root: Path) -> tuple[Path, dict]:
+        trainer = make_trainer(updates=10)
+        trainer.args.formal_stage = "lower"
+        resume = root / "latest_resume.pt"
+        receipt = self.lower_dataset_receipt()
+        formal._save_resume(
+            trainer,
+            resume,
+            completed_epochs=5,
+            rng_states=[{"fixture": True}],
+            world_size=1,
+            train_samples=len(trainer.train_data),
+            updates_per_epoch=trainer.train_length,
+            config_sha256="1" * 64,
+            lineage_sha256="2" * 64,
+            dataset_summary_sha256=receipt["summary_sha256"],
+            data_mdb_sha256=receipt["data_mdb_sha256"],
+            dataset_receipt=receipt,
+            source_receipt_sha256=formal._payload_sha256(source_receipt()),
+            optimizer_updates=trainer.formal_optimizer_updates,
+            candidate_manifest_sha256=None,
+            candidate_manifest_entry_count=0,
+            candidate_manifest_entries_sha256=(
+                formal._base_candidate_entries_sha256([])
+            ),
+            last_metrics={},
+            started_unix=1.0,
+        )
+        return resume, receipt
+
+    def load_lower_resume(
+        self,
+        resume: Path,
+        receipt: dict,
+        candidate_manifest: Path,
+    ):
+        restored = make_trainer()
+        restored.args.formal_stage = "lower"
+        with mock.patch.object(formal, "_restore_rng_state"):
+            return formal._load_resume(
+                restored,
+                resume,
+                rank=0,
+                world_size=1,
+                config_sha256="1" * 64,
+                lineage_sha256="2" * 64,
+                dataset_summary_sha256=receipt["summary_sha256"],
+                data_mdb_sha256=receipt["data_mdb_sha256"],
+                dataset_receipt=receipt,
+                source_receipt=source_receipt(),
+                source_receipt_sha256=formal._payload_sha256(
+                    source_receipt()
+                ),
+                candidate_manifest_path=candidate_manifest,
+            )
+
+    def test_resume_roundtrip_requires_exact_cache_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resume, receipt = self.save_lower_resume(root)
+            original = torch.load(
+                resume,
+                map_location="cpu",
+                weights_only=False,
+            )
+            self.assertEqual(
+                original["lower_target_joints_cache"],
+                self.cache_receipt(),
+            )
+            loaded = self.load_lower_resume(
+                resume,
+                receipt,
+                root / "base_candidate_manifest.json",
+            )
+            self.assertEqual(loaded[0], 5)
+
+            for mutation in ("missing", "mismatch", "null"):
+                with self.subTest(mutation=mutation):
+                    tampered = dict(original)
+                    if mutation == "missing":
+                        tampered.pop("lower_target_joints_cache")
+                    elif mutation == "mismatch":
+                        tampered["lower_target_joints_cache"] = {
+                            **self.cache_receipt(),
+                            "receipt_sha256": "8" * 64,
+                        }
+                    else:
+                        tampered["lower_target_joints_cache"] = None
+                    formal._atomic_torch_save(resume, tampered)
+                    with self.assertRaises(RuntimeError):
+                        self.load_lower_resume(
+                            resume,
+                            receipt,
+                            root / "base_candidate_manifest.json",
+                        )
+
+    def test_final_model_audit_binds_cache_receipt_exactly(self):
+        trainer = make_trainer(updates=20)
+        receipt = self.lower_dataset_receipt()
+        payload = formal._model_payload(
+            trainer,
+            formal_stage="lower",
+            config_sha256="1" * 64,
+            lineage_sha256="2" * 64,
+            dataset_receipt=receipt,
+            source_receipt=source_receipt(),
+            optimizer_updates=trainer.formal_optimizer_updates,
+            candidate_manifest_receipt=None,
+        )
+        self.assertEqual(
+            payload["audit"]["lower_target_joints_cache"],
+            self.cache_receipt(),
+        )
+        baseline = formal._model_payload(
+            trainer,
+            formal_stage="base",
+            config_sha256="1" * 64,
+            lineage_sha256="2" * 64,
+            dataset_receipt=dataset_receipt(),
+            source_receipt=source_receipt(),
+            optimizer_updates=trainer.formal_optimizer_updates,
+            candidate_manifest_receipt=None,
+        )
+        self.assertNotIn(
+            "lower_target_joints_cache",
+            baseline["audit"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

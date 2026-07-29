@@ -96,6 +96,7 @@ RVQ_DIMS = {
     "lower": 61,
 }
 CHECKPOINT_STAGES = ("base", "face", "upper", "hands", "lower", "global")
+EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 MODEL_V2_AUDIT_KEYS = {
     "format",
     "formal_stage",
@@ -109,6 +110,32 @@ MODEL_V2_AUDIT_KEYS = {
     "source_receipt_sha256",
     "optimizer_updates",
     "base_candidate_manifest",
+}
+LOWER_TARGET_CACHE_RECEIPT_KEY = "lower_target_joints_cache"
+LOWER_TARGET_CACHE_RECEIPT_KEYS = {
+    "format",
+    "cache_version",
+    "cache_path",
+    "manifest_path",
+    "manifest_sha256",
+    "checker_receipt_path",
+    "checker_receipt_sha256",
+    "data_mdb_sha256",
+    "lock_mdb_sha256",
+    "entry_aggregate_sha256",
+    "entries",
+    "entry_shape",
+    "dtype",
+    "speaker_scope",
+    "speaker_ids",
+    "source_receipt",
+    "current_inputs",
+    "exact_once",
+    "finite",
+    "torch_equal_checked",
+    "target_requires_grad",
+    "target_optimizer_excluded",
+    "receipt_sha256",
 }
 BASE_CANDIDATE_AUDIT_KEYS = {
     "format",
@@ -261,6 +288,117 @@ def compact_json_sha256(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_lower_target_cache_binding(
+    *,
+    formal_stage: str,
+    audit: Mapping[str, Any],
+    dataset_receipt: Mapping[str, Any],
+    status: Mapping[str, Any] | None,
+    path: Path,
+) -> None:
+    """Require the frozen lower-target receipt on lower and forbid it elsewhere."""
+
+    key = LOWER_TARGET_CACHE_RECEIPT_KEY
+    if formal_stage != "lower":
+        if (
+            key in audit
+            or key in dataset_receipt
+            or (status is not None and key in status)
+        ):
+            raise InferenceContractError(
+                f"{path}: non-lower stage carries a lower target cache receipt"
+            )
+        return
+
+    audit_receipt = audit.get(key)
+    dataset_cache_receipt = dataset_receipt.get(key)
+    status_receipt = status.get(key) if status is not None else audit_receipt
+    if (
+        type(audit_receipt) is not dict
+        or audit_receipt != dataset_cache_receipt
+        or audit_receipt != status_receipt
+        or set(audit_receipt) != LOWER_TARGET_CACHE_RECEIPT_KEYS
+    ):
+        raise InferenceContractError(
+            f"{path}: lower target cache receipt is missing or inconsistent"
+        )
+    receipt_without_sha = dict(audit_receipt)
+    receipt_sha = receipt_without_sha.pop("receipt_sha256", None)
+    current_inputs = audit_receipt.get("current_inputs")
+    source = audit_receipt.get("source_receipt")
+    audit_source = audit.get("source_receipt")
+    smplx_asset = dataset_receipt.get("smplx_asset")
+    digest_fields = (
+        "manifest_sha256",
+        "checker_receipt_sha256",
+        "data_mdb_sha256",
+        "lock_mdb_sha256",
+        "entry_aggregate_sha256",
+    )
+    if (
+        audit_receipt.get("format")
+        != "semtalk_show_lower_target_joints_raw_lmdb_v1"
+        or type(audit_receipt.get("cache_version")) is not int
+        or audit_receipt.get("cache_version") != 1
+        or type(audit_receipt.get("entries")) is not int
+        or audit_receipt.get("entries") != 127_309
+        or audit_receipt.get("entry_shape") != [64, 127, 3]
+        or audit_receipt.get("dtype") != "<f4"
+        or audit_receipt.get("speaker_scope") != "All"
+        or audit_receipt.get("speaker_ids") != [0, 1, 2, 3]
+        or audit_receipt.get("exact_once") is not True
+        or audit_receipt.get("finite") is not True
+        or audit_receipt.get("torch_equal_checked") is not True
+        or audit_receipt.get("target_requires_grad") is not False
+        or audit_receipt.get("target_optimizer_excluded") is not True
+        or any(
+            type(audit_receipt.get(field)) is not str
+            or len(audit_receipt[field]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in audit_receipt[field]
+            )
+            for field in digest_fields
+        )
+        or type(receipt_sha) is not str
+        or receipt_sha != canonical_json_sha256(receipt_without_sha)
+        or type(source) is not dict
+        or set(source) != {"origin", "commit", "tree"}
+        or source.get("origin") != EXPECTED_ORIGIN
+        or any(
+            type(source.get(field)) is not str
+            or len(source[field]) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in source[field]
+            )
+            for field in ("commit", "tree")
+        )
+        or type(audit_source) is not dict
+        or {
+            name: source.get(name)
+            for name in ("origin", "commit", "tree")
+        }
+        != {
+            name: audit_source.get(name)
+            for name in ("origin", "commit", "tree")
+        }
+        or type(current_inputs) is not dict
+        or current_inputs.get("representation_summary_sha256")
+        != dataset_receipt.get("summary_sha256")
+        or current_inputs.get("representation_lineage_sha256")
+        != dataset_receipt.get("lineage_sha256")
+        or current_inputs.get("data_mdb_sha256")
+        != dataset_receipt.get("data_mdb_sha256")
+        or type(smplx_asset) is not dict
+        or current_inputs.get("smplx_asset_sha256")
+        != smplx_asset.get("sha256")
+    ):
+        raise InferenceContractError(
+            f"{path}: invalid lower target cache receipt contract"
+        )
 
 
 def training_json_document_sha256(value: Any) -> str:
@@ -1665,8 +1803,11 @@ def _validate_model_v2_audit(
     base_candidate_manifest: Mapping[str, Any] | None,
     path: Path,
 ) -> None:
+    expected_audit_keys = set(MODEL_V2_AUDIT_KEYS)
+    if formal_stage == "lower":
+        expected_audit_keys.add(LOWER_TARGET_CACHE_RECEIPT_KEY)
     if (
-        set(audit) != MODEL_V2_AUDIT_KEYS
+        set(audit) != expected_audit_keys
         or audit.get("format") != "semtalk_show_model_v2"
         or audit.get("formal_stage") != formal_stage
         or audit.get("config_sha256") != config_sha256
@@ -1692,6 +1833,13 @@ def _validate_model_v2_audit(
         raise InferenceContractError(
             f"{path}: invalid model_v2 formal audit for {formal_stage}"
         )
+    _validate_lower_target_cache_binding(
+        formal_stage=formal_stage,
+        audit=audit,
+        dataset_receipt=dataset_receipt,
+        status=None,
+        path=path,
+    )
 
 
 def _base_candidate_relative_path(epoch: int, optimizer_updates: int) -> str:
@@ -2414,6 +2562,13 @@ def _checkpoint_payload_and_receipt(
             raise InferenceContractError(
                 f"{resolved_status}: model_v2 SMPL-X receipt mismatch"
             )
+        _validate_lower_target_cache_binding(
+            formal_stage=formal_stage,
+            audit=audit,
+            dataset_receipt=dataset_receipt,
+            status=status,
+            path=resolved_status,
+        )
         _validate_model_v2_audit(
             audit,
             formal_stage=formal_stage,
