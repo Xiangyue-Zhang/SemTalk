@@ -524,6 +524,8 @@ def _load_pinned_helper(
         "deterministic_npz_bytes",
         "RELEASED_ALL_SPEAKERS_MODELS",
         "OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT",
+        "PRE_FRAMES",
+        "STRIDE",
     }
     missing = sorted(name for name in required if not hasattr(module, name))
     if missing:
@@ -1273,9 +1275,13 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
         _set_deterministic(args.seed)
         runtime_contract, device_receipt = _runtime(args.device, args.seed)
         runtime_contract["joint_masks"] = joint_mask_receipt
+        runtime_contract["auxiliary_loss_bypass"] = (
+            helper._inference_auxiliary_loss_bypass_receipt()
+        )
+        torch = __import__("torch")
         masks = _joint_masks_from_arrays(
             joint_mask_arrays,
-            __import__("torch").device(args.device),
+            torch.device(args.device),
         )
         models, model_receipts = _load_models(
             helper,
@@ -1296,16 +1302,31 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
                 audio_by_id[clip_id],
                 expected_frames=frames,
             )
-            prediction = helper._infer_clip(
-                pose=canonical["pose"],
-                trans=canonical["trans"],
-                beat=audio["beat"],
-                hubert=audio["hubert"],
-                speaker_id=helper.SHOW_SPEAKER_IDS[canonical_row["speaker"]],
-                models=models,
-                masks=masks,
-                device=args.device,
+            expected_calls = max(
+                1,
+                math.ceil(
+                    (frames - helper.PRE_FRAMES) / helper.STRIDE
+                ),
             )
+            with (
+                torch.inference_mode(),
+                helper._inference_only_auxiliary_loss_bypass(
+                    models["base"],
+                    expected_calls=expected_calls,
+                ),
+            ):
+                prediction = helper._infer_clip(
+                    pose=canonical["pose"],
+                    trans=canonical["trans"],
+                    beat=audio["beat"],
+                    hubert=audio["hubert"],
+                    speaker_id=helper.SHOW_SPEAKER_IDS[
+                        canonical_row["speaker"]
+                    ],
+                    models=models,
+                    masks=masks,
+                    device=args.device,
+                )
             prediction_arrays = helper._output_arrays(
                 betas=canonical["beta"][0],
                 poses=prediction["poses"],

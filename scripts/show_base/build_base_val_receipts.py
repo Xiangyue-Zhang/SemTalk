@@ -33,11 +33,11 @@ from scripts.show_base import select_base_official_adapt as selector
 TRANSFER_FORMAT = "semtalk_show_official_transfer_v1"
 EXPECTED_HELPER_SOURCE = {
     "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "78412d9a4bb349da45c7eb2dc5995021c3688e4f",
-    "tree": "1a99575c994d375d9abb02f0ef98577192444ed2",
+    "commit": "8da5c0dc4e9694319d742609ae145476c5408399",
+    "tree": "3e3a451eda15f28b3309a66faba6d55ccdb58e6f",
     "entrypoint": "run_base_inference.py",
     "entrypoint_sha256": (
-        "8f634d9fb3e76fa620f3690638d40b5b6bc12dbb3293f148389fc2fdc09f4cf4"
+        "d1f5da319d76c0b0190db479327c8c31774efe3f5e1222ad0f35e556d78d59ab"
     ),
 }
 EXPECTED_TRANSFER_SOURCE = {
@@ -558,7 +558,8 @@ def _validate_official_checkpoint(
 def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     if selector.VAL_INFERENCE_SOURCE != EXPECTED_HELPER_SOURCE:
         raise ReceiptBuildError(
-            "selector validation helper pin is not 78412d9/1a995/8f634d"
+            "selector validation helper pin does not match the audited "
+            "deterministic inference helper"
         )
     helper, resolved_helper, _ = _artifact(
         args.pinned_helper,
@@ -571,7 +572,7 @@ def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ]
     ):
         raise ReceiptBuildError(
-            "validation helper is not the exact 78412d9 pinned entrypoint"
+            "validation helper is not the exact audited pinned entrypoint"
         )
     face = _validate_transfer(
         stage="face",

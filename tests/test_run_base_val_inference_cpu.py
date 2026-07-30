@@ -461,6 +461,37 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             inspect.getsource(PRODUCER._load_models),
         )
 
+    def test_inference_auxiliary_loss_bypass_is_pinned_and_scoped(self) -> None:
+        required = set(PRODUCER.selector.INFERENCE_HELPERS)
+        self.assertIn(
+            "_inference_only_auxiliary_loss_bypass",
+            required,
+        )
+        self.assertIn(
+            "_inference_auxiliary_loss_bypass_receipt",
+            required,
+        )
+        shard_source = inspect.getsource(PRODUCER.run_shard)
+        bypass = shard_source.index(
+            "helper._inference_only_auxiliary_loss_bypass("
+        )
+        inference_mode = shard_source.rindex(
+            "torch.inference_mode()",
+            0,
+            bypass,
+        )
+        infer = shard_source.index("helper._infer_clip(", bypass)
+        self.assertLess(inference_mode, bypass)
+        self.assertLess(bypass, infer)
+        self.assertIn(
+            'runtime_contract["auxiliary_loss_bypass"]',
+            shard_source,
+        )
+        self.assertIn(
+            "(frames - helper.PRE_FRAMES) / helper.STRIDE",
+            shard_source,
+        )
+
     def test_pinned_meta_schema_cuda_shim_is_meta_only_and_scoped(
         self,
     ) -> None:

@@ -85,6 +85,8 @@ INFERENCE_HELPERS = (
     "_load_canonical_clip",
     "_load_audio_features",
     "_infer_clip",
+    "_inference_only_auxiliary_loss_bypass",
+    "_inference_auxiliary_loss_bypass_receipt",
     "_output_arrays",
 )
 # Match reserved labels, not incidental substrings such as Latest or contest.
@@ -162,11 +164,11 @@ BASE_PRODUCER_SOURCE = {
 }
 VAL_INFERENCE_SOURCE = {
     "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "78412d9a4bb349da45c7eb2dc5995021c3688e4f",
-    "tree": "1a99575c994d375d9abb02f0ef98577192444ed2",
+    "commit": "8da5c0dc4e9694319d742609ae145476c5408399",
+    "tree": "3e3a451eda15f28b3309a66faba6d55ccdb58e6f",
     "entrypoint": "run_base_inference.py",
     "entrypoint_sha256": (
-        "8f634d9fb3e76fa620f3690638d40b5b6bc12dbb3293f148389fc2fdc09f4cf4"
+        "d1f5da319d76c0b0190db479327c8c31774efe3f5e1222ad0f35e556d78d59ab"
     ),
 }
 
