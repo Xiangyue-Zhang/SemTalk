@@ -5,6 +5,13 @@ This entry point deliberately does not instantiate a trainer.  It loads exactly
 the formal Base checkpoint, the four formal RVQ checkpoints, and the formal
 global/root VAE checkpoint.  SemGate, Sparse, Speaker2 remapping, CLIP,
 emotion, semantic, ASR, TextGrid, and vocabulary components are forbidden.
+The default checkpoint source remains the fully audited SHOW-trained contract.
+An explicit ``released_all_speakers_v1`` mode instead accepts only the exact
+hash-pinned official BEAT2 All-Speakers release files, forbids SHOW-training
+status receipts for those files, and labels them as not SHOW-trained.  Base and
+the five representation prerequisites have independent source selections so a
+future SHOW-trained Base can consume the frozen official representations while
+the official All-Speakers Base remains an independently auditable option.
 
 The autoregressive contract is the released SemTalk Base ``_g_test`` contract,
 with its future-ground-truth dependency removed:
@@ -41,6 +48,7 @@ from pathlib import Path
 import platform
 import random
 import shutil
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -108,6 +116,163 @@ RVQ_DIMS = {
 }
 CHECKPOINT_STAGES = ("base", "face", "upper", "hands", "lower", "global")
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+SHOW_TRAINED_CHECKPOINT_SOURCE = "show_trained_v1"
+RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE = "released_all_speakers_v1"
+CHECKPOINT_SOURCES = (
+    SHOW_TRAINED_CHECKPOINT_SOURCE,
+    RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE,
+)
+RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
+    "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
+)
+RELEASED_ALL_SPEAKERS_BASE_CLASSIFICATION = (
+    "official_BEAT2_All-Speakers_released_Base_not_SHOW-trained"
+)
+RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT = {
+    "origin": EXPECTED_ORIGIN,
+    "commit": "806b008c97bf51fce203e54109e4c22325253618",
+    "tree": "029deb438330fcaa36377195bad79ffe0f06335c",
+    "archive_sha256": (
+        "3cbe7a3a923075ad39bcdd41bb88e828fd6161be4c5299c4"
+        "e62eedcf20ea5664"
+    ),
+    "readme_sha256": (
+        "27f846e150e8101c1124c3a8bfd026617508554f59ee359c5"
+        "5eae825b2edeb1e"
+    ),
+    "sha256s_sha256": (
+        "f7c08cb621f884c7deb0c0cba757fcd08c8b1ad471bab939e"
+        "b0d1bd02d4abc1b"
+    ),
+    "best_run_sha256": (
+        "6edaae9f21b7a7164f7457ca93240989fcfa3cb8ea02aa94f"
+        "7602c17f9491c9a"
+    ),
+    "all_speaker_metrics_sha256": (
+        "3ecd9586b6eb34eb4a05cdd57f29ed51de50399e02ff476d"
+        "f8c4d4c7fb4cc317"
+    ),
+}
+RELEASED_ALL_SPEAKERS_MODELS = {
+    "base": {
+        "filename": "best_semtalk_base.bin",
+        "sha256": (
+            "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc"
+            "1d89603"
+        ),
+        "model_class": "semtalk_base",
+    },
+    "face": {
+        "filename": "rvq_face_600.bin",
+        "sha256": (
+            "31b04c88456a25f4d57841c0cb507b4c856daccb3875878d06545110"
+            "a6152127"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 106,
+        "vae_layer": 2,
+    },
+    "hands": {
+        "filename": "rvq_hands_500.bin",
+        "sha256": (
+            "08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a38055ca47a5"
+            "39b03e436"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 180,
+        "vae_layer": 2,
+    },
+    "upper": {
+        "filename": "rvq_upper_500.bin",
+        "sha256": (
+            "05101461e75b4e9b687ef30437585d56969c6a13d0047b91000b31d8"
+            "8d08ac17"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 78,
+        "vae_layer": 2,
+    },
+    "lower": {
+        "filename": "rvq_lower_600.bin",
+        "sha256": (
+            "2bb43d10e5f32d13d21e6b85580a1b70d36e407c8552a7e62f99c17"
+            "1ae4efce8"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 61,
+        "vae_layer": 4,
+    },
+    "global": {
+        "filename": "last_1700_foot.bin",
+        "sha256": (
+            "6e6f88abd98ccbe2c52102b937067f4ade0aa307d6e1dac8e127e19e"
+            "0144ee12"
+        ),
+        "model_class": "VAEConvZero",
+        "vae_test_dim": 61,
+        "vae_layer": 4,
+    },
+}
+RELEASED_PREREQUISITE_RECORD_KEYS = {
+    "path",
+    "filename",
+    "sha256",
+    "bytes",
+    "formal_stage",
+    "prerequisite_source",
+    "classification",
+    "training_dataset",
+    "speaker_scope",
+    "show_trained",
+    "checkpoint_container_schema",
+    "model_class",
+    "model_state_tensors",
+    "model_state_schema_sha256",
+    "all_model_state_tensors_finite",
+    "strict_state_dict_load",
+    "frozen_eval",
+    "source_receipt",
+    "source_receipt_sha256",
+}
+RELEASED_IMPORT_RECEIPT_KEYS = {
+    "format",
+    "status",
+    "prerequisite_source",
+    "classification",
+    "training_dataset",
+    "speaker_scope",
+    "show_trained",
+    "source_receipt",
+    "source_receipt_sha256",
+    "files",
+    "strict_state_dict_load",
+    "all_model_state_tensors_finite",
+    "frozen_eval",
+    "receipt_sha256",
+}
+RELEASED_BASE_CONTAINER_SCHEMA = [
+    "epoch",
+    "lrs",
+    "model_state",
+    "opt_state",
+]
+RELEASED_BASE_LRS = {
+    "param_group_field": "lr",
+    "_initial_param_group_field": "initial_lr",
+    "base_values": [0.00030000000000000003],
+    "metric": None,
+    "noise_range_t": None,
+    "noise_pct": 0.67,
+    "noise_type": "normal",
+    "noise_std": 1.0,
+    "noise_seed": 42,
+    "decay_t": 999,
+    "decay_rate": 0.3,
+    "warmup_t": 0,
+    "warmup_lr_init": 0.0005,
+    "t_in_epochs": True,
+    "warmup_steps": [1],
+}
 FORMAL_SMPLX_FILENAME = "SMPLX_NEUTRAL_2020.npz"
 FORMAL_SMPLX_SHA256 = (
     "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
@@ -946,6 +1111,26 @@ def _source_receipt(args: argparse.Namespace) -> dict[str, Any]:
         "script": str(script),
         "script_relative": script_relative,
         "script_sha256": observed_script_sha,
+    }
+
+
+def _expected_source_role_receipt(
+    *,
+    role: str,
+    commit: str,
+    tree: str,
+) -> dict[str, str]:
+    formats = {
+        "training": "semtalk_show_training_source_expectation_v1",
+        "input_artifact": "semtalk_show_input_artifact_source_v1",
+    }
+    if role not in formats:
+        raise ValueError(f"unsupported source role: {role!r}")
+    return {
+        "format": formats[role],
+        "origin": EXPECTED_ORIGIN,
+        "commit": commit,
+        "tree": tree,
     }
 
 
@@ -1968,6 +2153,457 @@ def _normalize_data_parallel_state(
     return normalized
 
 
+def _state_dict_schema_sha256(state: Mapping[str, Any]) -> str:
+    schema = [
+        {
+            "key": key,
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+        for key, value in sorted(state.items())
+    ]
+    return canonical_json_sha256(schema)
+
+
+def _released_weight_source_receipt(
+    *,
+    classification: str = RELEASED_ALL_SPEAKERS_CLASSIFICATION,
+    checkpoint_container_schema: Sequence[str] = ("model_state",),
+) -> dict[str, Any]:
+    return {
+        "format": "semtalk_released_all_speakers_weight_source_v1",
+        "prerequisite_source": RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE,
+        "classification": classification,
+        "release_trust_root": dict(
+            RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT
+        ),
+        "official_release": True,
+        "training_dataset": "BEAT2",
+        "speaker_scope": "All-Speakers",
+        "show_trained": False,
+        "checkpoint_container_schema": list(checkpoint_container_schema),
+    }
+
+
+def _load_released_model_state_only(
+    path: Path,
+    *,
+    expected_filename: str,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], Path, bytes, str]:
+    """Read one exact official release checkpoint without pickle fallback."""
+    import torch
+
+    candidate = Path(path).expanduser()
+    if candidate.name != expected_filename:
+        raise InferenceContractError(
+            f"released checkpoint filename {candidate.name!r} != "
+            f"{expected_filename!r}"
+        )
+    try:
+        mode = os.lstat(candidate).st_mode
+    except FileNotFoundError:
+        raise FileNotFoundError(candidate) from None
+    if candidate.is_symlink() or not stat.S_ISREG(mode):
+        raise InferenceContractError(
+            "released checkpoint must be a regular non-symlink file: "
+            f"{candidate}"
+        )
+    resolved = candidate.resolve(strict=True)
+    if resolved.name != expected_filename or not resolved.is_file():
+        raise InferenceContractError(
+            f"unsafe released checkpoint path: {candidate}"
+        )
+    snapshot = resolved.read_bytes()
+    observed_sha = hashlib.sha256(snapshot).hexdigest()
+    if observed_sha != expected_sha256:
+        raise InferenceContractError(
+            f"{resolved}: released checkpoint SHA-256 {observed_sha} != "
+            f"{expected_sha256}"
+        )
+    try:
+        payload = torch.load(
+            io.BytesIO(snapshot),
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError as exc:  # pragma: no cover - supported formal torch has it
+        raise InferenceContractError(
+            "released_all_speakers_v1 requires "
+            "torch.load(weights_only=True)"
+        ) from exc
+    except Exception as exc:
+        raise InferenceContractError(
+            f"{resolved}: cannot deserialize released checkpoint with "
+            "weights_only=True"
+        ) from exc
+    if type(payload) is not dict or set(payload) != {"model_state"}:
+        raise InferenceContractError(
+            f"{resolved}: released checkpoint must contain only model_state"
+        )
+    raw_state = payload["model_state"]
+    if not isinstance(raw_state, Mapping) or not raw_state:
+        raise InferenceContractError(
+            f"{resolved}: released model_state must be a non-empty mapping"
+        )
+    normalized = _normalize_data_parallel_state(raw_state, resolved)
+    _finite_state_dict(normalized, resolved)
+    return normalized, resolved, snapshot, observed_sha
+
+
+def _load_released_base_state(
+    path: Path,
+    *,
+    expected_filename: str,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], Path, bytes, str, dict[str, Any]]:
+    """Read the exact official Base envelope and validate all auxiliary state."""
+    import torch
+
+    candidate = Path(path).expanduser()
+    if candidate.name != expected_filename:
+        raise InferenceContractError(
+            f"released Base filename {candidate.name!r} != "
+            f"{expected_filename!r}"
+        )
+    try:
+        mode = os.lstat(candidate).st_mode
+    except FileNotFoundError:
+        raise FileNotFoundError(candidate) from None
+    if candidate.is_symlink() or not stat.S_ISREG(mode):
+        raise InferenceContractError(
+            "released Base must be a regular non-symlink file: "
+            f"{candidate}"
+        )
+    resolved = candidate.resolve(strict=True)
+    snapshot = resolved.read_bytes()
+    observed_sha = hashlib.sha256(snapshot).hexdigest()
+    if observed_sha != expected_sha256:
+        raise InferenceContractError(
+            f"{resolved}: released Base SHA-256 {observed_sha} != "
+            f"{expected_sha256}"
+        )
+    try:
+        payload = torch.load(
+            io.BytesIO(snapshot),
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError as exc:  # pragma: no cover - supported formal torch has it
+        raise InferenceContractError(
+            "released official Base requires torch.load(weights_only=True)"
+        ) from exc
+    except Exception as exc:
+        raise InferenceContractError(
+            f"{resolved}: cannot deserialize released Base with "
+            "weights_only=True"
+        ) from exc
+    if (
+        type(payload) is not dict
+        or set(payload) != set(RELEASED_BASE_CONTAINER_SCHEMA)
+        or type(payload.get("epoch")) is not int
+        or payload["epoch"] != 401
+        or payload.get("lrs") != RELEASED_BASE_LRS
+    ):
+        raise InferenceContractError(
+            f"{resolved}: invalid exact official Base checkpoint envelope"
+        )
+    raw_state = payload.get("model_state")
+    if not isinstance(raw_state, Mapping) or not raw_state:
+        raise InferenceContractError(
+            f"{resolved}: official Base model_state is invalid"
+        )
+    state = _normalize_data_parallel_state(raw_state, resolved)
+    _finite_state_dict(state, resolved)
+    optimizer = payload.get("opt_state")
+    if (
+        type(optimizer) is not dict
+        or set(optimizer) != {"state", "param_groups"}
+        or type(optimizer["state"]) is not dict
+        or len(optimizer["state"]) != 1_655
+        or type(optimizer["param_groups"]) is not list
+        or len(optimizer["param_groups"]) != 1
+    ):
+        raise InferenceContractError(
+            f"{resolved}: invalid official Base optimizer envelope"
+        )
+    group = optimizer["param_groups"][0]
+    expected_group_without_params = {
+        "lr": 0.00030000000000000003,
+        "betas": (0.5, 0.999),
+        "eps": 1e-08,
+        "weight_decay": 0.0,
+        "amsgrad": False,
+        "maximize": False,
+        "foreach": None,
+        "capturable": False,
+        "differentiable": False,
+        "fused": None,
+        "decoupled_weight_decay": False,
+        "initial_lr": 0.00030000000000000003,
+    }
+    if (
+        type(group) is not dict
+        or set(group) != set(expected_group_without_params) | {"params"}
+        or {
+            key: group[key] for key in expected_group_without_params
+        }
+        != expected_group_without_params
+        or type(group["params"]) is not list
+        or group["params"] != list(range(1_783))
+    ):
+        raise InferenceContractError(
+            f"{resolved}: invalid official Base optimizer parameter group"
+        )
+    for parameter_index, parameter_state in optimizer["state"].items():
+        if (
+            type(parameter_index) is not int
+            or not 0 <= parameter_index < 1_783
+            or type(parameter_state) is not dict
+            or set(parameter_state) != {"step", "exp_avg", "exp_avg_sq"}
+            or any(
+                not torch.is_tensor(parameter_state[key])
+                for key in ("step", "exp_avg", "exp_avg_sq")
+            )
+            or any(
+                not bool(torch.isfinite(parameter_state[key]).all().item())
+                for key in ("step", "exp_avg", "exp_avg_sq")
+            )
+        ):
+            raise InferenceContractError(
+                f"{resolved}: invalid/non-finite official Base optimizer "
+                f"state at parameter {parameter_index!r}"
+            )
+    auxiliary_receipt = {
+        "epoch_counter": payload["epoch"],
+        "lr_scheduler_sha256": canonical_json_sha256(payload["lrs"]),
+        "optimizer_state_entries": len(optimizer["state"]),
+        "optimizer_parameter_count": len(group["params"]),
+        "optimizer_all_tensors_finite": True,
+    }
+    return state, resolved, snapshot, observed_sha, auxiliary_receipt
+
+
+_RELEASED_REPRESENTATION_SCHEMAS: (
+    dict[str, dict[str, tuple[Any, tuple[int, ...]]]] | None
+) = None
+
+
+def _expected_released_representation_schemas(
+) -> dict[str, dict[str, tuple[Any, tuple[int, ...]]]]:
+    global _RELEASED_REPRESENTATION_SCHEMAS
+    if _RELEASED_REPRESENTATION_SCHEMAS is None:
+        import torch
+        from models.motion_representation import VAEConvZero
+        from models.rvq import RVQVAE
+
+        schemas: dict[str, dict[str, tuple[Any, tuple[int, ...]]]] = {}
+        for name in (*RVQ_DIMS, "global"):
+            specification = RELEASED_ALL_SPEAKERS_MODELS[name]
+            model_args = SimpleNamespace(
+                vae_test_dim=specification["vae_test_dim"],
+                vae_layer=specification["vae_layer"],
+                vae_length=256,
+            )
+            try:
+                with torch.device("meta"):
+                    model = (
+                        VAEConvZero(model_args)
+                        if name == "global"
+                        else RVQVAE(model_args)
+                    )
+            except Exception as exc:
+                raise InferenceContractError(
+                    f"cannot construct strict released {name} schema on "
+                    "the PyTorch meta device"
+                ) from exc
+            schemas[name] = {
+                key: (value.dtype, tuple(value.shape))
+                for key, value in model.state_dict().items()
+            }
+            del model
+        _RELEASED_REPRESENTATION_SCHEMAS = schemas
+    return _RELEASED_REPRESENTATION_SCHEMAS
+
+
+def _validate_released_model_state_schema(
+    state: Mapping[str, Any],
+    *,
+    formal_stage: str,
+    path: Path,
+) -> None:
+    if formal_stage == "base":
+        _validate_base_model_state_schema(state, path)
+        return
+    expected = _expected_released_representation_schemas()[formal_stage]
+    if set(state) != set(expected):
+        raise InferenceContractError(
+            f"{path}: model_state keys are not the exact released "
+            f"{formal_stage} schema"
+        )
+    for key, value in state.items():
+        expected_dtype, expected_shape = expected[key]
+        if value.dtype != expected_dtype or tuple(value.shape) != expected_shape:
+            raise InferenceContractError(
+                f"{path}: released model_state tensor schema mismatch "
+                f"for {key!r}"
+            )
+
+
+def _strict_load_freeze_eval(
+    model: Any,
+    state: Mapping[str, Any],
+    *,
+    path: Path,
+) -> None:
+    incompatible = model.load_state_dict(state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise InferenceContractError(
+            f"{path}: strict released state load was not exact"
+        )
+    model.eval()
+    model.requires_grad_(False)
+    if model.training or any(
+        parameter.requires_grad for parameter in model.parameters()
+    ):
+        raise InferenceContractError(
+            f"{path}: released model did not freeze in eval mode"
+        )
+
+
+def _validate_released_prerequisite_lineage_binding(
+    *,
+    lineage: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Validate the exact builder receipt for the five official weights."""
+    stages = set(CHECKPOINT_STAGES) - {"base"}
+    records = lineage.get("formal_checkpoints")
+    receipt = lineage.get("prerequisite_source_receipt")
+    source_receipt = _released_weight_source_receipt()
+    source_receipt_sha = canonical_json_sha256(source_receipt)
+    if (
+        not isinstance(records, dict)
+        or set(records) != stages
+        or not isinstance(receipt, dict)
+        or set(receipt) != RELEASED_IMPORT_RECEIPT_KEYS
+        or receipt.get("format")
+        != "semtalk_released_all_speakers_import_receipt_v1"
+        or receipt.get("status") != "complete"
+        or receipt.get("prerequisite_source")
+        != RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        or receipt.get("classification")
+        != RELEASED_ALL_SPEAKERS_CLASSIFICATION
+        or receipt.get("training_dataset") != "BEAT2"
+        or receipt.get("speaker_scope") != "All-Speakers"
+        or receipt.get("show_trained") is not False
+        or receipt.get("source_receipt") != source_receipt
+        or receipt.get("source_receipt_sha256") != source_receipt_sha
+        or receipt.get("strict_state_dict_load") is not True
+        or receipt.get("all_model_state_tensors_finite") is not True
+        or receipt.get("frozen_eval") is not True
+    ):
+        raise InferenceContractError(
+            "Base feature lineage lacks the exact official All-Speakers "
+            "prerequisite import receipt"
+        )
+    receipt_without_sha = dict(receipt)
+    receipt_sha = receipt_without_sha.pop("receipt_sha256", None)
+    if (
+        type(receipt_sha) is not str
+        or receipt_sha != canonical_json_sha256(receipt_without_sha)
+    ):
+        raise InferenceContractError(
+            "official All-Speakers import receipt SHA is invalid"
+        )
+    files = receipt.get("files")
+    if not isinstance(files, dict) or set(files) != stages:
+        raise InferenceContractError(
+            "official All-Speakers import receipt file cover is invalid"
+        )
+    normalized_records: dict[str, dict[str, Any]] = {}
+    for stage in sorted(stages):
+        specification = RELEASED_ALL_SPEAKERS_MODELS[stage]
+        expected_path = _resolved_regular_file(
+            getattr(args, f"{stage}_checkpoint"),
+            f"{stage} official released checkpoint",
+        )
+        record = records[stage]
+        file_record = files[stage]
+        if (
+            not isinstance(record, dict)
+            or set(record) != RELEASED_PREREQUISITE_RECORD_KEYS
+            or not isinstance(file_record, dict)
+            or set(file_record)
+            != {
+                "path",
+                "filename",
+                "sha256",
+                "bytes",
+                "model_class",
+                "model_state_schema_sha256",
+            }
+            or record.get("path") != str(expected_path)
+            or file_record.get("path") != str(expected_path)
+            or record.get("filename") != specification["filename"]
+            or file_record.get("filename") != specification["filename"]
+            or record.get("sha256") != specification["sha256"]
+            or file_record.get("sha256") != specification["sha256"]
+            or record.get("bytes") != expected_path.stat().st_size
+            or file_record.get("bytes") != expected_path.stat().st_size
+            or record.get("formal_stage") != stage
+            or record.get("prerequisite_source")
+            != RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+            or record.get("classification")
+            != RELEASED_ALL_SPEAKERS_CLASSIFICATION
+            or record.get("training_dataset") != "BEAT2"
+            or record.get("speaker_scope") != "All-Speakers"
+            or record.get("show_trained") is not False
+            or record.get("checkpoint_container_schema") != ["model_state"]
+            or record.get("model_class") != specification["model_class"]
+            or file_record.get("model_class") != specification["model_class"]
+            or type(record.get("model_state_tensors")) is not int
+            or record["model_state_tensors"] <= 0
+            or record.get("model_state_schema_sha256")
+            != file_record.get("model_state_schema_sha256")
+            or type(record.get("model_state_schema_sha256")) is not str
+            or len(record["model_state_schema_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in record["model_state_schema_sha256"]
+            )
+            or record.get("all_model_state_tensors_finite") is not True
+            or record.get("strict_state_dict_load") is not True
+            or record.get("frozen_eval") is not True
+            or record.get("source_receipt") != source_receipt
+            or record.get("source_receipt_sha256") != source_receipt_sha
+        ):
+            raise InferenceContractError(
+                f"{stage}: invalid official All-Speakers prerequisite "
+                "lineage record"
+            )
+        normalized_records[stage] = dict(record)
+    expected_files = {
+        stage: {
+            key: normalized_records[stage][key]
+            for key in (
+                "path",
+                "filename",
+                "sha256",
+                "bytes",
+                "model_class",
+                "model_state_schema_sha256",
+            )
+        }
+        for stage in sorted(stages)
+    }
+    if files != expected_files:
+        raise InferenceContractError(
+            "official All-Speakers import receipt/files mismatch"
+        )
+    return dict(receipt), normalized_records
+
+
 def _validate_base_state_schema_pair(
     candidate_state: Mapping[str, Any],
     candidate_path: Path,
@@ -2585,16 +3221,146 @@ def _checkpoint_payload_and_receipt(
     *,
     formal_stage: str,
     expected_sha256: str,
-    expected_training_lineage_sha256: str,
-    status_path: Path,
-    expected_source_receipt: Mapping[str, Any],
-    expected_dataset_summary_sha256: str,
-    expected_data_mdb_sha256: str,
+    expected_training_lineage_sha256: str | None,
+    status_path: Path | None,
+    expected_source_receipt: Mapping[str, Any] | None,
+    expected_dataset_summary_sha256: str | None,
+    expected_data_mdb_sha256: str | None,
+    checkpoint_source: str = SHOW_TRAINED_CHECKPOINT_SOURCE,
+    expected_release_record: Mapping[str, Any] | None = None,
     base_candidate_manifest_path: Path | None = None,
     expected_base_candidate_manifest_sha256: str | None = None,
     expected_base_formal_status_sha256: str | None = None,
     expected_base_final_checkpoint_sha256: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if checkpoint_source == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE:
+        if any(
+            value is not None
+            for value in (
+                status_path,
+                base_candidate_manifest_path,
+                expected_base_candidate_manifest_sha256,
+                expected_base_formal_status_sha256,
+                expected_base_final_checkpoint_sha256,
+            )
+        ):
+            raise InferenceContractError(
+                "released_all_speakers_v1 forbids SHOW training status and "
+                "Base candidate trust-root receipts"
+            )
+        specification = RELEASED_ALL_SPEAKERS_MODELS[formal_stage]
+        pinned_sha = str(specification["sha256"])
+        if expected_sha256 != pinned_sha:
+            raise InferenceContractError(
+                f"{formal_stage}: released expected SHA-256 "
+                f"{expected_sha256} != hard-pinned {pinned_sha}"
+            )
+        auxiliary_receipt: dict[str, Any] | None = None
+        if formal_stage == "base":
+            (
+                state,
+                resolved,
+                checkpoint_snapshot,
+                observed_sha,
+                auxiliary_receipt,
+            ) = _load_released_base_state(
+                path,
+                expected_filename=str(specification["filename"]),
+                expected_sha256=pinned_sha,
+            )
+        else:
+            state, resolved, checkpoint_snapshot, observed_sha = (
+                _load_released_model_state_only(
+                    path,
+                    expected_filename=str(specification["filename"]),
+                    expected_sha256=pinned_sha,
+                )
+            )
+        _validate_released_model_state_schema(
+            state,
+            formal_stage=formal_stage,
+            path=resolved,
+        )
+        classification = (
+            RELEASED_ALL_SPEAKERS_BASE_CLASSIFICATION
+            if formal_stage == "base"
+            else RELEASED_ALL_SPEAKERS_CLASSIFICATION
+        )
+        release_source = _released_weight_source_receipt(
+            classification=classification,
+            checkpoint_container_schema=(
+                RELEASED_BASE_CONTAINER_SCHEMA
+                if formal_stage == "base"
+                else ("model_state",)
+            ),
+        )
+        record: dict[str, Any] = {
+            "path": str(resolved),
+            "filename": str(specification["filename"]),
+            "sha256": observed_sha,
+            "bytes": len(checkpoint_snapshot),
+            "formal_stage": formal_stage,
+            (
+                "base_checkpoint_source"
+                if formal_stage == "base"
+                else "prerequisite_source"
+            ): RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE,
+            "classification": classification,
+            "training_dataset": "BEAT2",
+            "speaker_scope": "All-Speakers",
+            "show_trained": False,
+            "checkpoint_container_schema": (
+                list(RELEASED_BASE_CONTAINER_SCHEMA)
+                if formal_stage == "base"
+                else ["model_state"]
+            ),
+            "model_class": str(specification["model_class"]),
+            "model_state_tensors": len(state),
+            "model_state_schema_sha256": _state_dict_schema_sha256(state),
+            "all_model_state_tensors_finite": True,
+            "strict_state_dict_load": True,
+            "frozen_eval": True,
+            "source_receipt": release_source,
+            "source_receipt_sha256": canonical_json_sha256(release_source),
+        }
+        if auxiliary_receipt is not None:
+            record["release_auxiliary_state"] = auxiliary_receipt
+        if formal_stage != "base":
+            if not isinstance(expected_release_record, Mapping):
+                raise InferenceContractError(
+                    f"{formal_stage}: Base feature lineage lacks the exact "
+                    "released prerequisite record"
+                )
+            if dict(expected_release_record) != record:
+                raise InferenceContractError(
+                    f"{formal_stage}: released checkpoint does not match the "
+                    "Base feature lineage record"
+                )
+        elif expected_release_record is not None:
+            raise InferenceContractError(
+                "official released Base is not a representation prerequisite"
+            )
+        return {"model_state": state}, record
+
+    if checkpoint_source != SHOW_TRAINED_CHECKPOINT_SOURCE:
+        raise InferenceContractError(
+            f"unsupported checkpoint source {checkpoint_source!r}"
+        )
+    if expected_release_record is not None:
+        raise InferenceContractError(
+            "show_trained_v1 cannot carry a released checkpoint record"
+        )
+    if (
+        expected_training_lineage_sha256 is None
+        or status_path is None
+        or expected_source_receipt is None
+        or expected_dataset_summary_sha256 is None
+        or expected_data_mdb_sha256 is None
+    ):
+        raise InferenceContractError(
+            f"{formal_stage}: show_trained_v1 requires complete lineage, "
+            "source, dataset, and status receipts"
+        )
     resolved, checkpoint_snapshot, observed_sha = (
         _read_verified_checkpoint_snapshot(
             path,
@@ -2917,12 +3683,13 @@ def _load_models(
         **validation["base"],
     )
     base = semtalk_base(_model_args()).to(args.device)
-    base.load_state_dict(
+    _strict_load_freeze_eval(
+        base,
         _normalize_data_parallel_state(
             base_payload["model_state"],
             Path(receipts["base"]["path"]),
         ),
-        strict=True,
+        path=Path(receipts["base"]["path"]),
     )
     models["base"] = base
     del base_payload
@@ -2934,13 +3701,23 @@ def _load_models(
             expected_sha256=getattr(args, f"expected_{name}_sha256"),
             **validation[name],
         )
-        model = RVQVAE(SimpleNamespace(vae_test_dim=dimension)).to(args.device)
-        model.load_state_dict(
+        if args.prerequisite_source == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE:
+            specification = RELEASED_ALL_SPEAKERS_MODELS[name]
+            model_arguments = SimpleNamespace(
+                vae_test_dim=specification["vae_test_dim"],
+                vae_layer=specification["vae_layer"],
+                vae_length=256,
+            )
+        else:
+            model_arguments = SimpleNamespace(vae_test_dim=dimension)
+        model = RVQVAE(model_arguments).to(args.device)
+        _strict_load_freeze_eval(
+            model,
             _normalize_data_parallel_state(
                 payload["model_state"],
                 Path(receipts[name]["path"]),
             ),
-            strict=True,
+            path=Path(receipts[name]["path"]),
         )
         models[name] = model
         del payload
@@ -2957,12 +3734,13 @@ def _load_models(
         vae_length=256,
     )
     global_motion = VAEConvZero(global_args).to(args.device)
-    global_motion.load_state_dict(
+    _strict_load_freeze_eval(
+        global_motion,
         _normalize_data_parallel_state(
             global_payload["model_state"],
             Path(receipts["global"]["path"]),
         ),
-        strict=True,
+        path=Path(receipts["global"]["path"]),
     )
     models["global"] = global_motion
     del global_payload
@@ -3515,6 +4293,16 @@ def _input_contract(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     source_receipt = _source_receipt(args)
+    training_source_receipt = _expected_source_role_receipt(
+        role="training",
+        commit=args.expected_training_source_commit,
+        tree=args.expected_training_source_tree,
+    )
+    input_source_receipt = _expected_source_role_receipt(
+        role="input_artifact",
+        commit=args.expected_input_source_commit,
+        tree=args.expected_input_source_tree,
+    )
     canonical_manifest = _resolved_regular_file(
         args.canonical_manifest,
         "canonical manifest",
@@ -3576,8 +4364,8 @@ def _input_contract(
             canonical_manifest_sha=canonical_sha,
             canonical_lineage_contract_sha256=canonical_contract_sha,
             canonical_receipt=canonical_receipt,
-            expected_source_commit=args.expected_source_commit,
-            expected_source_tree=args.expected_source_tree,
+            expected_source_commit=args.expected_input_source_commit,
+            expected_source_tree=args.expected_input_source_tree,
             expected_hubert_tree_sha256=(
                 args.expected_hubert_tree_sha256
             ),
@@ -3701,6 +4489,16 @@ def _input_contract(
         != "int64_all_zero_unused_placeholder"
         or set(base_protocol.get("forbidden_components", []))
         != FORBIDDEN_COMPONENTS
+        or (
+            args.prerequisite_source
+            == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+            and base_protocol.get("prerequisite_source")
+            != RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        )
+        or (
+            args.prerequisite_source == SHOW_TRAINED_CHECKPOINT_SOURCE
+            and base_protocol.get("prerequisite_source") not in (None, "")
+        )
         or not isinstance(representation_protocol, dict)
         or representation_protocol.get("split") != "train"
         or representation_protocol.get("speaker_map")
@@ -3730,9 +4528,20 @@ def _input_contract(
         str(representation_lineage_payload.get("data_mdb_sha256", "")),
         "representation training data.mdb receipt",
     )
-    source_triplet = {
-        key: source_receipt[key] for key in ("origin", "commit", "tree")
+    training_source_triplet = {
+        key: training_source_receipt[key]
+        for key in ("origin", "commit", "tree")
     }
+    input_source_triplet = {
+        key: input_source_receipt[key]
+        for key in ("origin", "commit", "tree")
+    }
+    lineage_input_source = base_lineage_payload.get(
+        "input_artifact_source_receipt"
+    )
+    lineage_input_source_sha = base_lineage_payload.get(
+        "input_artifact_source_receipt_sha256"
+    )
     if (
         base_lineage_payload.get("canonical_receipt") != canonical_receipt
         or representation_lineage_payload.get("canonical_receipt")
@@ -3747,14 +4556,28 @@ def _input_contract(
             key: base_lineage_payload.get("source_receipt", {}).get(key)
             for key in ("origin", "commit", "tree")
         }
-        != source_triplet
+        != training_source_triplet
         or {
             key: representation_lineage_payload.get(
                 "source_receipt", {}
             ).get(key)
             for key in ("origin", "commit", "tree")
         }
-        != source_triplet
+        != input_source_triplet
+        or (
+            lineage_input_source is not None
+            and lineage_input_source != input_source_receipt
+        )
+        or (
+            lineage_input_source is not None
+            and lineage_input_source_sha
+            != canonical_json_sha256(input_source_receipt)
+        )
+        or (
+            args.prerequisite_source
+            == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+            and lineage_input_source != input_source_receipt
+        )
     ):
         raise InferenceContractError(
             "training lineage canonical/source binding mismatch"
@@ -3774,49 +4597,70 @@ def _input_contract(
         raise InferenceContractError(
             "Base feature lineage lacks the exact five prerequisite receipts"
         )
-    for stage in sorted(prerequisite_stages):
-        record = expected_prerequisites[stage]
-        expected_path = _resolved_regular_file(
-            getattr(args, f"{stage}_checkpoint"),
-            f"{stage} checkpoint",
-        )
-        expected_sha = _require_sha256(
-            str(getattr(args, f"expected_{stage}_sha256")),
-            f"{stage} expected SHA",
-        )
-        expected_status = _resolved_regular_file(
-            getattr(args, f"{stage}_status_json"),
-            f"{stage} formal training status",
-        )
-        record_audit_source = record.get("audit", {}).get("source_receipt")
-        if (
-            not isinstance(record, dict)
-            or record.get("formal_stage") != stage
-            or Path(str(record.get("path", ""))).resolve() != expected_path
-            or record.get("sha256") != expected_sha
-            or record.get("audit", {}).get(
-                "lineage_manifest_sha256"
+    release_import_receipt: dict[str, Any] | None = None
+    release_records: dict[str, dict[str, Any]] = {}
+    if (
+        args.prerequisite_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    ):
+        release_import_receipt, release_records = (
+            _validate_released_prerequisite_lineage_binding(
+                lineage=base_lineage_payload,
+                args=args,
             )
-            != representation_training_lineage_sha
-            or Path(
-                str(record.get("formal_training_status", ""))
-            ).resolve()
-            != expected_status
-            or record.get("formal_training_status_sha256")
-            != sha256_file(expected_status)
-            or not isinstance(record_audit_source, dict)
-            or {
-                key: record_audit_source.get(key)
-                for key in ("origin", "commit", "tree")
-            }
-            != source_triplet
-            or record.get("audit", {}).get("source_receipt_sha256")
-            != compact_json_sha256(record_audit_source)
-        ):
+        )
+    else:
+        if base_lineage_payload.get("prerequisite_source_receipt") is not None:
             raise InferenceContractError(
-                f"{stage}: checkpoint is not the prerequisite bound to "
-                "this Base feature lineage"
+                "show_trained_v1 Base lineage cannot carry an official "
+                "release import receipt"
             )
+        for stage in sorted(prerequisite_stages):
+            record = expected_prerequisites[stage]
+            expected_path = _resolved_regular_file(
+                getattr(args, f"{stage}_checkpoint"),
+                f"{stage} checkpoint",
+            )
+            expected_sha = _require_sha256(
+                str(getattr(args, f"expected_{stage}_sha256")),
+                f"{stage} expected SHA",
+            )
+            expected_status = _resolved_regular_file(
+                getattr(args, f"{stage}_status_json"),
+                f"{stage} formal training status",
+            )
+            record_audit_source = record.get("audit", {}).get(
+                "source_receipt"
+            )
+            if (
+                not isinstance(record, dict)
+                or record.get("formal_stage") != stage
+                or Path(str(record.get("path", ""))).resolve()
+                != expected_path
+                or record.get("sha256") != expected_sha
+                or record.get("audit", {}).get(
+                    "lineage_manifest_sha256"
+                )
+                != representation_training_lineage_sha
+                or Path(
+                    str(record.get("formal_training_status", ""))
+                ).resolve()
+                != expected_status
+                or record.get("formal_training_status_sha256")
+                != sha256_file(expected_status)
+                or not isinstance(record_audit_source, dict)
+                or {
+                    key: record_audit_source.get(key)
+                    for key in ("origin", "commit", "tree")
+                }
+                != input_source_triplet
+                or record.get("audit", {}).get("source_receipt_sha256")
+                != compact_json_sha256(record_audit_source)
+            ):
+                raise InferenceContractError(
+                    f"{stage}: checkpoint is not the prerequisite bound to "
+                    "this Base feature lineage"
+                )
     training_lineage_hashes = {
         "base": {
             "path": str(base_training_lineage),
@@ -3827,53 +4671,104 @@ def _input_contract(
             "sha256": representation_training_lineage_sha,
         },
     }
-    accepted_training_lineages = {
-        stage: (
-            base_training_lineage_sha
-            if stage == "base"
+    base_is_released = (
+        args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    )
+    accepted_training_lineages: dict[str, Any] = {}
+    accepted_training_lineages["base"] = (
+        {
+            "kind": "official_release",
+            "checkpoint_source": args.base_checkpoint_source,
+            "classification": RELEASED_ALL_SPEAKERS_BASE_CLASSIFICATION,
+        }
+        if base_is_released
+        else base_training_lineage_sha
+    )
+    for stage in sorted(prerequisite_stages):
+        accepted_training_lineages[stage] = (
+            {
+                "kind": "official_release",
+                "checkpoint_source": args.prerequisite_source,
+                "import_receipt_sha256": (
+                    release_import_receipt["receipt_sha256"]
+                    if release_import_receipt is not None
+                    else None
+                ),
+            }
+            if release_import_receipt is not None
             else representation_training_lineage_sha
         )
-        for stage in CHECKPOINT_STAGES
+    checkpoint_validation: dict[str, dict[str, Any]] = {}
+    checkpoint_validation["base"] = {
+        "checkpoint_source": args.base_checkpoint_source,
+        "expected_training_lineage_sha256": (
+            None if base_is_released else base_training_lineage_sha
+        ),
+        "status_path": (
+            None
+            if base_is_released
+            else _resolved_regular_file(
+                args.base_status_json,
+                "base formal training status",
+            )
+        ),
+        "expected_source_receipt": (
+            None if base_is_released else training_source_receipt
+        ),
+        "expected_dataset_summary_sha256": (
+            None if base_is_released else base_training_summary_sha
+        ),
+        "expected_data_mdb_sha256": (
+            None if base_is_released else base_data_sha
+        ),
+        "base_candidate_manifest_path": (
+            None if base_is_released else args.base_candidate_manifest
+        ),
+        "expected_base_candidate_manifest_sha256": (
+            None
+            if base_is_released
+            else args.expected_base_candidate_manifest_sha256
+        ),
+        "expected_base_formal_status_sha256": (
+            None
+            if base_is_released
+            else args.expected_base_formal_status_sha256
+        ),
+        "expected_base_final_checkpoint_sha256": (
+            None
+            if base_is_released
+            else args.expected_base_final_checkpoint_sha256
+        ),
     }
-    checkpoint_validation = {
-        stage: {
+    for stage in sorted(prerequisite_stages):
+        released = release_import_receipt is not None
+        checkpoint_validation[stage] = {
+            "checkpoint_source": args.prerequisite_source,
             "expected_training_lineage_sha256": (
-                base_training_lineage_sha
-                if stage == "base"
-                else representation_training_lineage_sha
+                None if released else representation_training_lineage_sha
             ),
-            "status_path": _resolved_regular_file(
-                getattr(args, f"{stage}_status_json"),
-                f"{stage} formal training status",
+            "status_path": (
+                None
+                if released
+                else _resolved_regular_file(
+                    getattr(args, f"{stage}_status_json"),
+                    f"{stage} formal training status",
+                )
             ),
-            "expected_source_receipt": source_receipt,
+            "expected_source_receipt": (
+                None if released else input_source_receipt
+            ),
             "expected_dataset_summary_sha256": (
-                base_training_summary_sha
-                if stage == "base"
-                else representation_training_lineage_sha
+                None if released else representation_training_lineage_sha
             ),
             "expected_data_mdb_sha256": (
-                base_data_sha
-                if stage == "base"
-                else representation_data_sha
+                None if released else representation_data_sha
+            ),
+            "expected_release_record": (
+                release_records[stage] if released else None
             ),
         }
-        for stage in CHECKPOINT_STAGES
-    }
-    checkpoint_validation["base"].update(
-        {
-            "base_candidate_manifest_path": args.base_candidate_manifest,
-            "expected_base_candidate_manifest_sha256": (
-                args.expected_base_candidate_manifest_sha256
-            ),
-            "expected_base_formal_status_sha256": (
-                args.expected_base_formal_status_sha256
-            ),
-            "expected_base_final_checkpoint_sha256": (
-                args.expected_base_final_checkpoint_sha256
-            ),
-        }
-    )
     return {
         "canonical_manifest": canonical_manifest,
         "canonical_manifest_sha256": canonical_sha,
@@ -3901,6 +4796,14 @@ def _input_contract(
             representation_lineage_payload
         ),
         "source": source_receipt,
+        "source_roles": {
+            "inference": source_receipt,
+            "training": training_source_receipt,
+            "input_artifact": input_source_receipt,
+        },
+        "prerequisite_source": args.prerequisite_source,
+        "base_checkpoint_source": args.base_checkpoint_source,
+        "released_prerequisite_import_receipt": release_import_receipt,
     }
 
 
@@ -3940,6 +4843,14 @@ def _stable_contract_receipt(
             "accepted_training_lineages"
         ],
         "source": inputs["source"],
+        "source_roles": inputs["source_roles"],
+        "base_checkpoint_source": inputs["base_checkpoint_source"],
+        "representation_prerequisite_source": inputs[
+            "prerequisite_source"
+        ],
+        "released_prerequisite_import_receipt": inputs[
+            "released_prerequisite_import_receipt"
+        ],
         "checkpoints": checkpoints,
         "speaker_mapping": SHOW_SPEAKER_IDS,
         "test_clips": EXPECTED_TEST_CLIPS,
@@ -4044,14 +4955,21 @@ def _revalidate_frozen_inputs(
             str(receipt["sha256"]),
             f"{stage} checkpoint",
         )
-        _verify_file_sha(
-            _resolved_regular_file(
-                receipt["formal_training_status"],
+        formal_status = receipt.get("formal_training_status")
+        formal_status_sha = receipt.get("formal_training_status_sha256")
+        if formal_status is not None or formal_status_sha is not None:
+            if formal_status is None or formal_status_sha is None:
+                raise InferenceContractError(
+                    f"{stage}: partial formal training status receipt"
+                )
+            _verify_file_sha(
+                _resolved_regular_file(
+                    formal_status,
+                    f"{stage} formal training status",
+                ),
+                str(formal_status_sha),
                 f"{stage} formal training status",
-            ),
-            str(receipt["formal_training_status_sha256"]),
-            f"{stage} formal training status",
-        )
+            )
         candidate_manifest = receipt.get("base_candidate_manifest")
         if candidate_manifest is not None:
             _verify_file_sha(
@@ -4933,6 +5851,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--prerequisite-source",
+        choices=CHECKPOINT_SOURCES,
+        default=SHOW_TRAINED_CHECKPOINT_SOURCE,
+        help="Source contract for face/upper/hands/lower/global weights.",
+    )
+    parser.add_argument(
+        "--base-checkpoint-source",
+        choices=CHECKPOINT_SOURCES,
+        default=SHOW_TRAINED_CHECKPOINT_SOURCE,
+        help="Independent source contract for the Base checkpoint.",
+    )
+    parser.add_argument(
         "--expected-inference-script-sha256",
         required=True,
     )
@@ -4944,6 +5874,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-source-tree",
         required=True,
     )
+    parser.add_argument("--expected-training-source-commit")
+    parser.add_argument("--expected-training-source-tree")
+    parser.add_argument("--expected-input-source-commit")
+    parser.add_argument("--expected-input-source-tree")
     parser.add_argument(
         "--expected-canonical-source-commit",
         required=True,
@@ -4969,12 +5903,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.add_argument(
             f"--{stage}-status-json",
             type=Path,
-            required=True,
         )
     parser.add_argument(
         "--base-candidate-manifest",
         type=Path,
-        required=True,
         help=(
             "Immutable manifest v2 proving that --base-checkpoint is one of "
             "the 40 formal Base candidates."
@@ -4982,12 +5914,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--expected-base-candidate-manifest-sha256",
-        required=True,
         help="Expected SHA-256 for --base-candidate-manifest.",
     )
     parser.add_argument(
         "--expected-base-formal-status-sha256",
-        required=True,
         help=(
             "External expected SHA-256 for the complete Base formal-status "
             "JSON."
@@ -4995,7 +5925,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--expected-base-final-checkpoint-sha256",
-        required=True,
         help=(
             "External expected SHA-256 for the completed final Base "
             "checkpoint."
@@ -5043,6 +5972,57 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.expected_source_tree,
         "--expected-source-tree",
     )
+    source_pairs = (
+        (
+            "training",
+            "expected_training_source_commit",
+            "expected_training_source_tree",
+        ),
+        (
+            "input",
+            "expected_input_source_commit",
+            "expected_input_source_tree",
+        ),
+    )
+    release_mode = (
+        args.prerequisite_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        or args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    )
+    for label, commit_name, tree_name in source_pairs:
+        commit = getattr(args, commit_name)
+        tree = getattr(args, tree_name)
+        if (commit is None) != (tree is None):
+            parser.error(
+                f"--expected-{label}-source-commit and "
+                f"--expected-{label}-source-tree must be supplied together"
+            )
+        if release_mode and commit is None:
+            parser.error(
+                f"released_all_speakers_v1 requires explicit "
+                f"--expected-{label}-source-commit and "
+                f"--expected-{label}-source-tree"
+            )
+        if commit is None:
+            commit = args.expected_source_commit
+            tree = args.expected_source_tree
+        setattr(
+            args,
+            commit_name,
+            _require_git_oid(
+                commit,
+                f"--expected-{label}-source-commit",
+            ),
+        )
+        setattr(
+            args,
+            tree_name,
+            _require_git_oid(
+                tree,
+                f"--expected-{label}-source-tree",
+            ),
+        )
     args.expected_canonical_source_commit = _require_git_oid(
         args.expected_canonical_source_commit,
         "--expected-canonical-source-commit",
@@ -5055,18 +6035,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.expected_hubert_tree_sha256,
         "--expected-hubert-tree-sha256",
     )
-    args.expected_base_candidate_manifest_sha256 = _require_sha256(
-        args.expected_base_candidate_manifest_sha256,
-        "--expected-base-candidate-manifest-sha256",
-    )
-    args.expected_base_formal_status_sha256 = _require_sha256(
-        args.expected_base_formal_status_sha256,
-        "--expected-base-formal-status-sha256",
-    )
-    args.expected_base_final_checkpoint_sha256 = _require_sha256(
-        args.expected_base_final_checkpoint_sha256,
-        "--expected-base-final-checkpoint-sha256",
-    )
+    for name in (
+        "expected_base_candidate_manifest_sha256",
+        "expected_base_formal_status_sha256",
+        "expected_base_final_checkpoint_sha256",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(
+                args,
+                name,
+                _require_sha256(value, f"--{name.replace('_', '-')}"),
+            )
     for stage in CHECKPOINT_STAGES:
         setattr(
             args,
@@ -5076,6 +6056,90 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 f"--expected-{stage}-sha256",
             ),
         )
+    representation_stages = set(CHECKPOINT_STAGES) - {"base"}
+    representation_statuses = {
+        stage: getattr(args, f"{stage}_status_json")
+        for stage in representation_stages
+    }
+    if args.prerequisite_source == SHOW_TRAINED_CHECKPOINT_SOURCE:
+        missing = sorted(
+            stage
+            for stage, status in representation_statuses.items()
+            if status is None
+        )
+        if missing:
+            parser.error(
+                "show_trained_v1 requires representation status JSON for "
+                + ", ".join(missing)
+            )
+    else:
+        unexpected = sorted(
+            stage
+            for stage, status in representation_statuses.items()
+            if status is not None
+        )
+        if unexpected:
+            parser.error(
+                "released_all_speakers_v1 forbids SHOW representation "
+                "status JSON for "
+                + ", ".join(unexpected)
+            )
+        for stage in sorted(representation_stages):
+            specification = RELEASED_ALL_SPEAKERS_MODELS[stage]
+            if (
+                getattr(args, f"expected_{stage}_sha256")
+                != specification["sha256"]
+            ):
+                parser.error(
+                    f"--expected-{stage}-sha256 must equal the hard-pinned "
+                    "official release SHA-256"
+                )
+            if Path(getattr(args, f"{stage}_checkpoint")).name != (
+                specification["filename"]
+            ):
+                parser.error(
+                    f"--{stage}-checkpoint basename must be "
+                    f"{specification['filename']}"
+                )
+    base_trust_roots = {
+        "base status JSON": args.base_status_json,
+        "Base candidate manifest": args.base_candidate_manifest,
+        "Base candidate manifest SHA": (
+            args.expected_base_candidate_manifest_sha256
+        ),
+        "Base formal status SHA": args.expected_base_formal_status_sha256,
+        "Base final checkpoint SHA": (
+            args.expected_base_final_checkpoint_sha256
+        ),
+    }
+    if args.base_checkpoint_source == SHOW_TRAINED_CHECKPOINT_SOURCE:
+        missing = sorted(
+            label for label, value in base_trust_roots.items() if value is None
+        )
+        if missing:
+            parser.error(
+                "show_trained_v1 Base requires " + ", ".join(missing)
+            )
+    else:
+        unexpected = sorted(
+            label for label, value in base_trust_roots.items() if value is not None
+        )
+        if unexpected:
+            parser.error(
+                "released_all_speakers_v1 Base forbids "
+                + ", ".join(unexpected)
+            )
+        base_specification = RELEASED_ALL_SPEAKERS_MODELS["base"]
+        if args.expected_base_sha256 != base_specification["sha256"]:
+            parser.error(
+                "--expected-base-sha256 must equal the hard-pinned official "
+                "release SHA-256"
+            )
+        if Path(args.base_checkpoint).name != base_specification["filename"]:
+            parser.error(
+                "--base-checkpoint basename must be "
+                f"{base_specification['filename']}"
+            )
     args.output_root = args.output_root.expanduser().resolve()
     return args
 
