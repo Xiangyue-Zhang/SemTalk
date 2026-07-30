@@ -38,6 +38,10 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 sys.dont_write_bytecode = True
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 OFFICIAL_RELEASE_COMMIT = "806b008c97bf51fce203e54109e4c22325253618"

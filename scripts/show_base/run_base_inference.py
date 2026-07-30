@@ -63,6 +63,10 @@ import numpy as np
 # therefore never create untracked bytecode inside the immutable source tree.
 sys.dont_write_bytecode = True
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 EXPECTED_TEST_CLIPS = 1708
 EXPECTED_NUM_SHARDS = 8

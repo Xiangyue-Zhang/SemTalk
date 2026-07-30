@@ -539,6 +539,10 @@ class ThresholdTest(unittest.TestCase):
 
 
 class ParserContractTest(unittest.TestCase):
+    def test_entrypoint_makes_the_tracked_project_importable(self) -> None:
+        self.assertEqual(gate.PROJECT_ROOT, ROOT)
+        self.assertIn(str(ROOT), sys.path)
+
     def test_measure_and_decide_are_disjoint_subcommands(self) -> None:
         parser = gate.build_parser()
         with self.assertRaises(SystemExit):

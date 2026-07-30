@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -161,6 +162,10 @@ def _released_argv(*, released_base: bool = False) -> list[str]:
 
 
 class ReleasedCliContractTests(unittest.TestCase):
+    def test_entrypoint_makes_the_tracked_project_importable(self) -> None:
+        self.assertEqual(INFERENCE.PROJECT_ROOT, ROOT)
+        self.assertIn(str(ROOT), sys.path)
+
     def test_default_show_trained_contract_is_unchanged(self) -> None:
         args = INFERENCE.parse_args(_default_argv())
         self.assertEqual(
