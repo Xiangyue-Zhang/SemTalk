@@ -21,6 +21,11 @@ except ImportError:  # pragma: no cover - minimal local environments
     torch = None
     FORMAL = None
 
+try:
+    import torch as BYPASS_TORCH
+except ImportError:  # pragma: no cover - minimal local environments
+    BYPASS_TORCH = None
+
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -1646,6 +1651,169 @@ class OptionalTextDependencyTest(unittest.TestCase):
             if isinstance(node, ast.Name) and node.id == "Vocab"
         ]
         self.assertEqual(vocab_references, [])
+
+
+@unittest.skipIf(BYPASS_TORCH is None, "PyTorch is unavailable")
+class InferenceAuxiliaryLossBypassTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            from models.semtalk import (  # noqa: F401
+                RhythmicIdentificationLoss,
+                semtalk_base,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                f"SemTalk model dependencies are unavailable: {error}"
+            ) from error
+
+    @staticmethod
+    def _base_shell():
+        from models.semtalk import (
+            RhythmicIdentificationLoss,
+            semtalk_base,
+        )
+
+        base = semtalk_base.__new__(semtalk_base)
+        BYPASS_TORCH.nn.Module.__init__(base)
+        base.hubert_face_cons_loss = RhythmicIdentificationLoss(
+            temperature=0.1
+        )
+        base.beat_cons_loss = RhythmicIdentificationLoss(temperature=0.1)
+        base.eval()
+        base.requires_grad_(False)
+        return base
+
+    def test_bypass_is_local_rng_neutral_and_exactly_restored(self) -> None:
+        base = self._base_shell()
+        modules = {
+            name: getattr(base, name)
+            for name in MODULE.INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS
+        }
+        original_functions = {
+            name: getattr(module.forward, "__func__")
+            for name, module in modules.items()
+        }
+        state_before = tuple(base.state_dict())
+        rng_before = BYPASS_TORCH.get_rng_state().clone()
+        deterministic_before = (
+            BYPASS_TORCH.are_deterministic_algorithms_enabled()
+        )
+        warn_before = (
+            BYPASS_TORCH.is_deterministic_algorithms_warn_only_enabled()
+        )
+        try:
+            BYPASS_TORCH.use_deterministic_algorithms(
+                True,
+                warn_only=False,
+            )
+            facial = BYPASS_TORCH.zeros(1, 16, 256)
+            audio = BYPASS_TORCH.zeros(1, 64, 256)
+            with (
+                BYPASS_TORCH.inference_mode(),
+                MODULE._inference_only_auxiliary_loss_bypass(
+                    base,
+                    expected_calls=1,
+                ) as receipt,
+            ):
+                for name, module in modules.items():
+                    self.assertIs(getattr(base, name), module)
+                    value = module(facial, audio)
+                    self.assertEqual(tuple(value.shape), ())
+                    self.assertEqual(value.dtype, facial.dtype)
+                    self.assertEqual(value.device, facial.device)
+                    self.assertEqual(value.item(), 0.0)
+                self.assertEqual(
+                    receipt["calls"],
+                    {
+                        "hubert_face_cons_loss": 1,
+                        "beat_cons_loss": 1,
+                    },
+                )
+                self.assertEqual(
+                    receipt["format"],
+                    MODULE.INFERENCE_AUXILIARY_LOSS_BYPASS_FORMAT,
+                )
+            unsigned_activation = dict(receipt)
+            activation_claim = unsigned_activation.pop("activation_sha256")
+            self.assertEqual(
+                activation_claim,
+                MODULE.compact_json_sha256(unsigned_activation),
+            )
+            for name, module in modules.items():
+                self.assertNotIn("forward", module.__dict__)
+                self.assertIs(
+                    getattr(module.forward, "__func__"),
+                    original_functions[name],
+                )
+                self.assertIs(getattr(base, name), module)
+            self.assertEqual(tuple(base.state_dict()), state_before)
+            self.assertTrue(
+                BYPASS_TORCH.equal(
+                    BYPASS_TORCH.get_rng_state(),
+                    rng_before,
+                )
+            )
+        finally:
+            BYPASS_TORCH.use_deterministic_algorithms(
+                deterministic_before,
+                warn_only=warn_before,
+            )
+
+    def test_bypass_fails_closed_and_still_restores(self) -> None:
+        base = self._base_shell()
+        module = base.hubert_face_cons_loss
+        original = getattr(module.forward, "__func__")
+        deterministic_before = (
+            BYPASS_TORCH.are_deterministic_algorithms_enabled()
+        )
+        warn_before = (
+            BYPASS_TORCH.is_deterministic_algorithms_warn_only_enabled()
+        )
+        try:
+            BYPASS_TORCH.use_deterministic_algorithms(
+                True,
+                warn_only=False,
+            )
+            with self.assertRaises(MODULE.InferenceContractError):
+                with (
+                    BYPASS_TORCH.inference_mode(),
+                    MODULE._inference_only_auxiliary_loss_bypass(
+                        base,
+                        expected_calls=1,
+                    ),
+                ):
+                    pass
+            self.assertNotIn("forward", module.__dict__)
+            self.assertIs(getattr(module.forward, "__func__"), original)
+
+            base.train()
+            with self.assertRaises(MODULE.InferenceContractError):
+                with (
+                    BYPASS_TORCH.inference_mode(),
+                    MODULE._inference_only_auxiliary_loss_bypass(
+                        base,
+                        expected_calls=1,
+                    ),
+                ):
+                    pass
+        finally:
+            BYPASS_TORCH.use_deterministic_algorithms(
+                deterministic_before,
+                warn_only=warn_before,
+            )
+
+    def test_pinned_source_receipt_rejects_drift(self) -> None:
+        receipt = MODULE._inference_auxiliary_loss_bypass_receipt()
+        unsigned = dict(receipt)
+        claim = unsigned.pop("receipt_sha256")
+        self.assertEqual(claim, MODULE.compact_json_sha256(unsigned))
+        with mock.patch.dict(
+            MODULE.PINNED_SEMTALK_MODEL_SOURCE,
+            {"sha256": "0" * 64},
+        ):
+            with self.assertRaises(MODULE.InferenceContractError):
+                MODULE._inference_auxiliary_loss_bypass_receipt()
 
 
 class VerifiedInputSnapshotTest(unittest.TestCase):

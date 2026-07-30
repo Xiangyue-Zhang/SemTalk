@@ -40,6 +40,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -51,7 +52,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 import uuid
 import zipfile
@@ -144,6 +145,39 @@ OFFICIAL_SHOW_ADAPT_BASE_FROZEN_FORMAT = (
 OFFICIAL_SHOW_ADAPT_TRANSFER_FORMAT = "semtalk_show_official_transfer_v1"
 OFFICIAL_SHOW_ADAPT_BASE_CANDIDATE_EPOCHS = (1, 2, 4, 8, 16, 32, 40)
 OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH = 248
+INFERENCE_AUXILIARY_LOSS_BYPASS_FORMAT = (
+    "semtalk_inference_auxiliary_loss_bypass_v1"
+)
+INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS = (
+    "hubert_face_cons_loss",
+    "beat_cons_loss",
+)
+PINNED_SEMTALK_MODEL_SOURCE = {
+    "relative_path": "models/semtalk.py",
+    "sha256": (
+        "ddcc622c9778413b73c2b51b90354cd82dcedce62fea25006f8219de17f7ba2e"
+    ),
+    "git_blob_sha1": "6e786a5f5d29c070145c49f2a277cc7667c78ace",
+}
+PINNED_SEMTALK_BASE_FORWARD = {
+    "source_sha256": (
+        "032ee956dde6297cb9e3211c713f9eb1183b4937663f42a76586f1a42c0dbbcb"
+    ),
+    "signature": (
+        "(self, in_audio=None, in_word=None, mask=None, is_train=False, "
+        "in_motion=None, use_attentions=True, use_word=True, in_id=None, "
+        "hubert=None)"
+    ),
+}
+PINNED_RHYTHMIC_LOSS_FORWARD = {
+    "source_sha256": (
+        "eae08dca9b9f7605dc4ff35576c9630380a365e4ab2b61429755aa490fef659e"
+    ),
+    "signature": "(self, facial_features, audio_features)",
+}
+PINNED_RVQ_INDICES_SOURCE_SHA256 = (
+    "467e0115387738b2ccc9aa46a0174d4a7b93aa1199d8e8bae9070e90f1150ffc"
+)
 RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
     "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
 )
@@ -5066,6 +5100,229 @@ def _checkpoint_receipts_without_models(
     return receipts
 
 
+def _callable_source_sha256(function: Any) -> str:
+    try:
+        lines, _ = inspect.getsourcelines(function)
+    except (OSError, TypeError) as error:
+        raise InferenceContractError(
+            f"cannot inspect pinned callable {function!r}"
+        ) from error
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
+def _inference_auxiliary_loss_bypass_receipt() -> dict[str, Any]:
+    model_path = (PROJECT_ROOT / PINNED_SEMTALK_MODEL_SOURCE["relative_path"])
+    try:
+        model_mode = os.lstat(model_path).st_mode
+    except FileNotFoundError:
+        raise InferenceContractError(
+            f"missing pinned SemTalk model source: {model_path}"
+        ) from None
+    if stat.S_ISLNK(model_mode) or not stat.S_ISREG(model_mode):
+        raise InferenceContractError(
+            f"pinned SemTalk model source is not a regular file: {model_path}"
+        )
+    model_payload = model_path.read_bytes()
+    model_blob = hashlib.sha1(
+        f"blob {len(model_payload)}\0".encode("ascii") + model_payload
+    ).hexdigest()
+    if (
+        hashlib.sha256(model_payload).hexdigest()
+        != PINNED_SEMTALK_MODEL_SOURCE["sha256"]
+        or model_blob != PINNED_SEMTALK_MODEL_SOURCE["git_blob_sha1"]
+    ):
+        raise InferenceContractError("pinned SemTalk model source changed")
+
+    from models.semtalk import RhythmicIdentificationLoss, semtalk_base
+
+    model_resolved = model_path.resolve(strict=True)
+    semtalk_source = inspect.getsourcefile(semtalk_base)
+    loss_source = inspect.getsourcefile(RhythmicIdentificationLoss)
+    if (
+        semtalk_base.__module__ != "models.semtalk"
+        or RhythmicIdentificationLoss.__module__ != "models.semtalk"
+        or not isinstance(semtalk_source, str)
+        or not isinstance(loss_source, str)
+        or Path(semtalk_source).resolve(strict=True) != model_resolved
+        or Path(loss_source).resolve(strict=True) != model_resolved
+        or str(inspect.signature(semtalk_base.forward))
+        != PINNED_SEMTALK_BASE_FORWARD["signature"]
+        or _callable_source_sha256(semtalk_base.forward)
+        != PINNED_SEMTALK_BASE_FORWARD["source_sha256"]
+        or str(inspect.signature(RhythmicIdentificationLoss.forward))
+        != PINNED_RHYTHMIC_LOSS_FORWARD["signature"]
+        or _callable_source_sha256(RhythmicIdentificationLoss.forward)
+        != PINNED_RHYTHMIC_LOSS_FORWARD["source_sha256"]
+        or _callable_source_sha256(_rvq_indices)
+        != PINNED_RVQ_INDICES_SOURCE_SHA256
+    ):
+        raise InferenceContractError(
+            "inference-only auxiliary-loss bypass source contract changed"
+        )
+    receipt = {
+        "format": INFERENCE_AUXILIARY_LOSS_BYPASS_FORMAT,
+        "scope": "validation_and_test_inference_only",
+        "model_source": dict(PINNED_SEMTALK_MODEL_SOURCE),
+        "base_forward": dict(PINNED_SEMTALK_BASE_FORWARD),
+        "loss_forward": dict(PINNED_RHYTHMIC_LOSS_FORWARD),
+        "rvq_indices_source_sha256": PINNED_RVQ_INDICES_SOURCE_SHA256,
+        "patched_attributes": list(INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS),
+        "patch_mechanism": "instance_forward_MethodType_with_finally_restore",
+        "replacement": "first_input_new_zeros_scalar",
+        "module_identity_preserved": True,
+        "state_dict_preserved": True,
+        "deterministic_algorithms_required": True,
+        "deterministic_warn_only_required": False,
+        "model_eval_required": True,
+        "all_parameters_frozen_required": True,
+        "torch_inference_mode_required": True,
+    }
+    receipt["receipt_sha256"] = compact_json_sha256(receipt)
+    return receipt
+
+
+@contextmanager
+def _inference_only_auxiliary_loss_bypass(
+    base: Any,
+    *,
+    expected_calls: int,
+) -> Iterable[dict[str, Any]]:
+    import torch
+    from models.semtalk import RhythmicIdentificationLoss, semtalk_base
+
+    receipt = _inference_auxiliary_loss_bypass_receipt()
+    if (
+        type(expected_calls) is not int
+        or expected_calls < 1
+        or type(base) is not semtalk_base
+        or base.training
+        or any(parameter.requires_grad for parameter in base.parameters())
+        or not torch.is_inference_mode_enabled()
+        or not torch.are_deterministic_algorithms_enabled()
+        or torch.is_deterministic_algorithms_warn_only_enabled()
+    ):
+        raise InferenceContractError(
+            "auxiliary-loss bypass requires frozen eval inference under "
+            "strict deterministic algorithms"
+        )
+
+    modules: dict[str, Any] = {}
+    original_forwards: dict[str, Any] = {}
+    patched_forwards: dict[str, Any] = {}
+    calls = {name: 0 for name in INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS}
+    for name in INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS:
+        module = getattr(base, name, None)
+        if (
+            type(module) is not RhythmicIdentificationLoss
+            or module.temperature != 0.1
+            or module.training
+            or module in modules.values()
+            or module is not base._modules.get(name)
+            or "forward" in module.__dict__
+            or module.state_dict()
+            or tuple(module.parameters())
+            or tuple(module.buffers())
+            or module._forward_hooks
+            or module._forward_pre_hooks
+            or module._backward_hooks
+        ):
+            raise InferenceContractError(
+                f"{name}: auxiliary-loss module contract changed"
+            )
+        modules[name] = module
+        original_forwards[name] = module.forward
+
+    def make_zero_loss(name: str, module: Any) -> Any:
+        def zero_loss(
+            self: Any,
+            facial_features: Any,
+            audio_features: Any,
+        ) -> Any:
+            if (
+                self is not module
+                or not torch.is_inference_mode_enabled()
+                or not torch.are_deterministic_algorithms_enabled()
+                or torch.is_deterministic_algorithms_warn_only_enabled()
+                or not isinstance(facial_features, torch.Tensor)
+                or not isinstance(audio_features, torch.Tensor)
+                or tuple(facial_features.shape) != (1, 16, 256)
+                or tuple(audio_features.shape) != (1, 64, 256)
+                or facial_features.device != audio_features.device
+                or facial_features.dtype != audio_features.dtype
+                or facial_features.requires_grad
+                or audio_features.requires_grad
+            ):
+                raise InferenceContractError(
+                    f"{name}: invalid inference-only auxiliary-loss call"
+                )
+            calls[name] += 1
+            return facial_features.new_zeros(())
+
+        return MethodType(zero_loss, module)
+
+    try:
+        for name in INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS:
+            module = modules[name]
+            patched = make_zero_loss(name, module)
+            patched_forwards[name] = patched
+            module.forward = patched
+            if module.__dict__.get("forward") is not patched:
+                raise InferenceContractError(
+                    f"{name}: failed to install auxiliary-loss bypass"
+                )
+    except BaseException:
+        for name in reversed(tuple(patched_forwards)):
+            module = modules[name]
+            if module.__dict__.get("forward") is patched_forwards[name]:
+                delattr(module, "forward")
+        raise
+
+    activation = {
+        **receipt,
+        "expected_calls_per_loss": expected_calls,
+        "calls": calls,
+    }
+    completed = False
+    try:
+        yield activation
+        completed = True
+    finally:
+        restoration_error: str | None = None
+        for name in reversed(INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS):
+            module = modules[name]
+            installed = module.__dict__.get("forward")
+            if installed is not patched_forwards[name]:
+                restoration_error = (
+                    f"{name}: auxiliary-loss bypass was changed while active"
+                )
+            if "forward" in module.__dict__:
+                delattr(module, "forward")
+            restored = module.forward
+            original = original_forwards[name]
+            if (
+                getattr(restored, "__self__", None) is not module
+                or getattr(restored, "__func__", None)
+                is not getattr(original, "__func__", None)
+                or getattr(base, name, None) is not module
+                or module is not base._modules.get(name)
+                or module.state_dict()
+            ):
+                restoration_error = (
+                    f"{name}: auxiliary-loss module restoration failed"
+                )
+        if restoration_error is not None:
+            raise InferenceContractError(restoration_error)
+    if completed and any(
+        calls[name] != expected_calls
+        for name in INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS
+    ):
+        raise InferenceContractError(
+            "auxiliary-loss bypass call count does not match inference rounds"
+        )
+    if completed:
+        activation["activation_sha256"] = compact_json_sha256(activation)
+
+
 def _runtime_receipt(device: str) -> dict[str, Any]:
     import torch
 
@@ -5097,6 +5354,7 @@ def _runtime_receipt(device: str) -> dict[str, Any]:
         "stride": STRIDE,
         "rvq_levels": RVQ_LEVELS,
         "rvq_token_frames": RVQ_TOKEN_FRAMES,
+        "auxiliary_loss_bypass": _inference_auxiliary_loss_bypass_receipt(),
     }
 
 
@@ -6718,16 +6976,24 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
                 expected_frames=frames,
             )
             speaker_id = SHOW_SPEAKER_IDS[str(row["speaker"])]
-            prediction = _infer_clip(
-                pose=canonical["pose"],
-                trans=canonical["trans"],
-                beat=audio["beat"],
-                hubert=audio["hubert"],
-                speaker_id=speaker_id,
-                models=models,
-                masks=masks,
-                device=args.device,
+            expected_calls = max(
+                1,
+                math.ceil((frames - PRE_FRAMES) / STRIDE),
             )
+            with _inference_only_auxiliary_loss_bypass(
+                models["base"],
+                expected_calls=expected_calls,
+            ):
+                prediction = _infer_clip(
+                    pose=canonical["pose"],
+                    trans=canonical["trans"],
+                    beat=audio["beat"],
+                    hubert=audio["hubert"],
+                    speaker_id=speaker_id,
+                    models=models,
+                    masks=masks,
+                    device=args.device,
+                )
             result_arrays = _output_arrays(
                 betas=canonical["beta"][0],
                 poses=prediction["poses"],
