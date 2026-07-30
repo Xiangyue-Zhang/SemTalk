@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -64,6 +65,94 @@ CANONICAL_FIELDS = (
     "speaker_id",
 )
 RVQ_NAMES = ("face", "upper", "hands", "lower")
+SHOW_TRAINED_PREREQUISITE_SOURCE = "show_trained_v1"
+RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE = (
+    "released_all_speakers_v1"
+)
+PREREQUISITE_SOURCES = (
+    SHOW_TRAINED_PREREQUISITE_SOURCE,
+    RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE,
+)
+RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
+    "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
+)
+RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT = {
+    "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+    "commit": "806b008c97bf51fce203e54109e4c22325253618",
+    "tree": "029deb438330fcaa36377195bad79ffe0f06335c",
+    "archive_sha256": (
+        "3cbe7a3a923075ad39bcdd41bb88e828fd6161be4c5299c4"
+        "e62eedcf20ea5664"
+    ),
+    "readme_sha256": (
+        "27f846e150e8101c1124c3a8bfd026617508554f59ee359c5"
+        "5eae825b2edeb1e"
+    ),
+    "sha256s_sha256": (
+        "f7c08cb621f884c7deb0c0cba757fcd08c8b1ad471bab939e"
+        "b0d1bd02d4abc1b"
+    ),
+    "best_run_sha256": (
+        "6edaae9f21b7a7164f7457ca93240989fcfa3cb8ea02aa94f"
+        "7602c17f9491c9a"
+    ),
+    "all_speaker_metrics_sha256": (
+        "3ecd9586b6eb34eb4a05cdd57f29ed51de50399e02ff476d"
+        "f8c4d4c7fb4cc317"
+    ),
+}
+RELEASED_ALL_SPEAKERS_MODELS = {
+    "face": {
+        "filename": "rvq_face_600.bin",
+        "sha256": (
+            "31b04c88456a25f4d57841c0cb507b4c856daccb3875878d"
+            "06545110a6152127"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 106,
+        "vae_layer": 2,
+    },
+    "hands": {
+        "filename": "rvq_hands_500.bin",
+        "sha256": (
+            "08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a3805"
+            "5ca47a539b03e436"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 180,
+        "vae_layer": 2,
+    },
+    "upper": {
+        "filename": "rvq_upper_500.bin",
+        "sha256": (
+            "05101461e75b4e9b687ef30437585d56969c6a13d0047b910"
+            "00b31d88d08ac17"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 78,
+        "vae_layer": 2,
+    },
+    "lower": {
+        "filename": "rvq_lower_600.bin",
+        "sha256": (
+            "2bb43d10e5f32d13d21e6b85580a1b70d36e407c8552a7e6"
+            "2f99c171ae4efce8"
+        ),
+        "model_class": "RVQVAE",
+        "vae_test_dim": 61,
+        "vae_layer": 4,
+    },
+    "global": {
+        "filename": "last_1700_foot.bin",
+        "sha256": (
+            "6e6f88abd98ccbe2c52102b937067f4ade0aa307d6e1dac8e"
+            "127e19e0144ee12"
+        ),
+        "model_class": "VAEConvZero",
+        "vae_test_dim": 61,
+        "vae_layer": 4,
+    },
+}
 SPEAKER_MAP = {
     "oliver": 0,
     "chemistry": 1,
@@ -556,6 +645,45 @@ def source_receipt(
             f"feature source tree {receipt['tree']} != {expected_tree}"
         )
     return receipt
+
+
+def input_artifact_source_receipt(
+    expected_commit: str,
+    expected_tree: str,
+) -> dict[str, str]:
+    """Describe the already-built audio/representation artifact producer."""
+    return {
+        "format": "semtalk_show_input_artifact_source_v1",
+        "origin": EXPECTED_ORIGIN,
+        "commit": expected_commit,
+        "tree": expected_tree,
+    }
+
+
+def normalize_input_artifact_source_args(
+    args: argparse.Namespace,
+) -> None:
+    """Resolve the Base input producer, defaulting to the builder source."""
+    if args.mode != "base":
+        return
+    commit = args.expected_input_source_commit
+    tree = args.expected_input_source_tree
+    if (commit is None) != (tree is None):
+        raise ValueError(
+            "--expected-input-source-commit and "
+            "--expected-input-source-tree must be supplied together"
+        )
+    if commit is None:
+        commit = args.expected_source_commit
+        tree = args.expected_source_tree
+    args.expected_input_source_commit = require_git_oid(
+        commit,
+        "--expected-input-source-commit",
+    )
+    args.expected_input_source_tree = require_git_oid(
+        tree,
+        "--expected-input-source-tree",
+    )
 
 
 def load_canonical_receipt(
@@ -2100,6 +2228,114 @@ def _finite_state_dict(state: dict[str, Any], path: Path) -> None:
                 raise RuntimeError(f"{path}: non-finite checkpoint tensor {name}")
 
 
+def _state_dict_schema_sha256(state: Mapping[str, Any]) -> str:
+    schema = [
+        {
+            "key": key,
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+        for key, value in sorted(state.items())
+    ]
+    return canonical_file_payload_sha256(schema)
+
+
+def _load_released_model_state_only(
+    path: Path,
+    *,
+    expected_filename: str,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], Path, str, int]:
+    """Load one hash-pinned, tensor-only official release checkpoint."""
+    import torch
+
+    if path.name != expected_filename:
+        raise RuntimeError(
+            f"released checkpoint filename {path.name!r} != "
+            f"{expected_filename!r}"
+        )
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        raise FileNotFoundError(path) from None
+    if path.is_symlink() or not stat.S_ISREG(mode):
+        raise RuntimeError(
+            f"released checkpoint must be a regular non-symlink file: {path}"
+        )
+    resolved = path.resolve(strict=True)
+    if resolved.name != expected_filename or not resolved.is_file():
+        raise RuntimeError(f"unsafe released checkpoint path: {path}")
+    checkpoint_bytes = resolved.read_bytes()
+    actual_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"{resolved}: released checkpoint SHA-256 "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+    buffer = io.BytesIO(checkpoint_bytes)
+    try:
+        payload = torch.load(
+            buffer,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError as error:  # pragma: no cover - supported PyTorch has it
+        raise RuntimeError(
+            "released_all_speakers_v1 requires torch.load(weights_only=True)"
+        ) from error
+    if type(payload) is not dict or set(payload) != {"model_state"}:
+        raise RuntimeError(
+            f"{resolved}: released checkpoint must contain only model_state"
+        )
+    raw_state = payload["model_state"]
+    if not isinstance(raw_state, Mapping) or not raw_state:
+        raise RuntimeError(
+            f"{resolved}: released model_state must be a non-empty mapping"
+        )
+    normalized: dict[str, Any] = {}
+    for key, value in raw_state.items():
+        if type(key) is not str or not key:
+            raise RuntimeError(
+                f"{resolved}: every released model_state key must be a "
+                "non-empty string"
+            )
+        if not torch.is_tensor(value):
+            raise RuntimeError(
+                f"{resolved}: released model_state value {key!r} is not a "
+                "tensor"
+            )
+        normalized_key = key[7:] if key.startswith("module.") else key
+        if not normalized_key or normalized_key in normalized:
+            raise RuntimeError(
+                f"{resolved}: released model_state key normalization collision"
+            )
+        if (
+            value.is_floating_point() or value.is_complex()
+        ) and not bool(torch.isfinite(value).all().item()):
+            raise RuntimeError(
+                f"{resolved}: non-finite released model_state tensor {key!r}"
+            )
+        normalized[normalized_key] = value
+    return normalized, resolved, actual_sha256, len(checkpoint_bytes)
+
+
+def _strict_load_freeze_eval(
+    model: Any,
+    state: Mapping[str, Any],
+    *,
+    path: Path,
+) -> None:
+    incompatible = model.load_state_dict(state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(f"{path}: strict released state load was not exact")
+    model.eval()
+    model.requires_grad_(False)
+    if model.training or any(
+        parameter.requires_grad for parameter in model.parameters()
+    ):
+        raise RuntimeError(f"{path}: released model did not freeze in eval mode")
+
+
 def checkpoint_record(
     path: Path,
     *,
@@ -2382,6 +2618,156 @@ def load_rvq_models(
     return models, records
 
 
+def load_released_all_speakers_models(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Import the exact official BEAT2 All-Speakers representation suite."""
+    import torch
+    from models.motion_representation import VAEConvZero
+    from models.rvq import RVQVAE
+
+    source_receipt = {
+        "format": "semtalk_released_all_speakers_weight_source_v1",
+        "prerequisite_source": RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE,
+        "classification": RELEASED_ALL_SPEAKERS_CLASSIFICATION,
+        "release_trust_root": dict(
+            RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT
+        ),
+        "official_release": True,
+        "training_dataset": "BEAT2",
+        "speaker_scope": "All-Speakers",
+        "show_trained": False,
+        "checkpoint_container_schema": ["model_state"],
+    }
+    source_receipt_sha256 = canonical_file_payload_sha256(source_receipt)
+    models: dict[str, Any] = {}
+    records: dict[str, Any] = {}
+    receipt_files: dict[str, Any] = {}
+    for name in (*RVQ_NAMES, "global"):
+        specification = RELEASED_ALL_SPEAKERS_MODELS[name]
+        path = Path(getattr(args, f"{name}_checkpoint"))
+        state, resolved, checkpoint_sha256, checkpoint_bytes = (
+            _load_released_model_state_only(
+                path,
+                expected_filename=str(specification["filename"]),
+                expected_sha256=str(specification["sha256"]),
+            )
+        )
+        model_args = SimpleNamespace(
+            vae_test_dim=int(specification["vae_test_dim"]),
+            vae_layer=int(specification["vae_layer"]),
+            vae_length=256,
+        )
+        model = (
+            VAEConvZero(model_args)
+            if name == "global"
+            else RVQVAE(model_args)
+        ).to(args.device)
+        _strict_load_freeze_eval(model, state, path=resolved)
+        schema_sha256 = _state_dict_schema_sha256(state)
+        record = {
+            "path": str(resolved),
+            "filename": str(specification["filename"]),
+            "sha256": checkpoint_sha256,
+            "bytes": checkpoint_bytes,
+            "formal_stage": name,
+            "prerequisite_source": (
+                RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
+            ),
+            "classification": RELEASED_ALL_SPEAKERS_CLASSIFICATION,
+            "training_dataset": "BEAT2",
+            "speaker_scope": "All-Speakers",
+            "show_trained": False,
+            "checkpoint_container_schema": ["model_state"],
+            "model_class": str(specification["model_class"]),
+            "model_state_tensors": len(state),
+            "model_state_schema_sha256": schema_sha256,
+            "all_model_state_tensors_finite": True,
+            "strict_state_dict_load": True,
+            "frozen_eval": True,
+            "source_receipt": dict(source_receipt),
+            "source_receipt_sha256": source_receipt_sha256,
+        }
+        records[name] = record
+        receipt_files[name] = {
+            "path": str(resolved),
+            "filename": str(specification["filename"]),
+            "sha256": checkpoint_sha256,
+            "bytes": checkpoint_bytes,
+            "model_class": str(specification["model_class"]),
+            "model_state_schema_sha256": schema_sha256,
+        }
+        if name == "global":
+            # Base features do not consume Global, but the official VAE must
+            # still pass the same exact schema/load/freeze gate.
+            del model
+        else:
+            models[name] = model
+        del state
+    if set(models) != set(RVQ_NAMES) or set(records) != {
+        *RVQ_NAMES,
+        "global",
+    }:
+        raise RuntimeError(
+            "released_all_speakers_v1 did not import the exact five models"
+        )
+    receipt = {
+        "format": "semtalk_released_all_speakers_import_receipt_v1",
+        "status": "complete",
+        "prerequisite_source": RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE,
+        "classification": RELEASED_ALL_SPEAKERS_CLASSIFICATION,
+        "training_dataset": "BEAT2",
+        "speaker_scope": "All-Speakers",
+        "show_trained": False,
+        "source_receipt": source_receipt,
+        "source_receipt_sha256": source_receipt_sha256,
+        "files": receipt_files,
+        "strict_state_dict_load": True,
+        "all_model_state_tensors_finite": True,
+        "frozen_eval": True,
+    }
+    receipt["receipt_sha256"] = canonical_file_payload_sha256(receipt)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return models, records, receipt
+
+
+def load_prerequisite_models(
+    args: argparse.Namespace,
+    expected_lineage_sha256: str,
+    expected_source_receipt: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    source = args.prerequisite_source
+    statuses = {
+        name: getattr(args, f"{name}_status_json")
+        for name in (*RVQ_NAMES, "global")
+    }
+    if source == SHOW_TRAINED_PREREQUISITE_SOURCE:
+        missing = sorted(name for name, path in statuses.items() if path is None)
+        if missing:
+            raise RuntimeError(
+                "show_trained_v1 requires status JSON for "
+                f"{', '.join(missing)}"
+            )
+        models, records = load_rvq_models(
+            args,
+            expected_lineage_sha256,
+            expected_source_receipt,
+        )
+        return models, records, None
+    if source == RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE:
+        unexpected = sorted(
+            name for name, path in statuses.items() if path is not None
+        )
+        if unexpected:
+            raise RuntimeError(
+                "released_all_speakers_v1 forbids SHOW training status JSON "
+                f"for {', '.join(unexpected)}"
+            )
+        return load_released_all_speakers_models(args)
+    raise RuntimeError(f"unsupported prerequisite source: {source!r}")
+
+
 def revalidate_checkpoint_records(
     records: dict[str, dict[str, Any]],
 ) -> None:
@@ -2389,6 +2775,40 @@ def revalidate_checkpoint_records(
         raise RuntimeError("formal checkpoint receipt set changed")
     for name, record in records.items():
         checkpoint = Path(str(record["path"]))
+        if (
+            record.get("prerequisite_source")
+            == RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
+        ):
+            specification = RELEASED_ALL_SPEAKERS_MODELS[name]
+            try:
+                mode = os.lstat(checkpoint).st_mode
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"{name} released checkpoint disappeared: {checkpoint}"
+                ) from None
+            if (
+                checkpoint.is_symlink()
+                or not stat.S_ISREG(mode)
+                or checkpoint.name != specification["filename"]
+                or record.get("filename") != specification["filename"]
+                or record.get("sha256") != specification["sha256"]
+                or sha256(checkpoint) != specification["sha256"]
+                or record.get("classification")
+                != RELEASED_ALL_SPEAKERS_CLASSIFICATION
+                or record.get("training_dataset") != "BEAT2"
+                or record.get("speaker_scope") != "All-Speakers"
+                or record.get("show_trained") is not False
+                or record.get("checkpoint_container_schema")
+                != ["model_state"]
+                or record.get("strict_state_dict_load") is not True
+                or record.get("all_model_state_tensors_finite") is not True
+                or record.get("frozen_eval") is not True
+            ):
+                raise RuntimeError(
+                    f"{name} released checkpoint receipt changed during "
+                    "Base cache build"
+                )
+            continue
         status = Path(str(record["formal_training_status"]))
         for path, expected, label in (
             (checkpoint, str(record["sha256"]), f"{name} checkpoint"),
@@ -2714,6 +3134,10 @@ def base_mode(args: argparse.Namespace) -> None:
         args.expected_source_commit,
         args.expected_source_tree,
     )
+    input_source_receipt_record = input_artifact_source_receipt(
+        args.expected_input_source_commit,
+        args.expected_input_source_tree,
+    )
     audio_paths = [Path(path) for path in args.audio_manifest]
     audio_lineage_paths = [Path(path) for path in args.audio_lineage_json]
     canonical_rows, canonical_hashes = canonical_split_rows(
@@ -2748,8 +3172,8 @@ def base_mode(args: argparse.Namespace) -> None:
             canonical_rows[0]["lineage_contract_sha256"]
         ),
         expected_train_clips=len(canonical_rows),
-        expected_source_commit=args.expected_source_commit,
-        expected_source_tree=args.expected_source_tree,
+        expected_source_commit=args.expected_input_source_commit,
+        expected_source_tree=args.expected_input_source_tree,
         expected_hubert_tree_sha256=args.expected_hubert_tree_sha256,
     )
     canonical_ids = [str(row["clip_id"]) for row in canonical_rows]
@@ -2843,9 +3267,9 @@ def base_mode(args: argparse.Namespace) -> None:
         or training_lineage.get("source_receipt", {}).get("origin")
         != EXPECTED_ORIGIN
         or training_lineage.get("source_receipt", {}).get("commit")
-        != args.expected_source_commit
+        != args.expected_input_source_commit
         or training_lineage.get("source_receipt", {}).get("tree")
-        != args.expected_source_tree
+        != args.expected_input_source_tree
         or set(training_lineage.get("speaker_clip_counts", {}))
         != set(SPEAKER_MAP)
         or set(training_lineage.get("speaker_window_counts", {}))
@@ -2878,7 +3302,11 @@ def base_mode(args: argparse.Namespace) -> None:
             "invalid representation training lineage manifest"
         )
 
-    models, checkpoint_records = load_rvq_models(
+    (
+        models,
+        checkpoint_records,
+        prerequisite_source_receipt,
+    ) = load_prerequisite_models(
         args,
         training_lineage_sha,
         source_receipt_record,
@@ -3022,6 +3450,10 @@ def base_mode(args: argparse.Namespace) -> None:
             args.expected_source_commit,
             args.expected_source_tree,
         )
+        final_input_source_receipt = input_artifact_source_receipt(
+            args.expected_input_source_commit,
+            args.expected_input_source_tree,
+        )
         final_canonical_rows, final_canonical_hashes = canonical_split_rows(
             canonical_paths,
             "train",
@@ -3063,12 +3495,13 @@ def base_mode(args: argparse.Namespace) -> None:
                 final_canonical_rows[0]["lineage_contract_sha256"]
             ),
             expected_train_clips=len(final_canonical_rows),
-            expected_source_commit=args.expected_source_commit,
-            expected_source_tree=args.expected_source_tree,
+            expected_source_commit=args.expected_input_source_commit,
+            expected_source_tree=args.expected_input_source_tree,
             expected_hubert_tree_sha256=args.expected_hubert_tree_sha256,
         )
         if (
             final_source_receipt != source_receipt_record
+            or final_input_source_receipt != input_source_receipt_record
             or final_canonical_rows != canonical_rows
             or final_canonical_hashes != canonical_hashes
             or final_canonical_receipt != canonical_receipt
@@ -3143,6 +3576,10 @@ def base_mode(args: argparse.Namespace) -> None:
         "canonical_manifest_sha256": canonical_hashes,
         "canonical_receipt": canonical_receipt,
         "source_receipt": source_receipt_record,
+        "input_artifact_source_receipt": input_source_receipt_record,
+        "input_artifact_source_receipt_sha256": (
+            canonical_file_payload_sha256(input_source_receipt_record)
+        ),
         "audio_manifest_sha256": audio_hashes,
         "audio_lineage_json_sha256": audio_lineage_hashes,
         "audio_lineage": audio_lineage_records,
@@ -3163,6 +3600,13 @@ def base_mode(args: argparse.Namespace) -> None:
         "runtime": runtime_record(),
         "argv": sys.argv,
     }
+    if prerequisite_source_receipt is not None:
+        lineage["prerequisite_source_receipt"] = (
+            prerequisite_source_receipt
+        )
+        lineage["protocol"]["prerequisite_source"] = (
+            RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
+        )
     atomic_json(lineage_path, lineage)
     lineage_sha = sha256(lineage_path)
     summary = {
@@ -3260,9 +3704,14 @@ def parse_args() -> argparse.Namespace:
         "--representation-training-lineage-manifest",
         required=True,
     )
+    base.add_argument(
+        "--prerequisite-source",
+        choices=PREREQUISITE_SOURCES,
+        default=SHOW_TRAINED_PREREQUISITE_SOURCE,
+    )
     for name in (*RVQ_NAMES, "global"):
         base.add_argument(f"--{name}-checkpoint", required=True)
-        base.add_argument(f"--{name}-status-json", required=True)
+        base.add_argument(f"--{name}-status-json")
     base.add_argument("--output-lmdb", required=True)
     base.add_argument("--summary-json", required=True)
     base.add_argument("--lineage-json", required=True)
@@ -3277,12 +3726,50 @@ def parse_args() -> argparse.Namespace:
     base.add_argument("--expected-hubert-tree-sha256", required=True)
     base.add_argument("--expected-source-commit", required=True)
     base.add_argument("--expected-source-tree", required=True)
+    base.add_argument("--expected-input-source-commit")
+    base.add_argument("--expected-input-source-tree")
     base.add_argument("--expected-canonical-source-commit", required=True)
     base.add_argument("--expected-canonical-source-tree", required=True)
     base.add_argument("--expected-canonical-manifest-sha256", required=True)
     base.add_argument("--expected-canonical-summary-sha256", required=True)
     base.add_argument("--expected-canonical-lineage-sha256", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mode == "base":
+        if (
+            args.expected_input_source_commit is None
+        ) != (
+            args.expected_input_source_tree is None
+        ):
+            parser.error(
+                "--expected-input-source-commit and "
+                "--expected-input-source-tree must be supplied together"
+            )
+        statuses = {
+            name: getattr(args, f"{name}_status_json")
+            for name in (*RVQ_NAMES, "global")
+        }
+        if args.prerequisite_source == SHOW_TRAINED_PREREQUISITE_SOURCE:
+            missing = sorted(
+                name for name, path in statuses.items() if path is None
+            )
+            if missing:
+                parser.error(
+                    "show_trained_v1 requires status JSON for "
+                    f"{', '.join(missing)}"
+                )
+        elif (
+            args.prerequisite_source
+            == RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
+        ):
+            unexpected = sorted(
+                name for name, path in statuses.items() if path is not None
+            )
+            if unexpected:
+                parser.error(
+                    "released_all_speakers_v1 forbids SHOW training status "
+                    f"JSON for {', '.join(unexpected)}"
+                )
+    return args
 
 
 def main() -> None:
@@ -3299,6 +3786,7 @@ def main() -> None:
         args.expected_source_tree,
         "--expected-source-tree",
     )
+    normalize_input_artifact_source_args(args)
     args.expected_canonical_source_commit = require_git_oid(
         args.expected_canonical_source_commit,
         "--expected-canonical-source-commit",
