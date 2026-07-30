@@ -330,6 +330,37 @@ def frozen_global_state(model: Any, *, policy: str) -> dict[str, Any]:
     raise ValueError(policy)
 
 
+def _matrix_geodesic(torch: Any, relative: Any) -> Any:
+    """Return a finite-gradient SO(3) angle for relative rotation matrices.
+
+    ``acos(trace)`` has an infinite derivative at identity and can turn the
+    first perfectly aligned temporal delta into NaN gradients.  For a valid
+    rotation matrix, the norm of the skew-vector is ``abs(sin(theta))``.
+    ``atan2(abs(sin(theta)), cos(theta))`` therefore returns the same angle in
+    ``[0, pi]`` while PyTorch's zero subgradient for ``vector_norm(0)`` keeps
+    exact identity and pi rotations finite.
+    """
+
+    if relative.shape[-2:] != (3, 3):
+        raise ValueError("relative rotations must end in a 3x3 matrix")
+    cosine = (
+        relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0
+    ) / 2.0
+    skew_vector = 0.5 * torch.stack(
+        (
+            relative[..., 2, 1] - relative[..., 1, 2],
+            relative[..., 0, 2] - relative[..., 2, 0],
+            relative[..., 1, 0] - relative[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    sine_magnitude = torch.linalg.vector_norm(skew_vector, dim=-1)
+    return torch.atan2(
+        sine_magnitude,
+        cosine.clamp(-1.0, 1.0),
+    )
+
+
 def rotation_geodesic(torch: Any, target: Any, prediction: Any) -> Any:
     """Return SO(3) geodesic distance for matching ``(..., 6)`` tensors."""
 
@@ -340,10 +371,7 @@ def rotation_geodesic(torch: Any, target: Any, prediction: Any) -> Any:
     target_matrix = rc.rotation_6d_to_matrix(target)
     prediction_matrix = rc.rotation_6d_to_matrix(prediction)
     relative = prediction_matrix.transpose(-1, -2) @ target_matrix
-    cosine = (
-        (relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0
-    ).clamp(-1.0, 1.0)
-    return torch.acos(cosine)
+    return _matrix_geodesic(torch, relative)
 
 
 def _rotation_delta_geodesic(torch: Any, target: Any, prediction: Any) -> Any:
@@ -356,10 +384,7 @@ def _rotation_delta_geodesic(torch: Any, target: Any, prediction: Any) -> Any:
         prediction_matrix[:, :-1].transpose(-1, -2) @ prediction_matrix[:, 1:]
     )
     relative = prediction_delta.transpose(-1, -2) @ target_delta
-    cosine = (
-        (relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0
-    ).clamp(-1.0, 1.0)
-    return torch.acos(cosine)
+    return _matrix_geodesic(torch, relative)
 
 
 def face_task_losses(

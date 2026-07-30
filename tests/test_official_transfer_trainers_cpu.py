@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from scripts.show_base import train_official_transfer as transfer
+from utils import show_official_transfer as transfer_math
 
 
 class OfficialTransferCacheAuditTests(unittest.TestCase):
@@ -205,6 +206,67 @@ class OfficialTransferFaceAutogradTests(unittest.TestCase):
                 torch.isfinite(torch.tensor(value))
                 for value in metrics.values()
             )
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is unavailable in the lightweight CPU test environment",
+    )
+    def test_rotation_geodesics_preserve_angles_and_have_finite_boundaries(
+        self,
+    ) -> None:
+        import torch
+
+        identity = torch.tensor(
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            dtype=torch.float64,
+        )
+        angle = torch.tensor(torch.pi / 3.0, dtype=torch.float64)
+        rotated = torch.stack(
+            (
+                torch.cos(angle),
+                -torch.sin(angle),
+                torch.tensor(0.0, dtype=torch.float64),
+                torch.sin(angle),
+                torch.cos(angle),
+                torch.tensor(0.0, dtype=torch.float64),
+            )
+        )
+        observed = transfer_math.rotation_geodesic(
+            torch,
+            identity,
+            rotated,
+        )
+        self.assertTrue(
+            torch.allclose(
+                observed,
+                angle,
+                atol=1e-12,
+                rtol=1e-12,
+            )
+        )
+
+        prediction = identity.clone().requires_grad_(True)
+        exact = transfer_math.rotation_geodesic(
+            torch,
+            identity,
+            prediction,
+        )
+        self.assertEqual(float(exact.detach().item()), 0.0)
+        exact.backward()
+        self.assertTrue(bool(prediction.grad.isfinite().all().item()))
+
+        sequence = identity.repeat(1, 4, 1)
+        predicted_sequence = sequence.clone().requires_grad_(True)
+        delta = transfer_math._rotation_delta_geodesic(
+            torch,
+            sequence,
+            predicted_sequence,
+        )
+        self.assertTrue(bool((delta == 0.0).all().item()))
+        delta.sum().backward()
+        self.assertTrue(
+            bool(predicted_sequence.grad.isfinite().all().item())
         )
 
 
