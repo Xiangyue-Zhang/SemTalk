@@ -153,6 +153,41 @@ RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT = {
         "f8c4d4c7fb4cc317"
     ),
 }
+FULLY_RELEASED_ZERO_SHOT_MODE = "fully_released_zero_shot_v1"
+RELEASED_CROSS_DOMAIN_GATE_FORMAT = (
+    "semtalk_released_all_speakers_show_cross_domain_gate_v1"
+)
+RELEASED_CROSS_DOMAIN_GATE_SCRIPT_RELATIVE = (
+    "scripts/show_base/gate_released_all_speakers_on_show.py"
+)
+RELEASED_CROSS_DOMAIN_GATE_KEYS = {
+    "format",
+    "status",
+    "authorization",
+    "release_trust_root",
+    "official_weights",
+    "canonical_receipt",
+    "source_roles",
+    "protocol",
+    "gate_script",
+    "measurement_receipt",
+    "threshold_receipt",
+    "measurements",
+    "thresholds",
+    "decisions",
+    "receipt_sha256",
+}
+RELEASED_CROSS_DOMAIN_ARTIFACT_KEYS = {"path", "sha256"}
+SOURCE_RECEIPT_KEYS = {
+    "source_root",
+    "origin",
+    "commit",
+    "tree",
+    "clean",
+    "script",
+    "script_relative",
+    "script_sha256",
+}
 RELEASED_ALL_SPEAKERS_MODELS = {
     "base": {
         "filename": "best_semtalk_base.bin",
@@ -2185,6 +2220,292 @@ def _released_weight_source_receipt(
     }
 
 
+def _official_released_weights_receipt() -> dict[str, dict[str, str]]:
+    return {
+        stage: {
+            "filename": str(RELEASED_ALL_SPEAKERS_MODELS[stage]["filename"]),
+            "sha256": str(RELEASED_ALL_SPEAKERS_MODELS[stage]["sha256"]),
+        }
+        for stage in CHECKPOINT_STAGES
+    }
+
+
+def _parse_verified_json_snapshot(
+    path: Path,
+    expected_sha256: str,
+    label: str,
+) -> tuple[Path, dict[str, Any], str]:
+    resolved, snapshot, observed_sha = _read_verified_checkpoint_snapshot(
+        path,
+        expected_sha256,
+        label,
+    )
+    try:
+        payload = json.loads(
+            snapshot.decode("utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                InferenceContractError(
+                    f"{resolved}: non-finite JSON constant {token!r}"
+                )
+            ),
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise InferenceContractError(
+            f"cannot parse verified JSON snapshot {resolved}: {exc}"
+        ) from exc
+    if type(payload) is not dict:
+        raise InferenceContractError(
+            f"{resolved}: expected a JSON object"
+        )
+    return resolved, payload, observed_sha
+
+
+def _validate_finite_measurement_tree(value: Any, label: str) -> None:
+    if type(value) is dict:
+        if not value or any(type(key) is not str or not key for key in value):
+            raise InferenceContractError(
+                f"{label} must be a non-empty string-keyed object"
+            )
+        for key, item in value.items():
+            _validate_finite_measurement_tree(item, f"{label}.{key}")
+        return
+    if type(value) is list:
+        if not value:
+            raise InferenceContractError(f"{label} must not be empty")
+        for index, item in enumerate(value):
+            _validate_finite_measurement_tree(
+                item,
+                f"{label}[{index}]",
+            )
+        return
+    if type(value) is int:
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    raise InferenceContractError(
+        f"{label} must contain only finite numeric leaves"
+    )
+
+
+def _validate_gate_artifact_receipt(
+    value: Any,
+    label: str,
+) -> dict[str, str]:
+    if type(value) is not dict or set(value) != (
+        RELEASED_CROSS_DOMAIN_ARTIFACT_KEYS
+    ):
+        raise InferenceContractError(
+            f"{label} must have the exact path/SHA receipt schema"
+        )
+    path_value = value.get("path")
+    sha_value = value.get("sha256")
+    if type(path_value) is not str or not Path(path_value).is_absolute():
+        raise InferenceContractError(
+            f"{label} path must be absolute and canonical"
+        )
+    resolved = _resolved_regular_file(Path(path_value), label)
+    if str(resolved) != path_value:
+        raise InferenceContractError(
+            f"{label} path is not canonical: {path_value}"
+        )
+    if type(sha_value) is not str:
+        raise InferenceContractError(f"{label} SHA must be a string")
+    observed_sha = _verify_file_sha(resolved, sha_value, label)
+    return {"path": str(resolved), "sha256": observed_sha}
+
+
+def _validate_released_cross_domain_gate(
+    *,
+    args: argparse.Namespace,
+    source_receipt: Mapping[str, Any],
+    input_source_receipt: Mapping[str, Any],
+    canonical_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        args.released_cross_domain_gate_json is None
+        or args.expected_released_cross_domain_gate_sha256 is None
+    ):
+        raise InferenceContractError(
+            "fully released zero-shot inference lacks its cross-domain gate"
+        )
+    gate_path, gate, gate_file_sha = _parse_verified_json_snapshot(
+        args.released_cross_domain_gate_json,
+        args.expected_released_cross_domain_gate_sha256,
+        "released cross-domain gate",
+    )
+    artifact_receipts = {
+        name: _validate_gate_artifact_receipt(
+            gate.get(name),
+            f"released cross-domain {name.replace('_', ' ')}",
+        )
+        for name in (
+            "gate_script",
+            "measurement_receipt",
+            "threshold_receipt",
+        )
+    }
+    artifact_paths = {
+        receipt["path"] for receipt in artifact_receipts.values()
+    }
+    if len(artifact_paths) != len(artifact_receipts) or str(gate_path) in (
+        artifact_paths
+    ):
+        raise InferenceContractError(
+            f"{gate_path}: cross-domain gate artifacts must be distinct"
+        )
+    if (
+        set(source_receipt) != SOURCE_RECEIPT_KEYS
+        or source_receipt.get("clean") is not True
+    ):
+        raise InferenceContractError(
+            "current inference source receipt has an invalid schema"
+        )
+    source_root_value = source_receipt.get("source_root")
+    if (
+        type(source_root_value) is not str
+        or not Path(source_root_value).is_absolute()
+    ):
+        raise InferenceContractError(
+            "current inference source root is not canonical"
+        )
+    source_root = Path(source_root_value).resolve()
+    if str(source_root) != source_root_value:
+        raise InferenceContractError(
+            "current inference source root is not canonical"
+        )
+    gate_script_path = Path(artifact_receipts["gate_script"]["path"])
+    try:
+        gate_script_relative = str(gate_script_path.relative_to(source_root))
+    except ValueError as exc:
+        raise InferenceContractError(
+            "cross-domain gate script escapes the inference source root"
+        ) from exc
+    if gate_script_relative != RELEASED_CROSS_DOMAIN_GATE_SCRIPT_RELATIVE:
+        raise InferenceContractError(
+            "cross-domain gate script is not the frozen formal entrypoint"
+        )
+    tracked_gate_script = _git_output(
+        source_root,
+        "ls-files",
+        "--error-unmatch",
+        gate_script_relative,
+    )
+    if tracked_gate_script != gate_script_relative:
+        raise InferenceContractError(
+            "cross-domain gate script is not tracked by the source tree"
+        )
+    expected_gate_source = {
+        "source_root": str(source_root),
+        "origin": source_receipt["origin"],
+        "commit": source_receipt["commit"],
+        "tree": source_receipt["tree"],
+        "clean": True,
+        "script": str(gate_script_path),
+        "script_relative": gate_script_relative,
+        "script_sha256": artifact_receipts["gate_script"]["sha256"],
+    }
+    expected_canonical_receipt = {
+        key: canonical_receipt[key]
+        for key in (
+            "manifest",
+            "manifest_sha256",
+            "summary",
+            "summary_sha256",
+            "lineage",
+            "lineage_sha256",
+            "lineage_contract_sha256",
+        )
+    }
+    expected_source_roles = {
+        "current": dict(source_receipt),
+        "gate": expected_gate_source,
+        "canonical": dict(canonical_receipt["source_receipt"]),
+        "input_artifact": dict(input_source_receipt),
+    }
+    expected_protocol = {
+        "mode": FULLY_RELEASED_ZERO_SHOT_MODE,
+        "split": "test",
+        "show_speakers": [0, 1, 2, 3],
+        "exact_once": True,
+        "all_tensors_finite": True,
+        "deterministic": True,
+        "evaluated_components": [
+            "face",
+            "upper",
+            "hands",
+            "lower",
+            "global_sanity",
+        ],
+        "bound_not_evaluated": ["base"],
+        "forbidden_components": sorted(
+            FORBIDDEN_COMPONENTS | {"Speaker2"}
+        ),
+    }
+    if (
+        set(gate) != RELEASED_CROSS_DOMAIN_GATE_KEYS
+        or gate.get("format") != RELEASED_CROSS_DOMAIN_GATE_FORMAT
+        or gate.get("status") != "pass"
+        or gate.get("authorization") is not True
+        or gate.get("release_trust_root")
+        != RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT
+        or gate.get("official_weights")
+        != _official_released_weights_receipt()
+        or gate.get("canonical_receipt") != expected_canonical_receipt
+        or gate.get("source_roles") != expected_source_roles
+        or gate.get("protocol") != expected_protocol
+    ):
+        raise InferenceContractError(
+            f"{gate_path}: invalid or mismatched released cross-domain gate"
+        )
+    receipt_sha = gate.get("receipt_sha256")
+    if type(receipt_sha) is not str:
+        raise InferenceContractError(
+            f"{gate_path}: cross-domain receipt SHA is not a string"
+        )
+    receipt_sha = _require_sha256(
+        receipt_sha,
+        "released cross-domain gate receipt",
+    )
+    payload_without_sha = dict(gate)
+    del payload_without_sha["receipt_sha256"]
+    if canonical_json_sha256(payload_without_sha) != receipt_sha:
+        raise InferenceContractError(
+            f"{gate_path}: cross-domain receipt SHA mismatch"
+        )
+
+    measurements = gate.get("measurements")
+    thresholds = gate.get("thresholds")
+    _validate_finite_measurement_tree(
+        measurements,
+        "released cross-domain measurements",
+    )
+    _validate_finite_measurement_tree(
+        thresholds,
+        "released cross-domain thresholds",
+    )
+    decisions = gate.get("decisions")
+    if (
+        type(decisions) is not dict
+        or not decisions
+        or any(type(key) is not str or not key for key in decisions)
+        or any(value is not True for value in decisions.values())
+    ):
+        raise InferenceContractError(
+            f"{gate_path}: every cross-domain decision must be exactly true"
+        )
+    return {
+        "path": str(gate_path),
+        "sha256": gate_file_sha,
+        "receipt_sha256": receipt_sha,
+        "payload": gate,
+        "artifacts": artifact_receipts,
+    }
+
+
 def _load_released_model_state_only(
     path: Path,
     *,
@@ -3228,6 +3549,7 @@ def _checkpoint_payload_and_receipt(
     expected_data_mdb_sha256: str | None,
     checkpoint_source: str = SHOW_TRAINED_CHECKPOINT_SOURCE,
     expected_release_record: Mapping[str, Any] | None = None,
+    released_cross_domain_gate_receipt_sha256: str | None = None,
     base_candidate_manifest_path: Path | None = None,
     expected_base_candidate_manifest_sha256: str | None = None,
     expected_base_formal_status_sha256: str | None = None,
@@ -3325,21 +3647,49 @@ def _checkpoint_payload_and_receipt(
         }
         if auxiliary_receipt is not None:
             record["release_auxiliary_state"] = auxiliary_receipt
+        if released_cross_domain_gate_receipt_sha256 is not None:
+            record["released_cross_domain_gate_receipt_sha256"] = (
+                _require_sha256(
+                    released_cross_domain_gate_receipt_sha256,
+                    f"{formal_stage} released cross-domain gate receipt",
+                )
+            )
         if formal_stage != "base":
-            if not isinstance(expected_release_record, Mapping):
+            if (
+                expected_release_record is None
+                and released_cross_domain_gate_receipt_sha256 is None
+            ):
                 raise InferenceContractError(
                     f"{formal_stage}: Base feature lineage lacks the exact "
-                    "released prerequisite record"
+                    "released prerequisite record or cross-domain gate"
                 )
-            if dict(expected_release_record) != record:
+            if (
+                expected_release_record is not None
+                and released_cross_domain_gate_receipt_sha256 is not None
+            ):
+                raise InferenceContractError(
+                    f"{formal_stage}: released checkpoint cannot mix Base "
+                    "feature lineage and cross-domain gate authorization"
+                )
+            if (
+                expected_release_record is not None
+                and dict(expected_release_record) != record
+            ):
                 raise InferenceContractError(
                     f"{formal_stage}: released checkpoint does not match the "
                     "Base feature lineage record"
                 )
-        elif expected_release_record is not None:
-            raise InferenceContractError(
-                "official released Base is not a representation prerequisite"
-            )
+        else:
+            if expected_release_record is not None:
+                raise InferenceContractError(
+                    "official released Base is not a representation "
+                    "prerequisite"
+                )
+            if released_cross_domain_gate_receipt_sha256 is None:
+                raise InferenceContractError(
+                    "official released Base requires the released "
+                    "cross-domain gate"
+                )
         return {"model_state": state}, record
 
     if checkpoint_source != SHOW_TRAINED_CHECKPOINT_SOURCE:
@@ -3349,6 +3699,10 @@ def _checkpoint_payload_and_receipt(
     if expected_release_record is not None:
         raise InferenceContractError(
             "show_trained_v1 cannot carry a released checkpoint record"
+        )
+    if released_cross_domain_gate_receipt_sha256 is not None:
+        raise InferenceContractError(
+            "show_trained_v1 cannot carry a released cross-domain gate"
         )
     if (
         expected_training_lineage_sha256 is None
@@ -4292,11 +4646,21 @@ def _output_arrays(
 def _input_contract(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
+    fully_released_zero_shot = (
+        args.prerequisite_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        and args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    )
     source_receipt = _source_receipt(args)
-    training_source_receipt = _expected_source_role_receipt(
-        role="training",
-        commit=args.expected_training_source_commit,
-        tree=args.expected_training_source_tree,
+    training_source_receipt = (
+        None
+        if fully_released_zero_shot
+        else _expected_source_role_receipt(
+            role="training",
+            commit=args.expected_training_source_commit,
+            tree=args.expected_training_source_tree,
+        )
     )
     input_source_receipt = _expected_source_role_receipt(
         role="input_artifact",
@@ -4401,6 +4765,93 @@ def _input_contract(
             raise InferenceContractError(
                 f"{clip_id}: audio shard/lineage ownership mismatch"
             )
+    if fully_released_zero_shot:
+        released_gate = _validate_released_cross_domain_gate(
+            args=args,
+            source_receipt=source_receipt,
+            input_source_receipt=input_source_receipt,
+            canonical_receipt=canonical_receipt,
+        )
+        gate_receipt_sha = released_gate["receipt_sha256"]
+        accepted_training_lineages = {
+            stage: {
+                "kind": "official_release",
+                "mode": FULLY_RELEASED_ZERO_SHOT_MODE,
+                "checkpoint_source": (
+                    args.base_checkpoint_source
+                    if stage == "base"
+                    else args.prerequisite_source
+                ),
+                "classification": (
+                    RELEASED_ALL_SPEAKERS_BASE_CLASSIFICATION
+                    if stage == "base"
+                    else RELEASED_ALL_SPEAKERS_CLASSIFICATION
+                ),
+                "cross_domain_gate_receipt_sha256": gate_receipt_sha,
+            }
+            for stage in CHECKPOINT_STAGES
+        }
+        checkpoint_validation: dict[str, dict[str, Any]] = {}
+        for stage in CHECKPOINT_STAGES:
+            checkpoint_validation[stage] = {
+                "checkpoint_source": (
+                    args.base_checkpoint_source
+                    if stage == "base"
+                    else args.prerequisite_source
+                ),
+                "expected_training_lineage_sha256": None,
+                "status_path": None,
+                "expected_source_receipt": None,
+                "expected_dataset_summary_sha256": None,
+                "expected_data_mdb_sha256": None,
+                "expected_release_record": None,
+                "released_cross_domain_gate_receipt_sha256": (
+                    gate_receipt_sha
+                ),
+            }
+        checkpoint_validation["base"].update(
+            {
+                "base_candidate_manifest_path": None,
+                "expected_base_candidate_manifest_sha256": None,
+                "expected_base_formal_status_sha256": None,
+                "expected_base_final_checkpoint_sha256": None,
+            }
+        )
+        return {
+            "canonical_manifest": canonical_manifest,
+            "canonical_manifest_sha256": canonical_sha,
+            "canonical_summary_path": canonical_summary,
+            "canonical_summary_sha256": sha256_file(canonical_summary),
+            "canonical_summary": canonical_summary_payload,
+            "canonical_lineage_path": canonical_lineage,
+            "canonical_lineage_sha256": sha256_file(canonical_lineage),
+            "canonical_lineage": canonical_lineage_payload,
+            "canonical_lineage_contract_sha256": canonical_contract_sha,
+            "canonical_receipt": canonical_receipt,
+            "canonical_rows": canonical_rows,
+            "canonical_by_id": canonical_by_id,
+            "audio_by_id": audio_by_id,
+            "audio_manifest_sha256": audio_hashes,
+            "audio_summary_sha256": audio_summary_hashes,
+            "audio_lineage_sha256": audio_lineage_hashes,
+            "audio_lineages": audio_lineages,
+            "training_lineage_manifest_sha256": {},
+            "base_training_summary_path": None,
+            "base_training_summary_sha256": None,
+            "accepted_training_lineages": accepted_training_lineages,
+            "checkpoint_validation": checkpoint_validation,
+            "base_training_lineage": None,
+            "representation_training_lineage": None,
+            "source": source_receipt,
+            "source_roles": dict(
+                released_gate["payload"]["source_roles"]
+            ),
+            "prerequisite_source": args.prerequisite_source,
+            "base_checkpoint_source": args.base_checkpoint_source,
+            "released_prerequisite_import_receipt": None,
+            "inference_mode": FULLY_RELEASED_ZERO_SHOT_MODE,
+            "fully_released_zero_shot_gate": released_gate,
+        }
     base_training_lineage = _resolved_regular_file(
         args.base_training_lineage_manifest,
         "Base training lineage manifest",
@@ -4824,7 +5275,7 @@ def _stable_contract_receipt(
     inputs: Mapping[str, Any],
     checkpoints: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    receipt = {
         "format": "semtalk_show_base_inference_contract_v1",
         "canonical_manifest": str(inputs["canonical_manifest"]),
         "canonical_manifest_sha256": inputs["canonical_manifest_sha256"],
@@ -4917,6 +5368,12 @@ def _stable_contract_receipt(
             "prediction_local_eyes_69_75": "zero",
         },
     }
+    if inputs.get("inference_mode") == FULLY_RELEASED_ZERO_SHOT_MODE:
+        receipt["inference_mode"] = FULLY_RELEASED_ZERO_SHOT_MODE
+        receipt["fully_released_zero_shot_gate"] = inputs[
+            "fully_released_zero_shot_gate"
+        ]
+    return receipt
 
 
 def _revalidate_frozen_inputs(
@@ -4934,13 +5391,29 @@ def _revalidate_frozen_inputs(
         str(inputs["canonical_manifest"]): inputs["canonical_manifest_sha256"],
         str(inputs["canonical_summary_path"]): inputs["canonical_summary_sha256"],
         str(inputs["canonical_lineage_path"]): inputs["canonical_lineage_sha256"],
-        str(inputs["base_training_summary_path"]): inputs[
-            "base_training_summary_sha256"
-        ],
         **inputs["audio_manifest_sha256"],
         **inputs["audio_summary_sha256"],
         **inputs["audio_lineage_sha256"],
     }
+    base_training_summary_path = inputs.get("base_training_summary_path")
+    base_training_summary_sha = inputs.get("base_training_summary_sha256")
+    if (
+        base_training_summary_path is None
+        or base_training_summary_sha is None
+    ):
+        if (
+            base_training_summary_path is not None
+            or base_training_summary_sha is not None
+            or inputs.get("inference_mode")
+            != FULLY_RELEASED_ZERO_SHOT_MODE
+        ):
+            raise InferenceContractError(
+                "partial or unauthorized absent Base training summary"
+            )
+    else:
+        fixed_files[str(base_training_summary_path)] = str(
+            base_training_summary_sha
+        )
     for receipt in inputs["training_lineage_manifest_sha256"].values():
         fixed_files[str(receipt["path"])] = str(receipt["sha256"])
     for path_value, expected_sha in fixed_files.items():
@@ -4949,6 +5422,19 @@ def _revalidate_frozen_inputs(
             str(expected_sha),
             "frozen inference input",
         )
+    if inputs.get("inference_mode") == FULLY_RELEASED_ZERO_SHOT_MODE:
+        observed_gate = _validate_released_cross_domain_gate(
+            args=args,
+            source_receipt=inputs["source"],
+            input_source_receipt=inputs["source_roles"][
+                "input_artifact"
+            ],
+            canonical_receipt=inputs["canonical_receipt"],
+        )
+        if observed_gate != inputs.get("fully_released_zero_shot_gate"):
+            raise InferenceContractError(
+                "released cross-domain gate changed during inference"
+            )
     for stage, receipt in checkpoint_receipts.items():
         _verify_file_sha(
             _resolved_regular_file(receipt["path"], f"{stage} checkpoint"),
@@ -5832,22 +6318,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--base-training-lineage-manifest",
         type=Path,
-        required=True,
-        help="Frozen lineage bound only to the formal Base checkpoint.",
+        help=(
+            "Frozen lineage bound only to a SHOW-trained Base checkpoint; "
+            "forbidden for fully released zero-shot inference."
+        ),
     )
     parser.add_argument(
         "--base-training-summary-json",
         type=Path,
-        required=True,
-        help="Frozen Base LMDB summary bound to its training lineage.",
+        help=(
+            "Frozen SHOW Base LMDB summary; forbidden for fully released "
+            "zero-shot inference."
+        ),
     )
     parser.add_argument(
         "--representation-training-lineage-manifest",
         type=Path,
-        required=True,
         help=(
             "Frozen lineage bound only to face/upper/hands/lower/global "
-            "representation checkpoints."
+            "representation checkpoints; forbidden for fully released "
+            "zero-shot inference."
         ),
     )
     parser.add_argument(
@@ -5878,6 +6368,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-training-source-tree")
     parser.add_argument("--expected-input-source-commit")
     parser.add_argument("--expected-input-source-tree")
+    parser.add_argument(
+        "--released-cross-domain-gate-json",
+        type=Path,
+        help=(
+            "Strict cross-domain authorization gate required only when Base "
+            "and all five representation checkpoints use the official "
+            "BEAT2 All-Speakers release."
+        ),
+    )
+    parser.add_argument(
+        "--expected-released-cross-domain-gate-sha256",
+        help="External SHA-256 trust root for the released cross-domain gate.",
+    )
     parser.add_argument(
         "--expected-canonical-source-commit",
         required=True,
@@ -5990,6 +6493,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         or args.base_checkpoint_source
         == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
     )
+    fully_released_zero_shot = (
+        args.prerequisite_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        and args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    )
     for label, commit_name, tree_name in source_pairs:
         commit = getattr(args, commit_name)
         tree = getattr(args, tree_name)
@@ -5998,6 +6507,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 f"--expected-{label}-source-commit and "
                 f"--expected-{label}-source-tree must be supplied together"
             )
+        if label == "training" and fully_released_zero_shot:
+            if commit is not None:
+                parser.error(
+                    "fully_released_zero_shot_v1 forbids a SHOW training "
+                    "source receipt"
+                )
+            continue
         if release_mode and commit is None:
             parser.error(
                 f"released_all_speakers_v1 requires explicit "
@@ -6035,6 +6551,72 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.expected_hubert_tree_sha256,
         "--expected-hubert-tree-sha256",
     )
+    if args.expected_released_cross_domain_gate_sha256 is not None:
+        args.expected_released_cross_domain_gate_sha256 = _require_sha256(
+            args.expected_released_cross_domain_gate_sha256,
+            "--expected-released-cross-domain-gate-sha256",
+        )
+    if (
+        args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        and args.prerequisite_source
+        != RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    ):
+        parser.error(
+            "released official Base requires all five official released "
+            "representation prerequisites"
+        )
+    training_artifacts = {
+        "Base training lineage": args.base_training_lineage_manifest,
+        "Base training summary": args.base_training_summary_json,
+        "representation training lineage": (
+            args.representation_training_lineage_manifest
+        ),
+    }
+    gate_trust_roots = {
+        "released cross-domain gate": (
+            args.released_cross_domain_gate_json
+        ),
+        "released cross-domain gate SHA": (
+            args.expected_released_cross_domain_gate_sha256
+        ),
+    }
+    if fully_released_zero_shot:
+        unexpected_training = sorted(
+            label
+            for label, value in training_artifacts.items()
+            if value is not None
+        )
+        missing_gate = sorted(
+            label for label, value in gate_trust_roots.items() if value is None
+        )
+        if unexpected_training:
+            parser.error(
+                "fully_released_zero_shot_v1 forbids "
+                + ", ".join(unexpected_training)
+            )
+        if missing_gate:
+            parser.error(
+                "fully_released_zero_shot_v1 requires "
+                + ", ".join(missing_gate)
+            )
+    else:
+        missing_training = sorted(
+            label for label, value in training_artifacts.items() if value is None
+        )
+        unexpected_gate = sorted(
+            label for label, value in gate_trust_roots.items() if value is not None
+        )
+        if missing_training:
+            parser.error(
+                "SHOW-trained or mixed inference requires "
+                + ", ".join(missing_training)
+            )
+        if unexpected_gate:
+            parser.error(
+                "released cross-domain gate is restricted to "
+                "fully_released_zero_shot_v1"
+            )
     for name in (
         "expected_base_candidate_manifest_sha256",
         "expected_base_formal_status_sha256",

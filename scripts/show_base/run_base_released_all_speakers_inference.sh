@@ -3,13 +3,13 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
 # Formal launcher for the exact official BEAT2 All-Speakers Base + five
-# representation files.  Canonical/audio/Base-feature/source/output arguments
-# remain caller supplied.  GPU execution must stay below
+# representation files.  Canonical/audio/source/output arguments remain caller
+# supplied; SHOW training artifacts are forbidden.  GPU execution must stay below
 # /tmp/globaldiff_guarded_runner.py.
 
-if [[ $# -lt 8 ]]; then
+if [[ $# -lt 10 ]]; then
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON BASE FACE UPPER HANDS LOWER GLOBAL [INFERENCE_ARGS...]"
+        "Usage: $0 REPO_ROOT PYTHON BASE FACE UPPER HANDS LOWER GLOBAL CROSS_DOMAIN_GATE CROSS_DOMAIN_GATE_SHA256 [INFERENCE_ARGS...]"
     exit 2
 fi
 
@@ -21,7 +21,9 @@ upper_checkpoint=$5
 hands_checkpoint=$6
 lower_checkpoint=$7
 global_checkpoint=$8
-shift 8
+cross_domain_gate=$9
+cross_domain_gate_sha256=${10}
+shift 10
 
 declare -A expected_names=(
     [base]=best_semtalk_base.bin
@@ -67,11 +69,34 @@ for stage in base face upper hands lower global; do
         exit 2
     fi
 done
+if [[ ! -f "$cross_domain_gate" || -L "$cross_domain_gate" ]]; then
+    printf 'missing/unsafe released cross-domain gate: %s\n' \
+        "$cross_domain_gate" >&2
+    exit 1
+fi
+if [[ ! "$cross_domain_gate_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'invalid released cross-domain gate SHA-256: %s\n' \
+        "$cross_domain_gate_sha256" >&2
+    exit 2
+fi
 
 for argument in "$@"; do
     case "$argument" in
         --prerequisite-source|--prerequisite-source=*|\
         --base-checkpoint-source|--base-checkpoint-source=*|\
+        --released-cross-domain-gate-json|\
+        --released-cross-domain-gate-json=*|\
+        --expected-released-cross-domain-gate-sha256|\
+        --expected-released-cross-domain-gate-sha256=*|\
+        --base-training-lineage-manifest|\
+        --base-training-lineage-manifest=*|\
+        --base-training-summary-json|--base-training-summary-json=*|\
+        --representation-training-lineage-manifest|\
+        --representation-training-lineage-manifest=*|\
+        --expected-training-source-commit|\
+        --expected-training-source-commit=*|\
+        --expected-training-source-tree|\
+        --expected-training-source-tree=*|\
         --base-checkpoint|--base-checkpoint=*|\
         --expected-base-sha256|--expected-base-sha256=*|\
         --base-status-json|--base-status-json=*|\
@@ -107,6 +132,9 @@ done
 exec "$python_bin" "$repo_root/scripts/show_base/run_base_inference.py" \
     --prerequisite-source released_all_speakers_v1 \
     --base-checkpoint-source released_all_speakers_v1 \
+    --released-cross-domain-gate-json "$cross_domain_gate" \
+    --expected-released-cross-domain-gate-sha256 \
+    "$cross_domain_gate_sha256" \
     --base-checkpoint "$base_checkpoint" \
     --expected-base-sha256 "${expected_hashes[base]}" \
     --face-checkpoint "$face_checkpoint" \

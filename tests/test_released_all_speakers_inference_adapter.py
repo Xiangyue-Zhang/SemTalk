@@ -135,8 +135,21 @@ def _released_argv(*, released_base: bool = False) -> list[str]:
             "--expected-base-candidate-manifest-sha256",
             "--expected-base-formal-status-sha256",
             "--expected-base-final-checkpoint-sha256",
+            "--base-training-lineage-manifest",
+            "--base-training-summary-json",
+            "--representation-training-lineage-manifest",
+            "--expected-training-source-commit",
+            "--expected-training-source-tree",
         ):
             _remove_option(argv, option)
+        argv.extend(
+            [
+                "--released-cross-domain-gate-json",
+                "/official/cross-domain-gate.json",
+                "--expected-released-cross-domain-gate-sha256",
+                "9" * 64,
+            ]
+        )
         specification = INFERENCE.RELEASED_ALL_SPEAKERS_MODELS["base"]
         checkpoint_index = argv.index("--base-checkpoint")
         argv[checkpoint_index + 1] = (
@@ -186,6 +199,12 @@ class ReleasedCliContractTests(unittest.TestCase):
         )
         self.assertIsNone(all_released.base_status_json)
         self.assertIsNone(all_released.base_candidate_manifest)
+        self.assertIsNone(
+            all_released.base_training_lineage_manifest
+        )
+        self.assertIsNone(
+            all_released.expected_training_source_commit
+        )
 
     def test_release_sources_are_fail_closed_and_independent(self) -> None:
         argv = _released_argv()
@@ -242,6 +261,11 @@ class ReleasedCliContractTests(unittest.TestCase):
             "--base-checkpoint-source released_all_speakers_v1",
             launcher,
         )
+        self.assertIn("--released-cross-domain-gate-json", launcher)
+        self.assertIn(
+            "--expected-released-cross-domain-gate-sha256",
+            launcher,
+        )
         for stage, specification in (
             INFERENCE.RELEASED_ALL_SPEAKERS_MODELS.items()
         ):
@@ -251,6 +275,341 @@ class ReleasedCliContractTests(unittest.TestCase):
                 self.assertIn(
                     f"--expected-{stage}-sha256",
                     launcher,
+                )
+
+    def test_fully_released_gate_replaces_show_training_artifacts(self) -> None:
+        valid = _released_argv(released_base=True)
+        self.assertEqual(
+            INFERENCE.parse_args(valid).released_cross_domain_gate_json,
+            Path("/official/cross-domain-gate.json"),
+        )
+        for option in (
+            "--released-cross-domain-gate-json",
+            "--expected-released-cross-domain-gate-sha256",
+        ):
+            with self.subTest(missing=option):
+                incomplete = list(valid)
+                _remove_option(incomplete, option)
+                with (
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    INFERENCE.parse_args(incomplete)
+        with_training_artifact = list(valid)
+        with_training_artifact.extend(
+            [
+                "--base-training-summary-json",
+                "/attacker/show-summary.json",
+            ]
+        )
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            INFERENCE.parse_args(with_training_artifact)
+        mixed = _released_argv()
+        mixed.extend(
+            [
+                "--released-cross-domain-gate-json",
+                "/attacker/gate.json",
+                "--expected-released-cross-domain-gate-sha256",
+                "0" * 64,
+            ]
+        )
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            INFERENCE.parse_args(mixed)
+
+
+class ReleasedCrossDomainGateTests(unittest.TestCase):
+    def _fixture(self, root: Path):
+        gate_script = (
+            root
+            / INFERENCE.RELEASED_CROSS_DOMAIN_GATE_SCRIPT_RELATIVE
+        )
+        current_script = root / "scripts/show_base/run_base_inference.py"
+        current_script.parent.mkdir(parents=True)
+        current_script.write_text("# inference\n", encoding="utf-8")
+        measurements_file = root / "measurements.json"
+        thresholds_file = root / "thresholds.json"
+        gate_script.write_text("# strict gate\n", encoding="utf-8")
+        measurements_file.write_text('{"fgd":0.25}\n', encoding="utf-8")
+        thresholds_file.write_text('{"fgd":0.5}\n', encoding="utf-8")
+
+        current_source = {
+            "source_root": str(root.resolve()),
+            "origin": INFERENCE.EXPECTED_ORIGIN,
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean": True,
+            "script": str(current_script.resolve()),
+            "script_relative": str(
+                current_script.resolve().relative_to(root.resolve())
+            ),
+            "script_sha256": hashlib.sha256(
+                current_script.read_bytes()
+            ).hexdigest(),
+        }
+        canonical_source = {
+            "format": "semtalk_show_canonical_source_v1",
+            "origin": INFERENCE.EXPECTED_ORIGIN,
+            "commit": "4" * 40,
+            "tree": "5" * 40,
+        }
+        input_source = {
+            "format": "semtalk_show_input_artifact_source_v1",
+            "origin": INFERENCE.EXPECTED_ORIGIN,
+            "commit": "6" * 40,
+            "tree": "7" * 40,
+        }
+        canonical_receipt = {
+            "manifest": "/frozen/canonical.jsonl",
+            "manifest_sha256": "8" * 64,
+            "summary": "/frozen/canonical.summary.json",
+            "summary_sha256": "9" * 64,
+            "lineage": "/frozen/canonical.lineage.json",
+            "lineage_sha256": "a" * 64,
+            "lineage_contract_sha256": "b" * 64,
+            "source_receipt": canonical_source,
+        }
+        artifact = lambda path: {
+            "path": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        gate = {
+            "format": INFERENCE.RELEASED_CROSS_DOMAIN_GATE_FORMAT,
+            "status": "pass",
+            "authorization": True,
+            "release_trust_root": copy.deepcopy(
+                INFERENCE.RELEASED_ALL_SPEAKERS_RELEASE_TRUST_ROOT
+            ),
+            "official_weights": (
+                INFERENCE._official_released_weights_receipt()
+            ),
+            "canonical_receipt": {
+                key: canonical_receipt[key]
+                for key in (
+                    "manifest",
+                    "manifest_sha256",
+                    "summary",
+                    "summary_sha256",
+                    "lineage",
+                    "lineage_sha256",
+                    "lineage_contract_sha256",
+                )
+            },
+            "source_roles": {
+                "current": current_source,
+                "gate": {
+                    "source_root": str(root.resolve()),
+                    "origin": INFERENCE.EXPECTED_ORIGIN,
+                    "commit": "1" * 40,
+                    "tree": "2" * 40,
+                    "clean": True,
+                    "script": str(gate_script.resolve()),
+                    "script_relative": str(
+                        gate_script.resolve().relative_to(root.resolve())
+                    ),
+                    "script_sha256": hashlib.sha256(
+                        gate_script.read_bytes()
+                    ).hexdigest(),
+                },
+                "canonical": canonical_source,
+                "input_artifact": input_source,
+            },
+            "protocol": {
+                "mode": INFERENCE.FULLY_RELEASED_ZERO_SHOT_MODE,
+                "split": "test",
+                "show_speakers": [0, 1, 2, 3],
+                "exact_once": True,
+                "all_tensors_finite": True,
+                "deterministic": True,
+                "evaluated_components": [
+                    "face",
+                    "upper",
+                    "hands",
+                    "lower",
+                    "global_sanity",
+                ],
+                "bound_not_evaluated": ["base"],
+                "forbidden_components": sorted(
+                    INFERENCE.FORBIDDEN_COMPONENTS | {"Speaker2"}
+                ),
+            },
+            "gate_script": artifact(gate_script),
+            "measurement_receipt": artifact(measurements_file),
+            "threshold_receipt": artifact(thresholds_file),
+            "measurements": {
+                "released2_fgd": 0.25,
+                "finite_tensors": 123,
+            },
+            "thresholds": {"maximum_released2_fgd": 0.5},
+            "decisions": {
+                "released2_fgd_within_threshold": True,
+                "all_outputs_finite": True,
+                "deterministic_replay": True,
+            },
+        }
+        gate["receipt_sha256"] = INFERENCE.canonical_json_sha256(gate)
+        gate_path = root / "cross-domain-gate.json"
+        gate_path.write_bytes(INFERENCE.canonical_json_bytes(gate))
+        args = SimpleNamespace(
+            released_cross_domain_gate_json=gate_path,
+            expected_released_cross_domain_gate_sha256=(
+                hashlib.sha256(gate_path.read_bytes()).hexdigest()
+            ),
+        )
+        return (
+            args,
+            gate,
+            current_source,
+            input_source,
+            canonical_receipt,
+            measurements_file,
+        )
+
+    @staticmethod
+    def _validate(**kwargs):
+        with mock.patch.object(
+            INFERENCE,
+            "_git_output",
+            side_effect=lambda _root, *_arguments: _arguments[-1],
+        ):
+            return INFERENCE._validate_released_cross_domain_gate(**kwargs)
+
+    @staticmethod
+    def _rewrite_gate(
+        args: SimpleNamespace,
+        gate: dict,
+    ) -> None:
+        gate.pop("receipt_sha256", None)
+        gate["receipt_sha256"] = INFERENCE.canonical_json_sha256(gate)
+        args.released_cross_domain_gate_json.write_bytes(
+            INFERENCE.canonical_json_bytes(gate)
+        )
+        args.expected_released_cross_domain_gate_sha256 = (
+            hashlib.sha256(
+                args.released_cross_domain_gate_json.read_bytes()
+            ).hexdigest()
+        )
+
+    def test_exact_cross_domain_gate_passes_and_binds_all_six_weights(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            (
+                args,
+                gate,
+                current_source,
+                input_source,
+                canonical_receipt,
+                _,
+            ) = self._fixture(Path(temporary))
+            receipt = self._validate(
+                args=args,
+                source_receipt=current_source,
+                input_source_receipt=input_source,
+                canonical_receipt=canonical_receipt,
+            )
+            self.assertEqual(
+                set(gate["official_weights"]),
+                set(INFERENCE.CHECKPOINT_STAGES),
+            )
+            self.assertEqual(
+                receipt["receipt_sha256"],
+                gate["receipt_sha256"],
+            )
+
+    def test_coherent_trust_source_and_decision_tampering_fails(self) -> None:
+        mutations = (
+            lambda gate: gate["release_trust_root"].__setitem__(
+                "commit",
+                "0" * 40,
+            ),
+            lambda gate: gate["source_roles"].__setitem__(
+                "gate",
+                {"attacker": True},
+            ),
+            lambda gate: gate["decisions"].__setitem__(
+                "deterministic_replay",
+                False,
+            ),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    (
+                        args,
+                        gate,
+                        current_source,
+                        input_source,
+                        canonical_receipt,
+                        _,
+                    ) = self._fixture(Path(temporary))
+                    mutation(gate)
+                    self._rewrite_gate(args, gate)
+                    with self.assertRaises(
+                        INFERENCE.InferenceContractError
+                    ):
+                        self._validate(
+                            args=args,
+                            source_receipt=current_source,
+                            input_source_receipt=input_source,
+                            canonical_receipt=canonical_receipt,
+                        )
+
+    def test_other_tracked_file_cannot_impersonate_gate_entrypoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            (
+                args,
+                gate,
+                current_source,
+                input_source,
+                canonical_receipt,
+                _,
+            ) = self._fixture(Path(temporary))
+            other_tracked_file = Path(current_source["script"])
+            other_sha = hashlib.sha256(
+                other_tracked_file.read_bytes()
+            ).hexdigest()
+            gate["gate_script"] = {
+                "path": str(other_tracked_file.resolve()),
+                "sha256": other_sha,
+            }
+            gate["source_roles"]["gate"] = copy.deepcopy(current_source)
+            self._rewrite_gate(args, gate)
+            with self.assertRaises(INFERENCE.InferenceContractError):
+                self._validate(
+                    args=args,
+                    source_receipt=current_source,
+                    input_source_receipt=input_source,
+                    canonical_receipt=canonical_receipt,
+                )
+
+    def test_bound_measurement_artifact_is_rehashed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            (
+                args,
+                _,
+                current_source,
+                input_source,
+                canonical_receipt,
+                measurements_file,
+            ) = self._fixture(Path(temporary))
+            measurements_file.write_text(
+                '{"fgd":999.0}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(INFERENCE.InferenceContractError):
+                self._validate(
+                    args=args,
+                    source_receipt=current_source,
+                    input_source_receipt=input_source,
+                    canonical_receipt=canonical_receipt,
                 )
 
 
@@ -425,6 +784,118 @@ class ReleasedCheckpointPrimitiveTests(unittest.TestCase):
                     expected_filename=tampered.name,
                     expected_sha256=tampered_digest,
                 )
+
+    def test_cross_domain_gate_replaces_only_builder_record_binding(
+        self,
+    ) -> None:
+        gate_sha = "f" * 64
+        state = {"weight": torch.ones(1)}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            face_path = root / "face.bin"
+            face_path.write_bytes(b"face")
+            base_path = root / "base.bin"
+            base_path.write_bytes(b"base")
+            models = copy.deepcopy(
+                INFERENCE.RELEASED_ALL_SPEAKERS_MODELS
+            )
+            models["face"] = {
+                "filename": face_path.name,
+                "sha256": "a" * 64,
+                "model_class": "TinyFace",
+            }
+            models["base"] = {
+                "filename": base_path.name,
+                "sha256": "b" * 64,
+                "model_class": "TinyBase",
+            }
+            common = {
+                "expected_training_lineage_sha256": None,
+                "status_path": None,
+                "expected_source_receipt": None,
+                "expected_dataset_summary_sha256": None,
+                "expected_data_mdb_sha256": None,
+                "checkpoint_source": (
+                    INFERENCE.RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+                ),
+            }
+            with (
+                mock.patch.object(
+                    INFERENCE,
+                    "RELEASED_ALL_SPEAKERS_MODELS",
+                    models,
+                ),
+                mock.patch.object(
+                    INFERENCE,
+                    "_validate_released_model_state_schema",
+                ),
+                mock.patch.object(
+                    INFERENCE,
+                    "_load_released_model_state_only",
+                    return_value=(
+                        state,
+                        face_path.resolve(),
+                        b"face",
+                        "a" * 64,
+                    ),
+                ),
+                mock.patch.object(
+                    INFERENCE,
+                    "_load_released_base_state",
+                    return_value=(
+                        state,
+                        base_path.resolve(),
+                        b"base",
+                        "b" * 64,
+                        {
+                            "epoch_counter": 401,
+                            "lr_scheduler_sha256": "c" * 64,
+                            "optimizer_state_entries": 1_655,
+                            "optimizer_parameter_count": 1_783,
+                            "optimizer_all_tensors_finite": True,
+                        },
+                    ),
+                ),
+            ):
+                _, face_receipt = (
+                    INFERENCE._checkpoint_payload_and_receipt(
+                        face_path,
+                        formal_stage="face",
+                        expected_sha256="a" * 64,
+                        released_cross_domain_gate_receipt_sha256=gate_sha,
+                        **common,
+                    )
+                )
+                _, base_receipt = (
+                    INFERENCE._checkpoint_payload_and_receipt(
+                        base_path,
+                        formal_stage="base",
+                        expected_sha256="b" * 64,
+                        released_cross_domain_gate_receipt_sha256=gate_sha,
+                        **common,
+                    )
+                )
+                self.assertEqual(
+                    face_receipt[
+                        "released_cross_domain_gate_receipt_sha256"
+                    ],
+                    gate_sha,
+                )
+                self.assertEqual(
+                    base_receipt[
+                        "released_cross_domain_gate_receipt_sha256"
+                    ],
+                    gate_sha,
+                )
+                with self.assertRaises(
+                    INFERENCE.InferenceContractError
+                ):
+                    INFERENCE._checkpoint_payload_and_receipt(
+                        face_path,
+                        formal_stage="face",
+                        expected_sha256="a" * 64,
+                        **common,
+                    )
 
 
 class ReleasedLineageReceiptTests(unittest.TestCase):
