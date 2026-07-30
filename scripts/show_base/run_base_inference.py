@@ -122,10 +122,28 @@ CHECKPOINT_STAGES = ("base", "face", "upper", "hands", "lower", "global")
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SHOW_TRAINED_CHECKPOINT_SOURCE = "show_trained_v1"
 RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE = "released_all_speakers_v1"
+OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE = "official_show_adapt_v1"
 CHECKPOINT_SOURCES = (
     SHOW_TRAINED_CHECKPOINT_SOURCE,
     RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE,
+    OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
 )
+OFFICIAL_SHOW_ADAPT_MODE = "official_show_adapt_v1"
+OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT = (
+    "semtalk_show_base_official_adapt_checkpoint_v1"
+)
+OFFICIAL_SHOW_ADAPT_BASE_MANIFEST_FORMAT = (
+    "semtalk_show_base_official_adapt_manifest_v1"
+)
+OFFICIAL_SHOW_ADAPT_BASE_STATUS_FORMAT = (
+    "semtalk_show_base_official_adapt_status_v1"
+)
+OFFICIAL_SHOW_ADAPT_BASE_FROZEN_FORMAT = (
+    "semtalk_show_base_official_adapt_frozen_inputs_v1"
+)
+OFFICIAL_SHOW_ADAPT_TRANSFER_FORMAT = "semtalk_show_official_transfer_v1"
+OFFICIAL_SHOW_ADAPT_BASE_CANDIDATE_EPOCHS = (1, 2, 4, 8, 16, 32, 40)
+OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH = 248
 RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
     "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
 )
@@ -538,6 +556,37 @@ def compact_json_sha256(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def official_base_adapt_json_sha256(value: Any) -> str:
+    """Match train_base_official_adapt.canonical_json_sha256 exactly."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def official_transfer_state_dict_sha256(state: Mapping[str, Any]) -> str:
+    """Match show_official_transfer.state_dict_sha256 exactly."""
+    digest = hashlib.sha256()
+    for key in sorted(state):
+        value = state[key]
+        if not hasattr(value, "detach"):
+            raise InferenceContractError(
+                f"official transfer state entry {key!r} is not a tensor"
+            )
+        tensor = value.detach().cpu().contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(canonical_json_bytes(list(tensor.shape)))
+        digest.update(tensor.numpy().tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _validate_lower_target_cache_binding(
@@ -3541,6 +3590,709 @@ def _base_candidate_payload_and_receipt(
     }
 
 
+def _require_official_adapt_detached_source(source_root: Path) -> None:
+    """Fail closed unless the formal inference checkout is clean and detached."""
+
+    symbolic = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_root),
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if symbolic.returncode == 0:
+        raise InferenceContractError(
+            "official_show_adapt_v1 requires a detached source checkout"
+        )
+    if symbolic.returncode != 1:
+        raise InferenceContractError(
+            "cannot prove that official_show_adapt_v1 source is detached"
+        )
+
+
+def _reject_withdrawn_adapt_path(value: str | Path, label: str) -> None:
+    lowered = str(value).lower()
+    if "e30" in lowered or "speaker2" in lowered:
+        raise InferenceContractError(
+            f"{label} references withdrawn e30 or forbidden Speaker2: {value}"
+        )
+
+
+def _verified_json_object(
+    path: str | Path,
+    expected_sha256: str,
+    label: str,
+) -> tuple[Path, dict[str, Any], str]:
+    resolved = _resolved_regular_file(path, label)
+    _reject_withdrawn_adapt_path(resolved, label)
+    observed = _verify_file_sha(resolved, expected_sha256, label)
+    payload = load_json(resolved)
+    if type(payload) is not dict:
+        raise InferenceContractError(f"{resolved}: {label} must be an object")
+    return resolved, payload, observed
+
+
+def _validate_adapt_producer_source(
+    source: Any,
+    *,
+    expected_source_receipt: Mapping[str, Any],
+    label: str,
+    require_detached_receipt: bool,
+) -> dict[str, Any]:
+    if type(source) is not dict:
+        raise InferenceContractError(f"{label}: missing producer source receipt")
+    triplet = {
+        key: source.get(key) for key in ("origin", "commit", "tree")
+    }
+    expected_triplet = {
+        key: expected_source_receipt.get(key)
+        for key in ("origin", "commit", "tree")
+    }
+    if (
+        triplet != expected_triplet
+        or source.get("origin") != EXPECTED_ORIGIN
+        or source.get("clean") is not True
+    ):
+        raise InferenceContractError(
+            f"{label}: producer source is not the expected clean SemTalk tree"
+        )
+    if require_detached_receipt and source.get("branch", object()) is not None:
+        raise InferenceContractError(
+            f"{label}: producer source receipt is not detached"
+        )
+    entrypoint = source.get("entrypoint")
+    entrypoint_sha = source.get("entrypoint_sha256")
+    if (
+        type(entrypoint) is not str
+        or type(entrypoint_sha) is not str
+        or not Path(entrypoint).is_absolute()
+    ):
+        raise InferenceContractError(
+            f"{label}: invalid producer entrypoint receipt"
+        )
+    _verify_file_sha(
+        _resolved_regular_file(entrypoint, f"{label} producer entrypoint"),
+        entrypoint_sha,
+        f"{label} producer entrypoint",
+    )
+    return dict(source)
+
+
+def _validate_exact_official_reference(
+    receipt: Any,
+    *,
+    stage: str,
+    label: str,
+) -> dict[str, Any]:
+    specification = RELEASED_ALL_SPEAKERS_MODELS[stage]
+    if type(receipt) is not dict:
+        raise InferenceContractError(f"{label}: missing official {stage} receipt")
+    path_value = receipt.get("path")
+    if (
+        receipt.get("filename") != specification["filename"]
+        or receipt.get("sha256") != specification["sha256"]
+        or type(path_value) is not str
+    ):
+        raise InferenceContractError(
+            f"{label}: official {stage} initialization is not hash-pinned"
+        )
+    resolved = _resolved_regular_file(path_value, f"{label} official {stage}")
+    _reject_withdrawn_adapt_path(resolved, f"{label} official {stage}")
+    if resolved.name != specification["filename"]:
+        raise InferenceContractError(
+            f"{label}: official {stage} filename changed"
+        )
+    _verify_file_sha(
+        resolved,
+        str(specification["sha256"]),
+        f"{label} official {stage}",
+    )
+    if (
+        "official_all_speakers" in receipt
+        and receipt.get("official_all_speakers") is not True
+    ):
+        raise InferenceContractError(
+            f"{label}: {stage} is not marked official All-Speakers"
+        )
+    if (
+        "withdrawn_e30_allowed" in receipt
+        and receipt.get("withdrawn_e30_allowed") is not False
+    ):
+        raise InferenceContractError(
+            f"{label}: withdrawn e30 is not explicitly forbidden"
+        )
+    return dict(receipt)
+
+
+def _validate_official_transfer_metrics(
+    *,
+    path: Path,
+    summary: Mapping[str, Any],
+    transfer: Mapping[str, Any],
+    stage: str,
+) -> None:
+    rows = load_jsonl(path)
+    epochs = summary.get("epochs")
+    if (
+        type(epochs) is not int
+        or epochs <= 0
+        or len(rows) != epochs
+        or [row.get("epoch") for row in rows]
+        != list(range(1, epochs + 1))
+    ):
+        raise InferenceContractError(
+            f"{path}: incomplete {stage} validation selection history"
+        )
+    expected_keys = {
+        "epoch",
+        "train",
+        "val",
+        "elapsed_seconds",
+        "rank_count",
+        "finite",
+    }
+    for row in rows:
+        if (
+            set(row) != expected_keys
+            or row.get("finite") is not True
+            or type(row.get("rank_count")) is not int
+            or row["rank_count"] <= 0
+            or type(row.get("elapsed_seconds")) not in {int, float}
+            or isinstance(row.get("elapsed_seconds"), bool)
+            or not math.isfinite(float(row["elapsed_seconds"]))
+            or float(row["elapsed_seconds"]) < 0.0
+            or type(row.get("train")) is not dict
+            or type(row.get("val")) is not dict
+        ):
+            raise InferenceContractError(
+                f"{path}: invalid {stage} transfer metric event"
+            )
+        _validate_finite_measurement_tree(
+            row["train"],
+            f"{path}: epoch {row['epoch']} train metrics",
+        )
+        _validate_finite_measurement_tree(
+            row["val"],
+            f"{path}: epoch {row['epoch']} val metrics",
+        )
+        total = row["val"].get("total")
+        if (
+            type(total) not in {int, float}
+            or isinstance(total, bool)
+            or not math.isfinite(float(total))
+        ):
+            raise InferenceContractError(
+                f"{path}: epoch {row['epoch']} lacks finite val total"
+            )
+    best = min(rows, key=lambda row: (float(row["val"]["total"]), row["epoch"]))
+    if (
+        summary.get("best_epoch") != best["epoch"]
+        or summary.get("best_validation_total") != best["val"]["total"]
+        or transfer.get("validation") != best["val"]
+    ):
+        raise InferenceContractError(
+            f"{path}: {stage} best checkpoint is not the val minimum"
+        )
+
+
+def _validate_official_adapt_base(
+    *,
+    path: Path,
+    expected_sha256: str,
+    expected_source_receipt: Mapping[str, Any],
+    status_path: Path | None,
+    manifest_path: Path | None,
+    expected_manifest_sha256: str | None,
+    expected_status_sha256: str | None,
+    frozen_inputs_path: Path | None,
+    expected_frozen_inputs_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if any(
+        value is None
+        for value in (
+            status_path,
+            manifest_path,
+            expected_manifest_sha256,
+            expected_status_sha256,
+            frozen_inputs_path,
+            expected_frozen_inputs_sha256,
+        )
+    ):
+        raise InferenceContractError(
+            "official_show_adapt_v1 Base requires status, candidate manifest, "
+            "and frozen-input receipt with external SHA roots"
+        )
+    resolved, snapshot, observed_sha = _read_verified_checkpoint_snapshot(
+        path,
+        expected_sha256,
+        "official-adapt Base candidate",
+    )
+    _reject_withdrawn_adapt_path(resolved, "official-adapt Base candidate")
+    payload = _torch_load_checkpoint(snapshot, resolved)
+    if set(payload) != {"model_state", "audit"}:
+        raise InferenceContractError(
+            f"{resolved}: invalid official-adapt Base checkpoint envelope"
+        )
+    _finite_state_dict(payload["model_state"], resolved)
+    _validate_base_model_state_schema(payload["model_state"], resolved)
+
+    frozen_resolved, frozen, frozen_file_sha = _verified_json_object(
+        frozen_inputs_path,
+        str(expected_frozen_inputs_sha256),
+        "official-adapt Base frozen inputs",
+    )
+    frozen_receipt_sha = frozen.get("receipt_sha256")
+    frozen_without_sha = dict(frozen)
+    frozen_without_sha.pop("receipt_sha256", None)
+    if (
+        frozen.get("format") != OFFICIAL_SHOW_ADAPT_BASE_FROZEN_FORMAT
+        or type(frozen_receipt_sha) is not str
+        or official_base_adapt_json_sha256(frozen_without_sha)
+        != frozen_receipt_sha
+    ):
+        raise InferenceContractError(
+            f"{frozen_resolved}: invalid frozen-input receipt"
+        )
+    producer_source = _validate_adapt_producer_source(
+        frozen.get("source"),
+        expected_source_receipt=expected_source_receipt,
+        label="official-adapt Base",
+        require_detached_receipt=True,
+    )
+    official_base = _validate_exact_official_reference(
+        frozen.get("official_base"),
+        stage="base",
+        label="official-adapt Base",
+    )
+    dataset = frozen.get("dataset")
+    protocol = frozen.get("protocol")
+    if (
+        type(dataset) is not dict
+        or dataset.get("format")
+        != "semtalk_show_base_official_feature_dataset_receipt_v1"
+        or dataset.get("entries") != 127_286
+        or dataset.get("train_clips") != 13_687
+        or dataset.get("prerequisite_source")
+        != RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+        or dataset.get("vq_models_in_training_graph") is not False
+        or type(protocol) is not dict
+        or protocol.get("format")
+        != "semtalk_show_base_official_adapt_protocol_v1"
+        or protocol.get("target_dataset") != "SHOW"
+        or protocol.get("target_speaker_scope") != "All"
+        or protocol.get("target_speakers") != SHOW_SPEAKER_IDS
+        or protocol.get("candidate_epochs")
+        != list(OFFICIAL_SHOW_ADAPT_BASE_CANDIDATE_EPOCHS)
+        or protocol.get("epochs") != 40
+        or protocol.get("expected_updates_per_epoch")
+        != OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH
+        or protocol.get("vq_models_in_training_graph") is not False
+        or protocol.get("initialization", {}).get("sha256")
+        != RELEASED_ALL_SPEAKERS_MODELS["base"]["sha256"]
+        or protocol.get("initialization", {}).get("speaker_scope")
+        != "All-Speakers"
+        or protocol.get("forward_contract", {}).get(
+            "forwards_per_optimizer_step"
+        )
+        != 1
+        or protocol.get("forward_contract", {}).get(
+            "audio_conditioned_main_forward"
+        )
+        is not True
+    ):
+        raise InferenceContractError(
+            f"{frozen_resolved}: Base adaptation protocol leaks test data or "
+            "does not preserve the official initialization contract"
+        )
+
+    manifest_resolved, manifest, manifest_file_sha = _verified_json_object(
+        manifest_path,
+        str(expected_manifest_sha256),
+        "official-adapt Base candidate manifest",
+    )
+    entries = manifest.get("entries")
+    if (
+        manifest.get("format") != OFFICIAL_SHOW_ADAPT_BASE_MANIFEST_FORMAT
+        or manifest.get("status") != "complete"
+        or manifest.get("candidate_epochs")
+        != list(OFFICIAL_SHOW_ADAPT_BASE_CANDIDATE_EPOCHS)
+        or manifest.get("completed_epochs") != 40
+        or manifest.get("optimizer_updates")
+        != 40 * OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH
+        or manifest.get("frozen_receipt_sha256") != frozen_receipt_sha
+        or type(entries) is not list
+        or [entry.get("epoch") for entry in entries]
+        != list(OFFICIAL_SHOW_ADAPT_BASE_CANDIDATE_EPOCHS)
+        or manifest.get("entries_sha256")
+        != official_base_adapt_json_sha256(entries)
+    ):
+        raise InferenceContractError(
+            f"{manifest_resolved}: incomplete official-adapt Base manifest"
+        )
+    selected: dict[str, Any] | None = None
+    for entry in entries:
+        if type(entry) is not dict:
+            raise InferenceContractError(
+                f"{manifest_resolved}: invalid candidate entry"
+            )
+        candidate_path = _resolved_regular_file(
+            manifest_resolved.parent / str(entry.get("checkpoint", "")),
+            "official-adapt Base candidate entry",
+        )
+        _reject_withdrawn_adapt_path(
+            candidate_path,
+            "official-adapt Base candidate entry",
+        )
+        if (
+            entry.get("frozen_receipt_sha256") != frozen_receipt_sha
+            or entry.get("checkpoint_container_schema")
+            != ["audit", "model_state"]
+            or entry.get("all_model_state_tensors_finite") is not True
+        ):
+            raise InferenceContractError(
+                f"{manifest_resolved}: invalid candidate trust receipt"
+            )
+        candidate_sha = _verify_file_sha(
+            candidate_path,
+            str(entry.get("checkpoint_sha256", "")),
+            "official-adapt Base candidate entry",
+        )
+        if candidate_path == resolved:
+            selected = dict(entry)
+            if candidate_sha != observed_sha:
+                raise InferenceContractError(
+                    "selected Base candidate SHA differs from its manifest"
+                )
+    if selected is None:
+        raise InferenceContractError(
+            f"{resolved}: Base candidate is not in the complete manifest"
+        )
+    audit = payload.get("audit")
+    if (
+        type(audit) is not dict
+        or audit.get("format") != OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT
+        or audit.get("completed_epochs") != selected.get("epoch")
+        or audit.get("optimizer_updates")
+        != selected.get("optimizer_updates")
+        or audit.get("frozen_receipt_sha256") != frozen_receipt_sha
+        or audit.get("official_base_checkpoint_sha256")
+        != RELEASED_ALL_SPEAKERS_MODELS["base"]["sha256"]
+        or audit.get("speaker_scope") != "SHOW_All"
+        or audit.get("speaker_rows") != [0, 1, 2, 3]
+        or audit.get("vq_models_in_training_graph") is not False
+        or audit.get("all_model_state_tensors_finite") is not True
+    ):
+        raise InferenceContractError(
+            f"{resolved}: Base candidate audit is not frozen-input bound"
+        )
+
+    status_resolved, status, status_file_sha = _verified_json_object(
+        status_path,
+        str(expected_status_sha256),
+        "official-adapt Base status",
+    )
+    if (
+        status.get("format") != OFFICIAL_SHOW_ADAPT_BASE_STATUS_FORMAT
+        or status.get("status") != "complete"
+        or status.get("completed_epochs") != 40
+        or status.get("optimizer_updates")
+        != 40 * OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH
+        or status.get("updates_per_epoch")
+        != OFFICIAL_SHOW_ADAPT_BASE_UPDATES_PER_EPOCH
+        or status.get("candidate_manifest_sha256") != manifest_file_sha
+        or status.get("frozen_receipt_sha256") != frozen_receipt_sha
+        or status.get("world_size") != 8
+        or status.get("global_batch_size") != 512
+        or status.get("all_training_state_finite") is not True
+    ):
+        raise InferenceContractError(
+            f"{status_resolved}: Base official adaptation did not finalize"
+        )
+    return payload, {
+        "path": str(resolved),
+        "sha256": observed_sha,
+        "bytes": len(snapshot),
+        "formal_stage": "base",
+        "checkpoint_source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+        "candidate_epoch": selected["epoch"],
+        "candidate_optimizer_updates": selected["optimizer_updates"],
+        "audit": dict(audit),
+        "official_initialization": official_base,
+        "producer_source": producer_source,
+        "frozen_inputs": {
+            "path": str(frozen_resolved),
+            "sha256": frozen_file_sha,
+            "receipt_sha256": frozen_receipt_sha,
+        },
+        "candidate_manifest": {
+            "path": str(manifest_resolved),
+            "sha256": manifest_file_sha,
+            "entries_sha256": manifest["entries_sha256"],
+        },
+        "formal_training_status": str(status_resolved),
+        "formal_training_status_sha256": status_file_sha,
+        "all_model_state_tensors_finite": True,
+        "strict_state_dict_load": True,
+        "frozen_eval": True,
+    }
+
+
+def _validate_official_transfer_checkpoint(
+    *,
+    path: Path,
+    formal_stage: str,
+    expected_sha256: str,
+    status_path: Path | None,
+    expected_status_sha256: str | None,
+    expected_source_receipt: Mapping[str, Any],
+    expected_canonical_receipt: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if formal_stage not in {"face", "global"}:
+        raise InferenceContractError(
+            "official transfer validation is restricted to Face and Global"
+        )
+    if status_path is None or expected_status_sha256 is None:
+        raise InferenceContractError(
+            f"{formal_stage}: official transfer requires a hash-pinned summary"
+        )
+    expected_name = f"best_{formal_stage}_transfer.bin"
+    if Path(path).name != expected_name:
+        raise InferenceContractError(
+            f"{formal_stage}: adapted checkpoint must be {expected_name}"
+        )
+    resolved, snapshot, observed_sha = _read_verified_checkpoint_snapshot(
+        path,
+        expected_sha256,
+        f"official-adapt {formal_stage} best checkpoint",
+    )
+    _reject_withdrawn_adapt_path(
+        resolved,
+        f"official-adapt {formal_stage} best checkpoint",
+    )
+    payload = _torch_load_checkpoint(snapshot, resolved)
+    if set(payload) != {
+        "model_state",
+        "optimizer_state",
+        "epoch",
+        "transfer_receipt",
+    }:
+        raise InferenceContractError(
+            f"{resolved}: invalid official transfer envelope"
+        )
+    state = _normalize_data_parallel_state(payload["model_state"], resolved)
+    _finite_state_dict(state, resolved)
+    _validate_released_model_state_schema(
+        state,
+        formal_stage=formal_stage,
+        path=resolved,
+    )
+    model_state_sha = official_transfer_state_dict_sha256(state)
+    frozen_state = {
+        key: value
+        for key, value in state.items()
+        if (
+            key.startswith("encoder.")
+            or (
+                formal_stage == "face"
+                and key.startswith("quantizer.")
+            )
+        )
+    }
+    if not frozen_state:
+        raise InferenceContractError(
+            f"{resolved}: transfer checkpoint lacks frozen encoder state"
+        )
+    frozen_state_sha = official_transfer_state_dict_sha256(frozen_state)
+    transfer = payload.get("transfer_receipt")
+    if type(transfer) is not dict:
+        raise InferenceContractError(
+            f"{resolved}: missing transfer receipt"
+        )
+    transfer_sha = transfer.get("receipt_sha256")
+    transfer_without_sha = dict(transfer)
+    transfer_without_sha.pop("receipt_sha256", None)
+    if (
+        transfer.get("format") != OFFICIAL_SHOW_ADAPT_TRANSFER_FORMAT
+        or transfer.get("stage") != formal_stage
+        or transfer.get("epoch") != payload.get("epoch")
+        or transfer.get("test_visible") is not False
+        or transfer.get("withdrawn_e30_allowed") is not False
+        or transfer.get("model_state_sha256") != model_state_sha
+        or transfer.get("frozen_encoder_quantizer_sha256")
+        != frozen_state_sha
+        or type(transfer_sha) is not str
+        or canonical_json_sha256(transfer_without_sha) != transfer_sha
+    ):
+        raise InferenceContractError(
+            f"{resolved}: transfer receipt is incomplete or test-leaking"
+        )
+    producer_source = _validate_adapt_producer_source(
+        transfer.get("source_receipt"),
+        expected_source_receipt=expected_source_receipt,
+        label=f"official-adapt {formal_stage}",
+        require_detached_receipt=True,
+    )
+    official = transfer.get("official_initialization")
+    if type(official) is not dict:
+        raise InferenceContractError(
+            f"{resolved}: missing official initialization"
+        )
+    required_official = (
+        {"face": "face"}
+        if formal_stage == "face"
+        else {"global": "global", "lower": "lower"}
+    )
+    official_records = {
+        key: _validate_exact_official_reference(
+            official.get(key),
+            stage=stage,
+            label=f"official-adapt {formal_stage}",
+        )
+        for key, stage in required_official.items()
+    }
+    if set(official) != set(required_official):
+        raise InferenceContractError(
+            f"{resolved}: unexpected official initialization stages"
+        )
+    cache = transfer.get("cache_receipt")
+    protocol = transfer.get("protocol")
+    policy = transfer.get("trainable_policy")
+    if (
+        type(cache) is not dict
+        or cache.get("format")
+        != "semtalk_show_official_transfer_cache_v1"
+        or cache.get("stage") != formal_stage
+        or cache.get("canonical_receipt")
+        != dict(expected_canonical_receipt)
+        or type(cache.get("roots")) is not list
+        or any(
+            "e30" in str(root).lower() or "speaker2" in str(root).lower()
+            for root in cache.get("roots", [])
+        )
+        or type(protocol) is not dict
+        or protocol.get("stage") != formal_stage
+        or protocol.get("selection_split") != "val"
+        or protocol.get("test_visible") is not False
+        or type(policy) is not dict
+    ):
+        raise InferenceContractError(
+            f"{resolved}: transfer cache/protocol is not train+val only"
+        )
+    trainable_names = policy.get("trainable_parameter_names")
+    if (
+        type(trainable_names) is not list
+        or not trainable_names
+        or any(
+            type(name) is not str or not name.startswith("decoder.")
+            for name in trainable_names
+        )
+        or policy.get("frozen_encoder") is not True
+    ):
+        raise InferenceContractError(
+            f"{resolved}: {formal_stage} is not a frozen-encoder decoder transfer"
+        )
+    if formal_stage == "face":
+        if (
+            policy.get("frozen_quantizer") is not True
+            or policy.get("frozen_rvq_ema") is not True
+            or protocol.get("trainable") != "decoder only"
+            or transfer.get("frozen_encoder_quantizer_sha256") is None
+        ):
+            raise InferenceContractError(
+                f"{resolved}: Face encoder/quantizer freeze is not proven"
+            )
+    else:
+        if (
+            policy.get("policy") != "decoder_only"
+            or policy.get("full_model_fallback_authorized") is not False
+            or protocol.get("trainable") != "decoder_only"
+            or protocol.get("locked_inference_interface")
+            != "Base-predicted Lower code IDs -> frozen official Lower decode"
+            or protocol.get("lower_translation_54_57")
+            != "exact zero every frame"
+            or protocol.get("world_root_in_lower_recurrent_seed") is not False
+            or transfer.get("frozen_encoder_quantizer_sha256") is None
+        ):
+            raise InferenceContractError(
+                f"{resolved}: Global decoder-only locked interface is invalid"
+            )
+
+    summary_resolved, summary, summary_file_sha = _verified_json_object(
+        status_path,
+        expected_status_sha256,
+        f"official-adapt {formal_stage} summary",
+    )
+    summary_without_sha = dict(summary)
+    summary_receipt_sha = summary_without_sha.pop("receipt_sha256", None)
+    metrics_path = _resolved_regular_file(
+        summary.get("metrics_jsonl", ""),
+        f"official-adapt {formal_stage} validation metrics",
+    )
+    _reject_withdrawn_adapt_path(
+        metrics_path,
+        f"official-adapt {formal_stage} validation metrics",
+    )
+    if (
+        summary.get("format") != OFFICIAL_SHOW_ADAPT_TRANSFER_FORMAT
+        or summary.get("status") != "complete"
+        or summary.get("stage") != formal_stage
+        or summary.get("best_epoch") != payload.get("epoch")
+        or summary.get("best_validation_total")
+        != transfer.get("validation", {}).get("total")
+        or summary.get("official_initialization") != official
+        or summary.get("source_receipt") != transfer.get("source_receipt")
+        or summary.get("cache_receipt") != cache
+        or summary.get("trainable_policy") != policy
+        or summary.get("protocol") != protocol
+        or summary.get("frozen_encoder_quantizer_sha256")
+        != transfer.get("frozen_encoder_quantizer_sha256")
+        or summary.get("withdrawn_e30_allowed") is not False
+        or summary.get("test_visible") is not False
+        or type(summary_receipt_sha) is not str
+        or canonical_json_sha256(summary_without_sha) != summary_receipt_sha
+        or summary.get("metrics_jsonl_sha256")
+        != sha256_file(metrics_path)
+    ):
+        raise InferenceContractError(
+            f"{summary_resolved}: best transfer checkpoint/summary mismatch"
+        )
+    _validate_official_transfer_metrics(
+        path=metrics_path,
+        summary=summary,
+        transfer=transfer,
+        stage=formal_stage,
+    )
+    return {"model_state": state}, {
+        "path": str(resolved),
+        "sha256": observed_sha,
+        "bytes": len(snapshot),
+        "formal_stage": formal_stage,
+        "checkpoint_source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+        "checkpoint_kind": "val_selected_best_transfer",
+        "best_epoch": payload["epoch"],
+        "transfer_receipt": dict(transfer),
+        "producer_source": producer_source,
+        "official_initialization": official_records,
+        "formal_training_status": str(summary_resolved),
+        "formal_training_status_sha256": summary_file_sha,
+        "validation_metrics": {
+            "path": str(metrics_path),
+            "sha256": summary["metrics_jsonl_sha256"],
+        },
+        "all_model_state_tensors_finite": True,
+        "strict_state_dict_load": True,
+        "frozen_eval": True,
+    }
+
+
 def _checkpoint_payload_and_receipt(
     path: Path,
     *,
@@ -3558,7 +4310,112 @@ def _checkpoint_payload_and_receipt(
     expected_base_candidate_manifest_sha256: str | None = None,
     expected_base_formal_status_sha256: str | None = None,
     expected_base_final_checkpoint_sha256: str | None = None,
+    official_adapt_frozen_inputs_path: Path | None = None,
+    expected_official_adapt_frozen_inputs_sha256: str | None = None,
+    expected_official_adapt_status_sha256: str | None = None,
+    expected_official_adapt_canonical_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if checkpoint_source == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE:
+        if (
+            expected_source_receipt is None
+            or expected_official_adapt_canonical_receipt is None
+        ):
+            raise InferenceContractError(
+                f"{formal_stage}: official_show_adapt_v1 lacks source or "
+                "canonical receipt"
+            )
+        if formal_stage == "base":
+            if expected_base_final_checkpoint_sha256 is not None:
+                raise InferenceContractError(
+                    "official-adapt Base has no scratch final-checkpoint root"
+                )
+            return _validate_official_adapt_base(
+                path=path,
+                expected_sha256=expected_sha256,
+                expected_source_receipt=expected_source_receipt,
+                status_path=status_path,
+                manifest_path=base_candidate_manifest_path,
+                expected_manifest_sha256=(
+                    expected_base_candidate_manifest_sha256
+                ),
+                expected_status_sha256=(
+                    expected_official_adapt_status_sha256
+                ),
+                frozen_inputs_path=official_adapt_frozen_inputs_path,
+                expected_frozen_inputs_sha256=(
+                    expected_official_adapt_frozen_inputs_sha256
+                ),
+            )
+        if formal_stage in {"face", "global"}:
+            return _validate_official_transfer_checkpoint(
+                path=path,
+                formal_stage=formal_stage,
+                expected_sha256=expected_sha256,
+                status_path=status_path,
+                expected_status_sha256=(
+                    expected_official_adapt_status_sha256
+                ),
+                expected_source_receipt=expected_source_receipt,
+                expected_canonical_receipt=(
+                    expected_official_adapt_canonical_receipt
+                ),
+            )
+        if formal_stage not in {"hands", "upper", "lower"}:
+            raise InferenceContractError(
+                f"unsupported official-adapt stage {formal_stage!r}"
+            )
+        if any(
+            value is not None
+            for value in (
+                status_path,
+                base_candidate_manifest_path,
+                expected_base_candidate_manifest_sha256,
+                expected_base_formal_status_sha256,
+                expected_base_final_checkpoint_sha256,
+                official_adapt_frozen_inputs_path,
+                expected_official_adapt_frozen_inputs_sha256,
+                expected_official_adapt_status_sha256,
+            )
+        ):
+            raise InferenceContractError(
+                f"{formal_stage}: frozen official prerequisite forbids "
+                "adaptation receipts"
+            )
+        specification = RELEASED_ALL_SPEAKERS_MODELS[formal_stage]
+        if expected_sha256 != specification["sha256"]:
+            raise InferenceContractError(
+                f"{formal_stage}: expected SHA is not exact official "
+                "All-Speakers"
+            )
+        state, resolved, snapshot, observed_sha = (
+            _load_released_model_state_only(
+                path,
+                expected_filename=str(specification["filename"]),
+                expected_sha256=str(specification["sha256"]),
+            )
+        )
+        _validate_released_model_state_schema(
+            state,
+            formal_stage=formal_stage,
+            path=resolved,
+        )
+        return {"model_state": state}, {
+            "path": str(resolved),
+            "filename": specification["filename"],
+            "sha256": observed_sha,
+            "bytes": len(snapshot),
+            "formal_stage": formal_stage,
+            "checkpoint_source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+            "classification": RELEASED_ALL_SPEAKERS_CLASSIFICATION,
+            "training_dataset": "BEAT2",
+            "speaker_scope": "All-Speakers",
+            "show_trained": False,
+            "official_all_speakers": True,
+            "withdrawn_e30_allowed": False,
+            "strict_state_dict_load": True,
+            "frozen_eval": True,
+            "all_model_state_tensors_finite": True,
+        }
     if checkpoint_source == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE:
         if any(
             value is not None
@@ -4059,7 +4916,10 @@ def _load_models(
             expected_sha256=getattr(args, f"expected_{name}_sha256"),
             **validation[name],
         )
-        if args.prerequisite_source == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE:
+        if args.prerequisite_source in {
+            RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE,
+            OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+        }:
             specification = RELEASED_ALL_SPEAKERS_MODELS[name]
             model_arguments = SimpleNamespace(
                 vae_test_dim=specification["vae_test_dim"],
@@ -4656,6 +5516,21 @@ def _input_contract(
         and args.base_checkpoint_source
         == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
     )
+    official_show_adapt = (
+        args.prerequisite_source
+        == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+        and args.base_checkpoint_source
+        == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+    )
+    if (
+        OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+        in {args.prerequisite_source, args.base_checkpoint_source}
+        and not official_show_adapt
+    ):
+        raise InferenceContractError(
+            "official_show_adapt_v1 must be selected for both Base and "
+            "representation prerequisites"
+        )
     source_receipt = _source_receipt(args)
     training_source_receipt = (
         None
@@ -4769,6 +5644,151 @@ def _input_contract(
             raise InferenceContractError(
                 f"{clip_id}: audio shard/lineage ownership mismatch"
             )
+    if official_show_adapt:
+        _require_official_adapt_detached_source(
+            Path(str(source_receipt["source_root"]))
+        )
+        base_status = _resolved_regular_file(
+            args.base_status_json,
+            "official-adapt Base status",
+        )
+        base_manifest = _resolved_regular_file(
+            args.base_candidate_manifest,
+            "official-adapt Base candidate manifest",
+        )
+        base_frozen = _resolved_regular_file(
+            args.base_frozen_inputs_json,
+            "official-adapt Base frozen inputs",
+        )
+        face_summary = _resolved_regular_file(
+            args.face_status_json,
+            "official-adapt Face summary",
+        )
+        global_summary = _resolved_regular_file(
+            args.global_status_json,
+            "official-adapt Global summary",
+        )
+        checkpoint_validation: dict[str, dict[str, Any]] = {}
+        common = {
+            "expected_training_lineage_sha256": None,
+            "expected_source_receipt": training_source_receipt,
+            "expected_dataset_summary_sha256": None,
+            "expected_data_mdb_sha256": None,
+            "checkpoint_source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+            "expected_release_record": None,
+            "released_cross_domain_gate_receipt_sha256": None,
+            "expected_official_adapt_canonical_receipt": canonical_receipt,
+        }
+        checkpoint_validation["base"] = {
+            **common,
+            "status_path": base_status,
+            "base_candidate_manifest_path": base_manifest,
+            "expected_base_candidate_manifest_sha256": (
+                args.expected_base_candidate_manifest_sha256
+            ),
+            "expected_base_formal_status_sha256": None,
+            "expected_base_final_checkpoint_sha256": None,
+            "official_adapt_frozen_inputs_path": base_frozen,
+            "expected_official_adapt_frozen_inputs_sha256": (
+                args.expected_base_frozen_inputs_sha256
+            ),
+            "expected_official_adapt_status_sha256": (
+                args.expected_base_formal_status_sha256
+            ),
+        }
+        for stage in ("face", "global"):
+            checkpoint_validation[stage] = {
+                **common,
+                "status_path": (
+                    face_summary if stage == "face" else global_summary
+                ),
+                "expected_official_adapt_status_sha256": (
+                    args.expected_face_status_sha256
+                    if stage == "face"
+                    else args.expected_global_status_sha256
+                ),
+            }
+        for stage in ("hands", "upper", "lower"):
+            checkpoint_validation[stage] = {
+                **common,
+                "status_path": None,
+            }
+        frozen_receipts = {
+            "base_frozen_inputs": {
+                "path": str(base_frozen),
+                "sha256": args.expected_base_frozen_inputs_sha256,
+            },
+            "base_candidate_manifest": {
+                "path": str(base_manifest),
+                "sha256": args.expected_base_candidate_manifest_sha256,
+            },
+            "base_status": {
+                "path": str(base_status),
+                "sha256": args.expected_base_formal_status_sha256,
+            },
+            "face_summary": {
+                "path": str(face_summary),
+                "sha256": args.expected_face_status_sha256,
+            },
+            "global_summary": {
+                "path": str(global_summary),
+                "sha256": args.expected_global_status_sha256,
+            },
+        }
+        return {
+            "canonical_manifest": canonical_manifest,
+            "canonical_manifest_sha256": canonical_sha,
+            "canonical_summary_path": canonical_summary,
+            "canonical_summary_sha256": sha256_file(canonical_summary),
+            "canonical_summary": canonical_summary_payload,
+            "canonical_lineage_path": canonical_lineage,
+            "canonical_lineage_sha256": sha256_file(canonical_lineage),
+            "canonical_lineage": canonical_lineage_payload,
+            "canonical_lineage_contract_sha256": canonical_contract_sha,
+            "canonical_receipt": canonical_receipt,
+            "canonical_rows": canonical_rows,
+            "canonical_by_id": canonical_by_id,
+            "audio_by_id": audio_by_id,
+            "audio_manifest_sha256": audio_hashes,
+            "audio_summary_sha256": audio_summary_hashes,
+            "audio_lineage_sha256": audio_lineage_hashes,
+            "audio_lineages": audio_lineages,
+            "training_lineage_manifest_sha256": frozen_receipts,
+            "base_training_summary_path": None,
+            "base_training_summary_sha256": None,
+            "accepted_training_lineages": {
+                "base": {
+                    "kind": "official_SHOW_adaptation",
+                    "source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
+                    "selection_split": "val",
+                },
+                "face": {
+                    "kind": "official_decoder_transfer",
+                    "selection_split": "val",
+                },
+                "global": {
+                    "kind": "official_decoder_transfer",
+                    "selection_split": "val",
+                },
+                "hands": {"kind": "official_release", "speaker_scope": "All"},
+                "upper": {"kind": "official_release", "speaker_scope": "All"},
+                "lower": {"kind": "official_release", "speaker_scope": "All"},
+            },
+            "checkpoint_validation": checkpoint_validation,
+            "base_training_lineage": None,
+            "representation_training_lineage": None,
+            "source": source_receipt,
+            "source_roles": {
+                "inference": source_receipt,
+                "adaptation": training_source_receipt,
+                "input_artifact": input_source_receipt,
+                "canonical": canonical_receipt["source_receipt"],
+            },
+            "prerequisite_source": args.prerequisite_source,
+            "base_checkpoint_source": args.base_checkpoint_source,
+            "released_prerequisite_import_receipt": None,
+            "inference_mode": OFFICIAL_SHOW_ADAPT_MODE,
+        }
     if fully_released_zero_shot:
         released_gate = _validate_released_cross_domain_gate(
             args=args,
@@ -5377,6 +6397,42 @@ def _stable_contract_receipt(
         receipt["fully_released_zero_shot_gate"] = inputs[
             "fully_released_zero_shot_gate"
         ]
+    elif inputs.get("inference_mode") == OFFICIAL_SHOW_ADAPT_MODE:
+        receipt["inference_mode"] = OFFICIAL_SHOW_ADAPT_MODE
+        receipt["official_show_adapt_interface"] = {
+            "base": (
+                "val-selected official-initialized SHOW Base predicts "
+                "all four RVQ code streams"
+            ),
+            "face": "adapted decoder consumes Base-predicted Face codes",
+            "lower": (
+                "Base-predicted Lower codes are decoded by the exact frozen "
+                "official All-Speakers Lower RVQ"
+            ),
+            "global": (
+                "adapted decoder-only Global consumes that decoded Lower "
+                "motion with channels 54:57 zeroed"
+            ),
+            "selection_split": "val",
+            "test_evaluations": 1,
+            "test_feedback_into_selection": False,
+        }
+        receipt["public_g_test_global_compatibility"] = {
+            "recurrent_lower_translation": (
+                "official Lower decode is used only for generated recurrence"
+            ),
+            "recurrent_lower_contact": (
+                "preserve decoded Lower contact channels 57:61"
+            ),
+            "final_global_input": (
+                "Base-predicted Lower decode, SO(3)-projected rotations, "
+                "zero channels 54:57, decoded contacts 57:61"
+            ),
+            "final_translation": (
+                "integrate adapted Global channels 54:57"
+            ),
+            "known_training_inference_mismatch": None,
+        }
     return receipt
 
 
@@ -5409,7 +6465,10 @@ def _revalidate_frozen_inputs(
             base_training_summary_path is not None
             or base_training_summary_sha is not None
             or inputs.get("inference_mode")
-            != FULLY_RELEASED_ZERO_SHOT_MODE
+            not in {
+                FULLY_RELEASED_ZERO_SHOT_MODE,
+                OFFICIAL_SHOW_ADAPT_MODE,
+            }
         ):
             raise InferenceContractError(
                 "partial or unauthorized absent Base training summary"
@@ -6437,6 +7496,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "checkpoint."
         ),
     )
+    parser.add_argument(
+        "--base-frozen-inputs-json",
+        type=Path,
+        help=(
+            "Hash-pinned frozen_inputs.json emitted by "
+            "train_base_official_adapt.py."
+        ),
+    )
+    parser.add_argument(
+        "--expected-base-frozen-inputs-sha256",
+        help="External SHA-256 trust root for Base frozen_inputs.json.",
+    )
+    parser.add_argument(
+        "--expected-face-status-sha256",
+        help="External SHA-256 trust root for the Face transfer summary.",
+    )
+    parser.add_argument(
+        "--expected-global-status-sha256",
+        help="External SHA-256 trust root for the Global transfer summary.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=1001)
@@ -6503,6 +7582,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         and args.base_checkpoint_source
         == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
     )
+    official_show_adapt = (
+        args.prerequisite_source
+        == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+        and args.base_checkpoint_source
+        == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+    )
+    if (
+        OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE
+        in {args.prerequisite_source, args.base_checkpoint_source}
+        and not official_show_adapt
+    ):
+        parser.error(
+            "official_show_adapt_v1 must be selected for both Base and "
+            "representation prerequisites"
+        )
     for label, commit_name, tree_name in source_pairs:
         commit = getattr(args, commit_name)
         tree = getattr(args, tree_name)
@@ -6518,9 +7612,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                     "source receipt"
                 )
             continue
-        if release_mode and commit is None:
+        if (release_mode or official_show_adapt) and commit is None:
             parser.error(
-                f"released_all_speakers_v1 requires explicit "
+                f"non-scratch inference requires explicit "
                 f"--expected-{label}-source-commit and "
                 f"--expected-{label}-source-tree"
             )
@@ -6585,7 +7679,86 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             args.expected_released_cross_domain_gate_sha256
         ),
     }
-    if fully_released_zero_shot:
+    official_adapt_artifacts = {
+        "Base frozen inputs": args.base_frozen_inputs_json,
+        "Base frozen inputs SHA": (
+            args.expected_base_frozen_inputs_sha256
+        ),
+        "Base status JSON": args.base_status_json,
+        "Base status SHA": args.expected_base_formal_status_sha256,
+        "Base candidate manifest": args.base_candidate_manifest,
+        "Base candidate manifest SHA": (
+            args.expected_base_candidate_manifest_sha256
+        ),
+        "Face transfer summary": args.face_status_json,
+        "Face transfer summary SHA": args.expected_face_status_sha256,
+        "Global transfer summary": args.global_status_json,
+        "Global transfer summary SHA": args.expected_global_status_sha256,
+    }
+    if official_show_adapt:
+        adapt_paths = [
+            args.output_root,
+            args.base_frozen_inputs_json,
+            args.base_status_json,
+            args.base_candidate_manifest,
+            args.face_status_json,
+            args.global_status_json,
+            *[
+                getattr(args, f"{stage}_checkpoint")
+                for stage in CHECKPOINT_STAGES
+            ],
+        ]
+        forbidden_path = next(
+            (
+                value
+                for value in adapt_paths
+                if value is not None
+                and (
+                    "e30" in str(value).lower()
+                    or "speaker2" in str(value).lower()
+                )
+            ),
+            None,
+        )
+        if forbidden_path is not None:
+            parser.error(
+                "official_show_adapt_v1 path references withdrawn e30 or "
+                f"forbidden Speaker2: {forbidden_path}"
+            )
+        unexpected_training = sorted(
+            label
+            for label, value in training_artifacts.items()
+            if value is not None
+        )
+        missing_adapt = sorted(
+            label
+            for label, value in official_adapt_artifacts.items()
+            if value is None
+        )
+        unexpected_gate = sorted(
+            label for label, value in gate_trust_roots.items()
+            if value is not None
+        )
+        if unexpected_training:
+            parser.error(
+                "official_show_adapt_v1 forbids legacy training artifacts: "
+                + ", ".join(unexpected_training)
+            )
+        if missing_adapt:
+            parser.error(
+                "official_show_adapt_v1 requires "
+                + ", ".join(missing_adapt)
+            )
+        if unexpected_gate:
+            parser.error(
+                "official_show_adapt_v1 forbids released zero-shot gate roots"
+            )
+        if args.expected_base_final_checkpoint_sha256 is not None:
+            parser.error(
+                "official_show_adapt_v1 forbids the scratch Base final "
+                "checkpoint root"
+            )
+    elif fully_released_zero_shot:
         unexpected_training = sorted(
             label
             for label, value in training_artifacts.items()
@@ -6604,6 +7777,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "fully_released_zero_shot_v1 requires "
                 + ", ".join(missing_gate)
             )
+        if any(
+            value is not None
+            for value in (
+                args.base_frozen_inputs_json,
+                args.expected_base_frozen_inputs_sha256,
+                args.expected_face_status_sha256,
+                args.expected_global_status_sha256,
+            )
+        ):
+            parser.error(
+                "fully_released_zero_shot_v1 forbids official-adapt receipts"
+            )
     else:
         missing_training = sorted(
             label for label, value in training_artifacts.items() if value is None
@@ -6621,10 +7806,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "released cross-domain gate is restricted to "
                 "fully_released_zero_shot_v1"
             )
+        if any(
+            value is not None
+            for value in (
+                args.base_frozen_inputs_json,
+                args.expected_base_frozen_inputs_sha256,
+                args.expected_face_status_sha256,
+                args.expected_global_status_sha256,
+            )
+        ):
+            parser.error(
+                "legacy inference modes forbid official-adapt-only receipts"
+            )
     for name in (
         "expected_base_candidate_manifest_sha256",
         "expected_base_formal_status_sha256",
         "expected_base_final_checkpoint_sha256",
+        "expected_base_frozen_inputs_sha256",
+        "expected_face_status_sha256",
+        "expected_global_status_sha256",
     ):
         value = getattr(args, name)
         if value is not None:
@@ -6658,7 +7858,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "show_trained_v1 requires representation status JSON for "
                 + ", ".join(missing)
             )
-    else:
+    elif (
+        args.prerequisite_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    ):
         unexpected = sorted(
             stage
             for stage, status in representation_statuses.items()
@@ -6687,6 +7890,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                     f"--{stage}-checkpoint basename must be "
                     f"{specification['filename']}"
                 )
+    else:
+        expected_status_stages = {"face", "global"}
+        observed_status_stages = {
+            stage
+            for stage, status in representation_statuses.items()
+            if status is not None
+        }
+        if observed_status_stages != expected_status_stages:
+            parser.error(
+                "official_show_adapt_v1 requires status JSON exactly for "
+                "Face and Global"
+            )
+        for stage in ("hands", "upper", "lower"):
+            specification = RELEASED_ALL_SPEAKERS_MODELS[stage]
+            if (
+                getattr(args, f"expected_{stage}_sha256")
+                != specification["sha256"]
+                or Path(getattr(args, f"{stage}_checkpoint")).name
+                != specification["filename"]
+            ):
+                parser.error(
+                    f"official_show_adapt_v1 requires exact official {stage}"
+                )
+        for stage in ("face", "global"):
+            if Path(getattr(args, f"{stage}_checkpoint")).name != (
+                f"best_{stage}_transfer.bin"
+            ):
+                parser.error(
+                    f"official_show_adapt_v1 requires "
+                    f"best_{stage}_transfer.bin"
+                )
     base_trust_roots = {
         "base status JSON": args.base_status_json,
         "Base candidate manifest": args.base_candidate_manifest,
@@ -6706,7 +7940,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "show_trained_v1 Base requires " + ", ".join(missing)
             )
-    else:
+    elif (
+        args.base_checkpoint_source
+        == RELEASED_ALL_SPEAKERS_CHECKPOINT_SOURCE
+    ):
         unexpected = sorted(
             label for label, value in base_trust_roots.items() if value is not None
         )
@@ -6725,6 +7962,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "--base-checkpoint basename must be "
                 f"{base_specification['filename']}"
+            )
+    else:
+        if not Path(args.base_checkpoint).name.startswith(
+            "base_official_adapt_epoch_"
+        ) or Path(args.base_checkpoint).suffix != ".bin":
+            parser.error(
+                "official_show_adapt_v1 Base must be an immutable "
+                "base_official_adapt_epoch_*.bin candidate"
             )
     args.output_root = args.output_root.expanduser().resolve()
     return args
