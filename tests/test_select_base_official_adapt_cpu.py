@@ -562,12 +562,7 @@ class SelectionFixture:
                 },
             },
             "metrics": {
-                "fmd": 1.0 + epoch,
-                "fed": 2.0 + epoch,
-                "expression_diversity": 3.0 + epoch,
                 "fgd": fgd,
-                "pcm": 0.5,
-                "gesture_diversity": 4.0 + epoch,
             },
             "provenance": {
                 "evaluator": {
@@ -803,6 +798,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
             SELECTOR.EXPECTED_CANDIDATE_EPOCHS,
             (1, 2, 4, 8, 16, 32, 40),
         )
+        self.assertEqual(SELECTOR.VAL_METRIC_KEYS, ("fgd",))
         self.assertEqual(SELECTOR.EXPECTED_VAL_CLIPS, 1_715)
         self.assertEqual(
             SELECTOR.DIFFSHEG_PINNED_RECEIPT["paspa"]["commit"],
@@ -891,6 +887,18 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
         rows[0]["metrics"]["fgd"] = 0.2
         selected = SELECTOR.select_minimum_fgd(rows)
         self.assertEqual(selected["epoch"], 2)
+
+    def test_selection_rows_reject_non_fgd_metrics(self) -> None:
+        rows = [
+            {"epoch": epoch, "metrics": {"fgd": 0.1}}
+            for epoch in SELECTOR.EXPECTED_CANDIDATE_EPOCHS
+        ]
+        rows[0]["metrics"]["fmd"] = 1.0
+        with self.assertRaisesRegex(
+            SELECTOR.SelectionContractError,
+            "selection row metrics schema mismatch",
+        ):
+            SELECTOR.select_minimum_fgd(rows)
 
     def test_e30_is_not_a_candidate_epoch(self) -> None:
         rows = [
@@ -1194,6 +1202,37 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                     report,
                     expected_coverage=fixture.coverage,
                 )
+
+    def test_validation_report_requires_exact_fgd_only_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            report = fixture.report(1)
+            self.assertEqual(set(report["metrics"]), {"fgd"})
+            metrics, _ = SELECTOR.validate_diffsheg_report(
+                report,
+                expected_coverage=fixture.coverage,
+            )
+            self.assertEqual(metrics, {"fgd": 0.7})
+
+            for extra_key in (
+                "fmd",
+                "fed",
+                "expression_diversity",
+                "pcm",
+                "gesture_diversity",
+                "BA",
+            ):
+                with self.subTest(extra_key=extra_key):
+                    non_fgd_only = fixture.report(1)
+                    non_fgd_only["metrics"][extra_key] = 0.0
+                    with self.assertRaisesRegex(
+                        SELECTOR.SelectionContractError,
+                        "exactly FGD-only",
+                    ):
+                        SELECTOR.validate_diffsheg_report(
+                            non_fgd_only,
+                            expected_coverage=fixture.coverage,
+                        )
 
     def test_pinned_evaluator_or_autoencoder_mismatch_is_rejected(
         self,

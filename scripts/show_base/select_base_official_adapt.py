@@ -80,14 +80,7 @@ MEASUREMENT_FORMAT = (
 )
 SELECTION_FORMAT = "semtalk_show_base_official_adapt_selection_v1"
 
-VAL_METRIC_KEYS = (
-    "fmd",
-    "fed",
-    "expression_diversity",
-    "fgd",
-    "pcm",
-    "gesture_diversity",
-)
+VAL_METRIC_KEYS = ("fgd",)
 INFERENCE_HELPERS = (
     "_load_canonical_clip",
     "_load_audio_features",
@@ -2144,17 +2137,14 @@ def validate_diffsheg_report(
     )
     if set(metrics) != set(VAL_METRIC_KEYS):
         raise SelectionContractError(
-            "validation metric coverage must be the six skip-BA metrics"
+            "validation metric coverage must be exactly FGD-only"
         )
     validated_metrics = {
         key: require_finite_number(metrics[key], f"DiffSHEG metric {key}")
         for key in VAL_METRIC_KEYS
     }
-    for key in ("fmd", "fed", "fgd", "expression_diversity", "gesture_diversity"):
-        if validated_metrics[key] < 0.0:
-            raise SelectionContractError(f"DiffSHEG metric {key} is negative")
-    if not 0.0 <= validated_metrics["pcm"] <= 1.0:
-        raise SelectionContractError("DiffSHEG PCM must be in [0,1]")
+    if validated_metrics["fgd"] < 0.0:
+        raise SelectionContractError("DiffSHEG metric fgd is negative")
 
     evaluator = provenance.get("evaluator")
     diffsheg_root = provenance.get("diffsheg_root")
@@ -2224,9 +2214,12 @@ def select_minimum_fgd(
         )
     for row in rows:
         metrics = row.get("metrics")
-        if not isinstance(metrics, Mapping):
-            raise SelectionContractError("selection row metrics are missing")
-        require_finite_number(metrics.get("fgd"), "selection FGD")
+        require_exact_keys(
+            dict(metrics) if isinstance(metrics, Mapping) else metrics,
+            {"fgd"},
+            "selection row metrics",
+        )
+        require_finite_number(metrics["fgd"], "selection FGD")
     return min(
         rows,
         key=lambda row: (
