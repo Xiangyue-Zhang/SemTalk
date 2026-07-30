@@ -87,6 +87,10 @@ INFERENCE_HELPERS = (
     "_infer_clip",
     "_output_arrays",
 )
+# Match reserved labels, not incidental substrings such as Latest or contest.
+_TEST_PATH_LABEL_TOKENS = frozenset(
+    {"test", "tests", "testset", "testsets"}
+)
 
 DIFFSHEG_PINNED_RECEIPT: dict[str, Any] = {
     "protocol": "diffsheg_show_reconstructed",
@@ -282,10 +286,12 @@ def require_val_only_path(value: Any, label: str) -> Path:
 
 
 def reject_test_path(path: Path, label: str) -> None:
-    if any("test" in piece.casefold() for piece in path.parts):
-        raise SelectionContractError(
-            f"{label} must not expose a test-labeled path: {path}"
-        )
+    for piece in path.parts:
+        tokens = set(re.findall(r"[a-z0-9]+", piece.casefold()))
+        if tokens & _TEST_PATH_LABEL_TOKENS:
+            raise SelectionContractError(
+                f"{label} must not expose a test-labeled path: {path}"
+            )
 
 
 def require_directory(value: Any, label: str) -> Path:

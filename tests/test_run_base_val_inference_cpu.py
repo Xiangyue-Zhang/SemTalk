@@ -75,6 +75,41 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             with self.assertRaises(PRODUCER.ValInferenceContractError):
                 PRODUCER._reject_forbidden(value, "fixture")
 
+    def test_path_filter_allows_latest_but_rejects_test_labels(self) -> None:
+        real_validation_path = Path(
+            "/local-ssd/xiangyuezhang/"
+            "semtalk_show_base_canonical_cache_aa8e519_20260729_v1/"
+            "clips/val/conan/"
+            "Conan_On_Trump_s_Latest_Portrait_Faux_Pas_-_CONAN_on_TBS-"
+            "WIVVOCz9r50.webm/115448-00_03_58-00_04_08.npz"
+        )
+        PRODUCER._reject_path(real_validation_path, "fixture")
+        PRODUCER._reject_path(
+            Path("/frozen/val/contest/Latest/results.npz"),
+            "fixture",
+        )
+        for value in (
+            "/frozen/val/testimonial/results.npz",
+            "/frozen/val/testament/results.npz",
+        ):
+            with self.subTest(value=value):
+                PRODUCER._reject_path(Path(value), "fixture")
+        for value in (
+            "/frozen/test/clip.npz",
+            "/frozen/tests/clip.npz",
+            "/frozen/test_predictions/clip.npz",
+            "/frozen/testset/clip.npz",
+            "/frozen/testsets/clip.npz",
+            "/frozen/actual-test/clip.npz",
+            "/frozen/beat2_semtalk_test.pkl",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    PRODUCER.selector.SelectionContractError,
+                    "test-labeled",
+                ):
+                    PRODUCER._reject_path(Path(value), "fixture")
+
     def test_shard_model_load_does_not_revalidate_all_candidates(self) -> None:
         source = inspect.getsource(PRODUCER._load_models)
         self.assertNotIn("_validate_official_adapt_base", source)

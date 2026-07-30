@@ -853,6 +853,52 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
                 ):
                     SELECTOR.reject_forbidden_source_labels(value)
 
+    def test_real_latest_clip_path_is_not_test_labeled(self) -> None:
+        real_validation_path = Path(
+            "/local-ssd/xiangyuezhang/"
+            "semtalk_show_base_canonical_cache_aa8e519_20260729_v1/"
+            "clips/val/conan/"
+            "Conan_On_Trump_s_Latest_Portrait_Faux_Pas_-_CONAN_on_TBS-"
+            "WIVVOCz9r50.webm/115448-00_03_58-00_04_08.npz"
+        )
+        SELECTOR.reject_test_path(
+            real_validation_path,
+            "validation prediction",
+        )
+        SELECTOR.reject_test_path(
+            Path("/frozen/val/contest/Latest/results.npz"),
+            "validation prediction",
+        )
+        for value in (
+            "/frozen/val/testimonial/results.npz",
+            "/frozen/val/testament/results.npz",
+        ):
+            with self.subTest(value=value):
+                SELECTOR.reject_test_path(
+                    Path(value),
+                    "validation prediction",
+                )
+
+    def test_actual_test_path_labels_are_hard_rejected(self) -> None:
+        for value in (
+            "/frozen/test/clip.npz",
+            "/frozen/tests/clip.npz",
+            "/frozen/test_predictions/clip.npz",
+            "/frozen/testset/clip.npz",
+            "/frozen/testsets/clip.npz",
+            "/frozen/actual-test/clip.npz",
+            "/frozen/beat2_semtalk_test.pkl",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    SELECTOR.SelectionContractError,
+                    "test-labeled",
+                ):
+                    SELECTOR.reject_test_path(
+                        Path(value),
+                        "validation prediction",
+                    )
+
     def test_parent_symlink_cannot_hide_resolved_test_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
