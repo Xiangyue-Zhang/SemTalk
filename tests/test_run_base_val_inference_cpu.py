@@ -219,6 +219,29 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             shard_source,
         )
 
+    def test_shard_expected_call_arithmetic_has_runtime_math_dependency(
+        self,
+    ) -> None:
+        runtime_math = PRODUCER.run_shard.__globals__.get("math")
+        self.assertIs(runtime_math, __import__("math"))
+        for frames, expected in (
+            (1, 1),
+            (4, 1),
+            (64, 1),
+            (65, 2),
+            (124, 2),
+            (125, 3),
+        ):
+            self.assertEqual(
+                max(
+                    1,
+                    runtime_math.ceil(
+                        (frames - 4) / 60,
+                    ),
+                ),
+                expected,
+            )
+
     def test_fasttext_free_joint_masks_equal_pinned_helper(self) -> None:
         class FakeTensor:
             def __init__(self, array: np.ndarray) -> None:
