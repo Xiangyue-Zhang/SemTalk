@@ -593,7 +593,7 @@ def _build_cache(args: argparse.Namespace) -> int:
                             record_count += 1
             records_file.flush()
             os.fsync(records_file.fileno())
-        environment.sync(force=True)
+        environment.sync(True)
     finally:
         environment.close()
 

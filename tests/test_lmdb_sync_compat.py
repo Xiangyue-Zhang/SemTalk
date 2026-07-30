@@ -13,6 +13,7 @@ SYNC_CALL_SOURCES = (
     / "show_base"
     / "build_lower_target_joints_cache.py",
     REPOSITORY / "scripts" / "show_base" / "build_base_features.py",
+    REPOSITORY / "scripts" / "show_base" / "train_official_transfer.py",
 )
 
 
