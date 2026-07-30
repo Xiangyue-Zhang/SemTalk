@@ -91,10 +91,14 @@ def _argv() -> list[str]:
         "1" * 40,
         "--expected-source-tree",
         "2" * 40,
-        "--expected-training-source-commit",
+        "--expected-base-training-source-commit",
         "3" * 40,
-        "--expected-training-source-tree",
+        "--expected-base-training-source-tree",
         "4" * 40,
+        "--expected-transfer-training-source-commit",
+        "9" * 40,
+        "--expected-transfer-training-source-tree",
+        "a" * 40,
         "--expected-input-source-commit",
         "5" * 40,
         "--expected-input-source-tree",
@@ -177,6 +181,15 @@ class OfficialShowAdaptCliTests(unittest.TestCase):
         self.assertIsNone(args.upper_status_json)
         self.assertIsNone(args.hands_status_json)
         self.assertIsNone(args.lower_status_json)
+        self.assertIsNone(args.expected_training_source_commit)
+        self.assertEqual(
+            args.expected_base_training_source_commit,
+            "3" * 40,
+        )
+        self.assertEqual(
+            args.expected_transfer_training_source_commit,
+            "9" * 40,
+        )
 
     def test_every_new_external_receipt_root_is_required(self) -> None:
         for option in (
@@ -190,6 +203,10 @@ class OfficialShowAdaptCliTests(unittest.TestCase):
             "--expected-face-status-sha256",
             "--global-status-json",
             "--expected-global-status-sha256",
+            "--expected-base-training-source-commit",
+            "--expected-base-training-source-tree",
+            "--expected-transfer-training-source-commit",
+            "--expected-transfer-training-source-tree",
         ):
             with self.subTest(option=option):
                 argv = _argv()
@@ -210,6 +227,15 @@ class OfficialShowAdaptCliTests(unittest.TestCase):
         argv = _argv() + [
             "--base-training-summary-json",
             "/legacy/base-summary.json",
+        ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            INFERENCE.parse_args(argv)
+
+        argv = _argv() + [
+            "--expected-training-source-commit",
+            "b" * 40,
+            "--expected-training-source-tree",
+            "c" * 40,
         ]
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             INFERENCE.parse_args(argv)
@@ -240,6 +266,84 @@ class OfficialShowAdaptCliTests(unittest.TestCase):
 
 
 class OfficialShowAdaptReceiptTests(unittest.TestCase):
+    def test_base_and_transfer_producer_sources_are_independent(self) -> None:
+        producer_sources = (
+            INFERENCE._official_adapt_producer_source_receipts(
+                SimpleNamespace(
+                    expected_base_training_source_commit="3" * 40,
+                    expected_base_training_source_tree="4" * 40,
+                    expected_transfer_training_source_commit="9" * 40,
+                    expected_transfer_training_source_tree="a" * 40,
+                )
+            )
+        )
+        self.assertEqual(
+            producer_sources["base_training"],
+            {
+                "format": (
+                    "semtalk_show_base_training_source_expectation_v1"
+                ),
+                "origin": INFERENCE.EXPECTED_ORIGIN,
+                "commit": "3" * 40,
+                "tree": "4" * 40,
+            },
+        )
+        self.assertEqual(
+            producer_sources["transfer_training"],
+            {
+                "format": (
+                    "semtalk_show_transfer_training_source_expectation_v1"
+                ),
+                "origin": INFERENCE.EXPECTED_ORIGIN,
+                "commit": "9" * 40,
+                "tree": "a" * 40,
+            },
+        )
+        roles = INFERENCE._official_adapt_source_roles(
+            inference_source={"commit": "1" * 40},
+            producer_sources=producer_sources,
+            input_source={"commit": "5" * 40},
+            canonical_source={"commit": "7" * 40},
+        )
+        self.assertEqual(
+            list(roles),
+            [
+                "inference",
+                "base_training",
+                "transfer_training",
+                "input_artifact",
+                "canonical",
+            ],
+        )
+        self.assertEqual(roles["inference"], {"commit": "1" * 40})
+        self.assertNotEqual(
+            roles["inference"],
+            roles["base_training"],
+        )
+        self.assertNotEqual(
+            roles["base_training"],
+            roles["transfer_training"],
+        )
+
+        with self.assertRaises(INFERENCE.InferenceContractError):
+            INFERENCE._official_adapt_producer_source_receipts(
+                SimpleNamespace(
+                    expected_base_training_source_commit="3" * 40,
+                    expected_base_training_source_tree="4" * 40,
+                    expected_transfer_training_source_commit="9" * 40,
+                    expected_transfer_training_source_tree=None,
+                )
+            )
+        with self.assertRaises(INFERENCE.InferenceContractError):
+            INFERENCE._official_adapt_source_roles(
+                inference_source={},
+                producer_sources={
+                    "base_training": producer_sources["base_training"]
+                },
+                input_source={},
+                canonical_source={},
+            )
+
     def test_transfer_trainer_records_and_requires_detached_source(
         self,
     ) -> None:
@@ -632,6 +736,18 @@ class OfficialShowAdaptReceiptTests(unittest.TestCase):
                 require_detached_receipt=True,
             )
             self.assertEqual(observed, receipt)
+            transfer_expected = {
+                "origin": INFERENCE.EXPECTED_ORIGIN,
+                "commit": "9" * 40,
+                "tree": "a" * 40,
+            }
+            with self.assertRaises(INFERENCE.InferenceContractError):
+                INFERENCE._validate_adapt_producer_source(
+                    receipt,
+                    expected_source_receipt=transfer_expected,
+                    label="Base receipt checked as transfer producer",
+                    require_detached_receipt=True,
+                )
             for key, value in (
                 ("clean", False),
                 ("branch", "main"),

@@ -1138,7 +1138,14 @@ def _run_face_epoch(
                     )
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            prediction = decoder(exact_zq)
+            # ``exact_zq`` is deliberately recomputed under inference mode so
+            # the cache remains fail-closed against the frozen official
+            # quantizer.  An inference tensor cannot be saved by Conv1d for
+            # the trainable decoder's backward pass.  The byte-exact cached
+            # tensor was materialized normally by the LMDB dataset, so use it
+            # after the equality proof instead of weakening that proof or
+            # cloning inference state into the autograd path.
+            prediction = decoder(cached_zq)
             losses = face_task_losses(
                 torch,
                 prediction,

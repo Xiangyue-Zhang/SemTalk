@@ -1210,6 +1210,12 @@ def _expected_source_role_receipt(
 ) -> dict[str, str]:
     formats = {
         "training": "semtalk_show_training_source_expectation_v1",
+        "base_training": (
+            "semtalk_show_base_training_source_expectation_v1"
+        ),
+        "transfer_training": (
+            "semtalk_show_transfer_training_source_expectation_v1"
+        ),
         "input_artifact": "semtalk_show_input_artifact_source_v1",
     }
     if role not in formats:
@@ -1219,6 +1225,69 @@ def _expected_source_role_receipt(
         "origin": EXPECTED_ORIGIN,
         "commit": commit,
         "tree": tree,
+    }
+
+
+def _official_adapt_producer_source_receipts(
+    args: argparse.Namespace,
+) -> dict[str, dict[str, str]]:
+    """Return the two independently pinned official-adapt producer trees."""
+
+    specifications = {
+        "base_training": (
+            "expected_base_training_source_commit",
+            "expected_base_training_source_tree",
+        ),
+        "transfer_training": (
+            "expected_transfer_training_source_commit",
+            "expected_transfer_training_source_tree",
+        ),
+    }
+    receipts: dict[str, dict[str, str]] = {}
+    for role, (commit_name, tree_name) in specifications.items():
+        commit = getattr(args, commit_name, None)
+        tree = getattr(args, tree_name, None)
+        if type(commit) is not str or type(tree) is not str:
+            raise InferenceContractError(
+                f"official_show_adapt_v1 lacks the {role} source receipt"
+            )
+        try:
+            normalized_commit = _require_git_oid(
+                commit,
+                f"--expected-{role.replace('_', '-')}-source-commit",
+            )
+            normalized_tree = _require_git_oid(
+                tree,
+                f"--expected-{role.replace('_', '-')}-source-tree",
+            )
+        except ValueError as exc:
+            raise InferenceContractError(str(exc)) from exc
+        receipts[role] = _expected_source_role_receipt(
+            role=role,
+            commit=normalized_commit,
+            tree=normalized_tree,
+        )
+    return receipts
+
+
+def _official_adapt_source_roles(
+    *,
+    inference_source: Mapping[str, Any],
+    producer_sources: Mapping[str, Mapping[str, Any]],
+    input_source: Mapping[str, Any],
+    canonical_source: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if set(producer_sources) != {"base_training", "transfer_training"}:
+        raise InferenceContractError(
+            "official_show_adapt_v1 requires exactly the Base-training and "
+            "transfer-training producer source receipts"
+        )
+    return {
+        "inference": dict(inference_source),
+        "base_training": dict(producer_sources["base_training"]),
+        "transfer_training": dict(producer_sources["transfer_training"]),
+        "input_artifact": dict(input_source),
+        "canonical": dict(canonical_source),
     }
 
 
@@ -4316,15 +4385,17 @@ def _checkpoint_payload_and_receipt(
     expected_official_adapt_canonical_receipt: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if checkpoint_source == OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE:
-        if (
-            expected_source_receipt is None
-            or expected_official_adapt_canonical_receipt is None
-        ):
+        if expected_official_adapt_canonical_receipt is None:
             raise InferenceContractError(
-                f"{formal_stage}: official_show_adapt_v1 lacks source or "
-                "canonical receipt"
+                f"{formal_stage}: official_show_adapt_v1 lacks the canonical "
+                "receipt"
             )
         if formal_stage == "base":
+            if expected_source_receipt is None:
+                raise InferenceContractError(
+                    "base: official_show_adapt_v1 lacks the Base-training "
+                    "producer source receipt"
+                )
             if expected_base_final_checkpoint_sha256 is not None:
                 raise InferenceContractError(
                     "official-adapt Base has no scratch final-checkpoint root"
@@ -4347,6 +4418,11 @@ def _checkpoint_payload_and_receipt(
                 ),
             )
         if formal_stage in {"face", "global"}:
+            if expected_source_receipt is None:
+                raise InferenceContractError(
+                    f"{formal_stage}: official_show_adapt_v1 lacks the "
+                    "transfer-training producer source receipt"
+                )
             return _validate_official_transfer_checkpoint(
                 path=path,
                 formal_stage=formal_stage,
@@ -4368,6 +4444,7 @@ def _checkpoint_payload_and_receipt(
             value is not None
             for value in (
                 status_path,
+                expected_source_receipt,
                 base_candidate_manifest_path,
                 expected_base_candidate_manifest_sha256,
                 expected_base_formal_status_sha256,
@@ -5532,9 +5609,14 @@ def _input_contract(
             "representation prerequisites"
         )
     source_receipt = _source_receipt(args)
+    official_adapt_producer_sources = (
+        _official_adapt_producer_source_receipts(args)
+        if official_show_adapt
+        else {}
+    )
     training_source_receipt = (
         None
-        if fully_released_zero_shot
+        if fully_released_zero_shot or official_show_adapt
         else _expected_source_role_receipt(
             role="training",
             commit=args.expected_training_source_commit,
@@ -5671,7 +5753,6 @@ def _input_contract(
         checkpoint_validation: dict[str, dict[str, Any]] = {}
         common = {
             "expected_training_lineage_sha256": None,
-            "expected_source_receipt": training_source_receipt,
             "expected_dataset_summary_sha256": None,
             "expected_data_mdb_sha256": None,
             "checkpoint_source": OFFICIAL_SHOW_ADAPT_CHECKPOINT_SOURCE,
@@ -5681,6 +5762,9 @@ def _input_contract(
         }
         checkpoint_validation["base"] = {
             **common,
+            "expected_source_receipt": official_adapt_producer_sources[
+                "base_training"
+            ],
             "status_path": base_status,
             "base_candidate_manifest_path": base_manifest,
             "expected_base_candidate_manifest_sha256": (
@@ -5699,6 +5783,9 @@ def _input_contract(
         for stage in ("face", "global"):
             checkpoint_validation[stage] = {
                 **common,
+                "expected_source_receipt": official_adapt_producer_sources[
+                    "transfer_training"
+                ],
                 "status_path": (
                     face_summary if stage == "face" else global_summary
                 ),
@@ -5711,6 +5798,7 @@ def _input_contract(
         for stage in ("hands", "upper", "lower"):
             checkpoint_validation[stage] = {
                 **common,
+                "expected_source_receipt": None,
                 "status_path": None,
             }
         frozen_receipts = {
@@ -5778,12 +5866,12 @@ def _input_contract(
             "base_training_lineage": None,
             "representation_training_lineage": None,
             "source": source_receipt,
-            "source_roles": {
-                "inference": source_receipt,
-                "adaptation": training_source_receipt,
-                "input_artifact": input_source_receipt,
-                "canonical": canonical_receipt["source_receipt"],
-            },
+            "source_roles": _official_adapt_source_roles(
+                inference_source=source_receipt,
+                producer_sources=official_adapt_producer_sources,
+                input_source=input_source_receipt,
+                canonical_source=canonical_receipt["source_receipt"],
+            ),
             "prerequisite_source": args.prerequisite_source,
             "base_checkpoint_source": args.base_checkpoint_source,
             "released_prerequisite_import_receipt": None,
@@ -7429,6 +7517,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--expected-training-source-commit")
     parser.add_argument("--expected-training-source-tree")
+    parser.add_argument("--expected-base-training-source-commit")
+    parser.add_argument("--expected-base-training-source-tree")
+    parser.add_argument("--expected-transfer-training-source-commit")
+    parser.add_argument("--expected-transfer-training-source-tree")
     parser.add_argument("--expected-input-source-commit")
     parser.add_argument("--expected-input-source-tree")
     parser.add_argument(
@@ -7565,6 +7657,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "expected_training_source_tree",
         ),
         (
+            "base-training",
+            "expected_base_training_source_commit",
+            "expected_base_training_source_tree",
+        ),
+        (
+            "transfer-training",
+            "expected_transfer_training_source_commit",
+            "expected_transfer_training_source_tree",
+        ),
+        (
             "input",
             "expected_input_source_commit",
             "expected_input_source_tree",
@@ -7605,22 +7707,73 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 f"--expected-{label}-source-commit and "
                 f"--expected-{label}-source-tree must be supplied together"
             )
-        if label == "training" and fully_released_zero_shot:
-            if commit is not None:
+
+    if official_show_adapt:
+        if args.expected_training_source_commit is not None:
+            parser.error(
+                "official_show_adapt_v1 forbids the ambiguous generic "
+                "SHOW training source receipt; supply distinct Base-training "
+                "and transfer-training source receipts"
+            )
+        required_official_sources = (
+            (
+                "base-training",
+                "expected_base_training_source_commit",
+            ),
+            (
+                "transfer-training",
+                "expected_transfer_training_source_commit",
+            ),
+            ("input", "expected_input_source_commit"),
+        )
+        for label, commit_name in required_official_sources:
+            if getattr(args, commit_name) is None:
+                parser.error(
+                    "official_show_adapt_v1 requires explicit "
+                    f"--expected-{label}-source-commit and "
+                    f"--expected-{label}-source-tree"
+                )
+    else:
+        for label, commit_name, _ in source_pairs[1:3]:
+            if getattr(args, commit_name) is not None:
+                parser.error(
+                    f"--expected-{label}-source-commit/tree is restricted "
+                    "to official_show_adapt_v1"
+                )
+        if fully_released_zero_shot:
+            if args.expected_training_source_commit is not None:
                 parser.error(
                     "fully_released_zero_shot_v1 forbids a SHOW training "
                     "source receipt"
                 )
-            continue
-        if (release_mode or official_show_adapt) and commit is None:
-            parser.error(
-                f"non-scratch inference requires explicit "
-                f"--expected-{label}-source-commit and "
-                f"--expected-{label}-source-tree"
-            )
+        elif args.expected_training_source_commit is None:
+            if release_mode:
+                parser.error(
+                    "non-scratch inference requires explicit "
+                    "--expected-training-source-commit and "
+                    "--expected-training-source-tree"
+                )
+            args.expected_training_source_commit = args.expected_source_commit
+            args.expected_training_source_tree = args.expected_source_tree
+        if args.expected_input_source_commit is None:
+            if release_mode:
+                parser.error(
+                    "non-scratch inference requires explicit "
+                    "--expected-input-source-commit and "
+                    "--expected-input-source-tree"
+                )
+            args.expected_input_source_commit = args.expected_source_commit
+            args.expected_input_source_tree = args.expected_source_tree
+
+    for label, commit_name, tree_name in source_pairs:
+        commit = getattr(args, commit_name)
+        tree = getattr(args, tree_name)
         if commit is None:
-            commit = args.expected_source_commit
-            tree = args.expected_source_tree
+            continue
+        if tree is None:
+            parser.error(
+                f"--expected-{label}-source-tree is unexpectedly absent"
+            )
         setattr(
             args,
             commit_name,

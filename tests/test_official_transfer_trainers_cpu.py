@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.show_base import train_official_transfer as transfer
 
@@ -128,6 +130,82 @@ class OfficialTransferDistributedIndexTests(unittest.TestCase):
         flattened = [value for values in per_rank for value in values]
         self.assertEqual(sorted(flattened), list(range(127_280)))
         self.assertEqual(len(flattened), len(set(flattened)))
+
+
+class OfficialTransferFaceAutogradTests(unittest.TestCase):
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "torch is unavailable in the lightweight CPU test environment",
+    )
+    def test_verified_cached_zq_is_normal_tensor_for_decoder_backward(self) -> None:
+        import torch
+
+        cached_zq = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        with torch.inference_mode():
+            inference_zq = cached_zq.clone()
+        self.assertTrue(inference_zq.is_inference())
+        self.assertFalse(cached_zq.is_inference())
+
+        class Quantizer:
+            @staticmethod
+            def get_codebook_entry(code_ids):
+                self.assertEqual(tuple(code_ids.shape), (2, 4))
+                return inference_zq
+
+        class Model:
+            quantizer = Quantizer()
+
+        class RecordingConv(torch.nn.Conv1d):
+            observed_inference_input = None
+
+            def forward(self, tensor):
+                self.observed_inference_input = tensor.is_inference()
+                return super().forward(tensor)
+
+        decoder = RecordingConv(3, 3, kernel_size=1)
+        optimizer = torch.optim.SGD(decoder.parameters(), lr=1e-3)
+        loader = [
+            {
+                "code_ids": torch.zeros((2, 4), dtype=torch.long),
+                "zq": cached_zq,
+                "target": torch.zeros((2, 3, 4), dtype=torch.float32),
+            }
+        ]
+
+        def losses(torch_module, prediction, target, **_weights):
+            total = (prediction - target).square().mean()
+            return {
+                "total": total,
+                "jaw_geodesic": total,
+                "expression_l1": total,
+                "velocity": total,
+                "acceleration": total,
+            }
+
+        with mock.patch.object(transfer, "face_task_losses", losses):
+            metrics, samples = transfer._run_face_epoch(
+                torch,
+                model=Model(),
+                decoder=decoder,
+                loader=loader,
+                optimizer=optimizer,
+                device=torch.device("cpu"),
+                weights={
+                    "jaw": 1.0,
+                    "expression": 1.0,
+                    "velocity": 1.0,
+                    "acceleration": 1.0,
+                },
+            )
+
+        self.assertEqual(samples, 2)
+        self.assertFalse(decoder.observed_inference_input)
+        self.assertTrue(
+            all(
+                torch.isfinite(torch.tensor(value))
+                for value in metrics.values()
+            )
+        )
 
 
 if __name__ == "__main__":
