@@ -117,7 +117,78 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             source.count("helper._read_verified_checkpoint_snapshot("),
             1,
         )
+        self.assertIn("_prime_pinned_released_schema_cache", source)
         self.assertIn("_validate_base_model_state_schema", source)
+
+    def test_pinned_meta_schema_cuda_shim_is_meta_only_and_scoped(
+        self,
+    ) -> None:
+        class FakeTensor:
+            def __init__(self, device_type: str) -> None:
+                self.device = type(
+                    "FakeDevice",
+                    (),
+                    {"type": device_type},
+                )()
+
+            def cuda(self, *args: object, **kwargs: object) -> str:
+                del args, kwargs
+                return "original-cuda"
+
+        fake_torch = type("FakeTorch", (), {"Tensor": FakeTensor})()
+        original_cuda = FakeTensor.cuda
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            with PRODUCER._pinned_meta_schema_cuda_compat():
+                meta_tensor = FakeTensor("meta")
+                self.assertIs(meta_tensor.cuda(), meta_tensor)
+                with self.assertRaisesRegex(
+                    PRODUCER.ValInferenceContractError,
+                    "non-meta",
+                ):
+                    FakeTensor("cpu").cuda()
+                with self.assertRaisesRegex(
+                    PRODUCER.ValInferenceContractError,
+                    "parameterized",
+                ):
+                    meta_tensor.cuda(0)
+            self.assertIs(FakeTensor.cuda, original_cuda)
+            self.assertEqual(FakeTensor("cpu").cuda(), "original-cuda")
+
+    def test_pinned_meta_schema_cache_is_primed_without_relaxing_stages(
+        self,
+    ) -> None:
+        class FakeTensor:
+            def __init__(self) -> None:
+                self.device = type(
+                    "FakeDevice",
+                    (),
+                    {"type": "meta"},
+                )()
+
+            def cuda(self) -> None:
+                raise RuntimeError("legacy pinned helper meta failure")
+
+        fake_torch = type("FakeTorch", (), {"Tensor": FakeTensor})()
+        original_cuda = FakeTensor.cuda
+        expected_stages = {"face", "global", "hands", "upper", "lower"}
+
+        class FakeHelper:
+            @staticmethod
+            def _expected_released_representation_schemas() -> dict[
+                str,
+                dict[str, tuple[str, tuple[int, ...]]],
+            ]:
+                tensor = FakeTensor()
+                if tensor.cuda() is not tensor:
+                    raise AssertionError("meta shim did not preserve tensor")
+                return {
+                    stage: {"weight": ("float32", (1,))}
+                    for stage in expected_stages
+                }
+
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            PRODUCER._prime_pinned_released_schema_cache(FakeHelper())
+        self.assertIs(FakeTensor.cuda, original_cuda)
 
     def test_directory_tolerates_create_race_but_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory(prefix="semtalk_val_dir_") as raw:

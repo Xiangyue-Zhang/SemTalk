@@ -484,6 +484,7 @@ def _load_pinned_helper(
         "_torch_load_checkpoint",
         "_finite_state_dict",
         "_validate_base_model_state_schema",
+        "_expected_released_representation_schemas",
         "_model_args",
         "_joint_masks",
         "deterministic_npz_bytes",
@@ -496,6 +497,55 @@ def _load_pinned_helper(
             f"pinned inference helper lacks {missing}"
         )
     return module
+
+
+@contextmanager
+def _pinned_meta_schema_cuda_compat() -> Iterable[None]:
+    """Keep the pinned helper's legacy ``.cuda()`` call on the meta device."""
+
+    import torch
+
+    original_cuda = torch.Tensor.cuda
+
+    def meta_only_cuda(
+        tensor: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if (
+            args
+            or kwargs
+            or getattr(getattr(tensor, "device", None), "type", None)
+            != "meta"
+        ):
+            raise ValInferenceContractError(
+                "pinned helper schema construction attempted a non-meta "
+                "or parameterized Tensor.cuda call"
+            )
+        return tensor
+
+    torch.Tensor.cuda = meta_only_cuda
+    try:
+        yield
+    finally:
+        torch.Tensor.cuda = original_cuda
+
+
+def _prime_pinned_released_schema_cache(helper: ModuleType) -> None:
+    with _pinned_meta_schema_cuda_compat():
+        schemas = helper._expected_released_representation_schemas()
+    expected_stages = {"face", "global", "hands", "upper", "lower"}
+    if (
+        not isinstance(schemas, dict)
+        or set(schemas) != expected_stages
+        or any(
+            not isinstance(schemas[stage], dict) or not schemas[stage]
+            for stage in expected_stages
+        )
+    ):
+        raise ValInferenceContractError(
+            "pinned helper returned an invalid released schema cache"
+        )
 
 
 def _load_preflight_children(
@@ -655,6 +705,7 @@ def _load_models(
     from models.rvq import RVQVAE
     from models.semtalk import semtalk_base
 
+    _prime_pinned_released_schema_cache(helper)
     candidate = preflight["candidate_bundle"]["candidates"][str(epoch)]
     bundle = preflight["candidate_bundle"]
     for label, artifact in (
