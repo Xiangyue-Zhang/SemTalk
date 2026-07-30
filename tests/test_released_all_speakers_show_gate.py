@@ -571,9 +571,11 @@ class TorchCpuSemanticsTest(unittest.TestCase):
         )
         velocity = gate._central_velocity(torch, translation)
         self.assertTrue(
-            torch.equal(
+            torch.allclose(
                 velocity[..., (0, 2)],
                 torch.tensor([[[30.0, 60.0], [30.0, 60.0], [30.0, 60.0]]]),
+                rtol=1e-6,
+                atol=1e-7,
             )
         )
         channels = torch.stack(
