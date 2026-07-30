@@ -30,8 +30,18 @@ canonical_summary_sha256=${16}
 canonical_lineage_sha256=${17}
 builder="$repo_root/scripts/show_base/build_base_features.py"
 
-if [[ "$split" != train && "$split" != test ]]; then
-    printf 'split must be train or test, got: %s\n' "$split" >&2
+if [[ "$split" != train && "$split" != val && "$split" != test ]]; then
+    printf 'split must be train, val, or test, got: %s\n' "$split" >&2
+    exit 2
+fi
+case "$split" in
+    train) formal_expected_clips=13687 ;;
+    val) formal_expected_clips=1715 ;;
+    test) formal_expected_clips=1708 ;;
+esac
+if [[ "$expected_clips" != "$formal_expected_clips" ]]; then
+    printf 'formal %s audio clip count must be %s, got: %s\n' \
+        "$split" "$formal_expected_clips" "$expected_clips" >&2
     exit 2
 fi
 for frozen_sha in "$canonical_manifest_sha256" "$canonical_summary_sha256" \

@@ -6,8 +6,8 @@ There are deliberately only two modes:
 ``audio``
     Run the frozen HuBERT-large model on the *real 16 kHz* waveform and build
     SemTalk's three-channel rhythm/onset feature.  The mode is shardable and
-    writes one immutable NPZ per canonical train or test clip plus an audited
-    JSONL manifest.
+    writes one immutable NPZ per canonical train, validation, or test clip
+    plus an audited JSONL manifest.
 
 ``base``
     Load the four frozen RVQ checkpoints, reproduce the feature construction in
@@ -72,6 +72,12 @@ RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE = (
 PREREQUISITE_SOURCES = (
     SHOW_TRAINED_PREREQUISITE_SOURCE,
     RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE,
+)
+VAL_CANONICAL_SUMMARY_FORMAT = (
+    "semtalk_show_base_official_adapt_val_canonical_summary_v1"
+)
+VAL_CANONICAL_LINEAGE_FORMAT = (
+    "semtalk_show_base_official_adapt_val_canonical_lineage_v1"
 )
 RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
     "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
@@ -697,6 +703,7 @@ def load_canonical_receipt(
     expected_lineage_sha256: str,
     expected_canonical_source_commit: str,
     expected_canonical_source_tree: str,
+    split: str | None = None,
 ) -> dict[str, Any]:
     if len(manifest_paths) != 1:
         raise RuntimeError("formal feature build requires one final manifest")
@@ -731,6 +738,134 @@ def load_canonical_receipt(
         )
     summary = json.loads(summary_bytes.decode("utf-8"))
     lineage = json.loads(lineage_bytes.decode("utf-8"))
+    if split == "val":
+        summary_keys = {
+            "format",
+            "status",
+            "split",
+            "test_visible",
+            "clip_count",
+            "manifest_sha256",
+            "lineage_sha256",
+            "lineage_contract_sha256",
+            "receipt_payload_sha256",
+        }
+        lineage_keys = {
+            "format",
+            "status",
+            "split",
+            "test_visible",
+            "clip_count",
+            "manifest_sha256",
+            "lineage_contract_sha256",
+            "projection",
+            "source_receipt",
+            "receipt_payload_sha256",
+        }
+        if (
+            not isinstance(summary, dict)
+            or set(summary) != summary_keys
+            or not isinstance(lineage, dict)
+            or set(lineage) != lineage_keys
+        ):
+            raise RuntimeError(
+                "validation audio requires exact val-view canonical receipts"
+            )
+        summary_body = dict(summary)
+        summary_payload_sha = summary_body.pop(
+            "receipt_payload_sha256",
+            None,
+        )
+        lineage_body = dict(lineage)
+        lineage_payload_sha = lineage_body.pop(
+            "receipt_payload_sha256",
+            None,
+        )
+        projection = lineage["projection"]
+        canonical_source = lineage["source_receipt"]
+        if (
+            summary_payload_sha != compact_payload_sha256(summary_body)
+            or lineage_payload_sha != compact_payload_sha256(lineage_body)
+            or summary["format"] != VAL_CANONICAL_SUMMARY_FORMAT
+            or lineage["format"] != VAL_CANONICAL_LINEAGE_FORMAT
+            or summary["status"] != "complete"
+            or lineage["status"] != "complete"
+            or summary["split"] != "val"
+            or lineage["split"] != "val"
+            or summary["test_visible"] is not False
+            or lineage["test_visible"] is not False
+            or require_exact_int(
+                summary["clip_count"],
+                "val-view canonical summary clip_count",
+            )
+            != 1_715
+            or require_exact_int(
+                lineage["clip_count"],
+                "val-view canonical lineage clip_count",
+            )
+            != 1_715
+            or summary["manifest_sha256"] != manifest_sha
+            or lineage["manifest_sha256"] != manifest_sha
+            or summary["lineage_sha256"] != lineage_sha
+            or summary["lineage_contract_sha256"]
+            != lineage["lineage_contract_sha256"]
+            or not isinstance(projection, dict)
+            or set(projection)
+            != {"operation", "split", "test_rows_materialized"}
+            or projection
+            != {
+                "operation": "filter_exact_split",
+                "split": "val",
+                "test_rows_materialized": False,
+            }
+            or not isinstance(canonical_source, dict)
+            or set(canonical_source)
+            != {
+                "origin",
+                "commit",
+                "tree",
+                "full_manifest_sha256",
+                "full_summary_sha256",
+                "full_lineage_sha256",
+            }
+            or canonical_source.get("origin") != EXPECTED_ORIGIN
+            or canonical_source.get("commit")
+            != expected_canonical_source_commit
+            or canonical_source.get("tree")
+            != expected_canonical_source_tree
+        ):
+            raise RuntimeError(
+                "validation canonical val-view receipt binding mismatch"
+            )
+        for field in (
+            "full_manifest_sha256",
+            "full_summary_sha256",
+            "full_lineage_sha256",
+        ):
+            require_sha256(
+                canonical_source[field],
+                f"val-view canonical source {field}",
+            )
+        require_sha256(
+            lineage["lineage_contract_sha256"],
+            "val-view canonical lineage contract SHA",
+        )
+        return {
+            "manifest": str(manifest),
+            "manifest_sha256": manifest_sha,
+            "summary": str(summary_path),
+            "summary_sha256": summary_sha,
+            "lineage": str(lineage_path),
+            "lineage_sha256": lineage_sha,
+            "lineage_contract_sha256": lineage[
+                "lineage_contract_sha256"
+            ],
+            "source_receipt": canonical_source,
+            "split": "val",
+            "test_visible": False,
+        }
+    if split not in {None, "train", "test"}:
+        raise RuntimeError(f"unsupported canonical receipt split {split!r}")
     if (
         not isinstance(summary, dict)
         or summary.get("status") != "complete"
@@ -1040,12 +1175,20 @@ def canonical_split_rows(
     *,
     expected_manifest_sha256: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    if split not in {"train", "test"}:
+    if split not in {"train", "val", "test"}:
         raise ValueError(f"unsupported canonical split {split!r}")
     rows, hashes = load_jsonl(
         paths,
         expected_single_sha256=expected_manifest_sha256,
     )
+    if split == "val" and (
+        len(rows) != 1_715
+        or any(row.get("split") != "val" for row in rows)
+    ):
+        raise RuntimeError(
+            "validation audio requires one exact 1,715-row val-only "
+            "canonical view"
+        )
     split_rows = [row for row in rows if row.get("split") == split]
     required = {
         "clip_id",
@@ -1421,7 +1564,11 @@ def audio_mode(args: argparse.Namespace) -> None:
         raise ValueError("--shard-id must be in [0,num-shards)")
     if args.max_frame_mismatch != 1:
         raise ValueError("--max-frame-mismatch must be exactly one")
-    formal_expected = {"train": 13_687, "test": 1_708}[args.split]
+    formal_expected = {
+        "train": 13_687,
+        "val": 1_715,
+        "test": 1_708,
+    }[args.split]
     if args.expected_total_clips != formal_expected:
         raise RuntimeError(
             f"formal {args.split} audio clip count must be {formal_expected}"
@@ -1471,6 +1618,7 @@ def audio_mode(args: argparse.Namespace) -> None:
             args.expected_canonical_source_commit
         ),
         expected_canonical_source_tree=args.expected_canonical_source_tree,
+        split=args.split,
     )
     selected = [
         row for index, row in enumerate(rows)
@@ -1731,6 +1879,7 @@ def audio_mode(args: argparse.Namespace) -> None:
             expected_canonical_source_tree=(
                 args.expected_canonical_source_tree
             ),
+            split=args.split,
         )
         final_tree_sha, final_model_files = tree_sha256(hubert_dir)
         if (
@@ -3660,7 +3809,7 @@ def parse_args() -> argparse.Namespace:
     audio.add_argument("--canonical-lineage", required=True)
     audio.add_argument(
         "--split",
-        choices=("train", "test"),
+        choices=("train", "val", "test"),
         required=True,
     )
     audio.add_argument("--hubert-model", required=True)
