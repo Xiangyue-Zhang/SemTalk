@@ -446,6 +446,31 @@ class SelectionFixture:
         self.coverage = coverage
 
     def _write_pipeline(self) -> None:
+        pinned_entrypoint = (
+            self.root
+            / "pinned-78412"
+            / SELECTOR.VAL_INFERENCE_SOURCE["entrypoint"]
+        )
+        pinned_entrypoint.parent.mkdir()
+        pinned_bytes = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "show",
+                (
+                    f"{SELECTOR.VAL_INFERENCE_SOURCE['commit']}:"
+                    "scripts/show_base/run_base_inference.py"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        if hashlib.sha256(pinned_bytes).hexdigest() != (
+            SELECTOR.VAL_INFERENCE_SOURCE["entrypoint_sha256"]
+        ):
+            raise RuntimeError("pinned validation inference helper changed")
+        pinned_entrypoint.write_bytes(pinned_bytes)
         pipeline = _with_payload_hash(
             {
                 "format": SELECTOR.PIPELINE_FORMAT,
@@ -456,22 +481,8 @@ class SelectionFixture:
                 "base_candidate_variable_only": True,
                 "source": SELECTOR.VAL_INFERENCE_SOURCE,
                 "inference_entrypoint": {
-                    "path": str(
-                        (
-                            ROOT
-                            / "scripts"
-                            / "show_base"
-                            / "run_base_inference.py"
-                        ).resolve()
-                    ),
-                    "sha256": hashlib.sha256(
-                        (
-                            ROOT
-                            / "scripts"
-                            / "show_base"
-                            / "run_base_inference.py"
-                        ).read_bytes()
-                    ).hexdigest(),
+                    "path": str(pinned_entrypoint.resolve()),
+                    "sha256": hashlib.sha256(pinned_bytes).hexdigest(),
                 },
                 "inference_helpers": list(SELECTOR.INFERENCE_HELPERS),
                 "fixed_checkpoints": {
@@ -814,7 +825,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
                     "autoencoders"
                 ]
             ),
-            {"fmd", "fed", "fgd"},
+            {"fgd"},
         )
 
     def test_selector_cli_has_no_split_or_test_input(self) -> None:
@@ -1256,6 +1267,20 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
             with self.assertRaisesRegex(
                 SELECTOR.SelectionContractError,
                 "fgd autoencoder",
+            ):
+                SELECTOR.validate_diffsheg_report(
+                    report,
+                    expected_coverage=fixture.coverage,
+                )
+            report = fixture.report(1)
+            report["provenance"]["autoencoders"]["fmd"] = {
+                "path": "/assets/gesture_expression.pth.tar",
+                "sha256": "1" * 64,
+                "input_dim": 232,
+            }
+            with self.assertRaisesRegex(
+                SELECTOR.SelectionContractError,
+                "evaluator provenance",
             ):
                 SELECTOR.validate_diffsheg_report(
                     report,

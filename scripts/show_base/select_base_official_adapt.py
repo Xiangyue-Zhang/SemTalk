@@ -106,20 +106,6 @@ DIFFSHEG_PINNED_RECEIPT: dict[str, Any] = {
         "b90320eba94d0777e7160fd31d0fe6f04a7c86822ac875fb7db5cf58d298cef0"
     ),
     "autoencoders": {
-        "fmd": {
-            "filename": "gesture_expression.pth.tar",
-            "sha256": (
-                "1f2c0003389e03a727e91ebced3eeafd7d04f6782b81cf2062e9a5642441627f"
-            ),
-            "input_dim": 232,
-        },
-        "fed": {
-            "filename": "expression.pth.tar",
-            "sha256": (
-                "ebb75ecd2eaf36e52c7684a1767b889e4a28b41ea900ae6e036ff1be5d1aa707"
-            ),
-            "input_dim": 103,
-        },
         "fgd": {
             "filename": "gesture.pth.tar",
             "sha256": (
@@ -2159,7 +2145,7 @@ def validate_diffsheg_report(
         or diffsheg_root.get("git_head")
         != pins["diffsheg_reference_commit"]
         or not isinstance(autoencoders, dict)
-        or set(autoencoders) != {"fmd", "fed", "fgd"}
+        or set(autoencoders) != {"fgd"}
     ):
         raise SelectionContractError("DiffSHEG evaluator provenance mismatch")
     require_absolute_path(
