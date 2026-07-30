@@ -1808,6 +1808,10 @@ class InferenceAuxiliaryLossBypassTest(unittest.TestCase):
         unsigned = dict(receipt)
         claim = unsigned.pop("receipt_sha256")
         self.assertEqual(claim, MODULE.compact_json_sha256(unsigned))
+        self.assertEqual(
+            receipt["infer_clip"],
+            MODULE.PINNED_INFER_CLIP,
+        )
         with mock.patch.dict(
             MODULE.PINNED_SEMTALK_MODEL_SOURCE,
             {"sha256": "0" * 64},

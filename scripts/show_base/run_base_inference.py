@@ -178,6 +178,17 @@ PINNED_RHYTHMIC_LOSS_FORWARD = {
 PINNED_RVQ_INDICES_SOURCE_SHA256 = (
     "467e0115387738b2ccc9aa46a0174d4a7b93aa1199d8e8bae9070e90f1150ffc"
 )
+PINNED_INFER_CLIP = {
+    "source_sha256": (
+        "40e4b6982c85ded6f6fef2dafb2f9f5f4bc876150ecf40fac59de9c7c6e8242c"
+    ),
+    "signature": (
+        "(*, pose: 'np.ndarray', trans: 'np.ndarray', beat: 'np.ndarray', "
+        "hubert: 'np.ndarray', speaker_id: 'int', "
+        "models: 'Mapping[str, Any]', masks: 'Mapping[str, Any]', "
+        "device: 'str') -> 'dict[str, np.ndarray]'"
+    ),
+}
 RELEASED_ALL_SPEAKERS_CLASSIFICATION = (
     "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
 )
@@ -5155,6 +5166,10 @@ def _inference_auxiliary_loss_bypass_receipt() -> dict[str, Any]:
         != PINNED_RHYTHMIC_LOSS_FORWARD["source_sha256"]
         or _callable_source_sha256(_rvq_indices)
         != PINNED_RVQ_INDICES_SOURCE_SHA256
+        or str(inspect.signature(_infer_clip))
+        != PINNED_INFER_CLIP["signature"]
+        or _callable_source_sha256(_infer_clip)
+        != PINNED_INFER_CLIP["source_sha256"]
     ):
         raise InferenceContractError(
             "inference-only auxiliary-loss bypass source contract changed"
@@ -5166,6 +5181,7 @@ def _inference_auxiliary_loss_bypass_receipt() -> dict[str, Any]:
         "base_forward": dict(PINNED_SEMTALK_BASE_FORWARD),
         "loss_forward": dict(PINNED_RHYTHMIC_LOSS_FORWARD),
         "rvq_indices_source_sha256": PINNED_RVQ_INDICES_SOURCE_SHA256,
+        "infer_clip": dict(PINNED_INFER_CLIP),
         "patched_attributes": list(INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS),
         "patch_mechanism": "instance_forward_MethodType_with_finally_restore",
         "replacement": "first_input_new_zeros_scalar",
