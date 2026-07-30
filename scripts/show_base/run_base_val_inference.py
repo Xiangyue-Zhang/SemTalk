@@ -496,16 +496,18 @@ def _load_pinned_helper(
         raise ValInferenceContractError(
             f"pinned inference helper lacks {missing}"
         )
+    _prime_pinned_released_schema_cache(module)
     return module
 
 
 @contextmanager
-def _pinned_meta_schema_cuda_compat() -> Iterable[None]:
+def _pinned_meta_schema_cuda_compat() -> Iterable[dict[str, int]]:
     """Keep the pinned helper's legacy ``.cuda()`` call on the meta device."""
 
     import torch
 
     original_cuda = torch.Tensor.cuda
+    intercepted = {"calls": 0}
 
     def meta_only_cuda(
         tensor: Any,
@@ -522,21 +524,25 @@ def _pinned_meta_schema_cuda_compat() -> Iterable[None]:
                 "pinned helper schema construction attempted a non-meta "
                 "or parameterized Tensor.cuda call"
             )
+        intercepted["calls"] += 1
         return tensor
 
     torch.Tensor.cuda = meta_only_cuda
     try:
-        yield
+        yield intercepted
     finally:
         torch.Tensor.cuda = original_cuda
 
 
 def _prime_pinned_released_schema_cache(helper: ModuleType) -> None:
-    with _pinned_meta_schema_cuda_compat():
+    import torch
+
+    with _pinned_meta_schema_cuda_compat() as first_intercepted:
         schemas = helper._expected_released_representation_schemas()
     expected_stages = {"face", "global", "hands", "upper", "lower"}
     if (
-        not isinstance(schemas, dict)
+        first_intercepted != {"calls": 24}
+        or not isinstance(schemas, dict)
         or set(schemas) != expected_stages
         or any(
             not isinstance(schemas[stage], dict) or not schemas[stage]
@@ -545,6 +551,29 @@ def _prime_pinned_released_schema_cache(helper: ModuleType) -> None:
     ):
         raise ValInferenceContractError(
             "pinned helper returned an invalid released schema cache"
+        )
+    for stage in expected_stages:
+        for key, entry in schemas[stage].items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not isinstance(entry[0], torch.dtype)
+                or not isinstance(entry[1], tuple)
+                or any(
+                    type(dimension) is not int or dimension < 0
+                    for dimension in entry[1]
+                )
+            ):
+                raise ValInferenceContractError(
+                    "pinned helper returned a malformed released schema entry"
+                )
+    with _pinned_meta_schema_cuda_compat() as cached_intercepted:
+        cached_schemas = helper._expected_released_representation_schemas()
+    if cached_schemas is not schemas or cached_intercepted != {"calls": 0}:
+        raise ValInferenceContractError(
+            "pinned helper released schema cache is not stable"
         )
 
 
@@ -705,7 +734,6 @@ def _load_models(
     from models.rvq import RVQVAE
     from models.semtalk import semtalk_base
 
-    _prime_pinned_released_schema_cache(helper)
     candidate = preflight["candidate_bundle"]["candidates"][str(epoch)]
     bundle = preflight["candidate_bundle"]
     for label, artifact in (

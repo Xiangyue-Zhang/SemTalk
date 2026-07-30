@@ -117,8 +117,25 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             source.count("helper._read_verified_checkpoint_snapshot("),
             1,
         )
-        self.assertIn("_prime_pinned_released_schema_cache", source)
+        self.assertNotIn("_prime_pinned_released_schema_cache", source)
         self.assertIn("_validate_base_model_state_schema", source)
+
+    def test_pinned_schema_prime_precedes_deterministic_seed(self) -> None:
+        helper_source = inspect.getsource(PRODUCER._load_pinned_helper)
+        prime = helper_source.index(
+            "_prime_pinned_released_schema_cache(module)"
+        )
+        self.assertLess(helper_source.index("if missing:"), prime)
+        self.assertLess(prime, helper_source.index("return module"))
+        shard_source = inspect.getsource(PRODUCER.run_shard)
+        self.assertLess(
+            shard_source.index("_load_pinned_helper(pipeline)"),
+            shard_source.index("_set_deterministic(args.seed)"),
+        )
+        self.assertNotIn(
+            "_prime_pinned_released_schema_cache",
+            inspect.getsource(PRODUCER._load_models),
+        )
 
     def test_pinned_meta_schema_cuda_shim_is_meta_only_and_scoped(
         self,
@@ -138,7 +155,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
         fake_torch = type("FakeTorch", (), {"Tensor": FakeTensor})()
         original_cuda = FakeTensor.cuda
         with mock.patch.dict("sys.modules", {"torch": fake_torch}):
-            with PRODUCER._pinned_meta_schema_cuda_compat():
+            with PRODUCER._pinned_meta_schema_cuda_compat() as intercepted:
                 meta_tensor = FakeTensor("meta")
                 self.assertIs(meta_tensor.cuda(), meta_tensor)
                 with self.assertRaisesRegex(
@@ -151,6 +168,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                     "parameterized",
                 ):
                     meta_tensor.cuda(0)
+                self.assertEqual(intercepted, {"calls": 1})
             self.assertIs(FakeTensor.cuda, original_cuda)
             self.assertEqual(FakeTensor("cpu").cuda(), "original-cuda")
 
@@ -168,26 +186,73 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             def cuda(self) -> None:
                 raise RuntimeError("legacy pinned helper meta failure")
 
-        fake_torch = type("FakeTorch", (), {"Tensor": FakeTensor})()
+        class FakeDType:
+            pass
+
+        fake_torch = type(
+            "FakeTorch",
+            (),
+            {"Tensor": FakeTensor, "dtype": FakeDType},
+        )()
         original_cuda = FakeTensor.cuda
         expected_stages = {"face", "global", "hands", "upper", "lower"}
 
         class FakeHelper:
-            @staticmethod
-            def _expected_released_representation_schemas() -> dict[
+            def __init__(
+                self,
+                *,
+                intercepts: int = 24,
+                shape: tuple[int, ...] = (1,),
+                stable: bool = True,
+            ) -> None:
+                self.intercepts = intercepts
+                self.shape = shape
+                self.stable = stable
+                self.cache: dict[
+                    str,
+                    dict[str, tuple[FakeDType, tuple[int, ...]]],
+                ] | None = None
+
+            def _expected_released_representation_schemas(self) -> dict[
                 str,
-                dict[str, tuple[str, tuple[int, ...]]],
+                dict[str, tuple[FakeDType, tuple[int, ...]]],
             ]:
-                tensor = FakeTensor()
-                if tensor.cuda() is not tensor:
-                    raise AssertionError("meta shim did not preserve tensor")
-                return {
-                    stage: {"weight": ("float32", (1,))}
-                    for stage in expected_stages
-                }
+                if self.cache is None or not self.stable:
+                    for _index in range(self.intercepts):
+                        tensor = FakeTensor()
+                        if tensor.cuda() is not tensor:
+                            raise AssertionError(
+                                "meta shim did not preserve tensor"
+                            )
+                    self.cache = {
+                        stage: {"weight": (FakeDType(), self.shape)}
+                        for stage in expected_stages
+                    }
+                return self.cache
 
         with mock.patch.dict("sys.modules", {"torch": fake_torch}):
             PRODUCER._prime_pinned_released_schema_cache(FakeHelper())
+            with self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "invalid released schema cache",
+            ):
+                PRODUCER._prime_pinned_released_schema_cache(
+                    FakeHelper(intercepts=23)
+                )
+            with self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "malformed released schema entry",
+            ):
+                PRODUCER._prime_pinned_released_schema_cache(
+                    FakeHelper(shape=(-1,))
+                )
+            with self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "cache is not stable",
+            ):
+                PRODUCER._prime_pinned_released_schema_cache(
+                    FakeHelper(stable=False)
+                )
         self.assertIs(FakeTensor.cuda, original_cuda)
 
     def test_directory_tolerates_create_race_but_rejects_symlink(self) -> None:
