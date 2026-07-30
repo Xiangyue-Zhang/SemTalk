@@ -62,6 +62,35 @@ LINEAGE_FILENAME = "val-inference-lineage.json"
 SHARD_MANIFEST_FILENAME = "shard_manifest.jsonl"
 SHARD_RECEIPT_FILENAME = "shard_receipt.json"
 MAX_NUM_SHARDS = 256
+SMPLX_POSE_DIM = 165
+PINNED_JOINT_CONTEXT_SOURCE = {
+    "relative_path": "utils/show_base_joints.py",
+    "sha256": (
+        "4ae09ddc025a4585b92a50d7f85ace330c398cd676c2905e38a4e9b0f1d56a38"
+    ),
+    "git_blob_sha1": "9c3ccd0136d989b430ecc9d21090c059ef7fe5a6",
+}
+PINNED_JOINT_AUTHORITY_SOURCE = {
+    "relative_path": "dataloaders/data_tools.py",
+    "sha256": (
+        "6fd248c2a13ce164c80bab2d76012fa57e4d5fcb507e43e6a5309c1b8fac4db8"
+    ),
+    "git_blob_sha1": "7f59fa57d94880b92a4455eb8f8e33c89ea8a3c7",
+}
+PINNED_JOINT_MASK_SHA256 = {
+    "face": (
+        "803564ee8b4f306b80611eb6574c35d626155a89c38dca22756219cbecdf7021"
+    ),
+    "upper": (
+        "5ee4e5ffc6429f11547451a29a8ddbdb47d9b8f4af665a5e247d101e307d575a"
+    ),
+    "hands": (
+        "ded83502732ea488834d9af1fb9a5df711ea5cf6b7f2b4b150f69adefe2d09e7"
+    ),
+    "lower": (
+        "4aad0acba09e535d5a6b5b2aa333d1227cdd7ba5b8b21df0660f2fcb3a010776"
+    ),
+}
 
 
 class ValInferenceContractError(RuntimeError):
@@ -97,6 +126,11 @@ def _with_payload_sha(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _git_blob_sha1(payload: bytes) -> str:
+    header = f"blob {len(payload)}\0".encode("ascii")
+    return hashlib.sha1(header + payload).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -498,6 +532,245 @@ def _load_pinned_helper(
         )
     _prime_pinned_released_schema_cache(module)
     return module
+
+
+def _pinned_helper_root(
+    helper: ModuleType,
+    pipeline: Mapping[str, Any],
+) -> Path:
+    entrypoint = _regular_file(
+        Path(pipeline["inference_entrypoint"]["path"]),
+        "pinned validation inference helper",
+    )
+    helper_file_value = getattr(helper, "__file__", None)
+    if not isinstance(helper_file_value, str) or not helper_file_value:
+        raise ValInferenceContractError(
+            "pinned inference helper has no source path"
+        )
+    helper_file = _regular_file(
+        Path(helper_file_value),
+        "loaded pinned validation inference helper",
+    )
+    if helper_file != entrypoint:
+        raise ValInferenceContractError(
+            "loaded pinned inference helper path mismatch"
+        )
+    if (
+        helper_file.name != "run_base_inference.py"
+        or helper_file.parent.name != "show_base"
+        or helper_file.parent.parent.name != "scripts"
+    ):
+        raise ValInferenceContractError(
+            "pinned inference helper is outside scripts/show_base"
+        )
+    root = helper_file.parents[2]
+    if root / "scripts" / "show_base" / helper_file.name != helper_file:
+        raise ValInferenceContractError(
+            "cannot resolve pinned inference helper project root"
+        )
+    return root
+
+
+def _pinned_joint_mask_arrays(
+    helper: ModuleType,
+    pipeline: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    if (
+        type(getattr(helper, "POSE_DIM", None)) is not int
+        or helper.POSE_DIM != SMPLX_POSE_DIM
+    ):
+        raise ValInferenceContractError(
+            "pinned inference helper has unexpected SMPL-X pose dimension"
+        )
+    root = _pinned_helper_root(helper, pipeline)
+    source_path = root / PINNED_JOINT_CONTEXT_SOURCE["relative_path"]
+    payload = _verified_bytes(
+        source_path,
+        PINNED_JOINT_CONTEXT_SOURCE["sha256"],
+        "pinned joint-context source",
+    )
+    if (
+        _git_blob_sha1(payload)
+        != PINNED_JOINT_CONTEXT_SOURCE["git_blob_sha1"]
+    ):
+        raise ValInferenceContractError(
+            "pinned joint-context Git blob mismatch"
+        )
+    authority_path = root / PINNED_JOINT_AUTHORITY_SOURCE["relative_path"]
+    authority_payload = _verified_bytes(
+        authority_path,
+        PINNED_JOINT_AUTHORITY_SOURCE["sha256"],
+        "pinned joint authority source",
+    )
+    if (
+        _git_blob_sha1(authority_payload)
+        != PINNED_JOINT_AUTHORITY_SOURCE["git_blob_sha1"]
+    ):
+        raise ValInferenceContractError(
+            "pinned joint authority Git blob mismatch"
+        )
+    module = ModuleType(
+        "_semtalk_pinned_show_base_joints_"
+        f"{PINNED_JOINT_CONTEXT_SOURCE['sha256']}"
+    )
+    module.__file__ = str(source_path)
+    try:
+        code = compile(
+            payload,
+            str(source_path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__)
+    except Exception as error:
+        raise ValInferenceContractError(
+            "cannot execute pinned joint-context source"
+        ) from error
+    formal_joint_context = getattr(module, "formal_joint_context", None)
+    if not callable(formal_joint_context):
+        raise ValInferenceContractError(
+            "pinned joint-context source lacks formal_joint_context"
+        )
+    try:
+        context = formal_joint_context("beat_smplx_joints")
+    except Exception as error:
+        raise ValInferenceContractError(
+            "pinned formal joint context failed"
+        ) from error
+    if (
+        not isinstance(context, dict)
+        or set(context)
+        != {"ori_joint_list", "target_joint_sets", "masks", "joints"}
+        or type(context["joints"]) is not int
+        or context["joints"] != SMPLX_POSE_DIM // 3
+    ):
+        raise ValInferenceContractError(
+            "pinned formal joint context has invalid schema"
+        )
+    source = context["ori_joint_list"]
+    targets = context["target_joint_sets"]
+    masks = context["masks"]
+    expected_joint_counts = {"face": 1, "upper": 13, "hands": 30, "lower": 9}
+    if (
+        not isinstance(source, dict)
+        or len(source) != SMPLX_POSE_DIM // 3
+        or not isinstance(targets, dict)
+        or set(targets) != set(expected_joint_counts)
+        or not isinstance(masks, dict)
+        or set(masks) != set(expected_joint_counts)
+    ):
+        raise ValInferenceContractError(
+            "pinned formal joint context has invalid coverage"
+        )
+    for index, (joint_name, location) in enumerate(source.items(), start=1):
+        if (
+            not isinstance(joint_name, str)
+            or not joint_name
+            or not isinstance(location, list)
+            or len(location) != 2
+            or type(location[0]) is not int
+            or type(location[1]) is not int
+            or location != [3, index * 3]
+        ):
+            raise ValInferenceContractError(
+                "pinned SMPL-X source joint layout is malformed"
+            )
+
+    for name, expected_count in expected_joint_counts.items():
+        target = targets[name]
+        if (
+            not isinstance(target, dict)
+            or len(target) != expected_count
+            or any(
+                not isinstance(joint_name, str)
+                or type(width) is not int
+                or width != 3
+                or joint_name not in source
+                for joint_name, width in target.items()
+            )
+        ):
+            raise ValInferenceContractError(
+                f"{name}: malformed pinned joint target"
+            )
+
+    result: dict[str, np.ndarray] = {}
+    observed = np.zeros(SMPLX_POSE_DIM, dtype=np.int64)
+    for name in ("face", "upper", "hands", "lower"):
+        expected = np.zeros(SMPLX_POSE_DIM, dtype=bool)
+        for joint_name in targets[name]:
+            width, end = source[joint_name]
+            expected[end - width : end] = True
+        raw_mask = masks[name]
+        if (
+            not isinstance(raw_mask, np.ndarray)
+            or raw_mask.shape != (SMPLX_POSE_DIM,)
+            or not np.issubdtype(raw_mask.dtype, np.number)
+            or not bool(np.isfinite(raw_mask).all())
+            or not bool(np.logical_or(raw_mask == 0, raw_mask == 1).all())
+        ):
+            raise ValInferenceContractError(
+                f"{name}: malformed pinned joint mask"
+            )
+        mask = raw_mask.astype(bool, copy=True)
+        if (
+            not np.array_equal(mask, expected)
+            or int(mask.sum()) != expected_joint_counts[name] * 3
+            or _sha256_bytes(mask.tobytes())
+            != PINNED_JOINT_MASK_SHA256[name]
+        ):
+            raise ValInferenceContractError(
+                f"{name}: pinned joint mask contract mismatch"
+            )
+        observed += mask.astype(np.int64)
+        if name != "face":
+            result[name] = mask
+    if bool((observed > 1).any()):
+        raise ValInferenceContractError(
+            "face/upper/hands/lower joint masks overlap"
+        )
+    receipt = _with_payload_sha(
+        {
+            "format": "semtalk_pinned_joint_masks_v1",
+            "source": dict(selector.VAL_INFERENCE_SOURCE),
+            "context_source": dict(PINNED_JOINT_CONTEXT_SOURCE),
+            "authority_source": dict(PINNED_JOINT_AUTHORITY_SOURCE),
+            "pose_dim": SMPLX_POSE_DIM,
+            "dtype": "bool",
+            "masks": {
+                name: {
+                    "elements": expected_joint_counts[name] * 3,
+                    "sha256": PINNED_JOINT_MASK_SHA256[name],
+                }
+                for name in ("face", "upper", "hands", "lower")
+            },
+        }
+    )
+    return result, receipt
+
+
+def _joint_masks_from_arrays(
+    arrays: Mapping[str, np.ndarray],
+    device: Any,
+) -> dict[str, Any]:
+    import torch
+
+    if set(arrays) != {"upper", "hands", "lower"}:
+        raise ValInferenceContractError(
+            "pinned joint mask array coverage mismatch"
+        )
+    result: dict[str, Any] = {}
+    for name in ("upper", "hands", "lower"):
+        mask = arrays[name]
+        if (
+            not isinstance(mask, np.ndarray)
+            or mask.dtype != np.dtype(bool)
+            or mask.shape != (SMPLX_POSE_DIM,)
+        ):
+            raise ValInferenceContractError(
+                f"{name}: malformed pinned joint mask array"
+            )
+        result[name] = torch.from_numpy(mask).to(device=device)
+    return result
 
 
 @contextmanager
@@ -974,6 +1247,10 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
         _load_preflight_children(preflight)
     )
     helper = _load_pinned_helper(pipeline)
+    joint_mask_arrays, joint_mask_receipt = _pinned_joint_mask_arrays(
+        helper,
+        pipeline,
+    )
     output_root = _validate_output_root(args.output_root)
     shards_root = output_root / SHARDS_DIRECTORY
     _directory(shards_root, "shards root", create=True)
@@ -995,6 +1272,11 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
     try:
         _set_deterministic(args.seed)
         runtime_contract, device_receipt = _runtime(args.device, args.seed)
+        runtime_contract["joint_masks"] = joint_mask_receipt
+        masks = _joint_masks_from_arrays(
+            joint_mask_arrays,
+            __import__("torch").device(args.device),
+        )
         models, model_receipts = _load_models(
             helper,
             epoch=args.epoch,
@@ -1002,7 +1284,6 @@ def run_shard(args: argparse.Namespace) -> dict[str, Any]:
             pipeline=pipeline,
             device=args.device,
         )
-        masks = helper._joint_masks(__import__("torch").device(args.device))
         rows: list[dict[str, Any]] = []
         frame_count = 0
         for position, canonical_row in enumerate(canonical_rows):
