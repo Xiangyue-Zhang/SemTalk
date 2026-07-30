@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+
+REPOSITORY = Path(__file__).resolve().parents[1]
+SCRIPT = (
+    REPOSITORY
+    / "scripts"
+    / "show_base"
+    / "train_base_official_adapt.py"
+)
+SPEC = importlib.util.spec_from_file_location(
+    "train_base_official_adapt", SCRIPT
+)
+assert SPEC is not None and SPEC.loader is not None
+ADAPT = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(ADAPT)
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class OfficialBaseAdaptStaticContracts(unittest.TestCase):
+    def test_scratch_entrypoint_is_untouched_by_the_new_entrypoint(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "This is intentionally separate from ``show_base_train.py``",
+            source,
+        )
+        self.assertNotIn("load_pretrained_vq_suite", source)
+        self.assertNotIn("from models.rvq", source)
+        self.assertNotIn("import models.rvq", source)
+
+    def test_objective_contains_exactly_one_model_forward(self) -> None:
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT))
+        objective = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "audio_conditioned_objective"
+        )
+        calls = [
+            node
+            for node in ast.walk(objective)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "model"
+        ]
+        self.assertEqual(len(calls), 1)
+
+    def test_fixed_parallelism_candidates_and_gate_lengths(self) -> None:
+        self.assertEqual(ADAPT.WORLD_SIZE, 8)
+        self.assertEqual(ADAPT.LOCAL_BATCH_SIZE, 64)
+        self.assertEqual(ADAPT.GLOBAL_BATCH_SIZE, 512)
+        self.assertEqual(
+            ADAPT.CANDIDATE_EPOCHS,
+            (1, 2, 4, 8, 16, 32, 40),
+        )
+        self.assertEqual(ADAPT.THROUGHPUT_WARMUP_UPDATES, 20)
+        self.assertEqual(ADAPT.THROUGHPUT_TIMED_UPDATES, 50)
+        self.assertEqual(ADAPT.EXPECTED_UPDATES_PER_EPOCH, 248)
+
+    def test_protocol_is_main_forward_only_and_vq_free(self) -> None:
+        args = argparse.Namespace(learning_rate=3e-5, precision="bf16")
+        protocol = ADAPT.protocol_receipt(args)
+        self.assertEqual(
+            protocol["forward_contract"]["forwards_per_optimizer_step"], 1
+        )
+        self.assertTrue(
+            protocol["forward_contract"]["audio_conditioned_main_forward"]
+        )
+        self.assertFalse(
+            protocol["forward_contract"]["masked_self_forward"]
+        )
+        self.assertFalse(
+            protocol["forward_contract"]["word_auxiliary_forward"]
+        )
+        self.assertFalse(protocol["vq_models_in_training_graph"])
+        self.assertEqual(
+            protocol["initialization"]["sha256"],
+            "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc1d89603",
+        )
+
+    def test_e30_and_speaker2_are_hard_rejected(self) -> None:
+        for label in (
+            "/weights/e30/best_semtalk_base.bin",
+            "/weights/E_30/best_semtalk_base.bin",
+            "/weights/speaker2/best_semtalk_base.bin",
+            "SPEAKER-2-adaptation",
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ADAPT.AdaptationContractError):
+                    ADAPT.reject_forbidden_source_labels(label)
+        ADAPT.reject_forbidden_source_labels(
+            "/weights/all_speakers/best_semtalk_base.bin"
+        )
+
+    def test_argument_contract_rejects_wrong_batch_or_epochs(self) -> None:
+        parser = ADAPT.build_parser()
+        base = [
+            "--mode",
+            "throughput_gate",
+            "--official-base-checkpoint",
+            "/weights/all/best_semtalk_base.bin",
+            "--train-lmdb",
+            "/cache/base.lmdb",
+            "--dataset-summary",
+            "/cache/summary.json",
+            "--expected-dataset-summary-sha256",
+            "a" * 64,
+            "--lineage-manifest",
+            "/cache/lineage.json",
+            "--expected-lineage-sha256",
+            "b" * 64,
+            "--output-root",
+            "/runs/base",
+            "--run-name",
+            "official_all_show",
+        ]
+        args = parser.parse_args(base)
+        ADAPT.validate_args(args)
+        args.local_batch_size = 32
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT.validate_args(args)
+        args.local_batch_size = 64
+        args.epochs = 32
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT.validate_args(args)
+
+
+class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
+    class _FakeTensor:
+        shape = (2, 3)
+        dtype = "torch.float32"
+
+        def is_floating_point(self) -> bool:
+            return False
+
+        def is_complex(self) -> bool:
+            return False
+
+    class _FakeTorch:
+        envelope: object = None
+
+        @classmethod
+        def load(cls, *_: object, **__: object) -> object:
+            return cls.envelope
+
+        @staticmethod
+        def is_tensor(value: object) -> bool:
+            return isinstance(
+                value, OfficialBaseAdaptReceiptContracts._FakeTensor
+            )
+
+    def test_official_checkpoint_filename_sha_envelope_and_normalization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "best_semtalk_base.bin"
+            path.write_bytes(b"fixture-official-base")
+            specification = {
+                **ADAPT.OFFICIAL_BASE_SPEC,
+                "sha256": _sha(path),
+            }
+            self._FakeTorch.envelope = {
+                "epoch": ADAPT.OFFICIAL_BASE_EPOCH,
+                "lrs": dict(ADAPT.OFFICIAL_BASE_LRS),
+                "model_state": {
+                    "module.weight": self._FakeTensor(),
+                },
+                "opt_state": {
+                    "state": {},
+                    "param_groups": [
+                        {
+                            **ADAPT.OFFICIAL_BASE_OPTIMIZER_GROUP,
+                            "params": [],
+                        }
+                    ],
+                },
+            }
+            with (
+                mock.patch.object(
+                    ADAPT, "OFFICIAL_BASE_OPTIMIZER_STATE_ENTRIES", 0
+                ),
+                mock.patch.object(
+                    ADAPT, "OFFICIAL_BASE_OPTIMIZER_PARAMETERS", 0
+                ),
+            ):
+                state, receipt = ADAPT.read_official_base_checkpoint(
+                    path,
+                    torch_module=self._FakeTorch,
+                    specification=specification,
+                )
+            self.assertEqual(set(state), {"weight"})
+            self.assertEqual(
+                receipt["checkpoint_container_schema"],
+                ["epoch", "lrs", "model_state", "opt_state"],
+            )
+            self.assertTrue(receipt["strict_state_dict_load"])
+            self._FakeTorch.envelope = {
+                "epoch": ADAPT.OFFICIAL_BASE_EPOCH,
+                "lrs": dict(ADAPT.OFFICIAL_BASE_LRS),
+                "model_state": {"weight": self._FakeTensor()},
+                "opt_state": {
+                    "state": {},
+                    "param_groups": [
+                        {
+                            **ADAPT.OFFICIAL_BASE_OPTIMIZER_GROUP,
+                            "params": [],
+                        }
+                    ],
+                },
+                "unexpected": True,
+            }
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT.read_official_base_checkpoint(
+                    path,
+                    torch_module=self._FakeTorch,
+                    specification=specification,
+                )
+
+    def _dataset_fixture(
+        self, root: Path
+    ) -> tuple[argparse.Namespace, dict[str, object], dict[str, object]]:
+        lmdb = root / "base.lmdb"
+        lmdb.mkdir()
+        (lmdb / "data.mdb").write_bytes(b"official-base-data")
+        (lmdb / "lock.mdb").write_bytes(b"official-base-lock")
+        lineage_path = root / "lineage.json"
+        records = {}
+        for stage, specification in ADAPT.OFFICIAL_PREREQUISITE_SPECS.items():
+            records[stage] = {
+                "path": f"/weights/all/{specification['filename']}",
+                "filename": specification["filename"],
+                "sha256": specification["sha256"],
+                "formal_stage": stage,
+                "prerequisite_source": ADAPT.OFFICIAL_BASE_SOURCE,
+                "classification": ADAPT.OFFICIAL_BASE_CLASSIFICATION,
+                "training_dataset": "BEAT2",
+                "speaker_scope": "All-Speakers",
+                "show_trained": False,
+                "checkpoint_container_schema": ["model_state"],
+                "strict_state_dict_load": True,
+                "all_model_state_tensors_finite": True,
+                "frozen_eval": True,
+            }
+        lineage: dict[str, object] = {
+            "format": "semtalk_show_base_feature_lineage_v1",
+            "status": "complete",
+            "entries": ADAPT.EXPECTED_TRAIN_SAMPLES,
+            "train_clips": ADAPT.EXPECTED_TRAIN_CLIPS,
+            "protocol": {
+                "scope": "SemTalk Base only",
+                "split": "train",
+                "speakers": ADAPT.SHOW_SPEAKERS,
+                "window_length": 64,
+                "stride": 20,
+                "in_word": "int64_all_zero_unused_placeholder",
+                "forbidden_components": [
+                    "ASR",
+                    "TextGrid",
+                    "vocabulary",
+                    "CLIP",
+                    "emotion",
+                    "semantic",
+                    "SemGate",
+                    "Sparse",
+                ],
+                "prerequisite_source": ADAPT.OFFICIAL_BASE_SOURCE,
+            },
+            "formal_checkpoints": records,
+        }
+        lineage_path.write_text(
+            json.dumps(lineage, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        summary: dict[str, object] = {
+            "format": "semtalk_show_base_lmdb_summary_v1",
+            "status": "complete",
+            "scope": "SemTalk Base only",
+            "entries": ADAPT.EXPECTED_TRAIN_SAMPLES,
+            "train_clips": ADAPT.EXPECTED_TRAIN_CLIPS,
+            "lmdb": str(lmdb),
+            "data_mdb_sha256": _sha(lmdb / "data.mdb"),
+            "lock_mdb_sha256": _sha(lmdb / "lock.mdb"),
+            "lineage_json": str(lineage_path),
+            "lineage_json_sha256": _sha(lineage_path),
+        }
+        summary_path = root / "summary.json"
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            dataset_summary=str(summary_path),
+            expected_dataset_summary_sha256=_sha(summary_path),
+            lineage_manifest=str(lineage_path),
+            expected_lineage_sha256=_sha(lineage_path),
+            train_lmdb=str(lmdb),
+        )
+        return args, summary, lineage
+
+    def test_official_all_speakers_dataset_lineage_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args, _, _ = self._dataset_fixture(Path(temporary))
+            receipt = ADAPT.validate_dataset_receipts(args)
+            self.assertFalse(receipt["vq_models_in_training_graph"])
+            self.assertEqual(
+                receipt["vq_targets"],
+                "precomputed_frozen_lmdb_tensors",
+            )
+            self.assertEqual(
+                set(receipt["formal_checkpoints"]),
+                {"face", "hands", "upper", "lower", "global"},
+            )
+
+    def test_speaker2_or_nonofficial_vq_lineage_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args, summary, lineage = self._dataset_fixture(root)
+            lineage["formal_checkpoints"]["face"]["path"] = (
+                "/weights/speaker2/rvq_face_600.bin"
+            )
+            lineage_path = Path(args.lineage_manifest)
+            lineage_path.write_text(
+                json.dumps(lineage, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            summary["lineage_json_sha256"] = _sha(lineage_path)
+            summary_path = Path(args.dataset_summary)
+            summary_path.write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            args.expected_lineage_sha256 = _sha(lineage_path)
+            args.expected_dataset_summary_sha256 = _sha(summary_path)
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT.validate_dataset_receipts(args)
+
+    def test_throughput_gate_must_bind_exact_frozen_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = {
+                "format": ADAPT.GATE_FORMAT,
+                "status": "pass",
+                "frozen_receipt_sha256": "a" * 64,
+                "world_size": 8,
+                "local_batch_size": 64,
+                "global_batch_size": 512,
+                "warmup_updates": 20,
+                "timed_updates": 50,
+                "precision": "bf16",
+                "learning_rate": 3e-5,
+                "all_losses_finite": True,
+                "samples_per_second": 512.0,
+                "seconds_per_update": 1.0,
+            }
+            path = root / "gate.json"
+            path.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                throughput_gate_report=str(path),
+                expected_throughput_gate_sha256=_sha(path),
+                precision="bf16",
+                learning_rate=3e-5,
+            )
+            receipt = ADAPT.validate_throughput_gate(
+                args,
+                frozen_receipt={"receipt_sha256": "a" * 64},
+            )
+            self.assertEqual(receipt["samples_per_second"], 512.0)
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT.validate_throughput_gate(
+                    args,
+                    frozen_receipt={"receipt_sha256": "b" * 64},
+                )
+
+    def test_source_receipt_supports_detached_head(self) -> None:
+        scripted = [
+            subprocess.CompletedProcess([], 0, ADAPT.EXPECTED_ORIGIN + "\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", ""),
+            subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+            subprocess.CompletedProcess([], 0, "b" * 40 + "\n", ""),
+        ]
+        with mock.patch.object(
+            ADAPT.subprocess,
+            "run",
+            side_effect=scripted,
+        ):
+            receipt = ADAPT.source_receipt()
+        self.assertIsNone(receipt["branch"])
+        self.assertTrue(receipt["clean"])
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("torch") is not None,
+    "PyTorch is optional in the local CPU contract environment",
+)
+class OfficialBaseAdaptTorchContracts(unittest.TestCase):
+    def test_strict_load_and_mean_initializes_only_four_rows(self) -> None:
+        import torch
+
+        class Tiny(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.spearker_encoder_face = torch.nn.Embedding(25, 768)
+                self.spearker_encoder_body = torch.nn.Embedding(25, 768)
+                self.other = torch.nn.Linear(3, 2)
+
+        official = Tiny().state_dict()
+        official = {
+            key: torch.arange(
+                value.numel(), dtype=value.dtype
+            ).reshape_as(value)
+            for key, value in official.items()
+        }
+        model = Tiny()
+        receipt = ADAPT.strict_load_and_initialize_show_speakers(
+            model,
+            official,
+            torch_module=torch,
+        )
+        state = model.state_dict()
+        for key in ADAPT.SPEAKER_EMBEDDING_KEYS:
+            mean = official[key].mean(dim=0)
+            self.assertTrue(torch.equal(state[key][:4], mean.expand(4, -1)))
+            self.assertTrue(torch.equal(state[key][4:], official[key][4:]))
+        self.assertTrue(torch.equal(state["other.weight"], official["other.weight"]))
+        self.assertTrue(torch.equal(state["other.bias"], official["other.bias"]))
+        self.assertTrue(receipt["other_state_unchanged"])
+
+    def test_audio_objective_calls_model_once_and_is_finite(self) -> None:
+        import torch
+
+        class Fake:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, *_: object, **__: object) -> dict[str, object]:
+                self.calls += 1
+                output = {}
+                for stage in ("face", "upper", "hands", "lower"):
+                    output[f"rec_{stage}"] = torch.zeros(1, 6, 1, 16, 256)
+                    output[f"cls_{stage}"] = torch.zeros(1, 16, 256, 6)
+                output["hubert_cons_loss"] = torch.tensor(0.25)
+                output["beat_cons_loss"] = torch.tensor(0.5)
+                return output
+
+        batch = {
+            "beat": torch.zeros(1, 64, 3),
+            "in_word": torch.zeros(1, 64, dtype=torch.int64),
+            "tar_id": torch.zeros(1, 64, 1, dtype=torch.int64),
+            "latent_all": torch.zeros(1, 64, 337),
+            "hubert": torch.zeros(1, 64, 1024),
+        }
+        for stage in ("face", "upper", "hands", "lower"):
+            batch[f"zq_{stage}"] = torch.zeros(1, 6, 1, 16, 256)
+            batch[f"tar_index_value_{stage}_top"] = torch.zeros(
+                1, 16, 6, dtype=torch.int64
+            )
+        model = Fake()
+        loss, metrics = ADAPT.audio_conditioned_objective(
+            model, batch, torch_module=torch
+        )
+        self.assertEqual(model.calls, 1)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(set(ADAPT.LOSS_COMPONENTS) - set(metrics), set())
+
+
+if __name__ == "__main__":
+    unittest.main()
