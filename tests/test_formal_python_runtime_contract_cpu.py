@@ -20,6 +20,7 @@ LAUNCHERS = (
     "finalize_base_diffsheg_val_partitions.sh",
     "run_base_final_test.sh",
     "run_dual_node_guarded_transaction.sh",
+    "run_diffsheg_final_test_eval.sh",
 )
 
 
@@ -111,9 +112,46 @@ class FormalPythonRuntimeContractTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("required module", result.stderr)
 
+    def test_legacy_pyvenv_without_executable_field_remains_strictly_bound(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="semtalk-python-contract-") as raw:
+            root = Path(raw).resolve()
+            python = self._new_venv(root)
+            configuration = python.parents[1] / "pyvenv.cfg"
+            lines = configuration.read_text(encoding="utf-8").splitlines()
+            configuration.write_text(
+                "\n".join(
+                    line for line in lines
+                    if not line.casefold().startswith("executable =")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = self._contract(python)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [str(python), str(python)])
+
+    def test_optional_pyvenv_executable_field_must_match_base_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="semtalk-python-contract-") as raw:
+            root = Path(raw).resolve()
+            python = self._new_venv(root)
+            configuration = python.parents[1] / "pyvenv.cfg"
+            lines = configuration.read_text(encoding="utf-8").splitlines()
+            retained = [
+                line
+                for line in lines
+                if not line.casefold().startswith("executable =")
+            ]
+            configuration.write_text(
+                "\n".join((*retained, "executable = /bin/sh")) + "\n",
+                encoding="utf-8",
+            )
+            result = self._contract(python)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match", result.stderr)
+
 
 class FormalPythonLauncherStaticTests(unittest.TestCase):
-    def test_only_four_affected_launchers_use_shared_contract(self) -> None:
+    def test_affected_launchers_use_shared_contract(self) -> None:
         directory = REPOSITORY / "scripts" / "show_base"
         for name in LAUNCHERS:
             source = (directory / name).read_text(encoding="utf-8")

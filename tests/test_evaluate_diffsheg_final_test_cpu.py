@@ -90,6 +90,27 @@ class FinalDiffSHEGConstantsTests(unittest.TestCase):
             "/tmp/globaldiff_guarded_runner.py",
         ):
             self.assertIn(token, source)
+        for token in (
+            "SOURCE_COMMIT SOURCE_TREE --",
+            "semtalk_require_exact_guarded_runner_all_gpus",
+            "formal_python_runtime_contract.sh",
+            'semtalk_require_formal_venv_python "$python_bin" semtalk',
+            "remote get-url origin",
+            "rev-parse HEAD",
+            "rev-parse 'HEAD^{tree}'",
+            "status --porcelain=v1 --untracked-files=all",
+            "symbolic-ref -q --short HEAD",
+            "for-each-ref --format='%(refname)' refs/heads",
+        ):
+            self.assertIn(token, source)
+        self.assertIn("if ((preflight_count == 0)); then", source)
+        guarded_block = source.split(
+            "if ((preflight_count == 0)); then", 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("semtalk_require_exact_guarded_runner_all_gpus", guarded_block)
+        self.assertNotIn("semtalk_require_formal_venv_python", guarded_block)
+        self.assertNotIn("pgrep", source)
+        self.assertNotIn("pkill", source)
 
     def test_manifest_name_is_uniform(self) -> None:
         producer = (

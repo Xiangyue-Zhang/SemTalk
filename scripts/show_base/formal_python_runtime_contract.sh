@@ -117,7 +117,7 @@ try:
         configuration[key] = value.strip()
 except OSError as exc:
     fail(f"cannot read pyvenv.cfg: {exc}")
-required_keys = {"home", "include-system-site-packages", "version", "executable"}
+required_keys = {"home", "include-system-site-packages", "version"}
 if not required_keys.issubset(configuration):
     fail("pyvenv.cfg is missing required runtime identity fields")
 if configuration["include-system-site-packages"].casefold() not in {"true", "false"}:
@@ -126,15 +126,23 @@ if configuration["version"] != platform.python_version():
     fail("pyvenv.cfg Python version does not match the running interpreter")
 
 base_executable = Path(str(getattr(sys, "_base_executable", "")))
-configured_executable = Path(configuration["executable"])
 configured_home = Path(configuration["home"])
-if not base_executable.is_absolute() or not configured_executable.is_absolute():
+if not base_executable.is_absolute() or not configured_home.is_absolute():
     fail("base executable identity is not absolute")
 try:
-    if configured_executable.resolve(strict=True) != base_executable.resolve(strict=True):
-        fail("pyvenv.cfg executable does not match sys._base_executable")
-    if not configured_home.is_absolute() or configured_home.resolve(strict=True) != configured_executable.parent.resolve(strict=True):
-        fail("pyvenv.cfg home does not match its base executable")
+    resolved_base_executable = base_executable.resolve(strict=True)
+    resolved_home = configured_home.resolve(strict=True)
+    if resolved_home != resolved_base_executable.parent.resolve(strict=True):
+        fail("pyvenv.cfg home does not match sys._base_executable")
+    # Python 3.9 creates legitimate pyvenv.cfg files without ``executable``.
+    # Newer versions include it; when present it is an additional exact bind.
+    configured_executable_value = configuration.get("executable")
+    if configured_executable_value is not None:
+        configured_executable = Path(configured_executable_value)
+        if not configured_executable.is_absolute():
+            fail("pyvenv.cfg executable is not absolute")
+        if configured_executable.resolve(strict=True) != resolved_base_executable:
+            fail("pyvenv.cfg executable does not match sys._base_executable")
 except OSError as exc:
     fail(f"base executable identity is unavailable: {exc}")
 
