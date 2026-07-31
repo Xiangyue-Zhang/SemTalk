@@ -221,6 +221,8 @@ CANONICAL_WAV_MONO_POLICY = (
 
 TALKSHOW_METRIC_COMMIT = "9aef82df5ff1082f0cfa0cfc116c0b7208e85d5b"
 TALKSHOW_METRIC_TREE = "d993229539e63442a1f1327bae6d80d35f97c521"
+TALKSHOW_METRIC_UPSTREAM_ORIGIN = "https://github.com/yhw-yhw/TalkSHOW.git"
+TALKSHOW_METRIC_ONLY_INIT = b'"""Metric-only TalkSHOW package."""\n'
 FEATURE_EXTRACTOR_SHA256 = (
     "154259bfe8ae1e0fb477ba5afdd5674659ef9eb4d44d4ad49cd2ef4d20ccecfb"
 )
@@ -228,17 +230,27 @@ SMPLX_SHA256 = (
     "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
 )
 TALKSHOW_PATCH_MARKER = {
+    "upstream_origin": TALKSHOW_METRIC_UPSTREAM_ORIGIN,
     "upstream_commit": TALKSHOW_METRIC_COMMIT,
-    "patch_version": "globaldiff-show-metric-v1",
+    "upstream_tree": TALKSHOW_METRIC_TREE,
+    "patch_version": "semtalk-metric-only-no-eager-import-v2",
     "scope": "released-show-body-feature-extractor-only",
     "source_file": "nets/__init__.py",
+    "patch_operation": "replace_with_exact_bytes_v1",
     "source_sha256": (
         "d12f3ebd1b8f4b251085061404d72530df58bc972272995a3810236aefdd4d21"
     ),
+    "patched_bytes": 36,
     "patched_sha256": (
-        "e0e277d46475c203d78d355affd01a9e6f55462fbaa1911d140f91c438a0bef2"
+        "b511f4f4ee1421ddd212861e9d5817795a69dac74c493461a60424f19e2d36d1"
     ),
 }
+if (
+    len(TALKSHOW_METRIC_ONLY_INIT) != TALKSHOW_PATCH_MARKER["patched_bytes"]
+    or hashlib.sha256(TALKSHOW_METRIC_ONLY_INIT).hexdigest()
+    != TALKSHOW_PATCH_MARKER["patched_sha256"]
+):
+    raise RuntimeError("TalkSHOW metric-only patch constant is inconsistent")
 TALKSHOW_FGD_ENTRY_MODULES = ("nets.body_ae",)
 TALKSHOW_FGD_SOURCE_FILES = (
     "data_utils/__init__.py",

@@ -99,6 +99,7 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/semtalk_base_inference_core.py",
     "scripts/show_base/evaluate_talkshow_show_metrics.py",
+    "scripts/show_base/build_talkshow_metric_root.py",
     "scripts/show_base/replay_released2_primary.py",
     "scripts/show_base/build_base_features.py",
     "scripts/show_base/selected_prerequisites.py",
