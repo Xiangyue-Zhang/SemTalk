@@ -11,6 +11,7 @@ launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=guarded_runner_contract.sh
 . "$launcher_dir/guarded_runner_contract.sh"
 semtalk_require_exact_guarded_runner_all_gpus
+python_runtime_contract=$launcher_dir/formal_python_runtime_contract.sh
 
 python_bin=
 fresh_test_authority=
@@ -97,12 +98,17 @@ for required in \
     "$python_bin" "$fresh_test_authority" \
     "$paspa_root" "$diffsheg_root" "$talkshow_root" \
     "$source_audio_root" "$smplx_path" "$adapter" "$evaluator" \
-    "$audio_view_builder"; do
+    "$audio_view_builder" "$python_runtime_contract"; do
     [[ -e $required ]] || {
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
     }
 done
+if [[ ! -f $python_runtime_contract || -L $python_runtime_contract ]]; then
+    printf 'Python runtime contract is missing or unsafe: %s\n' \
+        "$python_runtime_contract" >&2
+    exit 1
+fi
 
 fresh_test_authority=$(realpath -e -- "$fresh_test_authority")
 paspa_root=$(realpath -e -- "$paspa_root")
@@ -110,7 +116,8 @@ diffsheg_root=$(realpath -e -- "$diffsheg_root")
 talkshow_root=$(realpath -e -- "$talkshow_root")
 source_audio_root=$(realpath -e -- "$source_audio_root")
 smplx_path=$(realpath -e -- "$smplx_path")
-python_bin=$(realpath -e -- "$python_bin")
+. "$python_runtime_contract"
+semtalk_require_formal_venv_python "$python_bin" semtalk
 
 authority_args=(
     --fresh-test-authority "$fresh_test_authority"

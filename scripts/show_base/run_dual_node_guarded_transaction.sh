@@ -21,24 +21,22 @@ python_bin=$1
 shift
 launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 helper="$launcher_dir/dual_node_guarded_transaction.py"
+python_runtime_contract="$launcher_dir/formal_python_runtime_contract.sh"
 
 # shellcheck source=guarded_runner_contract.sh
 . "$launcher_dir/guarded_runner_contract.sh"
 semtalk_require_exact_guarded_runner_all_gpus
 
-python_dir=$(CDPATH= cd -- "$(dirname -- "$python_bin")" 2>/dev/null && pwd -P) || {
-    printf '%s\n' 'Python parent directory is unavailable' >&2
-    exit 2
-}
-python_canonical="$python_dir/${python_bin##*/}"
-if [[ ! "$python_bin" = /* || "$python_canonical" != "$python_bin" || \
-      ! -f "$python_bin" || ! -x "$python_bin" || -L "$python_bin" ]]; then
-    printf '%s\n' 'Python must be an absolute executable non-symlink file' >&2
-    exit 2
-fi
 if [[ ! -f "$helper" || -L "$helper" ]]; then
     printf '%s\n' 'transaction helper is missing or unsafe' >&2
     exit 1
 fi
+if [[ ! -f "$python_runtime_contract" || -L "$python_runtime_contract" ]]; then
+    printf '%s\n' 'Python runtime contract is missing or unsafe' >&2
+    exit 1
+fi
+
+. "$python_runtime_contract"
+semtalk_require_formal_venv_python "$python_bin" semtalk
 
 exec "$python_bin" "$helper" "$@"

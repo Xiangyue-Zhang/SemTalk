@@ -160,7 +160,6 @@ if [[ $repo_root != "$raw_repo_root" || ! -d $repo_root || -L $raw_repo_root ]];
     printf 'repository root must be canonical and non-symlinked\n' >&2
     exit 1
 fi
-python_bin=$(realpath -e -- "$python_bin")
 if [[ ! -x $python_bin || ! -f $python_bin ]]; then
     printf 'Python interpreter is unavailable\n' >&2
     exit 1
@@ -191,7 +190,9 @@ if [[ $finalizer_path != "$launcher_dir/$finalizer_name" ]]; then
 fi
 partition_contract=$launcher_dir/base_diffsheg_val_partition_contract.py
 selector=$launcher_dir/select_base_official_adapt_long.py
-for required_path in "$partition_contract" "$selector"; do
+python_runtime_contract=$launcher_dir/formal_python_runtime_contract.sh
+for required_path in \
+    "$partition_contract" "$selector" "$python_runtime_contract"; do
     if [[ ! -f $required_path || -L $required_path ]]; then
         printf 'required tracked source is unavailable: %s\n' "$required_path" >&2
         exit 1
@@ -209,6 +210,7 @@ if [[ $(git -C "$repo_root" remote get-url origin) != \
 fi
 for tracked in \
     scripts/show_base/finalize_base_diffsheg_val_partitions.sh \
+    scripts/show_base/formal_python_runtime_contract.sh \
     scripts/show_base/base_diffsheg_val_partition_contract.py \
     scripts/show_base/select_base_official_adapt_long.py \
     scripts/show_base/base_long_val_contract.py; do
@@ -217,6 +219,9 @@ for tracked in \
         exit 1
     fi
 done
+
+. "$python_runtime_contract"
+semtalk_require_formal_venv_python "$python_bin" semtalk
 
 cd "$repo_root"
 "$python_bin" "$partition_contract" create-run-root \

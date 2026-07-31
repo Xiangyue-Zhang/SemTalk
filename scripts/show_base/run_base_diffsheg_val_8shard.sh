@@ -153,7 +153,6 @@ if [[ $repo_root != "$raw_repo_root" || ! -d $repo_root || -L $raw_repo_root ]];
     printf 'repository root must be canonical and non-symlinked\n' >&2
     exit 1
 fi
-python_bin=$(realpath -e -- "$python_bin")
 if [[ ! -x $python_bin || ! -f $python_bin ]]; then
     printf 'Python interpreter is unavailable\n' >&2
     exit 1
@@ -183,13 +182,15 @@ if [[ $launcher_path != "$launcher_dir/$launcher_name" ]]; then
     exit 1
 fi
 guard_contract=$launcher_dir/guarded_runner_contract.sh
+python_runtime_contract=$launcher_dir/formal_python_runtime_contract.sh
 partition_contract=$launcher_dir/base_diffsheg_val_partition_contract.py
 inference=$launcher_dir/run_base_val_inference.py
 evaluator=$launcher_dir/evaluate_diffsheg_val_fgd.py
 measurement_producer=$launcher_dir/produce_base_val_measurement.py
 long_selector=$launcher_dir/select_base_official_adapt_long.py
 for required_path in \
-    "$guard_contract" "$partition_contract" "$inference" "$evaluator" \
+    "$guard_contract" "$python_runtime_contract" "$partition_contract" \
+    "$inference" "$evaluator" \
     "$measurement_producer" "$long_selector"; do
     if [[ ! -f $required_path || -L $required_path ]]; then
         printf 'required tracked source is unavailable: %s\n' "$required_path" >&2
@@ -230,6 +231,7 @@ fi
 for tracked in \
     scripts/show_base/run_base_diffsheg_val_8shard.sh \
     scripts/show_base/guarded_runner_contract.sh \
+    scripts/show_base/formal_python_runtime_contract.sh \
     scripts/show_base/base_diffsheg_val_partition_contract.py \
     scripts/show_base/run_base_val_inference.py \
     scripts/show_base/evaluate_diffsheg_val_fgd.py \
@@ -241,6 +243,9 @@ for tracked in \
         exit 1
     fi
 done
+
+. "$python_runtime_contract"
+semtalk_require_formal_venv_python "$python_bin" semtalk
 
 cd "$repo_root"
 "$python_bin" "$partition_contract" create-run-root \
