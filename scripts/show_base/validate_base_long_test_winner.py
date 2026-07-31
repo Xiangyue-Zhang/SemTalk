@@ -60,19 +60,30 @@ def validate_test_winner(
     expected_checkpoint_sha256: str,
     candidate_bundle: Mapping[str, Any],
 ) -> dict[str, Any]:
-    selection_resolved, selection, selection_sha = legacy._verified_json(
-        selection_path,
-        expected_selection_sha256,
-        "long Base validation selection",
-    )
-    legacy.reject_test_path(
-        selection_resolved,
-        "long Base validation selection",
-    )
-    _reject_selection_paths(
-        selection,
-        "long Base validation selection",
-    )
+    try:
+        selection_resolved, selection, selection_sha = legacy._verified_json(
+            selection_path,
+            expected_selection_sha256,
+            "long Base validation selection",
+        )
+        legacy.reject_test_path(
+            selection_resolved,
+            "long Base validation selection",
+        )
+        _reject_selection_paths(
+            selection,
+            "long Base validation selection",
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        legacy.SelectionContractError,
+    ) as error:
+        raise TestWinnerContractError(
+            f"long Base selection input is invalid: {error}"
+        ) from error
     measurement_receipts = selection.get("measurement_receipts")
     if (
         not isinstance(measurement_receipts, list)

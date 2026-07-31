@@ -250,7 +250,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         contaminated = self.root / "actual-test" / "selection.json"
         contaminated.parent.mkdir()
         contaminated.write_bytes(self.selection_path.read_bytes())
-        with self.assertRaises(long_contract.SelectionContractError):
+        with self.assertRaises(validator.TestWinnerContractError):
             self._authorize(selection_path=contaminated)
 
     def test_embedded_fgd_must_match_replayed_report(self) -> None:

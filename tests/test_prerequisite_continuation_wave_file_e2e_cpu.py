@@ -326,6 +326,7 @@ def _write_runtime_statuses(
         latest = index["stages"][stage][-1]
         status = {
             "status": "complete",
+            "all_training_state_finite": True,
             "formal_stage": stage,
             "completed_epochs": boundary,
             "updates_per_epoch": contract.updates_per_epoch(stage),

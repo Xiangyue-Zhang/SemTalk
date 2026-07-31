@@ -924,6 +924,7 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
         selected = {}
         audits = {}
         for stage in consumer.STAGES:
+            updates_per_epoch = producer_contract.updates_per_epoch(stage)
             checkpoint = checkpoint_root / f"{stage}.bin"
             checkpoint.write_bytes(stage.encode("ascii"))
             source = {"stage": stage, "frozen": True}
@@ -934,7 +935,7 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                 "format": "semtalk_show_representation_candidate_v1",
                 "formal_stage": stage,
                 "completed_epochs": 20,
-                "optimizer_updates": 20 * 497,
+                "optimizer_updates": 20 * updates_per_epoch,
                 "selection_status": "offline_validation_pending",
                 "source_receipt": source,
                 "config_sha256": config,
@@ -944,7 +945,8 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
             config_sha256[stage] = config
             selected[stage] = {
                 "epoch": 20,
-                "optimizer_updates": 20 * 497,
+                "updates_per_epoch": updates_per_epoch,
+                "optimizer_updates": 20 * updates_per_epoch,
                 "selection_metric": consumer.EXPECTED_METRICS[stage],
                 "selection_score": 0.0,
                 "candidate_audit_sha256": (
