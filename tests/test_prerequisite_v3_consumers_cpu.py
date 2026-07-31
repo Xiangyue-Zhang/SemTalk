@@ -110,10 +110,26 @@ class PerStageConsumerTests(unittest.TestCase):
             "_fresh_local_module",
             return_value=contract,
         ):
+            candidate_epochs = sorted(
+                {epoch for stage_epochs in schedules.values() for epoch in stage_epochs}
+            )
             result = published._validate_continuation_waves(
                 artifacts,
                 prerequisite_selection={
-                    "protocol": {"candidate_epochs_by_stage": schedules}
+                    "format": published.PREREQUISITE_SELECTION_FORMAT,
+                    "protocol": {
+                        "name": "five_independent_show_prerequisite_validation_v2",
+                        "candidate_epochs": candidate_epochs,
+                        "candidate_epochs_by_stage": schedules,
+                        "candidates_per_stage": {
+                            stage: len(schedules[stage]) for stage in STAGES
+                        },
+                        "clips_per_candidate": published.EXPECTED_VAL_CLIPS,
+                        "shards_per_candidate": published.EXPECTED_SHARDS,
+                        "window_length": 64,
+                        "window_stride": 20,
+                        "full_base_fgd_used": False,
+                    },
                 },
             )
         self.assertEqual(result, artifacts)

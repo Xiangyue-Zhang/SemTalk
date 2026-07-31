@@ -307,21 +307,27 @@ value, _ = contract.load_candidate_index(
 print(value["format"])
 print(contract.PARTIAL_CANDIDATE_INDEX_FORMAT)
 print(contract.SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT)
+print(contract.CANDIDATE_INDEX_FORMAT)
+print(contract.SEGMENTED_CANDIDATE_INDEX_FORMAT)
 PY
 )
-if [[ ${#candidate_index_formats[@]} -ne 3 ]]; then
+if [[ ${#candidate_index_formats[@]} -ne 5 ]]; then
     printf 'candidate index format preflight returned incomplete fields\n' >&2
     exit 1
 fi
 candidate_index_format=${candidate_index_formats[0]}
 partial_candidate_index_format=${candidate_index_formats[1]}
 segmented_partial_candidate_index_format=${candidate_index_formats[2]}
+complete_candidate_index_format=${candidate_index_formats[3]}
+segmented_complete_candidate_index_format=${candidate_index_formats[4]}
 IFS=$'\t' read -r candidate_index_authority minimum_plan_jobs \
-    plan_stage_modulus gate_stage < <(
+    legacy_plan_job_modulus gate_stage < <(
         semtalk_prereq_candidate_index_authority \
             "$candidate_index_format" \
             "$partial_candidate_index_format" \
-            "$segmented_partial_candidate_index_format"
+            "$segmented_partial_candidate_index_format" \
+            "$complete_candidate_index_format" \
+            "$segmented_complete_candidate_index_format"
     )
 if [[ "$candidate_index_authority" == partial ]]; then
     case "$partition" in
@@ -345,8 +351,10 @@ if [[ ! -f "$plan_path" || -L "$plan_path" ]]; then
     exit 1
 fi
 mapfile -t candidate_plan <"$plan_path"
-if [[ ${#candidate_plan[@]} -lt "$minimum_plan_jobs" || \
-      $((${#candidate_plan[@]} % plan_stage_modulus)) -ne 0 ]]; then
+if ! semtalk_prereq_plan_job_count_valid \
+    "${#candidate_plan[@]}" \
+    "$minimum_plan_jobs" \
+    "$legacy_plan_job_modulus"; then
     printf 'candidate plan lacks its required complete stage/schedule authority\n' >&2
     exit 1
 fi

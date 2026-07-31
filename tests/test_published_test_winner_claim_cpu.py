@@ -774,6 +774,87 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         ):
             fixture.validate()
 
+    def test_initial_v1_stop_without_continuation_waves_is_accepted(
+        self,
+    ) -> None:
+        fixture = ClaimFixture(Path(self.temporary.name) / "initial-v1-stop")
+        fixture.prerequisite_payload["format"] = (
+            CLAIM.INITIAL_PREREQUISITE_SELECTION_FORMAT
+        )
+        fixture.prerequisite_payload["protocol"] = {
+            "name": "five_independent_show_prerequisite_validation_v1",
+            "candidate_epochs": list(
+                CLAIM.PREREQUISITE_CANDIDATE_EPOCHS
+            ),
+            "candidates_per_stage": len(
+                CLAIM.PREREQUISITE_CANDIDATE_EPOCHS
+            ),
+            "clips_per_candidate": CLAIM.EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": CLAIM.EXPECTED_SHARDS,
+            "window_length": 64,
+            "window_stride": 20,
+            "full_base_fgd_used": False,
+        }
+        fixture.prerequisite_artifact = _write_receipt(
+            Path(fixture.prerequisite_artifact["path"]),
+            fixture.prerequisite_payload,
+        )
+        prerequisite_artifact, prerequisite, _fixed = (
+            CLAIM._validate_prerequisite_selection(
+                fixture.prerequisite_artifact
+            )
+        )
+        fixture.continuation_payload = fixture._continuation_payload("stop")
+        fixture.continuation_artifact = _write_receipt(
+            Path(fixture.continuation_artifact["path"]),
+            fixture.continuation_payload,
+        )
+        _continuation_artifact, decision = (
+            CLAIM._validate_continuation_decision(
+                fixture.continuation_artifact,
+                prerequisite_artifact=prerequisite_artifact,
+                prerequisite_selection=prerequisite,
+            )
+        )
+        self.assertEqual(decision["decision"], "stop")
+        self.assertEqual(
+            CLAIM._validate_continuation_waves(
+                [],
+                prerequisite_selection=prerequisite,
+            ),
+            [],
+        )
+
+    def test_initial_v1_cannot_claim_an_appended_schedule(self) -> None:
+        fixture = ClaimFixture(
+            Path(self.temporary.name) / "initial-v1-appended"
+        )
+        fixture.prerequisite_payload["format"] = (
+            CLAIM.INITIAL_PREREQUISITE_SELECTION_FORMAT
+        )
+        appended = [*CLAIM.PREREQUISITE_CANDIDATE_EPOCHS, 220]
+        fixture.prerequisite_payload["protocol"] = {
+            "name": "five_independent_show_prerequisite_validation_v1",
+            "candidate_epochs": appended,
+            "candidates_per_stage": len(appended),
+            "clips_per_candidate": CLAIM.EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": CLAIM.EXPECTED_SHARDS,
+            "window_length": 64,
+            "window_stride": 20,
+            "full_base_fgd_used": False,
+        }
+        fixture.prerequisite_artifact = _write_receipt(
+            Path(fixture.prerequisite_artifact["path"]),
+            fixture.prerequisite_payload,
+        )
+        with self.assertRaisesRegex(
+            CLAIM.PublishedWinnerClaimError,
+            "initial-v1 schedule must be the mandatory prefix",
+        ):
+            CLAIM._validate_prerequisite_selection(
+                fixture.prerequisite_artifact
+            )
+
     def test_appended_e220_schedule_can_publish_a_fresh_stop(self) -> None:
         fixture = ClaimFixture(Path(self.temporary.name) / "e220-stop")
         fixture.prerequisite_payload["protocol"]["candidate_epochs"].append(
@@ -898,17 +979,24 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             first["path"]: first_receipt,
             second["path"]: second_receipt,
         }
+        extended = [*range(20, 201, 20), 220, 240]
         selection = {
+            "format": CLAIM.PREREQUISITE_SELECTION_FORMAT,
             "protocol": {
-                "candidate_epochs": [
-                    *range(20, 201, 20),
-                    220,
-                    240,
-                ],
+                "name": "five_independent_show_prerequisite_validation_v2",
+                "candidate_epochs": extended,
                 "candidate_epochs_by_stage": {
-                    stage: [*range(20, 201, 20), 220, 240]
+                    stage: list(extended)
                     for stage in CLAIM.STAGES
                 },
+                "candidates_per_stage": {
+                    stage: len(extended) for stage in CLAIM.STAGES
+                },
+                "clips_per_candidate": CLAIM.EXPECTED_VAL_CLIPS,
+                "shards_per_candidate": CLAIM.EXPECTED_SHARDS,
+                "window_length": 64,
+                "window_stride": 20,
+                "full_base_fgd_used": False,
             }
         }
         with (

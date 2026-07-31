@@ -32,6 +32,9 @@ WINNER_SELECTION_FORMAT = (
 PREREQUISITE_SELECTION_FORMAT = (
     "semtalk_show_prerequisite_val_selection_v2"
 )
+INITIAL_PREREQUISITE_SELECTION_FORMAT = (
+    "semtalk_show_prerequisite_val_selection_v1"
+)
 CONTINUATION_DECISION_FORMAT = (
     "semtalk_show_prerequisite_continuation_decision_v2"
 )
@@ -567,6 +570,91 @@ def _validate_checkpoint(value: Any, label: str) -> dict[str, Any]:
     return artifact
 
 
+def _prerequisite_candidate_schedules(
+    selection: Mapping[str, Any],
+    prerequisite_contract: Any,
+) -> tuple[tuple[int, ...], dict[str, tuple[int, ...]]]:
+    """Strictly normalize either formal prerequisite selection protocol."""
+
+    protocol = selection.get("protocol")
+    if not isinstance(protocol, dict):
+        raise PublishedWinnerClaimError(
+            "prerequisite selection protocol mismatch"
+        )
+    try:
+        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
+            protocol.get("candidate_epochs")
+        )
+        if selection.get("format") == INITIAL_PREREQUISITE_SELECTION_FORMAT:
+            if candidate_epochs != PREREQUISITE_CANDIDATE_EPOCHS:
+                raise ValueError(
+                    "initial-v1 schedule must be the mandatory prefix"
+                )
+            candidate_epochs_by_stage = {
+                stage: candidate_epochs for stage in STAGES
+            }
+            expected_protocol = {
+                "name": "five_independent_show_prerequisite_validation_v1",
+                "candidate_epochs": list(candidate_epochs),
+                "candidates_per_stage": len(candidate_epochs),
+                "clips_per_candidate": EXPECTED_VAL_CLIPS,
+                "shards_per_candidate": EXPECTED_SHARDS,
+                "window_length": 64,
+                "window_stride": 20,
+                "full_base_fgd_used": False,
+            }
+        elif selection.get("format") == PREREQUISITE_SELECTION_FORMAT:
+            raw_schedules = protocol.get("candidate_epochs_by_stage")
+            if not isinstance(raw_schedules, dict) or set(
+                raw_schedules
+            ) != set(STAGES):
+                raise ValueError("per-stage schedule coverage mismatch")
+            candidate_epochs_by_stage = {
+                stage: prerequisite_contract.validate_candidate_epochs(
+                    raw_schedules[stage]
+                )
+                for stage in STAGES
+            }
+            if tuple(
+                sorted(
+                    {
+                        epoch
+                        for values in candidate_epochs_by_stage.values()
+                        for epoch in values
+                    }
+                )
+            ) != candidate_epochs:
+                raise ValueError("per-stage schedule union mismatch")
+            expected_protocol = {
+                "name": "five_independent_show_prerequisite_validation_v2",
+                "candidate_epochs": list(candidate_epochs),
+                "candidate_epochs_by_stage": {
+                    stage: list(candidate_epochs_by_stage[stage])
+                    for stage in STAGES
+                },
+                "candidates_per_stage": {
+                    stage: len(candidate_epochs_by_stage[stage])
+                    for stage in STAGES
+                },
+                "clips_per_candidate": EXPECTED_VAL_CLIPS,
+                "shards_per_candidate": EXPECTED_SHARDS,
+                "window_length": 64,
+                "window_stride": 20,
+                "full_base_fgd_used": False,
+            }
+        else:
+            raise ValueError("selection format mismatch")
+    except Exception as error:
+        raise PublishedWinnerClaimError(
+            f"prerequisite candidate schedule is invalid: {error}"
+        ) from error
+    if protocol != expected_protocol:
+        raise PublishedWinnerClaimError(
+            "prerequisite selection protocol mismatch"
+        )
+    return candidate_epochs, candidate_epochs_by_stage
+
+
 def _validate_prerequisite_selection(
     artifact_value: Any,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
@@ -596,7 +684,11 @@ def _validate_prerequisite_selection(
         "prerequisite selection",
     )
     if (
-        selection["format"] != PREREQUISITE_SELECTION_FORMAT
+        selection["format"]
+        not in {
+            INITIAL_PREREQUISITE_SELECTION_FORMAT,
+            PREREQUISITE_SELECTION_FORMAT,
+        }
         or selection["status"] != "selected"
         or selection["target_dataset"] != "SHOW"
         or selection["target_speaker_scope"] != EXPECTED_SCOPE
@@ -605,11 +697,6 @@ def _validate_prerequisite_selection(
     ):
         raise PublishedWinnerClaimError(
             "prerequisite selection identity mismatch"
-        )
-    protocol = selection["protocol"]
-    if not isinstance(protocol, dict):
-        raise PublishedWinnerClaimError(
-            "prerequisite selection protocol mismatch"
         )
     prerequisite_contract = _fresh_local_module(
         "prerequisite_val_contract"
@@ -637,53 +724,12 @@ def _validate_prerequisite_selection(
         raise PublishedWinnerClaimError(
             "prerequisite schedule validator ABI mismatch"
         )
-    try:
-        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
-            protocol.get("candidate_epochs")
+    _candidate_epochs, candidate_epochs_by_stage = (
+        _prerequisite_candidate_schedules(
+            selection,
+            prerequisite_contract,
         )
-        raw_schedules = protocol.get("candidate_epochs_by_stage")
-        if not isinstance(raw_schedules, dict) or set(raw_schedules) != set(STAGES):
-            raise ValueError("per-stage schedule coverage mismatch")
-        candidate_epochs_by_stage = {
-            stage: prerequisite_contract.validate_candidate_epochs(
-                raw_schedules[stage]
-            )
-            for stage in STAGES
-        }
-        if tuple(
-            sorted(
-                {
-                    epoch
-                    for values in candidate_epochs_by_stage.values()
-                    for epoch in values
-                }
-            )
-        ) != candidate_epochs:
-            raise ValueError("per-stage schedule union mismatch")
-    except Exception as error:
-        raise PublishedWinnerClaimError(
-            f"prerequisite candidate schedule is invalid: {error}"
-        ) from error
-    if protocol != {
-        "name": "five_independent_show_prerequisite_validation_v2",
-        "candidate_epochs": list(candidate_epochs),
-        "candidate_epochs_by_stage": {
-            stage: list(candidate_epochs_by_stage[stage])
-            for stage in STAGES
-        },
-        "candidates_per_stage": {
-            stage: len(candidate_epochs_by_stage[stage])
-            for stage in STAGES
-        },
-        "clips_per_candidate": EXPECTED_VAL_CLIPS,
-        "shards_per_candidate": EXPECTED_SHARDS,
-        "window_length": 64,
-        "window_stride": 20,
-        "full_base_fgd_used": False,
-    }:
-        raise PublishedWinnerClaimError(
-            "prerequisite selection protocol mismatch"
-        )
+    )
     if selection["selection_policy"] != {
         "per_stage_independent": True,
         "ordering": [
@@ -844,20 +890,12 @@ def _validate_continuation_decision(
     prerequisite_contract = _fresh_local_module(
         "prerequisite_val_contract"
     )
-    try:
-        raw_schedules = prerequisite_selection["protocol"][
-            "candidate_epochs_by_stage"
-        ]
-        candidate_epochs_by_stage = {
-            stage: prerequisite_contract.validate_candidate_epochs(
-                raw_schedules[stage]
-            )
-            for stage in STAGES
-        }
-    except Exception as error:
-        raise PublishedWinnerClaimError(
-            f"continuation prerequisite schedule is invalid: {error}"
-        ) from error
+    _candidate_epochs, candidate_epochs_by_stage = (
+        _prerequisite_candidate_schedules(
+            prerequisite_selection,
+            prerequisite_contract,
+        )
+    )
     stage_rows = prerequisite_selection["stages"]
     decision_stages = decision["stages"]
     if not isinstance(decision_stages, list) or len(decision_stages) != len(
@@ -988,28 +1026,13 @@ def _validate_continuation_waves(
     *,
     prerequisite_selection: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    protocol = prerequisite_selection.get("protocol")
-    raw_schedules = (
-        protocol.get("candidate_epochs_by_stage")
-        if isinstance(protocol, dict)
-        else None
-    )
     prerequisite_contract = _fresh_local_module(
         "prerequisite_val_contract"
     )
-    try:
-        if not isinstance(raw_schedules, dict) or set(raw_schedules) != set(STAGES):
-            raise ValueError("per-stage schedule coverage mismatch")
-        schedules = {
-            stage: prerequisite_contract.validate_candidate_epochs(
-                raw_schedules[stage]
-            )
-            for stage in STAGES
-        }
-    except Exception as error:
-        raise PublishedWinnerClaimError(
-            f"continuation wave candidate schedule is invalid: {error}"
-        ) from error
+    _candidate_epochs, schedules = _prerequisite_candidate_schedules(
+        prerequisite_selection,
+        prerequisite_contract,
+    )
     if type(values) is not list:
         raise PublishedWinnerClaimError(
             "continuation waves must be a JSON list"
@@ -1747,6 +1770,7 @@ __all__ = [
     "CONTINUATION_DECISION_FORMAT",
     "DISTRIBUTION_FORMAT",
     "EXPECTED_SCOPE",
+    "INITIAL_PREREQUISITE_SELECTION_FORMAT",
     "METRIC_REPORT_FORMAT",
     "PAYLOAD_HASH_ALGORITHM",
     "PREREQUISITE_SELECTION_FORMAT",

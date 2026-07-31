@@ -875,6 +875,42 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                     ],
                 )
 
+    def test_initial_v1_stop_without_continuation_waves_is_accepted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = AuthorityFixture(Path(directory))
+            fixture.prerequisite_selection_payload["format"] = (
+                AUTH.INITIAL_PREREQUISITE_SELECTION_FORMAT
+            )
+            fixture.prerequisite_selection_payload["protocol"] = {
+                "candidate_epochs": list(range(20, 201, 20)),
+                "candidates_per_stage": 10,
+            }
+            with fixture.fresh_control_validators():
+                authority = AUTH.build_test_authority(**fixture.kwargs())
+            self.assertEqual(authority["continuation_waves"], [])
+            self.assertEqual(
+                authority["prerequisite_selection"]["stages"]["face"][
+                    "epoch"
+                ],
+                200,
+            )
+
+    def test_initial_v1_cannot_claim_an_appended_schedule(self) -> None:
+        selection = {
+            "format": AUTH.INITIAL_PREREQUISITE_SELECTION_FORMAT,
+            "protocol": {
+                "candidate_epochs": [*range(20, 201, 20), 220],
+                "candidates_per_stage": 11,
+            },
+        }
+        with self.assertRaisesRegex(
+            AUTH.BaseFinalAuthorityError,
+            "initial-v1 prerequisite schedule is not the mandatory prefix",
+        ):
+            AUTH._prerequisite_candidate_schedules(selection)
+
     def test_self_authored_inference_contract_and_receipts_are_not_api(
         self,
     ) -> None:

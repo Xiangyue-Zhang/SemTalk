@@ -1725,7 +1725,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             source,
         )
 
-    def test_launcher_executes_identical_legacy_and_segmented_partial_policy(
+    def test_launcher_distinguishes_legacy_and_segmented_plan_shape_policy(
         self,
     ) -> None:
         helper = (
@@ -1740,7 +1740,8 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             command = (
                 f"source {shlex.quote(str(helper))}; "
                 "semtalk_prereq_candidate_index_authority "
-                f"{shlex.quote(actual)} legacy-partial segmented-partial"
+                f"{shlex.quote(actual)} legacy-partial segmented-partial "
+                "legacy-complete segmented-complete"
             )
             return subprocess.run(
                 ["bash", "-c", command],
@@ -1755,12 +1756,54 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             authority("segmented-partial"),
-            "partial\t40\t4\tface",
+            "partial\t40\t0\tface",
         )
         self.assertEqual(
-            authority("complete"),
+            authority("legacy-complete"),
             "complete\t50\t5\tglobal",
         )
+        self.assertEqual(
+            authority("segmented-complete"),
+            "complete\t50\t0\tglobal",
+        )
+
+    def test_launcher_accepts_segmented_heterogeneous_plan_counts(
+        self,
+    ) -> None:
+        helper = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "show_base"
+            / "prerequisite_val_launcher_contract.sh"
+        )
+
+        def plan_is_accepted(actual: str, jobs: int) -> bool:
+            policy = (
+                "semtalk_prereq_candidate_index_authority "
+                f"{shlex.quote(actual)} legacy-partial segmented-partial "
+                "legacy-complete segmented-complete"
+            )
+            command = (
+                f"source {shlex.quote(str(helper))}; "
+                "IFS=$'\\t' read -r _ minimum modulus _ "
+                f"<<<\"$({policy})\"; "
+                "semtalk_prereq_plan_job_count_valid "
+                f"{jobs} \"$minimum\" \"$modulus\""
+            )
+            return (
+                subprocess.run(
+                    ["bash", "-c", command],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                == 0
+            )
+
+        self.assertFalse(plan_is_accepted("legacy-partial", 41))
+        self.assertTrue(plan_is_accepted("segmented-partial", 41))
+        self.assertFalse(plan_is_accepted("legacy-complete", 51))
+        self.assertTrue(plan_is_accepted("segmented-complete", 51))
 
     def test_source_policy_accepts_only_global_descendant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

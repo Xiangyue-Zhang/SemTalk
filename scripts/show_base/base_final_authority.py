@@ -27,6 +27,12 @@ ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 OFFICIAL_BASELINE_COMMIT = "806b008c97bf51fce203e54109e4c22325253618"
 CHECKPOINT_STAGES = ("base", "face", "hands", "upper", "lower", "global")
 REPRESENTATION_STAGES = ("face", "hands", "upper", "lower", "global")
+INITIAL_PREREQUISITE_SELECTION_FORMAT = (
+    "semtalk_show_prerequisite_val_selection_v1"
+)
+PER_STAGE_PREREQUISITE_SELECTION_FORMAT = (
+    "semtalk_show_prerequisite_val_selection_v2"
+)
 TEST_GLOBAL_START = 15_402
 TEST_GLOBAL_STOP = 17_110
 TEST_CLIPS = TEST_GLOBAL_STOP - TEST_GLOBAL_START
@@ -1524,6 +1530,92 @@ def _replay_continuation_waves(
     return normalized
 
 
+def _prerequisite_candidate_schedules(
+    selection: Mapping[str, Any],
+) -> dict[str, list[int]]:
+    """Normalize the replayed v1 common or v2 per-stage schedule."""
+
+    mandatory = tuple(range(20, 201, 20))
+
+    def normalize(value: Any, label: str) -> list[int]:
+        if type(value) is not list or any(
+            type(epoch) is not int for epoch in value
+        ):
+            raise BaseFinalAuthorityError(f"{label} is not an integer list")
+        schedule = list(value)
+        if (
+            len(schedule) < len(mandatory)
+            or tuple(schedule[: len(mandatory)]) != mandatory
+            or any(
+                epoch != schedule[index - 1] + 20
+                for index, epoch in enumerate(schedule)
+                if index
+            )
+        ):
+            raise BaseFinalAuthorityError(
+                f"{label} is not the exact append-only +20 schedule"
+            )
+        return schedule
+
+    protocol = selection.get("protocol")
+    selection_format = selection.get("format")
+    if type(protocol) is not dict:
+        raise BaseFinalAuthorityError(
+            "selected-five prerequisite protocol is missing"
+        )
+    common = normalize(
+        protocol.get("candidate_epochs"),
+        "selected-five common prerequisite schedule",
+    )
+    if selection_format == INITIAL_PREREQUISITE_SELECTION_FORMAT:
+        if (
+            tuple(common) != mandatory
+            or "candidate_epochs_by_stage" in protocol
+            or protocol.get("candidates_per_stage") != len(common)
+        ):
+            raise BaseFinalAuthorityError(
+                "initial-v1 prerequisite schedule is not the mandatory prefix"
+            )
+        return {stage: list(common) for stage in REPRESENTATION_STAGES}
+    if selection_format != PER_STAGE_PREREQUISITE_SELECTION_FORMAT:
+        raise BaseFinalAuthorityError(
+            "selected-five prerequisite selection format mismatch"
+        )
+    raw_schedules = protocol.get("candidate_epochs_by_stage")
+    if type(raw_schedules) is not dict or set(raw_schedules) != set(
+        REPRESENTATION_STAGES
+    ):
+        raise BaseFinalAuthorityError(
+            "selected-five per-stage prerequisite schedules are missing"
+        )
+    schedules = {
+        stage: normalize(
+            raw_schedules[stage],
+            f"selected-five {stage} prerequisite schedule",
+        )
+        for stage in REPRESENTATION_STAGES
+    }
+    union = sorted(
+        {
+            epoch
+            for schedule in schedules.values()
+            for epoch in schedule
+        }
+    )
+    if (
+        common != union
+        or protocol.get("candidates_per_stage")
+        != {
+            stage: len(schedules[stage])
+            for stage in REPRESENTATION_STAGES
+        }
+    ):
+        raise BaseFinalAuthorityError(
+            "selected-five per-stage prerequisite schedule union mismatch"
+        )
+    return schedules
+
+
 def _payload_artifact_from_binding(
     value: Mapping[str, Any],
     label: str,
@@ -1666,7 +1758,10 @@ def _control_authority(
     stages = prerequisite_selection.get("stages")
     if (
         prerequisite_selection.get("format")
-        != "semtalk_show_prerequisite_val_selection_v2"
+        not in {
+            INITIAL_PREREQUISITE_SELECTION_FORMAT,
+            PER_STAGE_PREREQUISITE_SELECTION_FORMAT,
+        }
         or prerequisite_selection.get("status") != "selected"
         or prerequisite_selection.get("split") != "val"
         or prerequisite_selection.get("test_visible") is not False
@@ -1709,19 +1804,9 @@ def _control_authority(
         raise BaseFinalAuthorityError(
             "selected-five replay stage coverage mismatch"
         )
-    protocol = prerequisite_selection.get("protocol")
-    candidate_epochs_by_stage = (
-        protocol.get("candidate_epochs_by_stage")
-        if type(protocol) is dict
-        else None
+    candidate_epochs_by_stage = _prerequisite_candidate_schedules(
+        prerequisite_selection
     )
-    if (
-        type(candidate_epochs_by_stage) is not dict
-        or set(candidate_epochs_by_stage) != set(REPRESENTATION_STAGES)
-    ):
-        raise BaseFinalAuthorityError(
-            "selected-five per-stage prerequisite schedules are missing"
-        )
     decision_stages = replayed_continuation.get("stages")
     caps = {
         "face": 600,
