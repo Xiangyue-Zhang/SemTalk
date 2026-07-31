@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
+
+from scripts.show_base import base_fresh_probe_producer as PRODUCER
 from scripts.show_base import base_fresh_val_orchestrator as ORCHESTRATOR
 from scripts.show_base import published_test_winner_claim as AUTHORITY
 
@@ -42,8 +48,15 @@ def _write_json(path: Path, value: object) -> dict[str, object]:
 def _write_jsonl(
     path: Path, rows: list[dict[str, object]]
 ) -> dict[str, object]:
-    payload = b"".join(_canonical_bytes(row) for row in rows)
-    return _write_bytes(path, payload)
+    return _write_bytes(
+        path, b"".join(_canonical_bytes(row) for row in rows)
+    )
+
+
+def _write_npy(path: Path, value: np.ndarray) -> dict[str, object]:
+    buffer = io.BytesIO()
+    np.save(buffer, value, allow_pickle=False)
+    return _write_bytes(path, buffer.getvalue())
 
 
 def _write_receipt(
@@ -61,31 +74,27 @@ def _write_receipt(
     return artifact
 
 
-def _payload_args(prefix: str, artifact: dict[str, object]) -> list[str]:
-    return [
-        f"--{prefix}-path",
-        str(artifact["path"]),
-        f"--{prefix}-sha256",
-        str(artifact["sha256"]),
-        f"--{prefix}-payload-sha256",
-        str(artifact["receipt_payload_sha256"]),
-    ]
+def _argv_sha(argv: list[str]) -> str:
+    return hashlib.sha256(
+        b"\0".join(os.fsencode(item) for item in argv) + b"\0"
+    ).hexdigest()
 
 
-def _plain_args(prefix: str, artifact: dict[str, object]) -> list[str]:
-    return [
-        f"--{prefix}-path",
-        str(artifact["path"]),
-        f"--{prefix}-sha256",
-        str(artifact["sha256"]),
-        f"--{prefix}-bytes",
-        str(artifact["bytes"]),
-    ]
-
-
-class ProbeFixture:
+class ProducerFixture:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
+        (self.root / "runs").mkdir()
+        self.spec_registry: dict[
+            str,
+            tuple[
+                dict[str, object],
+                dict[str, object],
+                dict[str, object],
+            ],
+        ] = {}
+        self.behavior: dict[str, object] = {}
+        self.elapsed_seconds = 120
+        self.fake_pid = 41000
         self.source = {
             "origin": AUTHORITY.EXPECTED_ORIGIN,
             "commit": "1" * 40,
@@ -102,12 +111,13 @@ class ProbeFixture:
                 "split": "val",
                 "test_visible": False,
                 "generator_module": ORCHESTRATOR.GENERATOR_MODULE,
+                "source_closure": {},
             },
         )
         self.prerequisite = _write_receipt(
-            self.root / "prerequisite.json",
+            self.root / "selected-five.json",
             {
-                "format": "semtalk_show_base_probe_prerequisite_fixture_v1",
+                "format": "semtalk_show_selected_five_fixture_v1",
                 "status": "selected",
                 "target_dataset": "SHOW",
                 "target_speaker_scope": AUTHORITY.EXPECTED_SCOPE,
@@ -118,7 +128,7 @@ class ProbeFixture:
         self.val_inputs = _write_receipt(
             self.root / "val-inputs.json",
             {
-                "format": "semtalk_show_base_probe_val_inputs_fixture_v1",
+                "format": "semtalk_show_base_val_inputs_fixture_v1",
                 "status": "frozen",
                 "dataset": "SHOW",
                 "target_speaker_scope": AUTHORITY.EXPECTED_SCOPE,
@@ -164,23 +174,323 @@ class ProbeFixture:
             ),
             "shards_per_candidate": AUTHORITY.EXPECTED_SHARDS,
         }
+        self.executables = {}
+        for name in ("python", "quality-producer", "runner", "nvidia-smi"):
+            path = self.root / "bin" / name
+            artifact = _write_bytes(path, b"#!/bin/sh\nexit 0\n")
+            path.chmod(0o700)
+            self.executables[name] = artifact
+        self.lmdb = {
+            role: _write_bytes(
+                self.root / "lmdb" / f"{role}.bin",
+                f"SHOW LMDB {role}\n".encode("ascii"),
+            )
+            for role in ("summary", "data", "lock")
+        }
+        self.candidate_bundle = {
+            role: _write_bytes(
+                self.root / "candidate-bundle" / f"{role}.json",
+                _canonical_bytes({"fixture_role": role}),
+            )
+            for role in ("manifest", "status", "frozen_inputs")
+        }
+        self.training_metric_rows = [
+            {
+                "format": "semtalk_show_base_long_epoch_metric_v1",
+                "epoch": epoch,
+                "optimizer_updates": epoch * 248,
+                "updates_per_epoch": 248,
+                "metrics": {"total": 1.0 / float(epoch + 1)},
+                "all_finite": True,
+            }
+            for epoch in range(1, 401)
+        ]
+        self.training_metrics = _write_jsonl(
+            self.root / "training" / "epoch-metrics.jsonl",
+            self.training_metric_rows,
+        )
+        self.candidate_bundle["status"] = _write_json(
+            Path(self.candidate_bundle["status"]["path"]),
+            {
+                "status": "complete",
+                "epoch_metrics_jsonl": self.training_metrics["path"],
+                "epoch_metrics_sha256": self.training_metrics["sha256"],
+                "epoch_metrics_records": 400,
+            },
+        )
+        self.feature_extractor = _write_bytes(
+            self.root / "metric-assets" / "feature-extractor.pth",
+            b"CPU fixture TalkSHOW feature extractor\n",
+        )
+        self.smplx_asset = _write_bytes(
+            self.root / "metric-assets" / "SMPLX_NEUTRAL_2020.npz",
+            b"CPU fixture SMPL-X asset\n",
+        )
+        self.ground_truth = _write_bytes(
+            self.root / "ground-truth" / "shared-val-ground-truth.npz",
+            b"CPU fixture canonical SHOW validation ground truth\n",
+        )
+        self.metric_assets = {
+            "talkshow_metric_root": str(
+                (self.root / "metric-assets" / "talkshow").resolve()
+            ),
+            "talkshow_source": {},
+            "feature_extractor": self.feature_extractor,
+            "smplx_asset": self.smplx_asset,
+        }
 
-    def candidate_outputs(
-        self, tag: str, *, changed_prediction: bool = False
-    ) -> list[dict[str, object]]:
-        outputs = []
-        for epoch in ORCHESTRATOR.PROBE_EPOCHS:
-            rows = []
-            for index, subset_row in enumerate(self.subset_rows):
-                suffix = "-changed" if changed_prediction and index == 0 else ""
-                prediction = _write_bytes(
-                    self.root
-                    / tag
-                    / f"e{epoch}"
-                    / f"prediction-{index:03d}.npy",
-                    f"e{epoch}-clip-{index:03d}{suffix}\n".encode("ascii"),
+    def execution_spec(
+        self,
+        tag: str,
+        *,
+        host: str,
+        candidates_per_wave: int,
+        execution_mode: str,
+        representation_lmdb: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        quality = _write_receipt(
+            self.root / "specs" / f"{tag}-quality.json",
+            {
+                "format": PRODUCER.QUALITY_INPUT_FORMAT,
+                "status": "frozen",
+                "dataset": "SHOW",
+                "target_speaker_scope": AUTHORITY.EXPECTED_SCOPE,
+                "split": "val",
+                "test_visible": False,
+                "source": self.binding["source"],
+                "pipeline": self.binding["pipeline"],
+                "selected_five_authority": self.binding[
+                    "prerequisite_selection"
+                ],
+                "candidate_bundle": self.candidate_bundle,
+                "val_inputs": self.binding["val_inputs"],
+                "representation_lmdb": representation_lmdb or self.lmdb,
+                "training_metrics": self.training_metrics,
+                "metric_assets": self.metric_assets,
+                "topology": {
+                    "world_size": 8,
+                    "physical_gpus": list(PRODUCER.EXPECTED_GPUS),
+                    "candidates_per_wave": candidates_per_wave,
+                    "execution_mode": execution_mode,
+                    "seed": self.binding["seed"],
+                    "clips_per_candidate": self.binding[
+                        "clips_per_candidate"
+                    ],
+                    "shards_per_candidate": self.binding[
+                        "shards_per_candidate"
+                    ],
+                },
+            },
+        )
+        spec_artifact = _write_receipt(
+            self.root / "specs" / f"{tag}-execution.json",
+            {
+                "format": PRODUCER.EXECUTION_SPEC_FORMAT,
+                "status": "frozen",
+                "split": "val",
+                "test_visible": False,
+                "formal_host": host,
+                "candidates_per_wave": candidates_per_wave,
+                "execution_mode": execution_mode,
+                "probe_binding": self.binding,
+                "quality_input": quality,
+                "source_root": str(self.root),
+                "python": self.executables["python"],
+                "quality_producer": self.executables["quality-producer"],
+                "runner": {
+                    **self.executables["runner"],
+                    "path": str(PRODUCER.EXPECTED_RUNNER),
+                },
+                "nvidia_smi": self.executables["nvidia-smi"],
+            },
+        )
+        _artifact, spec = PRODUCER._payload_artifact(
+            spec_artifact, "CPU execution spec fixture"
+        )
+        self.spec_registry[str(spec_artifact["path"])] = (
+            copy.deepcopy(spec_artifact),
+            copy.deepcopy(spec),
+            copy.deepcopy(self.binding),
+        )
+        return spec_artifact
+
+    def validate_execution_spec(
+        self, artifact: dict[str, object]
+    ) -> tuple[
+        dict[str, object], dict[str, object], dict[str, object]
+    ]:
+        normalized, _value = PRODUCER._payload_artifact(
+            artifact, "CPU execution spec fixture"
+        )
+        registered = self.spec_registry.get(normalized["path"])
+        if registered is None or registered[0] != normalized:
+            raise PRODUCER.ProbeProducerError(
+                "unregistered CPU execution spec fixture"
+            )
+        PRODUCER._payload_artifact(
+            registered[1]["quality_input"], "CPU quality input fixture"
+        )
+        return copy.deepcopy(registered)
+
+    def replay_context(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch.object(
+                PRODUCER,
+                "validate_execution_spec",
+                side_effect=self.validate_execution_spec,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                PRODUCER, "_execution_input_closure", return_value=[]
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                PRODUCER,
+                "_validate_full_inference_lineage",
+                side_effect=self.validate_full_inference_lineage,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                PRODUCER,
+                "_validate_workload_execution",
+                side_effect=self.validate_workload_execution,
+            )
+        )
+        return stack
+
+    def validate_full_inference_lineage(
+        self,
+        *,
+        lineage_artifact: dict[str, object],
+        lineage: dict[str, object],
+        epoch: int,
+        checkpoint: dict[str, object],
+        binding: dict[str, object],
+        workload_root: Path,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        del lineage_artifact, checkpoint, binding
+        reference = lineage["final_manifest"]
+        full_manifest = PRODUCER._output_artifact(
+            Path(reference["path"]),
+            f"CPU Base e{epoch} full prediction manifest",
+        )
+        if any(
+            full_manifest[key] != reference[key]
+            for key in ("path", "sha256", "bytes")
+        ):
+            raise PRODUCER.ProbeProducerError(
+                "CPU full prediction manifest reference changed"
+            )
+        Path(full_manifest["path"]).relative_to(workload_root)
+        rows = AUTHORITY._strict_jsonl_bytes(
+            Path(full_manifest["path"]).read_bytes(),
+            f"CPU Base e{epoch} full prediction manifest",
+        )
+        if len(rows) != ORCHESTRATOR.EXPECTED_CLIPS:
+            raise PRODUCER.ProbeProducerError(
+                "CPU full prediction coverage changed"
+            )
+        return full_manifest, rows
+
+    def validate_workload_execution(
+        self,
+        value: dict[str, object],
+        *,
+        execution_spec: dict[str, object],
+        binding: dict[str, object],
+        workload_root: Path,
+    ) -> tuple[
+        dict[str, object],
+        dict[int, dict[str, dict[str, object]]],
+        set[str],
+    ]:
+        artifact, receipt = PRODUCER._payload_artifact(
+            value, "CPU probe workload execution"
+        )
+        if (
+            receipt.get("format") != PRODUCER.WORKLOAD_EXECUTION_FORMAT
+            or receipt.get("status") != "complete"
+            or receipt.get("split") != "val"
+            or receipt.get("test_visible") is not False
+            or receipt.get("formal_host")
+            != execution_spec["formal_host"]
+            or receipt.get("candidates_per_wave")
+            != execution_spec["candidates_per_wave"]
+            or receipt.get("execution_mode")
+            != execution_spec["execution_mode"]
+            or receipt.get("probe_binding_sha256")
+            != AUTHORITY.canonical_json_sha256(binding)
+            or receipt.get("quality_input")
+            != execution_spec["quality_input"]
+            or artifact["path"]
+            != str(workload_root / "workload-execution.json")
+        ):
+            raise PRODUCER.ProbeProducerError(
+                "CPU workload execution identity changed"
+            )
+        candidates = receipt.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != len(
+            ORCHESTRATOR.PROBE_EPOCHS
+        ):
+            raise PRODUCER.ProbeProducerError(
+                "CPU workload execution coverage changed"
+            )
+        by_epoch: dict[int, dict[str, dict[str, object]]] = {}
+        for expected_epoch, row in zip(
+            ORCHESTRATOR.PROBE_EPOCHS, candidates
+        ):
+            if row.get("epoch") != expected_epoch:
+                raise PRODUCER.ProbeProducerError(
+                    "CPU workload execution order changed"
                 )
-                rows.append(
+            lineage_artifact, _lineage = PRODUCER._payload_artifact(
+                row["inference_lineage"],
+                f"CPU Base e{expected_epoch} execution lineage",
+            )
+            full_manifest = PRODUCER._output_artifact(
+                Path(row["full_prediction_manifest"]["path"]),
+                f"CPU Base e{expected_epoch} execution full manifest",
+            )
+            if full_manifest != row["full_prediction_manifest"]:
+                raise PRODUCER.ProbeProducerError(
+                    "CPU workload execution full manifest changed"
+                )
+            by_epoch[expected_epoch] = {
+                "inference_lineage": lineage_artifact,
+                "full_prediction_manifest": full_manifest,
+            }
+        return artifact, by_epoch, {artifact["path"]}
+
+    def _candidate_ready(
+        self,
+        *,
+        root: Path,
+        spec: dict[str, object],
+    ) -> dict[str, object]:
+        candidates = []
+        executed_candidates = []
+        real = np.arange(64 * 6, dtype=np.float64).reshape(64, 6) / 100.0
+        checkpoints = {
+            row["epoch"]: row["candidate_checkpoint"]
+            for row in self.binding["candidate_checkpoints"]
+        }
+        for epoch in ORCHESTRATOR.PROBE_EPOCHS:
+            prediction_rows = []
+            for index, subset_row in enumerate(self.subset_rows):
+                prediction = _write_bytes(
+                    (
+                        self.root / "external-predictions"
+                        if self.behavior.get("external_prediction")
+                        else root / f"e{epoch}" / "predictions"
+                    )
+                    / f"{epoch}-{index:03d}.npy",
+                    f"Base-e{epoch}-clip-{index:03d}\n".encode("ascii"),
+                )
+                prediction_rows.append(
                     {
                         "canonical_clip_id": subset_row[
                             "canonical_clip_id"
@@ -188,75 +498,345 @@ class ProbeFixture:
                         "prediction": prediction,
                     }
                 )
-            manifest = _write_jsonl(
-                self.root / tag / f"prediction-e{epoch}.jsonl", rows
+            prediction_manifest = _write_jsonl(
+                root / f"e{epoch}" / "prediction-manifest.jsonl",
+                prediction_rows,
             )
-            metric = ORCHESTRATOR.build_probe_metric(
-                epoch=epoch,
-                checkpoint=self.checkpoints[epoch],
-                subset_manifest=self.subset,
-                prediction_manifest=manifest,
-                metric_values={
-                    "body.released2.metrics.FGD": epoch / 100.0,
-                    "body.released2.metrics.BC": 1.0 - epoch / 100.0,
+            full_prediction_rows = [
+                {
+                    "global_index": index,
+                    "canonical_clip_id": row["canonical_clip_id"],
+                    "frames": 120,
+                    "epoch": epoch,
+                    "candidate_checkpoint_sha256": checkpoints[epoch][
+                        "sha256"
+                    ],
+                    "prediction": row["prediction"],
+                    "ground_truth": self.ground_truth,
+                }
+                for index, row in enumerate(prediction_rows)
+            ]
+            full_prediction_rows.extend(
+                {
+                    "global_index": index,
+                    "canonical_clip_id": (
+                        f"all-speakers-val-{index:04d}"
+                    ),
+                    "frames": 120,
+                    "epoch": epoch,
+                    "candidate_checkpoint_sha256": checkpoints[epoch][
+                        "sha256"
+                    ],
+                    "prediction": prediction_rows[-1]["prediction"],
+                    "ground_truth": self.ground_truth,
+                }
+                for index in range(
+                    ORCHESTRATOR.PROBE_CLIPS_PER_CANDIDATE,
+                    ORCHESTRATOR.EXPECTED_CLIPS,
+                )
+            )
+            full_prediction_manifest = _write_jsonl(
+                root / f"e{epoch}" / "final_manifest.jsonl",
+                full_prediction_rows,
+            )
+            real_features = _write_npy(
+                root / f"e{epoch}" / "real-features.npy", real
+            )
+            generated_features = _write_npy(
+                root / f"e{epoch}" / "generated-features.npy",
+                np.repeat(
+                    real + float(epoch) / 1000.0,
+                    2,
+                    axis=0,
+                ),
+            )
+            feature_manifest = _write_jsonl(
+                root / f"e{epoch}" / "feature-manifest.jsonl",
+                [
+                    {
+                        "canonical_clip_id": row["canonical_clip_id"],
+                        "real_start": index,
+                        "real_rows": 1,
+                        "generated_start": 2 * index,
+                        "generated_rows": 2,
+                    }
+                    for index, row in enumerate(self.subset_rows)
+                ],
+            )
+            trajectory = _write_jsonl(
+                root / f"e{epoch}" / "training-trajectory.jsonl",
+                [
+                    {
+                        "optimizer_update": row["optimizer_updates"],
+                        "loss": row["metrics"]["total"],
+                    }
+                    for row in self.training_metric_rows[:epoch]
+                ],
+            )
+            inference_lineage = _write_receipt(
+                root / f"e{epoch}" / "inference-lineage.json",
+                {
+                    "format": (
+                        ORCHESTRATOR.val_contract.VAL_INFERENCE_LINEAGE_FORMAT
+                    ),
+                    "status": "complete",
+                    "split": "val",
+                    "test_visible": False,
+                    "epoch": epoch,
+                    "candidate_checkpoint": {
+                        "path": checkpoints[epoch]["path"],
+                        "sha256": checkpoints[epoch]["sha256"],
+                    },
+                    "val_inputs_receipt": self.binding["val_inputs"],
+                    "pipeline_receipt": self.binding["pipeline"],
+                    "clip_count": ORCHESTRATOR.EXPECTED_CLIPS,
+                    "prediction_files": ORCHESTRATOR.EXPECTED_CLIPS,
+                    "ground_truth_files": ORCHESTRATOR.EXPECTED_CLIPS,
+                    "exact_once": True,
+                    "finite": True,
+                    "final_manifest": full_prediction_manifest,
                 },
             )
-            metric_artifact = _write_receipt(
-                self.root / tag / f"metric-e{epoch}.json", metric
+            native = _write_receipt(
+                root / f"e{epoch}" / "trainer-native.json",
+                {
+                    "format": PRODUCER.TRAINER_NATIVE_FORMAT,
+                    "status": "complete",
+                    "split": "val",
+                    "test_visible": False,
+                    "epoch": epoch,
+                    "candidate_checkpoint": checkpoints[epoch],
+                    "subset_manifest": self.binding["subset_manifest"],
+                    "prediction_manifest": prediction_manifest,
+                    "quality_input": spec["quality_input"],
+                    "inference_lineage": inference_lineage,
+                    "real_features": real_features,
+                    "generated_features": generated_features,
+                    "feature_manifest": feature_manifest,
+                    "training_trajectory": trajectory,
+                },
             )
-            outputs.append(
+            candidates.append(native)
+            executed_candidates.append(
                 {
                     "epoch": epoch,
-                    "candidate_checkpoint": copy.deepcopy(
-                        self.checkpoints[epoch]
-                    ),
-                    "prediction_manifest": manifest,
-                    "metric_receipt": metric_artifact,
+                    "inference_lineage": inference_lineage,
+                    "full_prediction_manifest": full_prediction_manifest,
                 }
             )
-        return outputs
-
-    def capture(
-        self,
-        tag: str,
-        *,
-        host: str,
-        candidates_per_wave: int,
-        execution_mode: str,
-        elapsed_seconds: int,
-        outputs: list[dict[str, object]] | None = None,
-        process: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        if outputs is None:
-            outputs = self.candidate_outputs(tag)
-        if process is None:
-            process = {
-                "runner_rc": 0,
-                "oom": False,
-                "descendants_exited": True,
-                "guards_restored": True,
-            }
-        captured = {
-            "format": ORCHESTRATOR.MULTICANDIDATE_PROBE_RUN_INPUT_FORMAT,
-            "status": "captured",
-            "split": "val",
-            "test_visible": False,
-            "formal_host": host,
-            "candidates_per_wave": candidates_per_wave,
-            "execution_mode": execution_mode,
-            "probe_binding": copy.deepcopy(self.binding),
-            "candidate_outputs": outputs,
-            "execution_trace": {
-                "started_monotonic_ns": 10_000_000_000,
-                "finished_monotonic_ns": (
-                    10_000_000_000 + elapsed_seconds * 1_000_000_000
+        workload_execution = _write_receipt(
+            root / "workload-execution.json",
+            {
+                "format": PRODUCER.WORKLOAD_EXECUTION_FORMAT,
+                "status": "complete",
+                "split": "val",
+                "test_visible": False,
+                "formal_host": spec["formal_host"],
+                "candidates_per_wave": spec["candidates_per_wave"],
+                "execution_mode": spec["execution_mode"],
+                "probe_binding_sha256": AUTHORITY.canonical_json_sha256(
+                    self.binding
                 ),
-                "gpu_peak_memory_bytes": [70] * AUTHORITY.EXPECTED_SHARDS,
-                "gpu_total_memory_bytes": [100] * AUTHORITY.EXPECTED_SHARDS,
+                "quality_input": spec["quality_input"],
+                "prepare": {},
+                "candidates": executed_candidates,
             },
-            "process_evidence": process,
+        )
+        return _write_receipt(
+            root / "candidate-ready.json",
+            {
+                "format": PRODUCER.CANDIDATE_READY_FORMAT,
+                "status": "complete",
+                "split": "val",
+                "test_visible": False,
+                "formal_host": spec["formal_host"],
+                "candidates_per_wave": spec["candidates_per_wave"],
+                "execution_mode": spec["execution_mode"],
+                "probe_binding_sha256": AUTHORITY.canonical_json_sha256(
+                    self.binding
+                ),
+                "quality_input": spec["quality_input"],
+                "workload_execution": workload_execution,
+                "candidates": candidates,
+            },
+        )
+
+    def fake_execute(self, **kwargs: object) -> PRODUCER.ObservedExecution:
+        runner_argv = list(kwargs["runner_argv"])
+        workload_argv = list(kwargs["workload_argv"])
+        root = Path(kwargs["root"])
+        spec_sha = workload_argv[
+            workload_argv.index("--execution-spec-sha256") + 1
+        ]
+        public_spec_path = next(
+            path
+            for path, (artifact, spec, _binding) in self.spec_registry.items()
+            if artifact["sha256"] == spec_sha
+            and spec["formal_host"]
+            == workload_argv[workload_argv.index("--formal-host") + 1]
+            and str(spec["candidates_per_wave"])
+            == workload_argv[
+                workload_argv.index("--candidates-per-wave") + 1
+            ]
+            and spec["execution_mode"]
+            == workload_argv[workload_argv.index("--execution-mode") + 1]
+        )
+        spec = self.spec_registry[public_spec_path][1]
+        workload_root = root / "workload"
+        self._candidate_ready(root=workload_root, spec=spec)
+
+        self.fake_pid += 100
+        runner_pid = self.fake_pid
+        child_pid = runner_pid + 1
+        restored = {
+            str(index): runner_pid + 10 + index
+            for index in PRODUCER.EXPECTED_GPUS
         }
-        return _write_receipt(self.root / f"{tag}-capture.json", captured)
+        return_code = int(self.behavior.get("runner_rc", 0))
+        status = {
+            "state": "finished",
+            "return_code": return_code,
+            "error": None,
+            "cleanup_error": None,
+            "restore_error": None,
+            "received_signal": None,
+            "command": workload_argv,
+            "wrapper_pid": runner_pid,
+            "child_pid": child_pid,
+            "restored_guards": restored,
+        }
+        if not self.behavior.get("missing_status"):
+            _write_json(root / "runner-status.json", status)
+        log_payload = (
+            b"CUDA out of memory\n"
+            if self.behavior.get("oom_log")
+            else b"guarded probe complete\n"
+        )
+        _write_bytes(root / "runner.log", log_payload)
+        if not self.behavior.get("missing_stdout"):
+            _write_bytes(root / "runner.stdout", b"quality probe complete\n")
+        _write_bytes(root / "runner.stderr", b"")
+        started = 1_000_000_000
+        finished = started + self.elapsed_seconds * 1_000_000_000
+        if self.behavior.get("bad_timing"):
+            finished = started
+        peaks = [70] * len(PRODUCER.EXPECTED_GPUS)
+        totals = [100] * len(PRODUCER.EXPECTED_GPUS)
+        if self.behavior.get("bad_memory"):
+            peaks[0] = 101
+        sample_stamp = started + 1 if finished > started else started
+        telemetry = ORCHESTRATOR._with_payload_sha(
+            {
+                "format": PRODUCER.MEMORY_TELEMETRY_FORMAT,
+                "status": "complete",
+                "gpu_indices": list(PRODUCER.EXPECTED_GPUS),
+                "samples": [
+                    {
+                        "monotonic_ns": sample_stamp,
+                        "used_bytes": peaks,
+                    }
+                ],
+                "peak_memory_bytes": peaks,
+                "total_memory_bytes": totals,
+            }
+        )
+        telemetry_artifact = ORCHESTRATOR._write_new(
+            root / "memory-telemetry.json", telemetry
+        )
+        runner_identity = {
+            "pid": runner_pid,
+            "ppid": 40000,
+            "pgid": runner_pid,
+            "sid": 40000,
+            "starttime_ticks": 1234,
+            "argv": runner_argv,
+            "argv_sha256": _argv_sha(runner_argv),
+        }
+        child_identity = {
+            "pid": child_pid,
+            "ppid": runner_pid,
+            "pgid": runner_pid,
+            "sid": 40000,
+            "starttime_ticks": 1235,
+            "argv": workload_argv,
+            "argv_sha256": _argv_sha(workload_argv),
+        }
+        guard_identities = {}
+        for index in PRODUCER.EXPECTED_GPUS:
+            argv = [
+                "python",
+                "globaldiff_gpu_guard_cnn",
+                "torchvision",
+                "resnet18",
+                str(index),
+            ]
+            if self.behavior.get("fake_guard") and index == 0:
+                argv = ["python", "fake_guard", "0"]
+            guard_identities[str(index)] = {
+                "pid": restored[str(index)],
+                "ppid": runner_identity["ppid"],
+                "pgid": restored[str(index)],
+                "sid": restored[str(index)],
+                "starttime_ticks": 2000 + index,
+                "argv": argv,
+                "argv_sha256": _argv_sha(argv),
+            }
+        guard_verification = {
+            "restored_guards": restored,
+            "guard_identities": guard_identities,
+            "guard_executables": {
+                str(index): (
+                    self.executables["quality-producer"]
+                    if self.behavior.get("fake_guard_executable")
+                    and index == 0
+                    else spec["python"]
+                )
+                for index in PRODUCER.EXPECTED_GPUS
+            },
+            "nvidia_smi_compute_rows_sha256": "a" * 64,
+            "nvidia_smi_uuid_rows_sha256": "b" * 64,
+        }
+        if self.behavior.get("swap_input"):
+            replacement = Path(public_spec_path).with_suffix(".replacement")
+            replacement.write_bytes(b"{}\n")
+            os.replace(replacement, public_spec_path)
+        if self.behavior.get("swap_root"):
+            moved = root.with_name(root.name + ".moved")
+            root.rename(moved)
+            root.mkdir()
+        return PRODUCER.ObservedExecution(
+            started_monotonic_ns=started,
+            finished_monotonic_ns=finished,
+            gpu_peak_memory_bytes=peaks,
+            gpu_total_memory_bytes=totals,
+            runner_return_code=return_code,
+            oom_observed=bool(self.behavior.get("fake_oom", False)),
+            descendants_exited=not bool(
+                self.behavior.get("live_descendant", False)
+            ),
+            runner_identity=runner_identity,
+            observed_descendants=[
+                child_identity,
+                *guard_identities.values(),
+            ],
+            status_artifact=PRODUCER._output_artifact(
+                root / "runner-status.json", "fake runner status"
+            ),
+            log_artifact=PRODUCER._output_artifact(
+                root / "runner.log", "fake runner log"
+            ),
+            stdout_artifact=PRODUCER._output_artifact(
+                root / "runner.stdout", "fake runner stdout"
+            ),
+            stderr_artifact=PRODUCER._output_artifact(
+                root / "runner.stderr",
+                "fake runner stderr",
+                allow_empty=True,
+            ),
+            telemetry_artifact=telemetry_artifact,
+            status=status,
+            guard_verification=guard_verification,
+        )
 
     def run(
         self,
@@ -266,27 +846,40 @@ class ProbeFixture:
         candidates_per_wave: int,
         execution_mode: str,
         elapsed_seconds: int,
-        outputs: list[dict[str, object]] | None = None,
+        behavior: dict[str, object] | None = None,
+        representation_lmdb: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        captured = self.capture(
+        spec = self.execution_spec(
             tag,
             host=host,
             candidates_per_wave=candidates_per_wave,
             execution_mode=execution_mode,
-            elapsed_seconds=elapsed_seconds,
-            outputs=outputs,
+            representation_lmdb=representation_lmdb,
         )
-        run = ORCHESTRATOR.build_probe_run(captured)
-        return _write_receipt(self.root / f"{tag}-run.json", run)
+        output_root = self.root / "runs" / tag
+        self.behavior = behavior or {}
+        self.elapsed_seconds = elapsed_seconds
+        try:
+            with self.replay_context(), mock.patch.object(
+                PRODUCER.FormalExecutionBackend,
+                "execute",
+                side_effect=self.fake_execute,
+            ):
+                run = PRODUCER.run_and_seal_probe(
+                    spec, output_root=output_root
+                )
+        finally:
+            self.behavior = {}
+        return _write_receipt(output_root / "probe-run.json", run)
 
     def comparison_matrix(self) -> list[dict[str, object]]:
         comparisons = []
-        concurrent_elapsed = {1: 90, 2: 55, 4: 40}
+        elapsed = {1: 90, 2: 55, 4: 40}
         for host_index, host in enumerate(
             ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values()
         ):
             serial = self.run(
-                f"h{host_index}-serial",
+                f"host{host_index}-serial",
                 host=host,
                 candidates_per_wave=1,
                 execution_mode="serial",
@@ -294,20 +887,24 @@ class ProbeFixture:
             )
             for mode in ORCHESTRATOR.CONCURRENCY_SELECTION_ORDER:
                 concurrent = self.run(
-                    f"h{host_index}-c{mode}",
+                    f"host{host_index}-c{mode}",
                     host=host,
                     candidates_per_wave=mode,
                     execution_mode="concurrent",
-                    elapsed_seconds=concurrent_elapsed[mode] + host_index,
+                    elapsed_seconds=elapsed[mode] + host_index,
                 )
-                comparison = ORCHESTRATOR.build_multicandidate_comparison(
-                    serial_run=serial,
-                    concurrent_run=concurrent,
-                )
+                with self.replay_context():
+                    comparison = (
+                        ORCHESTRATOR.build_multicandidate_comparison(
+                            serial_run=serial,
+                            concurrent_run=concurrent,
+                        )
+                    )
                 comparisons.append(
                     _write_receipt(
                         self.root
-                        / f"h{host_index}-c{mode}-comparison.json",
+                        / "comparisons"
+                        / f"host{host_index}-c{mode}.json",
                         comparison,
                     )
                 )
@@ -315,127 +912,9 @@ class ProbeFixture:
 
 
 class BaseFreshConcurrencyProducerCpuTests(unittest.TestCase):
-    def test_probe_metric_and_probe_run_cli_are_create_new(self) -> None:
+    def test_caller_scalar_and_capture_producers_are_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            fixture = ProbeFixture(Path(raw))
-            outputs = fixture.candidate_outputs("cli-probe")
-            first = outputs[0]
-            values = _write_json(
-                fixture.root / "cli-metric-values.json",
-                {
-                    "body.released2.metrics.FGD": 0.01,
-                    "body.released2.metrics.BC": 0.99,
-                },
-            )
-            metric_output = fixture.root / "cli-probe-metric.json"
-            argv = ["build-probe-metric", "--epoch", "1"]
-            argv += _plain_args("checkpoint", fixture.checkpoints[1])
-            argv += _plain_args("subset-manifest", fixture.subset)
-            argv += _plain_args(
-                "prediction-manifest", first["prediction_manifest"]
-            )
-            argv += _plain_args("metric-values", values)
-            argv += ["--output-json", str(metric_output)]
-            self.assertEqual(ORCHESTRATOR.main(argv), 0)
-            metric_artifact, metric = ORCHESTRATOR._artifact(
-                metric_output, payload_receipt=True
-            )
-            ORCHESTRATOR._probe_metric(
-                metric_artifact,
-                epoch=1,
-                checkpoint=fixture.checkpoints[1],
-                prediction_manifest=first["prediction_manifest"],
-                subset_manifest=fixture.subset,
-            )
-            self.assertEqual(metric["split"], "val")
-            with self.assertRaises(FileExistsError):
-                ORCHESTRATOR.main(argv)
-
-            capture = fixture.capture(
-                "cli-run",
-                host=next(
-                    iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
-                ),
-                candidates_per_wave=2,
-                execution_mode="concurrent",
-                elapsed_seconds=60,
-            )
-            run_output = fixture.root / "cli-probe-run.json"
-            run_argv = ["build-probe-run"]
-            run_argv += _payload_args("probe-run-input", capture)
-            run_argv += ["--output-json", str(run_output)]
-            self.assertEqual(ORCHESTRATOR.main(run_argv), 0)
-            run_artifact, _ = ORCHESTRATOR._artifact(
-                run_output, payload_receipt=True
-            )
-            _artifact, run, summary = ORCHESTRATOR._replay_probe_run(
-                run_artifact
-            )
-            self.assertEqual(run["status"], "complete")
-            self.assertTrue(summary["process_success"])
-
-    def test_full_two_host_matrix_builds_fresh_gate_cli(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            fixture = ProbeFixture(Path(raw))
-            comparisons = fixture.comparison_matrix()
-            gate = ORCHESTRATOR.build_multicandidate_gate(comparisons)
-            self.assertEqual(gate["status"], "pass")
-            self.assertEqual(gate["selected_candidates_per_wave"], 4)
-
-            _artifact, first_comparison = (
-                AUTHORITY._verify_compact_receipt(
-                    comparisons[0], "first fixture comparison"
-                )
-            )
-            comparison_output = (
-                fixture.root / "formal-concurrency-comparison.json"
-            )
-            comparison_argv = ["build-concurrency-comparison"]
-            comparison_argv += _payload_args(
-                "serial-run", first_comparison["serial_run"]
-            )
-            comparison_argv += _payload_args(
-                "concurrent-run", first_comparison["concurrent_run"]
-            )
-            comparison_argv += [
-                "--output-json",
-                str(comparison_output),
-            ]
-            self.assertEqual(ORCHESTRATOR.main(comparison_argv), 0)
-            self.assertEqual(
-                json.loads(comparison_output.read_text(encoding="utf-8")),
-                first_comparison,
-            )
-
-            gate_output = fixture.root / "formal-concurrency-gate.json"
-            argv = ["build-concurrency-gate"]
-            for comparison in comparisons:
-                argv += [
-                    "--comparison-path",
-                    str(comparison["path"]),
-                    "--comparison-sha256",
-                    str(comparison["sha256"]),
-                    "--comparison-payload-sha256",
-                    str(comparison["receipt_payload_sha256"]),
-                ]
-            argv += ["--output-json", str(gate_output)]
-            self.assertEqual(ORCHESTRATOR.main(argv), 0)
-            artifact, _ = ORCHESTRATOR._artifact(
-                gate_output, payload_receipt=True
-            )
-            _artifact, replayed = ORCHESTRATOR._validate_multicandidate_gate(
-                artifact
-            )
-            self.assertEqual(replayed, gate)
-            with self.assertRaises(FileExistsError):
-                ORCHESTRATOR.main(argv)
-
-    def test_probe_producers_fail_closed_on_invalid_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            fixture = ProbeFixture(Path(raw))
-            manifest = fixture.candidate_outputs("negative-metric")[0][
-                "prediction_manifest"
-            ]
+            fixture = ProducerFixture(Path(raw))
             with self.assertRaises(
                 ORCHESTRATOR.BaseFreshValOrchestratorError
             ):
@@ -443,271 +922,320 @@ class BaseFreshConcurrencyProducerCpuTests(unittest.TestCase):
                     epoch=1,
                     checkpoint=fixture.checkpoints[1],
                     subset_manifest=fixture.subset,
-                    prediction_manifest=manifest,
-                    metric_values={"body.released2.metrics.FGD": float("nan")},
+                    prediction_manifest=fixture.subset,
+                    metric_values={"body.released2.metrics.FGD": 0.0},
                 )
+            with self.assertRaises(
+                ORCHESTRATOR.BaseFreshValOrchestratorError
+            ):
+                ORCHESTRATOR.build_probe_run({})
+            with self.assertRaises(SystemExit):
+                ORCHESTRATOR._parse_args(["build-probe-metric"])
+            with self.assertRaises(SystemExit):
+                ORCHESTRATOR._parse_args(["build-probe-run"])
 
-            outputs = fixture.candidate_outputs("negative-run")
-            failed_capture = fixture.capture(
-                "failed-with-outputs",
+    def test_sole_formal_cli_runs_create_new_and_replays_standalone(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = ProducerFixture(Path(raw))
+            spec = fixture.execution_spec(
+                "formal-cli",
                 host=next(
                     iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
                 ),
                 candidates_per_wave=2,
                 execution_mode="concurrent",
-                elapsed_seconds=60,
-                outputs=outputs,
-                process={
-                    "runner_rc": 1,
-                    "oom": False,
-                    "descendants_exited": True,
-                    "guards_restored": True,
+            )
+            output_root = fixture.root / "runs" / "formal-cli"
+            output_json = output_root / "probe-run.json"
+            argv = [
+                "run-and-seal-probe",
+                "--execution-spec-path",
+                str(spec["path"]),
+                "--execution-spec-sha256",
+                str(spec["sha256"]),
+                "--execution-spec-payload-sha256",
+                str(spec["receipt_payload_sha256"]),
+                "--output-root",
+                str(output_root),
+                "--output-json",
+                str(output_json),
+            ]
+            with fixture.replay_context(), mock.patch.object(
+                PRODUCER.FormalExecutionBackend,
+                "execute",
+                side_effect=fixture.fake_execute,
+            ):
+                self.assertEqual(PRODUCER.main(argv), 0)
+                with self.assertRaises(PRODUCER.ProbeProducerError):
+                    PRODUCER.main(argv)
+            run_artifact, _run = PRODUCER._payload_artifact(
+                {
+                    "path": str(output_json),
+                    "sha256": hashlib.sha256(output_json.read_bytes()).hexdigest(),
+                    "bytes": output_json.stat().st_size,
+                    "receipt_payload_sha256": json.loads(
+                        output_json.read_text(encoding="utf-8")
+                    )["receipt_payload_sha256"],
                 },
+                "formal CLI probe run",
             )
-            with self.assertRaises(
-                ORCHESTRATOR.BaseFreshValOrchestratorError
-            ):
-                ORCHESTRATOR.build_probe_run(failed_capture)
+            replay_argv = [
+                "replay-probe-run",
+                "--probe-run-path",
+                str(run_artifact["path"]),
+                "--probe-run-sha256",
+                str(run_artifact["sha256"]),
+                "--probe-run-payload-sha256",
+                str(run_artifact["receipt_payload_sha256"]),
+            ]
+            with fixture.replay_context():
+                self.assertEqual(PRODUCER.main(replay_argv), 0)
 
-            invalid_serial = fixture.capture(
-                "serial-c2",
-                host=next(
-                    iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
-                ),
-                candidates_per_wave=2,
-                execution_mode="serial",
-                elapsed_seconds=60,
-            )
-            with self.assertRaises(
-                ORCHESTRATOR.BaseFreshValOrchestratorError
-            ):
-                ORCHESTRATOR.build_probe_run(invalid_serial)
+    def test_normal_two_host_serial_c1_c2_c4_matrix_and_gate_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = ProducerFixture(Path(raw))
+            comparisons = fixture.comparison_matrix()
+            self.assertEqual(len(comparisons), 6)
+            with fixture.replay_context():
+                gate = ORCHESTRATOR.build_multicandidate_gate(comparisons)
+                self.assertEqual(gate["status"], "pass")
+                self.assertEqual(gate["selected_candidates_per_wave"], 4)
+                for comparison in comparisons:
+                    _artifact, payload = AUTHORITY._verify_compact_receipt(
+                        comparison, "CPU comparison"
+                    )
+                    self.assertTrue(
+                        payload["equivalence"][
+                            "deterministic_semantics_equal"
+                        ]
+                    )
 
-            _artifact, captured = AUTHORITY._verify_compact_receipt(
-                fixture.capture(
-                    "forbidden-binding",
-                    host=next(
-                        iter(
-                            ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values()
-                        )
-                    ),
-                    candidates_per_wave=1,
-                    execution_mode="serial",
-                    elapsed_seconds=120,
-                ),
-                "fixture capture",
-            )
-            captured["probe_binding"]["pipeline"]["path"] = (
-                "/tmp/SemGate/foreign-pipeline.json"
-            )
-            forbidden = _write_receipt(
-                fixture.root / "forbidden-capture.json", captured
-            )
-            with self.assertRaises(
-                ORCHESTRATOR.BaseFreshValOrchestratorError
-            ):
-                ORCHESTRATOR.build_probe_run(forbidden)
-
-    def test_comparison_mismatch_and_incomplete_gate_are_not_publishable(
+    def test_serial_concurrent_pair_cannot_switch_representation_lmdb(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            fixture = ProbeFixture(Path(raw))
+            fixture = ProducerFixture(Path(raw))
             host = next(
                 iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
             )
             serial = fixture.run(
-                "mismatch-serial",
+                "lmdb-serial",
                 host=host,
                 candidates_per_wave=1,
                 execution_mode="serial",
                 elapsed_seconds=120,
             )
-            changed = fixture.candidate_outputs(
-                "mismatch-concurrent", changed_prediction=True
-            )
+            alternate_lmdb = {
+                role: _write_bytes(
+                    fixture.root / "alternate-lmdb" / f"{role}.bin",
+                    f"different SHOW LMDB {role}\n".encode("ascii"),
+                )
+                for role in ("summary", "data", "lock")
+            }
             concurrent = fixture.run(
-                "mismatch-concurrent-run",
+                "lmdb-concurrent",
                 host=host,
                 candidates_per_wave=2,
                 execution_mode="concurrent",
-                elapsed_seconds=50,
-                outputs=changed,
+                elapsed_seconds=55,
+                representation_lmdb=alternate_lmdb,
             )
-            comparison = ORCHESTRATOR.build_multicandidate_comparison(
-                serial_run=serial, concurrent_run=concurrent
-            )
-            self.assertEqual(comparison["status"], "fail")
-            self.assertFalse(
-                comparison["equivalence"]["prediction_sha_bytes_equal"]
-            )
-            comparison_artifact = _write_receipt(
-                fixture.root / "mismatch-comparison.json", comparison
-            )
-            with self.assertRaises(
+            with fixture.replay_context(), self.assertRaises(
                 ORCHESTRATOR.BaseFreshValOrchestratorError
             ):
-                ORCHESTRATOR.build_multicandidate_gate(
-                    [comparison_artifact]
+                ORCHESTRATOR.build_multicandidate_comparison(
+                    serial_run=serial,
+                    concurrent_run=concurrent,
                 )
 
-    def test_run_spec_producer_hardcodes_base_identity_and_replays_first(
+    def test_fake_runtime_evidence_and_path_swap_fail_closed(self) -> None:
+        attacks = {
+            "fake-rc": {"runner_rc": 7},
+            "fake-oom": {"fake_oom": True},
+            "owned-oom-log": {"oom_log": True},
+            "fake-memory": {"bad_memory": True},
+            "fake-timing": {"bad_timing": True},
+            "fake-guard": {"fake_guard": True},
+            "live-descendant": {"live_descendant": True},
+            "missing-status": {"missing_status": True},
+            "missing-stdout": {"missing_stdout": True},
+            "input-path-swap": {"swap_input": True},
+            "run-root-swap": {"swap_root": True},
+            "external-prediction": {"external_prediction": True},
+            "fake-guard-executable": {"fake_guard_executable": True},
+        }
+        for tag, behavior in attacks.items():
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as raw:
+                fixture = ProducerFixture(Path(raw))
+                with self.assertRaises(Exception):
+                    fixture.run(
+                        tag,
+                        host=next(
+                            iter(
+                                ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values()
+                            )
+                        ),
+                        candidates_per_wave=2,
+                        execution_mode="concurrent",
+                        elapsed_seconds=60,
+                        behavior=behavior,
+                    )
+
+    def test_replay_rejects_scalar_old_cross_mode_and_authority_attacks(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw).resolve()
-            source = {
-                "origin": AUTHORITY.EXPECTED_ORIGIN,
-                "commit": "a" * 40,
-                "tree": "b" * 40,
-                "clean": True,
-                "detached": True,
-                "local_branches_at_commit": [],
-            }
-            frozen = {
-                "format": ORCHESTRATOR.RUN_SPEC_INPUT_FORMAT,
-                "status": "frozen_inputs",
-                "split": "val",
-                "test_visible": False,
-                "source": source,
-                "multi_candidate_gate": {"path": "/formal/base-gate.json"},
-                "candidate_bundle": {},
-                "val_inputs": {"path": "/formal/show-val.json"},
-                "pipeline": {"path": "/formal/base-pipeline.json"},
-                "prerequisite_selection": {},
-                "continuation_decision": {},
-                "continuation_waves": [],
-                "canonical_manifest": {},
-                "validation_gates": [],
-                "metric_assets": {},
-                "real_feature_cache": {},
-            }
-            input_artifact = _write_receipt(
-                root / "run-spec-input.json", frozen
+            fixture = ProducerFixture(Path(raw))
+            host = next(
+                iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
             )
-            observed: list[dict[str, object]] = []
-
-            def replay(
-                artifact: dict[str, object],
-                *,
-                expected_source_commit: str,
-                expected_source_tree: str,
-            ) -> tuple[dict[str, object], dict[str, object]]:
-                normalized, payload = AUTHORITY._verify_compact_receipt(
-                    artifact, "generated run spec"
-                )
-                self.assertTrue(Path(normalized["path"]).is_file())
-                self.assertEqual(expected_source_commit, "a" * 40)
-                self.assertEqual(expected_source_tree, "b" * 40)
-                self.assertEqual(
-                    payload["generator_module"],
-                    "models.semtalk.semtalk_base",
-                )
-                self.assertEqual(payload["dataset"], "SHOW")
-                self.assertEqual(
-                    payload["target_speaker_scope"],
-                    AUTHORITY.EXPECTED_SCOPE,
-                )
-                self.assertEqual(payload["split"], "val")
-                self.assertIs(payload["test_visible"], False)
-                observed.append(payload)
-                return normalized, payload
-
-            output = root / "run-spec.json"
-            argv = ["build-run-spec"]
-            argv += _payload_args("run-spec-input", input_artifact)
-            argv += ["--output-json", str(output)]
-            with mock.patch.object(
-                ORCHESTRATOR, "validate_run_spec", side_effect=replay
-            ):
-                self.assertEqual(ORCHESTRATOR.main(argv), 0)
-                with self.assertRaises(FileExistsError):
-                    ORCHESTRATOR.main(argv)
-            self.assertEqual(len(observed), 2)
-            published = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(
-                published["generator"], "SemTalk Base Motion Generation"
+            run_c2 = fixture.run(
+                "replay-c2",
+                host=host,
+                candidates_per_wave=2,
+                execution_mode="concurrent",
+                elapsed_seconds=55,
             )
-            self.assertNotIn("semgate", json.dumps(published).casefold())
-            self.assertNotIn("sparse", json.dumps(published).casefold())
+            run_c4 = fixture.run(
+                "replay-c4",
+                host=host,
+                candidates_per_wave=4,
+                execution_mode="concurrent",
+                elapsed_seconds=40,
+            )
+            _artifact, base_run = AUTHORITY._verify_compact_receipt(
+                run_c2, "base run"
+            )
+            _artifact, evidence = AUTHORITY._verify_compact_receipt(
+                base_run["producer_evidence"], "base producer evidence"
+            )
 
-            failed_output = root / "must-not-exist.json"
-            failed_argv = ["build-run-spec"]
-            failed_argv += _payload_args("run-spec-input", input_artifact)
-            failed_argv += ["--output-json", str(failed_output)]
-            with mock.patch.object(
-                ORCHESTRATOR,
-                "validate_run_spec",
-                side_effect=ORCHESTRATOR.BaseFreshValOrchestratorError(
-                    "fresh replay failed"
-                ),
-            ):
-                with self.assertRaises(
+            metric_artifact = base_run["candidate_outputs"][0][
+                "metric_receipt"
+            ]
+            _artifact, metric = AUTHORITY._verify_compact_receipt(
+                metric_artifact, "base derived metric"
+            )
+            metric["metric_values"]["body.released2.metrics.FGD"] += 1.0
+            fake_metric = _write_receipt(
+                fixture.root / "attacks" / "fake-metric.json", metric
+            )
+            scalar_evidence = copy.deepcopy(evidence)
+            scalar_evidence["derived_metrics"][0] = fake_metric
+            scalar_evidence_artifact = _write_receipt(
+                fixture.root / "attacks" / "scalar-evidence.json",
+                scalar_evidence,
+            )
+            scalar_run = copy.deepcopy(base_run)
+            scalar_run["producer_evidence"] = scalar_evidence_artifact
+            scalar_run["candidate_outputs"][0]["metric_receipt"] = (
+                fake_metric
+            )
+            attacks = [
+                _write_receipt(
+                    fixture.root / "attacks" / "scalar-run.json",
+                    scalar_run,
+                )
+            ]
+
+            old_run = copy.deepcopy(base_run)
+            old_run["format"] = (
+                "semtalk_show_base_fresh_val_multicandidate_probe_run_v1"
+            )
+            attacks.append(
+                _write_receipt(
+                    fixture.root / "attacks" / "old-run.json", old_run
+                )
+            )
+
+            _artifact, c4_payload = AUTHORITY._verify_compact_receipt(
+                run_c4, "C4 run"
+            )
+            cross_mode = copy.deepcopy(base_run)
+            cross_mode["producer_evidence"] = c4_payload[
+                "producer_evidence"
+            ]
+            attacks.append(
+                _write_receipt(
+                    fixture.root / "attacks" / "cross-mode.json",
+                    cross_mode,
+                )
+            )
+
+            wrong_authority = copy.deepcopy(base_run)
+            wrong_authority["probe_binding"]["source"]["commit"] = "f" * 40
+            attacks.append(
+                _write_receipt(
+                    fixture.root / "attacks" / "wrong-authority.json",
+                    wrong_authority,
+                )
+            )
+            with fixture.replay_context():
+                for attack in attacks:
+                    with self.subTest(path=attack["path"]), self.assertRaises(
+                        ORCHESTRATOR.BaseFreshValOrchestratorError
+                    ):
+                        ORCHESTRATOR._replay_probe_run(attack)
+
+    def test_missing_owned_artifact_and_raw_trajectory_fail_replay(self) -> None:
+        for target in ("runner_stdout", "runner_status", "trajectory"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw:
+                fixture = ProducerFixture(Path(raw))
+                run = fixture.run(
+                    f"missing-{target}",
+                    host=next(
+                        iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
+                    ),
+                    candidates_per_wave=1,
+                    execution_mode="serial",
+                    elapsed_seconds=120,
+                )
+                _artifact, payload = AUTHORITY._verify_compact_receipt(
+                    run, "missing artifact run"
+                )
+                _artifact, evidence = AUTHORITY._verify_compact_receipt(
+                    payload["producer_evidence"], "producer evidence"
+                )
+                if target == "trajectory":
+                    _artifact, ready = AUTHORITY._verify_compact_receipt(
+                        evidence["candidate_ready"], "candidate ready"
+                    )
+                    _artifact, native = AUTHORITY._verify_compact_receipt(
+                        ready["candidates"][0], "trainer native"
+                    )
+                    path = Path(native["training_trajectory"]["path"])
+                else:
+                    path = Path(evidence[target]["path"])
+                path.unlink()
+                with fixture.replay_context(), self.assertRaises(
                     ORCHESTRATOR.BaseFreshValOrchestratorError
                 ):
-                    ORCHESTRATOR.main(failed_argv)
-            self.assertFalse(failed_output.exists())
+                    ORCHESTRATOR._replay_probe_run(run)
 
-    def test_run_spec_input_schema_scope_and_cli_abbreviation_fail_closed(
-        self,
-    ) -> None:
+    def test_output_root_is_create_new_and_nonreusable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw).resolve()
-            source = {
-                "origin": AUTHORITY.EXPECTED_ORIGIN,
-                "commit": "a" * 40,
-                "tree": "b" * 40,
-                "clean": True,
-                "detached": True,
-                "local_branches_at_commit": [],
-            }
-            base = {
-                "format": ORCHESTRATOR.RUN_SPEC_INPUT_FORMAT,
-                "status": "frozen_inputs",
-                "split": "val",
-                "test_visible": False,
-                "source": source,
-                "multi_candidate_gate": {},
-                "candidate_bundle": {},
-                "val_inputs": {},
-                "pipeline": {},
-                "prerequisite_selection": {},
-                "continuation_decision": {},
-                "continuation_waves": [],
-                "canonical_manifest": {},
-                "validation_gates": [],
-                "metric_assets": {},
-                "real_feature_cache": {},
-            }
-            malformed = copy.deepcopy(base)
-            malformed["unexpected"] = True
-            malformed_artifact = _write_receipt(
-                root / "malformed.json", malformed
+            fixture = ProducerFixture(Path(raw))
+            host = next(
+                iter(ORCHESTRATOR.FORMAL_HOST_BY_PARTITION.values())
             )
-            with self.assertRaises(
-                ORCHESTRATOR.BaseFreshValOrchestratorError
-            ):
-                ORCHESTRATOR.build_run_spec(malformed_artifact)
-
-            forbidden = copy.deepcopy(base)
-            forbidden["metric_assets"] = {
-                "talkshow_metric_root": "/formal/SemGate/metrics"
-            }
-            forbidden_artifact = _write_receipt(
-                root / "forbidden.json", forbidden
+            fixture.run(
+                "nonreuse",
+                host=host,
+                candidates_per_wave=1,
+                execution_mode="serial",
+                elapsed_seconds=120,
             )
-            with self.assertRaises(
-                ORCHESTRATOR.BaseFreshValOrchestratorError
+            spec = fixture.execution_spec(
+                "nonreuse-second",
+                host=host,
+                candidates_per_wave=1,
+                execution_mode="serial",
+            )
+            with fixture.replay_context(), self.assertRaises(
+                PRODUCER.ProbeProducerError
             ):
-                ORCHESTRATOR.build_run_spec(forbidden_artifact)
-
-            with self.assertRaises(SystemExit):
-                ORCHESTRATOR._parse_args(
-                    [
-                        "build-run-spec",
-                        "--run-spec-input-p",
-                        str(forbidden_artifact["path"]),
-                    ]
+                PRODUCER.run_and_seal_probe(
+                    spec, output_root=fixture.root / "runs" / "nonreuse"
                 )
 
 

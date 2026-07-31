@@ -44,19 +44,16 @@ CANDIDATE_SEAL_FORMAT = "semtalk_show_base_fresh_val_candidate_seal_v1"
 PARTITION_FORMAT = "semtalk_show_base_fresh_val_partition_v1"
 PARTITION_UNION_FORMAT = "semtalk_show_base_fresh_val_partition_union_v1"
 MULTICANDIDATE_GATE_FORMAT = (
-    "semtalk_show_base_fresh_val_multicandidate_gate_v1"
+    "semtalk_show_base_fresh_val_multicandidate_gate_v2"
 )
 MULTICANDIDATE_COMPARISON_FORMAT = (
-    "semtalk_show_base_fresh_val_multicandidate_comparison_v1"
+    "semtalk_show_base_fresh_val_multicandidate_comparison_v2"
 )
 MULTICANDIDATE_PROBE_RUN_FORMAT = (
-    "semtalk_show_base_fresh_val_multicandidate_probe_run_v1"
-)
-MULTICANDIDATE_PROBE_RUN_INPUT_FORMAT = (
-    "semtalk_show_base_fresh_val_multicandidate_probe_run_input_v1"
+    "semtalk_show_base_fresh_val_multicandidate_probe_run_v2"
 )
 MULTICANDIDATE_PROBE_METRIC_FORMAT = (
-    "semtalk_show_base_fresh_val_multicandidate_probe_metric_v1"
+    "semtalk_show_base_fresh_val_multicandidate_probe_metric_v2"
 )
 CONCURRENCY_SELECTION_ORDER = (1, 2, 4)
 CONCURRENCY_SELECTION_SAFETY_MARGIN = 0.02
@@ -857,7 +854,10 @@ def _probe_metric(
             "candidate_checkpoint",
             "subset_manifest",
             "prediction_manifest",
+            "trainer_native_candidate",
             "metric_values",
+            "trajectory_values_sha256",
+            "raw_metric_fingerprint_sha256",
             "receipt_payload_sha256",
         },
         f"throughput probe Base e{epoch} metric",
@@ -873,14 +873,19 @@ def _probe_metric(
         or metric["subset_manifest"] != subset_manifest
         or metric["prediction_manifest"] != prediction_manifest
         or not isinstance(values, dict)
-        or not values
-        or any(
-            not isinstance(key, str)
-            or not key
-            or type(number) not in (int, float)
-            or not math.isfinite(float(number))
-            for key, number in values.items()
+        or set(values) != {"body.released2.metrics.FGD"}
+        or type(values["body.released2.metrics.FGD"])
+        not in (int, float)
+        or not math.isfinite(float(values["body.released2.metrics.FGD"]))
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(metric["trajectory_values_sha256"])
         )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(metric["raw_metric_fingerprint_sha256"])
+        )
+        is None
+        or not isinstance(metric["trainer_native_candidate"], dict)
     ):
         raise BaseFreshValOrchestratorError(
             f"throughput probe Base e{epoch} metric changed"
@@ -896,65 +901,23 @@ def build_probe_metric(
     prediction_manifest: Mapping[str, Any],
     metric_values: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Seal one finite, validation-only metric receipt for a probe output."""
+    """Reject caller-supplied metric scalars.
 
-    if epoch not in PROBE_EPOCHS:
-        raise BaseFreshValOrchestratorError(
-            "throughput probe metric epoch is outside the frozen probe set"
-        )
-    normalized_checkpoint = authority._validate_checkpoint(
-        checkpoint, f"throughput probe Base e{epoch} checkpoint"
-    )
-    normalized_subset, _ = authority._normalize_artifact(
+    Formal probe metrics can only be emitted by
+    ``base_fresh_probe_producer.py run-and-seal-probe`` after raw feature and
+    trajectory replay.
+    """
+
+    del (
+        epoch,
+        checkpoint,
         subset_manifest,
-        "fresh Base throughput probe subset",
-        with_payload=False,
-    )
-    normalized_prediction, _ = authority._normalize_artifact(
         prediction_manifest,
-        f"throughput probe Base e{epoch} prediction manifest",
-        with_payload=False,
+        metric_values,
     )
-    if (
-        not isinstance(metric_values, Mapping)
-        or not metric_values
-        or any(
-            not isinstance(key, str)
-            or not key
-            or type(number) not in (int, float)
-            or not math.isfinite(float(number))
-            for key, number in metric_values.items()
-        )
-    ):
-        raise BaseFreshValOrchestratorError(
-            "throughput probe metric values must be finite and nonempty"
-        )
-    result = _with_payload_sha(
-        {
-            "format": MULTICANDIDATE_PROBE_METRIC_FORMAT,
-            "status": "complete",
-            "split": "val",
-            "test_visible": False,
-            "epoch": epoch,
-            "candidate_checkpoint": normalized_checkpoint,
-            "subset_manifest": normalized_subset,
-            "prediction_manifest": normalized_prediction,
-            "metric_values": dict(metric_values),
-        }
+    raise BaseFreshValOrchestratorError(
+        "caller-provided probe metrics are disabled; use run-and-seal-probe"
     )
-    _reject_non_base_scope(result, "fresh Base throughput probe metric")
-    _fresh_validate_generated_receipt(
-        result,
-        label=f"probe-metric-e{epoch}",
-        replay=lambda artifact: _probe_metric(
-            artifact,
-            epoch=epoch,
-            checkpoint=normalized_checkpoint,
-            prediction_manifest=normalized_prediction,
-            subset_manifest=normalized_subset,
-        ),
-    )
-    return result
 
 
 def _probe_candidate_output(
@@ -1055,6 +1018,12 @@ def _probe_candidate_output(
             "metric_values_sha256": authority.canonical_json_sha256(
                 metric["metric_values"]
             ),
+            "trajectory_values_sha256": metric[
+                "trajectory_values_sha256"
+            ],
+            "raw_metric_fingerprint_sha256": metric[
+                "raw_metric_fingerprint_sha256"
+            ],
         },
         output_paths,
     )
@@ -1080,10 +1049,21 @@ def _replay_probe_run(
             "candidate_outputs",
             "execution_trace",
             "process_evidence",
+            "producer_evidence",
             "receipt_payload_sha256",
         },
         "fresh Base multi-candidate probe run",
     )
+    try:
+        from scripts.show_base import base_fresh_probe_producer as producer
+
+        producer_evidence = producer._validate_probe_run_evidence(run)
+    except Exception as error:
+        if isinstance(error, BaseFreshValOrchestratorError):
+            raise
+        raise BaseFreshValOrchestratorError(
+            f"controlled probe producer evidence failed replay: {error}"
+        ) from error
     binding = _probe_binding(run["probe_binding"])
     trace = _exact(
         run["execution_trace"],
@@ -1143,7 +1123,19 @@ def _replay_probe_run(
     )
     outputs = run["candidate_outputs"]
     fingerprints: list[dict[str, Any]] = []
-    output_paths: set[str] = set()
+    output_paths: set[str] = {
+        run["producer_evidence"]["path"],
+        producer_evidence["runner_status"]["path"],
+        producer_evidence["runner_log"]["path"],
+        producer_evidence["runner_stdout"]["path"],
+        producer_evidence["runner_stderr"]["path"],
+        producer_evidence["memory_telemetry"]["path"],
+        producer_evidence["candidate_ready"]["path"],
+        *(
+            artifact["path"]
+            for artifact in producer_evidence["trainer_native_candidates"]
+        ),
+    }
     if run["status"] == "complete":
         if not process_success or not isinstance(outputs, list) or len(outputs) != len(PROBE_EPOCHS):
             raise BaseFreshValOrchestratorError(
@@ -1176,6 +1168,9 @@ def _replay_probe_run(
     )
     summary = {
         "binding": binding,
+        "quality_common_binding_sha256": producer_evidence[
+            "_quality_common_binding_sha256"
+        ],
         "fingerprints": fingerprints,
         "output_paths": output_paths,
         "elapsed_seconds": (finished - started) / 1_000_000_000.0,
@@ -1190,68 +1185,16 @@ def _replay_probe_run(
 def build_probe_run(
     input_artifact: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Seal one externally captured serial/concurrent probe transaction."""
+    """Reject caller-captured process evidence.
 
-    _normalized_input, captured = authority._verify_compact_receipt(
-        input_artifact, "fresh Base multi-candidate probe capture"
+    Formal timing, memory, return-code, ancestry, OOM and guard evidence is
+    emitted only by the controlled ``run-and-seal-probe`` producer.
+    """
+
+    del input_artifact
+    raise BaseFreshValOrchestratorError(
+        "caller-captured probe runs are disabled; use run-and-seal-probe"
     )
-    _exact(
-        captured,
-        {
-            "format",
-            "status",
-            "split",
-            "test_visible",
-            "formal_host",
-            "candidates_per_wave",
-            "execution_mode",
-            "probe_binding",
-            "candidate_outputs",
-            "execution_trace",
-            "process_evidence",
-            "receipt_payload_sha256",
-        },
-        "fresh Base multi-candidate probe capture",
-    )
-    process = captured["process_evidence"]
-    if (
-        captured["format"] != MULTICANDIDATE_PROBE_RUN_INPUT_FORMAT
-        or captured["status"] != "captured"
-        or captured["split"] != "val"
-        or captured["test_visible"] is not False
-        or not isinstance(process, dict)
-    ):
-        raise BaseFreshValOrchestratorError(
-            "fresh Base multi-candidate probe capture identity changed"
-        )
-    process_success = (
-        process.get("runner_rc") == 0
-        and process.get("oom") is False
-        and process.get("descendants_exited") is True
-        and process.get("guards_restored") is True
-    )
-    result = _with_payload_sha(
-        {
-            "format": MULTICANDIDATE_PROBE_RUN_FORMAT,
-            "status": "complete" if process_success else "failed",
-            "split": "val",
-            "test_visible": False,
-            "formal_host": captured["formal_host"],
-            "candidates_per_wave": captured["candidates_per_wave"],
-            "execution_mode": captured["execution_mode"],
-            "probe_binding": captured["probe_binding"],
-            "candidate_outputs": captured["candidate_outputs"],
-            "execution_trace": captured["execution_trace"],
-            "process_evidence": process,
-        }
-    )
-    _reject_non_base_scope(result, "fresh Base throughput probe run")
-    _fresh_validate_generated_receipt(
-        result,
-        label="probe-run",
-        replay=_replay_probe_run,
-    )
-    return result
 
 
 def build_multicandidate_comparison(
@@ -1273,6 +1216,8 @@ def build_multicandidate_comparison(
         not in CONCURRENCY_SELECTION_ORDER
         or serial["formal_host"] != concurrent["formal_host"]
         or serial_summary["binding"] != concurrent_summary["binding"]
+        or serial_summary["quality_common_binding_sha256"]
+        != concurrent_summary["quality_common_binding_sha256"]
         or serial_summary["output_paths"] & concurrent_summary["output_paths"]
     ):
         raise BaseFreshValOrchestratorError(
@@ -1292,11 +1237,27 @@ def build_multicandidate_comparison(
     metric_equal = (
         concurrent["status"] == "complete"
         and [
-            row["metric_values_sha256"]
+            {
+                "metric_values_sha256": row["metric_values_sha256"],
+                "trajectory_values_sha256": row[
+                    "trajectory_values_sha256"
+                ],
+                "raw_metric_fingerprint_sha256": row[
+                    "raw_metric_fingerprint_sha256"
+                ],
+            }
             for row in serial_summary["fingerprints"]
         ]
         == [
-            row["metric_values_sha256"]
+            {
+                "metric_values_sha256": row["metric_values_sha256"],
+                "trajectory_values_sha256": row[
+                    "trajectory_values_sha256"
+                ],
+                "raw_metric_fingerprint_sha256": row[
+                    "raw_metric_fingerprint_sha256"
+                ],
+            }
             for row in concurrent_summary["fingerprints"]
         ]
     )
@@ -1332,6 +1293,9 @@ def build_multicandidate_comparison(
             "probe_binding_sha256": authority.canonical_json_sha256(
                 serial_summary["binding"]
             ),
+            "quality_common_binding_sha256": serial_summary[
+                "quality_common_binding_sha256"
+            ],
             "serial_run": serial_artifact,
             "concurrent_run": concurrent_artifact,
             "equivalence": {
@@ -1382,6 +1346,7 @@ def _replay_multicandidate_comparison(
             "formal_host",
             "candidates_per_wave",
             "probe_binding_sha256",
+            "quality_common_binding_sha256",
             "serial_run",
             "concurrent_run",
             "equivalence",
@@ -1414,6 +1379,7 @@ def build_multicandidate_gate(
         )
     by_key: dict[tuple[int, str], tuple[dict[str, Any], dict[str, Any]]] = {}
     common_binding: dict[str, Any] | None = None
+    common_quality_binding: str | None = None
     artifact_paths: set[str] = set()
     for value in comparisons:
         artifact, comparison = _replay_multicandidate_comparison(value)
@@ -1440,13 +1406,28 @@ def build_multicandidate_gate(
             raise BaseFreshValOrchestratorError(
                 "multi-candidate comparisons use different probe bindings"
             )
+        if common_quality_binding is None:
+            common_quality_binding = serial_summary[
+                "quality_common_binding_sha256"
+            ]
+        elif (
+            common_quality_binding
+            != serial_summary["quality_common_binding_sha256"]
+        ):
+            raise BaseFreshValOrchestratorError(
+                "multi-candidate comparisons use different LMDB/input bindings"
+            )
         by_key[key] = (artifact, comparison)
     expected_keys = {
         (mode, host)
         for mode in CONCURRENCY_SELECTION_ORDER
         for host in FORMAL_HOST_BY_PARTITION.values()
     }
-    if set(by_key) != expected_keys or common_binding is None:
+    if (
+        set(by_key) != expected_keys
+        or common_binding is None
+        or common_quality_binding is None
+    ):
         raise BaseFreshValOrchestratorError(
             "multi-candidate comparison matrix is incomplete"
         )
@@ -1493,6 +1474,7 @@ def build_multicandidate_gate(
             "test_visible": False,
             "formal_hosts": list(FORMAL_HOST_BY_PARTITION.values()),
             "probe_binding": common_binding,
+            "quality_common_binding_sha256": common_quality_binding,
             "protocol": {
                 "evaluated_candidates_per_wave": list(
                     CONCURRENCY_SELECTION_ORDER
@@ -1541,6 +1523,7 @@ def _validate_multicandidate_gate(
             "test_visible",
             "formal_hosts",
             "probe_binding",
+            "quality_common_binding_sha256",
             "protocol",
             "attempts",
             "selected_candidates_per_wave",
@@ -1827,9 +1810,21 @@ def validate_run_spec(
     subset_rows = authority._strict_jsonl_bytes(
         subset_payload, "fresh Base throughput probe subset"
     )
+    normalized_probe_prefix = [
+        {
+            "global_index": row["global_index"],
+            "source_clip_id": row["clip_id"],
+            "canonical_clip_id": val_contract.canonical_clip_id(
+                row["clip_id"]
+            ),
+            "frames": row["frames"],
+            "split": "val",
+        }
+        for row in canonical_rows[:PROBE_CLIPS_PER_CANDIDATE]
+    ]
     if (
         len(canonical_rows) != EXPECTED_CLIPS
-        or subset_rows != canonical_rows[:PROBE_CLIPS_PER_CANDIDATE]
+        or subset_rows != normalized_probe_prefix
     ):
         raise BaseFreshValOrchestratorError(
             "multi-candidate probe subset is not the frozen val prefix"
@@ -3052,49 +3047,6 @@ def _add_payload_artifact(parser: argparse.ArgumentParser, prefix: str) -> None:
     parser.add_argument(f"--{prefix}-payload-sha256", required=True)
 
 
-def _add_plain_artifact(parser: argparse.ArgumentParser, prefix: str) -> None:
-    parser.add_argument(f"--{prefix}-path", type=Path, required=True)
-    parser.add_argument(f"--{prefix}-sha256", required=True)
-    parser.add_argument(f"--{prefix}-bytes", type=int, required=True)
-
-
-def _plain_from_args(
-    args: argparse.Namespace, prefix: str
-) -> dict[str, Any]:
-    attr = prefix.replace("-", "_")
-    artifact, _ = _artifact(
-        getattr(args, f"{attr}_path"),
-        getattr(args, f"{attr}_sha256"),
-        payload_receipt=False,
-    )
-    if artifact["bytes"] != getattr(args, f"{attr}_bytes"):
-        raise BaseFreshValOrchestratorError(
-            f"{prefix} byte count changed"
-        )
-    return artifact
-
-
-def _json_object_from_args(
-    args: argparse.Namespace, prefix: str
-) -> dict[str, Any]:
-    attr = prefix.replace("-", "_")
-    path, payload = _safe_snapshot(
-        getattr(args, f"{attr}_path"), prefix
-    )
-    if _sha256_bytes(payload) != _require_sha(
-        getattr(args, f"{attr}_sha256"), f"{prefix} SHA-256"
-    ):
-        raise BaseFreshValOrchestratorError(f"{prefix} SHA-256 changed")
-    if len(payload) != getattr(args, f"{attr}_bytes"):
-        raise BaseFreshValOrchestratorError(f"{prefix} byte count changed")
-    value = _strict_json(payload, str(path))
-    if not isinstance(value, dict):
-        raise BaseFreshValOrchestratorError(
-            f"{prefix} must be a strict JSON object"
-        )
-    return value
-
-
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3103,25 +3055,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     create_root.add_argument("--path", type=Path, required=True)
     create_root.add_argument("--subdirectory", action="append", default=[])
-
-    probe_metric = commands.add_parser(
-        "build-probe-metric", allow_abbrev=False
-    )
-    probe_metric.add_argument("--epoch", type=int, required=True)
-    for prefix in (
-        "checkpoint",
-        "subset-manifest",
-        "prediction-manifest",
-        "metric-values",
-    ):
-        _add_plain_artifact(probe_metric, prefix)
-    probe_metric.add_argument("--output-json", type=Path, required=True)
-
-    probe_run = commands.add_parser(
-        "build-probe-run", allow_abbrev=False
-    )
-    _add_payload_artifact(probe_run, "probe-run-input")
-    probe_run.add_argument("--output-json", type=Path, required=True)
 
     comparison = commands.add_parser(
         "build-concurrency-comparison", allow_abbrev=False
@@ -3370,21 +3303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
         )
         return 0
-    if args.command == "build-probe-metric":
-        result = build_probe_metric(
-            epoch=args.epoch,
-            checkpoint=_plain_from_args(args, "checkpoint"),
-            subset_manifest=_plain_from_args(args, "subset-manifest"),
-            prediction_manifest=_plain_from_args(
-                args, "prediction-manifest"
-            ),
-            metric_values=_json_object_from_args(args, "metric-values"),
-        )
-    elif args.command == "build-probe-run":
-        result = build_probe_run(
-            _compact_from_args(args, "probe-run-input")
-        )
-    elif args.command == "build-concurrency-comparison":
+    if args.command == "build-concurrency-comparison":
         result = build_multicandidate_comparison(
             serial_run=_compact_from_args(args, "serial-run"),
             concurrent_run=_compact_from_args(args, "concurrent-run"),
