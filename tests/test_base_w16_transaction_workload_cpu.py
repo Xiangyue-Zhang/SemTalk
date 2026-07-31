@@ -50,6 +50,8 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
         argv: list[str],
         source: dict[str, object],
         run_id: str = "formal-w16-run-001",
+        completion_timeout_ms: int = SHIM.W16_MIN_COMPLETION_TIMEOUT_MS,
+        command_timeout_ms: int | None = None,
     ) -> tuple[Path, dict[str, object]]:
         transaction_root = root / run_id
         transaction_root.mkdir()
@@ -92,7 +94,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
             },
             "participants": participants,
             "max_restarts": 0,
-            "timeouts": {},
+            "timeouts": {"completion_timeout_ms": completion_timeout_ms},
         }
         portable_sha = hashlib.sha256(SHIM._canonical_json_bytes(portable)).hexdigest()
         _write_json(
@@ -119,6 +121,12 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                 argv[0],
                 "--transaction-root",
                 str(transaction_root),
+                "--completion-timeout-ms",
+                str(
+                    completion_timeout_ms
+                    if command_timeout_ms is None
+                    else command_timeout_ms
+                ),
                 "--",
                 *argv,
             ]
@@ -204,6 +212,84 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                 hostname=SHIM.EXPECTED_HOST_BY_RANK[0],
             )
             self.assertRegex(result["portable_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_transaction_replay_rejects_inherited_short_completion_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            python = Path(os.path.realpath(os.sys.executable))
+            argv = [str(python), str(SCRIPT), "--source-commit", "c" * 40]
+            source = {
+                "origin": SHIM.EXPECTED_ORIGIN,
+                "commit": "c" * 40,
+                "tree": "d" * 40,
+                "detached": True,
+                "entrypoint_sha256": {
+                    "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
+                    "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
+                    "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
+                    "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
+                },
+            }
+            transaction_root, _ = self._transaction_fixture(
+                root,
+                argv=argv,
+                source=source,
+                completion_timeout_ms=120_000,
+            )
+            with self.assertRaisesRegex(SHIM.W16ShimError, "at least 24 hours"):
+                SHIM.validate_transaction_context(
+                    transaction_root=transaction_root,
+                    run_id=transaction_root.name,
+                    node_id=SHIM.EXPECTED_HOST_BY_RANK[0],
+                    node_rank=0,
+                    source=source,
+                    master_addr=SHIM.EXPECTED_HOST_BY_RANK[0],
+                    master_port=29601,
+                    original_argv=argv,
+                    parent_identity={**_identity(1000), "ppid": 900},
+                    hostname=SHIM.EXPECTED_HOST_BY_RANK[0],
+                )
+
+    def test_transaction_replay_rejects_timeout_argv_portable_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            python = Path(os.path.realpath(os.sys.executable))
+            argv = [str(python), str(SCRIPT), "--source-commit", "c" * 40]
+            source = {
+                "origin": SHIM.EXPECTED_ORIGIN,
+                "commit": "c" * 40,
+                "tree": "d" * 40,
+                "detached": True,
+                "entrypoint_sha256": {
+                    "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
+                    "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
+                    "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
+                    "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
+                },
+            }
+            transaction_root, _ = self._transaction_fixture(
+                root,
+                argv=argv,
+                source=source,
+                command_timeout_ms=SHIM.W16_MIN_COMPLETION_TIMEOUT_MS + 1,
+            )
+            with self.assertRaisesRegex(
+                SHIM.W16ShimError, "launcher chain changed"
+            ):
+                SHIM.validate_transaction_context(
+                    transaction_root=transaction_root,
+                    run_id=transaction_root.name,
+                    node_id=SHIM.EXPECTED_HOST_BY_RANK[0],
+                    node_rank=0,
+                    source=source,
+                    master_addr=SHIM.EXPECTED_HOST_BY_RANK[0],
+                    master_port=29601,
+                    original_argv=argv,
+                    parent_identity={**_identity(1000), "ppid": 900},
+                    hostname=SHIM.EXPECTED_HOST_BY_RANK[0],
+                )
 
     def test_transaction_replay_rejects_cross_node_argv_or_parent_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -7,6 +7,9 @@ coordinator and supervisor, so that launcher must never be nested.  This shim
 is the transaction-owned alternative: it replays the transaction, source, and
 SHOW input bindings and then replaces itself with the one fixed W16 torchrun
 command.  It never invokes a shell and never accepts a free-form executable.
+The outer transaction must pass ``--completion-timeout-ms 86400000`` (or a
+larger explicit value) before its workload delimiter; the generic 120-second
+transaction default is intentionally rejected for every W16 workload.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ SPEAKER2 = re.compile(
     r"(?<![a-z0-9])speaker[-_ ]?2(?![0-9])", re.IGNORECASE
 )
 MAX_JSON_BYTES = 8 << 20
+W16_MIN_COMPLETION_TIMEOUT_MS = 24 * 60 * 60 * 1000
 IDENTITY_KEYS = {
     "pid",
     "ppid",
@@ -380,6 +384,20 @@ def validate_transaction_context(
         or portable.get("max_restarts") != 0
     ):
         raise W16ShimError("portable transaction/source binding changed")
+    timeouts = portable.get("timeouts")
+    completion_timeout_ms = (
+        timeouts.get("completion_timeout_ms")
+        if isinstance(timeouts, dict)
+        else None
+    )
+    if (
+        not isinstance(completion_timeout_ms, int)
+        or isinstance(completion_timeout_ms, bool)
+        or completion_timeout_ms < W16_MIN_COMPLETION_TIMEOUT_MS
+    ):
+        raise W16ShimError(
+            "W16 transaction requires an explicit completion timeout of at least 24 hours"
+        )
     participants = portable.get("participants")
     if (
         not isinstance(participants, list)
@@ -448,6 +466,27 @@ def validate_transaction_context(
             coordinator, f"rank {rank} transaction coordinator"
         )
         command = runner.get("command")
+        try:
+            workload_delimiter = command.index("--") if isinstance(command, list) else -1
+        except ValueError:
+            workload_delimiter = -1
+        coordinator_argv = (
+            command[:workload_delimiter] if workload_delimiter >= 0 else []
+        )
+        timeout_positions = [
+            index
+            for index, token in enumerate(coordinator_argv)
+            if token == "--completion-timeout-ms"
+        ]
+        explicit_timeout = None
+        if (
+            len(timeout_positions) == 1
+            and timeout_positions[0] + 1 < len(coordinator_argv)
+        ):
+            try:
+                explicit_timeout = int(coordinator_argv[timeout_positions[0] + 1])
+            except ValueError:
+                explicit_timeout = None
         if (
             runner.get("path") != EXPECTED_RUNNER
             or not isinstance(command, list)
@@ -456,6 +495,7 @@ def validate_transaction_context(
             or command[:3]
             != ["/bin/bash", str(expected_launcher), original_argv[0]]
             or command[-len(original_argv) :] != list(original_argv)
+            or explicit_timeout != completion_timeout_ms
             or runner.get("command_argv_sha256") != _argv_sha256(command)
             or coordinator_identity["ppid"] != runner_identity["pid"]
         ):
