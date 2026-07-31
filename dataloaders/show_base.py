@@ -8,8 +8,10 @@ reader imports text, semantic, SemGate, Sparse, or test-time dependencies.
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 from pathlib import Path
+import stat
 from typing import Any
 
 import lmdb
@@ -149,13 +151,44 @@ def _joint_context(args: Any) -> tuple[np.ndarray, int]:
     return mask, len(target)
 
 
+def _stat_identity(value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "size": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+    }
+
+
 class _NPZLMDB(torch.utils.data.Dataset):
-    def __init__(self, path: str, required_fields: tuple[str, ...]):
+    def __init__(
+        self,
+        path: str,
+        required_fields: tuple[str, ...],
+        expected_binding: dict[str, Any] | None = None,
+    ):
         self.path = Path(path)
         if not self.path.is_dir():
             raise FileNotFoundError(f"LMDB directory not found: {self.path}")
         self.required_fields = required_fields
+        self.expected_binding = expected_binding
+        self._dirfd: int | None = None
         self._env: lmdb.Environment | None = None
+        if expected_binding is not None:
+            if (
+                not isinstance(expected_binding, dict)
+                or expected_binding.get("format")
+                != "semtalk_show_base_lmdb_inode_binding_v1"
+                or not isinstance(
+                    expected_binding.get("directory_identity"), dict
+                )
+                or set(expected_binding.get("files", {}))
+                != {"data.mdb", "lock.mdb"}
+            ):
+                raise RuntimeError("invalid immutable Base LMDB binding")
+            self._ensure_dirfd()
+            self.assert_source_unchanged(full_hash=False)
         env = self._open()
         with env.begin(buffers=True) as txn:
             self.length = int(txn.stat()["entries"])
@@ -167,15 +200,75 @@ class _NPZLMDB(torch.utils.data.Dataset):
         self._env.close()
         self._env = None
 
+    def _ensure_dirfd(self) -> int:
+        if self._dirfd is None:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            self._dirfd = os.open(self.path, flags)
+        return self._dirfd
+
+    def _lmdb_open_path(self) -> str:
+        if self.expected_binding is None:
+            return str(self.path)
+        descriptor = self._ensure_dirfd()
+        pinned = Path(f"/proc/self/fd/{descriptor}")
+        if not pinned.exists():
+            raise RuntimeError(
+                "formal immutable LMDB binding requires Linux /proc/self/fd"
+            )
+        return str(pinned)
+
+    def assert_source_unchanged(self, *, full_hash: bool) -> None:
+        if self.expected_binding is None:
+            return
+        descriptor = self._ensure_dirfd()
+        observed_directory = _stat_identity(os.fstat(descriptor))
+        if observed_directory != self.expected_binding["directory_identity"]:
+            raise RuntimeError("Base LMDB directory inode/metadata changed")
+        for filename in ("data.mdb", "lock.mdb"):
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            file_descriptor = os.open(filename, flags, dir_fd=descriptor)
+            try:
+                before = os.fstat(file_descriptor)
+                identity = _stat_identity(before)
+                expected = self.expected_binding["files"][filename]
+                if identity != expected.get("identity"):
+                    raise RuntimeError(
+                        f"Base LMDB {filename} inode/metadata changed"
+                    )
+                if full_hash:
+                    digest = hashlib.sha256()
+                    while True:
+                        block = os.read(file_descriptor, 8 * 1024 * 1024)
+                        if not block:
+                            break
+                        digest.update(block)
+                    after = os.fstat(file_descriptor)
+                    if _stat_identity(after) != identity:
+                        raise RuntimeError(
+                            f"Base LMDB {filename} changed while rehashed"
+                        )
+                    if digest.hexdigest() != expected.get("sha256"):
+                        raise RuntimeError(
+                            f"Base LMDB {filename} content hash changed"
+                        )
+            finally:
+                os.close(file_descriptor)
+
     def _open(self) -> lmdb.Environment:
-        return lmdb.open(
-            str(self.path),
+        self.assert_source_unchanged(full_hash=False)
+        env = lmdb.open(
+            self._lmdb_open_path(),
             readonly=True,
             lock=False,
             readahead=False,
             max_readers=512,
             subdir=True,
         )
+        self.assert_source_unchanged(full_hash=False)
+        return env
 
     def _ensure_env(self) -> lmdb.Environment:
         if self._env is None:
@@ -225,6 +318,9 @@ class _NPZLMDB(torch.utils.data.Dataset):
     def __del__(self) -> None:
         if self._env is not None:
             self._env.close()
+        if self._dirfd is not None:
+            os.close(self._dirfd)
+            self._dirfd = None
 
 
 class CustomDataset(_NPZLMDB):
@@ -336,7 +432,11 @@ class LMDBNPZDataset(_NPZLMDB):
         if loader_type != "train":
             raise RuntimeError("formal SHOW Base training exposes train only")
         self.args = args
-        super().__init__(args.train_path, self._FIELDS)
+        super().__init__(
+            args.train_path,
+            self._FIELDS,
+            getattr(args, "lmdb_inode_binding", None),
+        )
 
     def _validate_sample(self, sample: dict[str, np.ndarray]) -> None:
         super()._validate_sample(sample)
@@ -384,7 +484,9 @@ class LMDBNPZDataset(_NPZLMDB):
                 raise RuntimeError(f"{name} must be [6,1,T/4,256]")
 
     def __getitem__(self, index: int) -> dict[str, np.ndarray]:
-        return self._read(index)
+        result = self._read(index)
+        result["sample_index"] = np.int64(index)
+        return result
 
 
 class PickleDataset(torch.utils.data.Dataset):

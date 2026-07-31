@@ -161,6 +161,8 @@ CODEBOOK_SIZE = 256
 RVQ_LEVELS = 6
 EXPECTED_TRAIN_SAMPLES = 127_286
 EXPECTED_TRAIN_CLIPS = 13_687
+EXPECTED_SPLIT_COUNTS = {"train": 13_687, "val": 1_715, "test": 1_708}
+EXPECTED_CANONICAL_CLIPS = sum(EXPECTED_SPLIT_COUNTS.values())
 EXPECTED_UPDATES_PER_EPOCH = 248
 THROUGHPUT_WARMUP_UPDATES = 20
 THROUGHPUT_TIMED_UPDATES = 50
@@ -184,7 +186,7 @@ FRESH_TRAJECTORY_MODE = "fresh_lineage_gate_v1"
 FRESH_TRAJECTORY_FORMAT = (
     "semtalk_show_base_fresh_lineage_trajectory_contract_v1"
 )
-TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v1"
+TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v2"
 TRAJECTORY_PROBE_UPDATES = (
     THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
 )
@@ -225,29 +227,118 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def strict_json(path: Path) -> dict[str, Any]:
+def _stat_identity(value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "size": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+    }
+
+
+def _read_regular_file_bytes(
+    path: Path,
+    label: str,
+) -> tuple[Path, bytes, dict[str, int]]:
+    """Read, identify, hash, and later parse one immutable file descriptor."""
+
+    candidate = Path(path).expanduser()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as error:
+        raise AdaptationContractError(
+            f"could not safely open {label}: {candidate}: {error}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AdaptationContractError(
+                f"{label} must be a regular non-symlink file: {candidate}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _stat_identity(before) != _stat_identity(after):
+            raise AdaptationContractError(
+                f"{label} changed while its verified descriptor was read"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise AdaptationContractError(
+                f"{label} size changed while its verified descriptor was read"
+            )
+        resolved = candidate.resolve(strict=True)
+        current = os.stat(candidate, follow_symlinks=False)
+        if _stat_identity(current) != _stat_identity(before):
+            raise AdaptationContractError(
+                f"{label} pathname no longer names its verified descriptor"
+            )
+    finally:
+        os.close(descriptor)
+    return resolved, payload, _stat_identity(before)
+
+
+def _strict_json_bytes(payload: bytes, label: str) -> dict[str, Any]:
     def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
             if key in result:
                 raise AdaptationContractError(
-                    f"duplicate JSON key in {path}: {key}"
+                    f"duplicate JSON key in {label}: {key}"
                 )
             result[key] = value
         return result
 
-    value = json.loads(
-        path.read_text(encoding="utf-8"),
-        object_pairs_hook=no_duplicates,
-        parse_constant=lambda token: (_ for _ in ()).throw(
-            AdaptationContractError(
-                f"non-finite JSON token in {path}: {token}"
-            )
-        ),
-    )
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                AdaptationContractError(
+                    f"non-finite JSON token in {label}: {token}"
+                )
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AdaptationContractError(f"invalid strict JSON: {label}") from error
     if not isinstance(value, dict):
-        raise AdaptationContractError(f"expected JSON object: {path}")
+        raise AdaptationContractError(f"expected JSON object: {label}")
     return value
+
+
+def strict_json(path: Path) -> dict[str, Any]:
+    resolved, payload, _ = _read_regular_file_bytes(path, "JSON receipt")
+    return _strict_json_bytes(payload, str(resolved))
+
+
+def _strict_jsonl_bytes(payload: bytes, label: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(payload.splitlines(), 1):
+        if not line.strip():
+            continue
+        rows.append(_strict_json_bytes(line, f"{label}:{line_number}"))
+    return rows
+
+
+def _canonical_file_payload_sha256(payload: Any) -> str:
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -330,10 +421,12 @@ def read_official_base_checkpoint(
             f"official Base filename {checkpoint_path.name!r} != "
             f"{expected_filename!r}"
         )
-    resolved = _regular_file(checkpoint_path, "official Base checkpoint")
+    resolved, payload_bytes, checkpoint_identity = _read_regular_file_bytes(
+        checkpoint_path,
+        "official Base checkpoint",
+    )
     if resolved.name != expected_filename:
         raise AdaptationContractError("resolved official Base basename changed")
-    payload_bytes = resolved.read_bytes()
     observed_sha = hashlib.sha256(payload_bytes).hexdigest()
     if observed_sha != expected_sha:
         raise AdaptationContractError(
@@ -435,6 +528,7 @@ def read_official_base_checkpoint(
         "filename": expected_filename,
         "sha256": observed_sha,
         "bytes": len(payload_bytes),
+        "file_identity": checkpoint_identity,
         "checkpoint_container_schema": list(
             specification["checkpoint_container_schema"]
         ),
@@ -542,14 +636,388 @@ def _load_json_receipt(
         or any(character not in "0123456789abcdef" for character in expected_sha256)
     ):
         raise AdaptationContractError(f"{label} expected SHA-256 is invalid")
-    resolved = _regular_file(path, label)
-    observed = sha256_file(resolved)
+    resolved, payload_bytes, identity = _read_regular_file_bytes(path, label)
+    observed = hashlib.sha256(payload_bytes).hexdigest()
     if observed != expected_sha256:
         raise AdaptationContractError(
             f"{label} SHA-256 {observed} != {expected_sha256}"
         )
-    payload = strict_json(resolved)
+    payload = _strict_json_bytes(payload_bytes, str(resolved))
+    # The same bytes are hashed and parsed above.  Reopening by pathname here
+    # would reintroduce a hash/parse replacement window.
+    if identity["size"] != len(payload_bytes):
+        raise AdaptationContractError(f"{label} descriptor size mismatch")
     return payload, resolved, observed
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise AdaptationContractError(f"{label} is not a canonical SHA-256")
+    return value
+
+
+def _exact_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AdaptationContractError(f"{label} must be an exact integer")
+    return value
+
+
+def _hash_regular_descriptor(
+    descriptor: int,
+    *,
+    label: str,
+) -> tuple[str, dict[str, int]]:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise AdaptationContractError(f"{label} is not a regular file")
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 8 * 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if _stat_identity(before) != _stat_identity(after):
+        raise AdaptationContractError(f"{label} changed while being hashed")
+    return digest.hexdigest(), _stat_identity(before)
+
+
+def _verified_lmdb_receipt(
+    path: Path,
+) -> tuple[Path, dict[str, Any]]:
+    """Bind LMDB hashes to the exact directory and file inodes consumed."""
+
+    candidate = Path(path).expanduser()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(candidate, flags)
+    except OSError as error:
+        raise AdaptationContractError(
+            f"could not safely open Base LMDB directory {candidate}: {error}"
+        ) from error
+    try:
+        directory_stat = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise AdaptationContractError(
+                f"Base LMDB path is not a directory: {candidate}"
+            )
+        files: dict[str, Any] = {}
+        for filename in ("data.mdb", "lock.mdb"):
+            file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            file_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(
+                    filename,
+                    file_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as error:
+                raise AdaptationContractError(
+                    f"could not safely open Base LMDB {filename}: {error}"
+                ) from error
+            try:
+                observed_sha, identity = _hash_regular_descriptor(
+                    descriptor,
+                    label=f"Base LMDB {filename}",
+                )
+            finally:
+                os.close(descriptor)
+            files[filename] = {
+                "sha256": observed_sha,
+                "identity": identity,
+            }
+        final_directory_stat = os.fstat(directory_descriptor)
+        if _stat_identity(directory_stat) != _stat_identity(
+            final_directory_stat
+        ):
+            raise AdaptationContractError(
+                "Base LMDB directory changed during immutable preflight"
+            )
+        resolved = candidate.resolve(strict=True)
+        current_directory = os.stat(candidate, follow_symlinks=False)
+        if _stat_identity(current_directory) != _stat_identity(directory_stat):
+            raise AdaptationContractError(
+                "Base LMDB pathname no longer names its verified directory"
+            )
+    finally:
+        os.close(directory_descriptor)
+    return resolved, {
+        "format": "semtalk_show_base_lmdb_inode_binding_v1",
+        "directory_identity": _stat_identity(directory_stat),
+        "files": files,
+    }
+
+
+def _validate_canonical_dataset_evidence(
+    summary: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replay full canonical split and clip-ledger evidence for Base train."""
+
+    canonical = lineage.get("canonical_receipt")
+    manifest_bindings = lineage.get("canonical_manifest_sha256")
+    if not isinstance(canonical, dict) or set(canonical) != {
+        "manifest",
+        "manifest_sha256",
+        "summary",
+        "summary_sha256",
+        "lineage",
+        "lineage_sha256",
+        "lineage_contract_sha256",
+        "source_receipt",
+    }:
+        raise AdaptationContractError(
+            "Base feature lineage lacks the exact full canonical receipt"
+        )
+    manifest_sha = _require_sha256(
+        canonical["manifest_sha256"], "canonical manifest SHA-256"
+    )
+    canonical_summary_sha = _require_sha256(
+        canonical["summary_sha256"], "canonical summary SHA-256"
+    )
+    canonical_lineage_sha = _require_sha256(
+        canonical["lineage_sha256"], "canonical lineage SHA-256"
+    )
+    lineage_contract_sha = _require_sha256(
+        canonical["lineage_contract_sha256"],
+        "canonical lineage contract SHA-256",
+    )
+    manifest_path, manifest_bytes, _ = _read_regular_file_bytes(
+        Path(str(canonical["manifest"])), "canonical SHOW manifest"
+    )
+    if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha:
+        raise AdaptationContractError("canonical SHOW manifest SHA mismatch")
+    canonical_summary, canonical_summary_path, _ = _load_json_receipt(
+        Path(str(canonical["summary"])),
+        canonical_summary_sha,
+        "canonical SHOW summary",
+    )
+    canonical_lineage, canonical_lineage_path, _ = _load_json_receipt(
+        Path(str(canonical["lineage"])),
+        canonical_lineage_sha,
+        "canonical SHOW lineage",
+    )
+    if (
+        manifest_path != Path(str(canonical["manifest"])).resolve(strict=True)
+        or canonical_summary_path
+        != Path(str(canonical["summary"])).resolve(strict=True)
+        or canonical_lineage_path
+        != Path(str(canonical["lineage"])).resolve(strict=True)
+        or not isinstance(manifest_bindings, dict)
+        or len(manifest_bindings) != 1
+        or list(manifest_bindings.values()) != [manifest_sha]
+        or Path(next(iter(manifest_bindings))).resolve(strict=True)
+        != manifest_path
+    ):
+        raise AdaptationContractError(
+            "Base feature lineage canonical artifact paths/hashes disagree"
+        )
+    source_receipt = canonical_lineage.get("lineage_contract", {}).get(
+        "source_receipt"
+    )
+    if (
+        canonical_summary.get("status") != "complete"
+        or canonical_summary.get("schema_name")
+        != "semtalk-show-canonical-motion"
+        or _exact_int(
+            canonical_summary.get("schema_version"),
+            "canonical summary schema_version",
+        )
+        != 1
+        or canonical_summary.get("split_counts") != EXPECTED_SPLIT_COUNTS
+        or _exact_int(
+            canonical_summary.get("clip_count"),
+            "canonical summary clip_count",
+        )
+        != EXPECTED_CANONICAL_CLIPS
+        or canonical_summary.get("manifest_sha256") != manifest_sha
+        or canonical_summary.get("exact_once") is not True
+        or canonical_summary.get("finite") is not True
+        or canonical_summary.get("split_disjoint") is not True
+        or canonical_lineage.get("final_manifest_sha256") != manifest_sha
+        or canonical_lineage.get("lineage_contract_sha256")
+        != lineage_contract_sha
+        or canonical_summary.get("lineage_contract_sha256")
+        != lineage_contract_sha
+        or _canonical_file_payload_sha256(canonical_lineage)
+        != canonical_summary.get("lineage_sha256")
+        or _canonical_file_payload_sha256(
+            canonical_lineage.get("lineage_contract")
+        )
+        != lineage_contract_sha
+        or not isinstance(source_receipt, dict)
+        or canonical.get("source_receipt") != source_receipt
+        or source_receipt.get("origin") != EXPECTED_ORIGIN
+        or canonical_summary.get("source_receipt_sha256")
+        != _canonical_file_payload_sha256(source_receipt)
+    ):
+        raise AdaptationContractError(
+            "canonical SHOW summary/lineage/source proof is incomplete"
+        )
+
+    rows = _strict_jsonl_bytes(manifest_bytes, str(manifest_path))
+    if len(rows) != EXPECTED_CANONICAL_CLIPS:
+        raise AdaptationContractError("canonical SHOW manifest row count changed")
+    split_ids: dict[str, list[str]] = {
+        split: [] for split in EXPECTED_SPLIT_COUNTS
+    }
+    global_indices: set[int] = set()
+    all_ids: set[str] = set()
+    train_rows: list[dict[str, Any]] = []
+    for line_number, row in enumerate(rows, 1):
+        split = row.get("split")
+        clip_id = row.get("clip_id")
+        global_index = _exact_int(
+            row.get("global_index"),
+            f"canonical manifest row {line_number} global_index",
+        )
+        speaker = row.get("speaker")
+        speaker_id = _exact_int(
+            row.get("speaker_id"),
+            f"canonical manifest row {line_number} speaker_id",
+        )
+        if (
+            split not in EXPECTED_SPLIT_COUNTS
+            or not isinstance(clip_id, str)
+            or not clip_id
+            or clip_id in all_ids
+            or global_index < 0
+            or global_index >= EXPECTED_CANONICAL_CLIPS
+            or global_index in global_indices
+            or speaker not in SHOW_SPEAKERS
+            or speaker_id != SHOW_SPEAKERS[speaker]
+            or _exact_int(
+                row.get("frames"),
+                f"canonical manifest row {line_number} frames",
+            )
+            <= 0
+            or row.get("lineage_contract_sha256") != lineage_contract_sha
+        ):
+            raise AdaptationContractError(
+                f"canonical SHOW manifest row {line_number} is invalid"
+            )
+        _require_sha256(
+            row.get("canonical_npz_sha256"),
+            f"canonical manifest row {line_number} NPZ SHA-256",
+        )
+        all_ids.add(clip_id)
+        global_indices.add(global_index)
+        split_ids[split].append(clip_id)
+        if split == "train":
+            train_rows.append(row)
+    if (
+        {split: len(ids) for split, ids in split_ids.items()}
+        != EXPECTED_SPLIT_COUNTS
+        or global_indices != set(range(EXPECTED_CANONICAL_CLIPS))
+        or sum(len(set(ids)) for ids in split_ids.values()) != len(all_ids)
+    ):
+        raise AdaptationContractError(
+            "canonical SHOW manifest is not exact-once and split-disjoint"
+        )
+    train_rows.sort(
+        key=lambda row: (str(row["clip_id"]), str(row.get("canonical_npz", "")))
+    )
+    expected_train_ids = [str(row["clip_id"]) for row in train_rows]
+
+    per_clip = summary.get("per_clip")
+    skipped = summary.get("skipped_short_clip_ids")
+    if (
+        not isinstance(per_clip, list)
+        or len(per_clip) != EXPECTED_TRAIN_CLIPS
+        or not isinstance(skipped, list)
+        or any(not isinstance(value, str) for value in skipped)
+        or len(set(skipped)) != len(skipped)
+        or summary.get("entry_aggregate_sha256")
+        != lineage.get("entry_aggregate_sha256")
+    ):
+        raise AdaptationContractError("Base per-clip ledger schema mismatch")
+    _require_sha256(
+        summary.get("entry_aggregate_sha256"),
+        "Base entry aggregate SHA-256",
+    )
+    ledger_ids: list[str] = []
+    zero_window_ids: set[str] = set()
+    windows_total = 0
+    raw_frames_total = 0
+    usable_frames_total = 0
+    dropped_frames_total = 0
+    for index, (ledger, canonical_row) in enumerate(zip(per_clip, train_rows)):
+        if not isinstance(ledger, dict):
+            raise AdaptationContractError(
+                f"Base per-clip ledger row {index} is not an object"
+            )
+        clip_id = ledger.get("clip_id")
+        windows = _exact_int(ledger.get("windows"), f"ledger {index} windows")
+        raw_frames = _exact_int(
+            ledger.get("raw_frames"), f"ledger {index} raw_frames"
+        )
+        usable_frames = _exact_int(
+            ledger.get("usable_frames"), f"ledger {index} usable_frames"
+        )
+        dropped_frames = _exact_int(
+            ledger.get("dropped_tail_frames"),
+            f"ledger {index} dropped_tail_frames",
+        )
+        if (
+            clip_id != canonical_row["clip_id"]
+            or ledger.get("canonical_npz_sha256")
+            != canonical_row.get("canonical_npz_sha256")
+            or raw_frames != canonical_row["frames"]
+            or usable_frames != (raw_frames // 30) * 30
+            or dropped_frames != raw_frames - usable_frames
+            or windows != max(0, (usable_frames - POSE_LENGTH) // 20 + 1)
+            or ledger.get("speaker_id") != canonical_row["speaker_id"]
+        ):
+            raise AdaptationContractError(
+                f"Base per-clip ledger row {index} disagrees with canonical train"
+            )
+        ledger_ids.append(clip_id)
+        windows_total += windows
+        raw_frames_total += raw_frames
+        usable_frames_total += usable_frames
+        dropped_frames_total += dropped_frames
+        if windows == 0:
+            zero_window_ids.add(clip_id)
+    if (
+        ledger_ids != expected_train_ids
+        or len(set(ledger_ids)) != EXPECTED_TRAIN_CLIPS
+        or set(skipped) != zero_window_ids
+        or windows_total != EXPECTED_TRAIN_SAMPLES
+        or summary.get("raw_frames") != raw_frames_total
+        or summary.get("usable_frames") != usable_frames_total
+        or summary.get("dropped_tail_frames") != dropped_frames_total
+    ):
+        raise AdaptationContractError(
+            "Base train clip ledger is not exact-once or count-complete"
+        )
+    return {
+        "format": "semtalk_show_base_canonical_split_proof_v1",
+        "manifest": str(manifest_path),
+        "manifest_sha256": manifest_sha,
+        "summary": str(canonical_summary_path),
+        "summary_sha256": canonical_summary_sha,
+        "lineage": str(canonical_lineage_path),
+        "lineage_sha256": canonical_lineage_sha,
+        "lineage_contract_sha256": lineage_contract_sha,
+        "split_counts": dict(EXPECTED_SPLIT_COUNTS),
+        "split_clip_ids_sha256": {
+            split: canonical_json_sha256(sorted(ids))
+            for split, ids in split_ids.items()
+        },
+        "global_clip_ids_sha256": canonical_json_sha256(sorted(all_ids)),
+        "split_disjoint": True,
+        "exact_once": True,
+        "train_per_clip_ledger_exact": True,
+        "train_windows": windows_total,
+        "test_rows_used_as_training_samples": False,
+        "source_receipt": source_receipt,
+    }
 
 
 def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
@@ -565,11 +1033,11 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         args.expected_lineage_sha256,
         "Base feature lineage",
     )
-    lmdb_path = Path(args.train_lmdb).resolve()
-    data_path = _regular_file(lmdb_path / "data.mdb", "Base LMDB data.mdb")
-    lock_path = _regular_file(lmdb_path / "lock.mdb", "Base LMDB lock.mdb")
-    observed_data_sha = sha256_file(data_path)
-    observed_lock_sha = sha256_file(lock_path)
+    lmdb_path, lmdb_binding = _verified_lmdb_receipt(
+        Path(args.train_lmdb)
+    )
+    observed_data_sha = lmdb_binding["files"]["data.mdb"]["sha256"]
+    observed_lock_sha = lmdb_binding["files"]["lock.mdb"]["sha256"]
     expected_forbidden = {
         "ASR",
         "TextGrid",
@@ -614,6 +1082,10 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
             "Base summary/lineage does not match the frozen All-Speakers "
             "SHOW Base-only feature contract"
         )
+    canonical_evidence = _validate_canonical_dataset_evidence(
+        summary,
+        lineage,
+    )
     selected_mode = (
         getattr(args, "prerequisite_selection_json", None) is not None
     )
@@ -727,10 +1199,12 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         "test_visible": False,
         "data_mdb_sha256": observed_data_sha,
         "lock_mdb_sha256": observed_lock_sha,
+        "lmdb_inode_binding": lmdb_binding,
         "summary": str(summary_path),
         "summary_sha256": summary_sha,
         "lineage": str(lineage_path),
         "lineage_sha256": lineage_sha,
+        "canonical_dataset_evidence": canonical_evidence,
         "prerequisite_source": (
             SHOW_VAL_SELECTED_SOURCE if selected_mode else OFFICIAL_BASE_SOURCE
         ),
@@ -832,6 +1306,10 @@ def validate_long_contract_receipts(
         selected_sha256 = dataset_receipt.get(
             "selected_prerequisite_sha256"
         )
+        canonical_evidence = dataset_receipt.get(
+            "canonical_dataset_evidence"
+        )
+        lmdb_inode_binding = dataset_receipt.get("lmdb_inode_binding")
         if (
             schedule.get("format") != FRESH_SCHEDULE_FORMAT
             or schedule.get("trajectory_contract")
@@ -854,6 +1332,17 @@ def validate_long_contract_receipts(
             or not isinstance(selected_sha256, dict)
             or set(selected_sha256) != set(selected_contract.STAGES)
             or dataset_receipt.get("global_verified_not_consumed") is not True
+            or not isinstance(canonical_evidence, dict)
+            or canonical_evidence.get("split_counts")
+            != EXPECTED_SPLIT_COUNTS
+            or canonical_evidence.get("split_disjoint") is not True
+            or canonical_evidence.get("exact_once") is not True
+            or canonical_evidence.get("train_per_clip_ledger_exact") is not True
+            or canonical_evidence.get("test_rows_used_as_training_samples")
+            is not False
+            or not isinstance(lmdb_inode_binding, dict)
+            or lmdb_inode_binding.get("format")
+            != "semtalk_show_base_lmdb_inode_binding_v1"
         ):
             raise AdaptationContractError(
                 "fresh Base trajectory is not bound to the exact selected "
@@ -873,6 +1362,8 @@ def validate_long_contract_receipts(
             "feature_lineage_sha256": dataset_receipt["lineage_sha256"],
             "data_mdb_sha256": dataset_receipt["data_mdb_sha256"],
             "lock_mdb_sha256": dataset_receipt["lock_mdb_sha256"],
+            "lmdb_inode_binding": lmdb_inode_binding,
+            "canonical_dataset_evidence": canonical_evidence,
             "prerequisite_selection_sha256": prerequisite_selection[
                 "sha256"
             ],
@@ -882,7 +1373,9 @@ def validate_long_contract_receipts(
             },
             "probe_optimizer_updates": TRAJECTORY_PROBE_UPDATES,
             "probe_source": "matching_frozen_receipt_throughput_gate",
-            "comparison": "byte_exact_model_state_semantic_sha256",
+            "comparison": (
+                "byte_exact_all_rank_model_adam_rng_and_sample_order_v2"
+            ),
             "seed": args.seed,
             "precision": args.precision,
             "learning_rate": args.learning_rate,
@@ -938,18 +1431,11 @@ def validate_long_contract_receipts(
         or set(entries) != {str(epoch) for epoch in TRAJECTORY_ANCHOR_EPOCHS}
     ):
         raise AdaptationContractError("invalid long-training trajectory anchor")
-    source_manifest = _regular_file(
+    manifest, source_manifest, _ = _load_json_receipt(
         source_manifest_path,
+        source_manifest_sha,
         "trajectory source candidate manifest",
     )
-    if (
-        len(source_manifest_sha) != 64
-        or sha256_file(source_manifest) != source_manifest_sha
-    ):
-        raise AdaptationContractError(
-            "trajectory source candidate manifest SHA mismatch"
-        )
-    manifest = strict_json(source_manifest)
     manifest_entries = manifest.get("entries")
     if (
         manifest.get("format")
@@ -1111,7 +1597,7 @@ def protocol_receipt(
                 else None
             ),
             "comparison": (
-                "byte_exact_model_state_semantic_sha256"
+                "byte_exact_all_rank_model_adam_rng_and_sample_order_v2"
                 if fresh_trajectory
                 else None
             ),
@@ -1125,6 +1611,22 @@ def protocol_receipt(
             "scheduler": "constant",
         },
         "precision": args.precision,
+        "determinism": {
+            "python_random_seed": args.seed,
+            "numpy_random_seed": args.seed,
+            "torch_cpu_seed": args.seed,
+            "torch_cuda_seed_all": args.seed,
+            "cublas_workspace_config": ":4096:8",
+            "deterministic_algorithms": True,
+            "cudnn_benchmark": False,
+            "cudnn_deterministic": True,
+            "matmul_tf32": False,
+            "cudnn_tf32": False,
+            "float32_matmul_precision": "highest",
+            "loader_generator_seed": args.seed,
+            "loader_worker_seed": "torch_initial_seed_mod_2pow32",
+            "multiprocessing_context": "fork",
+        },
         "forward_contract": {
             "forwards_per_optimizer_step": 1,
             "audio_conditioned_main_forward": True,
@@ -1473,14 +1975,73 @@ def _state_tree_semantic_sha256(value: Any) -> str:
     return canonical_json_sha256(normalize(value))
 
 
-def _trajectory_probe(
+def _record_sample_order(
+    digest: Any,
+    batch: Mapping[str, Any],
+    *,
+    rank: int,
+    optimizer_update: int,
+) -> int:
+    import torch
+
+    indices = batch.get("sample_index")
+    if (
+        not torch.is_tensor(indices)
+        or indices.ndim != 1
+        or int(indices.numel()) != LOCAL_BATCH_SIZE
+    ):
+        raise AdaptationContractError(
+            "trajectory batches must carry exactly 64 immutable LMDB indices"
+        )
+    values = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    digest.update(int(rank).to_bytes(4, "little", signed=False))
+    digest.update(int(optimizer_update).to_bytes(8, "little", signed=False))
+    digest.update(int(values.numel()).to_bytes(4, "little", signed=False))
+    digest.update(values.numpy().astype("<i8", copy=False).tobytes(order="C"))
+    return int(values.numel())
+
+
+def _rng_state_hashes(device: Any) -> dict[str, str]:
+    import random
+
+    import numpy as np
+    import torch
+
+    numpy_state = np.random.get_state()
+    normalized_numpy = {
+        "algorithm": str(numpy_state[0]),
+        "keys_sha256": hashlib.sha256(
+            np.asarray(numpy_state[1], dtype="<u4").tobytes(order="C")
+        ).hexdigest(),
+        "position": int(numpy_state[2]),
+        "has_gauss": int(numpy_state[3]),
+        "cached_gaussian": float(numpy_state[4]),
+    }
+    return {
+        "python_random_state_sha256": _state_tree_semantic_sha256(
+            random.getstate()
+        ),
+        "numpy_random_state_sha256": canonical_json_sha256(normalized_numpy),
+        "torch_cpu_rng_state_sha256": _tensor_sha256(torch.get_rng_state()),
+        "torch_cuda_rng_state_sha256": _tensor_sha256(
+            torch.cuda.get_rng_state(device)
+        ),
+    }
+
+
+def _trajectory_rank_probe(
     model: Any,
     optimizer: Any,
     optimizer_updates: int,
+    *,
+    rank: int,
+    device: Any,
+    sample_order_sha256: str,
+    sample_count: int,
 ) -> dict[str, Any]:
     state = _unwrap_model(model).state_dict()
     return {
-        "format": TRAJECTORY_PROBE_FORMAT,
+        "rank": rank,
         "optimizer_updates": optimizer_updates,
         "model_state_tensors": len(state),
         "model_state_schema_sha256": _state_schema_sha256(state),
@@ -1488,7 +2049,130 @@ def _trajectory_probe(
         "optimizer_state_semantic_sha256": _state_tree_semantic_sha256(
             optimizer.state_dict()
         ),
+        **_rng_state_hashes(device),
+        "sample_order_sha256": _require_sha256(
+            sample_order_sha256,
+            f"rank {rank} sample order SHA-256",
+        ),
+        "sample_count": sample_count,
     }
+
+
+def _assemble_trajectory_probe(
+    rank_probes: Sequence[Any],
+    *,
+    optimizer_updates: int,
+) -> dict[str, Any]:
+    expected_rank_keys = {
+        "rank",
+        "optimizer_updates",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "optimizer_state_semantic_sha256",
+        "python_random_state_sha256",
+        "numpy_random_state_sha256",
+        "torch_cpu_rng_state_sha256",
+        "torch_cuda_rng_state_sha256",
+        "sample_order_sha256",
+        "sample_count",
+    }
+    if (
+        len(rank_probes) != WORLD_SIZE
+        or any(
+            not isinstance(probe, dict) or set(probe) != expected_rank_keys
+            for probe in rank_probes
+        )
+        or [probe["rank"] for probe in rank_probes] != list(range(WORLD_SIZE))
+    ):
+        raise AdaptationContractError(
+            "trajectory probe does not contain exact ordered all-rank state"
+        )
+    for probe in rank_probes:
+        if (
+            probe["optimizer_updates"] != optimizer_updates
+            or probe["sample_count"]
+            != optimizer_updates * LOCAL_BATCH_SIZE
+            or probe["model_state_tensors"] <= 0
+        ):
+            raise AdaptationContractError(
+                f"trajectory rank {probe['rank']} metadata mismatch"
+            )
+        for key, value in probe.items():
+            if key.endswith("_sha256"):
+                _require_sha256(value, f"trajectory rank {probe['rank']} {key}")
+    model_consensus = {
+        (
+            probe["model_state_tensors"],
+            probe["model_state_schema_sha256"],
+            probe["model_state_semantic_sha256"],
+        )
+        for probe in rank_probes
+    }
+    optimizer_consensus = {
+        probe["optimizer_state_semantic_sha256"] for probe in rank_probes
+    }
+    if len(model_consensus) != 1 or len(optimizer_consensus) != 1:
+        raise AdaptationContractError(
+            "DDP ranks disagree on model or Adam state at trajectory probe"
+        )
+    return {
+        "format": TRAJECTORY_PROBE_FORMAT,
+        "optimizer_updates": optimizer_updates,
+        "world_size": WORLD_SIZE,
+        "rank_order": list(range(WORLD_SIZE)),
+        "all_rank_model_state_identical": True,
+        "all_rank_optimizer_state_identical": True,
+        "ranks": [dict(probe) for probe in rank_probes],
+    }
+
+
+def _distributed_trajectory_probe(
+    model: Any,
+    optimizer: Any,
+    optimizer_updates: int,
+    *,
+    rank: int,
+    device: Any,
+    sample_order_sha256: str,
+    sample_count: int,
+) -> dict[str, Any]:
+    import torch.distributed as dist
+
+    try:
+        local_probe: Any = {
+            "status": "complete",
+            "probe": _trajectory_rank_probe(
+                model,
+                optimizer,
+                optimizer_updates,
+                rank=rank,
+                device=device,
+                sample_order_sha256=sample_order_sha256,
+                sample_count=sample_count,
+            ),
+        }
+    except BaseException as error:
+        local_probe = {
+            "status": "failed",
+            "rank": rank,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    gathered: list[Any] = [None for _ in range(WORLD_SIZE)]
+    dist.all_gather_object(gathered, local_probe)
+    if any(
+        not isinstance(item, dict) or item.get("status") != "complete"
+        for item in gathered
+    ):
+        raise AdaptationContractError(
+            f"distributed trajectory rank probe failed: {gathered}"
+        )
+    rank_probes = [item["probe"] for item in gathered]
+    return _assemble_trajectory_probe(
+        rank_probes,
+        optimizer_updates=optimizer_updates,
+    )
 
 
 def _validate_trajectory_probe(
@@ -1499,10 +2183,11 @@ def _validate_trajectory_probe(
     expected_keys = {
         "format",
         "optimizer_updates",
-        "model_state_tensors",
-        "model_state_schema_sha256",
-        "model_state_semantic_sha256",
-        "optimizer_state_semantic_sha256",
+        "world_size",
+        "rank_order",
+        "all_rank_model_state_identical",
+        "all_rank_optimizer_state_identical",
+        "ranks",
     }
     if not isinstance(probe, dict) or set(probe) != expected_keys:
         raise AdaptationContractError(f"{label} schema mismatch")
@@ -1510,23 +2195,20 @@ def _validate_trajectory_probe(
         probe.get("format") != TRAJECTORY_PROBE_FORMAT
         or type(probe.get("optimizer_updates")) is not int
         or probe["optimizer_updates"] != TRAJECTORY_PROBE_UPDATES
-        or type(probe.get("model_state_tensors")) is not int
-        or probe["model_state_tensors"] <= 0
+        or probe.get("world_size") != WORLD_SIZE
+        or probe.get("rank_order") != list(range(WORLD_SIZE))
+        or probe.get("all_rank_model_state_identical") is not True
+        or probe.get("all_rank_optimizer_state_identical") is not True
+        or not isinstance(probe.get("ranks"), list)
     ):
         raise AdaptationContractError(f"{label} metadata mismatch")
-    for key in (
-        "model_state_schema_sha256",
-        "model_state_semantic_sha256",
-        "optimizer_state_semantic_sha256",
-    ):
-        value = probe.get(key)
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise AdaptationContractError(f"{label} {key} is invalid")
-    return dict(probe)
+    assembled = _assemble_trajectory_probe(
+        probe["ranks"],
+        optimizer_updates=TRAJECTORY_PROBE_UPDATES,
+    )
+    if assembled != probe:
+        raise AdaptationContractError(f"{label} canonical aggregate mismatch")
+    return assembled
 
 
 def _require_matching_trajectory_probe(
@@ -2012,6 +2694,37 @@ def _model_args() -> SimpleNamespace:
     )
 
 
+def _prepare_deterministic_environment() -> None:
+    expected = ":4096:8"
+    observed = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if observed not in {None, expected}:
+        raise AdaptationContractError(
+            "CUBLAS_WORKSPACE_CONFIG must be unset or exactly :4096:8"
+        )
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = expected
+
+
+def _configure_deterministic_runtime(
+    torch_module: Any,
+    *,
+    seed: int,
+) -> None:
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch_module.manual_seed(seed)
+    torch_module.cuda.manual_seed_all(seed)
+    torch_module.use_deterministic_algorithms(True, warn_only=False)
+    torch_module.backends.cudnn.benchmark = False
+    torch_module.backends.cudnn.deterministic = True
+    torch_module.backends.cuda.matmul.allow_tf32 = False
+    torch_module.backends.cudnn.allow_tf32 = False
+    torch_module.set_float32_matmul_precision("highest")
+
+
 def _distributed_context() -> tuple[int, int, int]:
     try:
         rank = int(os.environ["RANK"])
@@ -2028,13 +2741,32 @@ def _distributed_context() -> tuple[int, int, int]:
     return rank, local_rank, world_size
 
 
-def _create_dataloader(args: argparse.Namespace, rank: int, world_size: int) -> Any:
+def _seed_loader_worker(worker_id: int) -> None:
+    import random
+
+    import numpy as np
+    import torch
+
+    del worker_id
+    worker_seed = int(torch.initial_seed() % (2**32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _create_dataloader(
+    args: argparse.Namespace,
+    rank: int,
+    world_size: int,
+    dataset_receipt: Mapping[str, Any],
+) -> Any:
     import torch
     from dataloaders.show_base import LMDBNPZDataset
 
     dataset_args = SimpleNamespace(
-        train_path=args.train_lmdb,
+        # Never reopen the caller's original alias after rank-0 preflight.
+        train_path=dataset_receipt["lmdb"],
         pose_length=POSE_LENGTH,
+        lmdb_inode_binding=dataset_receipt["lmdb_inode_binding"],
     )
     dataset = LMDBNPZDataset(dataset_args, "train")
     if len(dataset) != EXPECTED_TRAIN_SAMPLES:
@@ -2049,6 +2781,11 @@ def _create_dataloader(args: argparse.Namespace, rank: int, world_size: int) -> 
         seed=args.seed,
         drop_last=False,
     )
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
+    loader_kwargs: dict[str, Any] = {}
+    if args.loader_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "fork"
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=LOCAL_BATCH_SIZE,
@@ -2058,12 +2795,49 @@ def _create_dataloader(args: argparse.Namespace, rank: int, world_size: int) -> 
         drop_last=True,
         pin_memory=True,
         persistent_workers=args.loader_workers > 0,
+        worker_init_fn=_seed_loader_worker,
+        generator=generator,
+        **loader_kwargs,
     )
     if len(loader) != EXPECTED_UPDATES_PER_EPOCH:
         raise AdaptationContractError(
             f"updates/epoch {len(loader)} != {EXPECTED_UPDATES_PER_EPOCH}"
         )
     return loader, sampler
+
+
+def _distributed_verify_loader_source(
+    loader: Any,
+    *,
+    rank: int,
+    full_hash_on_rank0: bool,
+) -> None:
+    import torch.distributed as dist
+
+    local: dict[str, Any]
+    try:
+        loader.dataset.assert_source_unchanged(
+            full_hash=full_hash_on_rank0 and rank == 0
+        )
+        local = {"rank": rank, "status": "verified"}
+    except BaseException as error:
+        local = {
+            "rank": rank,
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    gathered: list[Any] = [None for _ in range(WORLD_SIZE)]
+    dist.all_gather_object(gathered, local)
+    if [item.get("rank") for item in gathered if isinstance(item, dict)] != list(
+        range(WORLD_SIZE)
+    ) or any(
+        not isinstance(item, dict) or item.get("status") != "verified"
+        for item in gathered
+    ):
+        raise AdaptationContractError(
+            f"distributed immutable Base LMDB verification failed: {gathered}"
+        )
 
 
 def _frozen_receipt(
@@ -2107,11 +2881,22 @@ def _run_throughput_gate(
     sampler.set_epoch(0)
     iterator = iter(loader)
     last_metrics: dict[str, float] = {}
+    sample_order = hashlib.sha256()
+    sample_count = 0
+    optimizer_update = 0
     for _ in range(THROUGHPUT_WARMUP_UPDATES):
+        batch = next(iterator)
+        optimizer_update += 1
+        sample_count += _record_sample_order(
+            sample_order,
+            batch,
+            rank=rank,
+            optimizer_update=optimizer_update,
+        )
         last_metrics = one_optimizer_update(
             model,
             optimizer,
-            _move_batch(next(iterator), device),
+            _move_batch(batch, device),
             device=device,
             precision=args.precision,
         )
@@ -2119,10 +2904,18 @@ def _run_throughput_gate(
     dist.barrier()
     started = time.perf_counter()
     for _ in range(THROUGHPUT_TIMED_UPDATES):
+        batch = next(iterator)
+        optimizer_update += 1
+        sample_count += _record_sample_order(
+            sample_order,
+            batch,
+            rank=rank,
+            optimizer_update=optimizer_update,
+        )
         last_metrics = one_optimizer_update(
             model,
             optimizer,
-            _move_batch(next(iterator), device),
+            _move_batch(batch, device),
             device=device,
             precision=args.precision,
         )
@@ -2133,19 +2926,28 @@ def _run_throughput_gate(
     dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
     elapsed = float(elapsed_tensor.item())
     _assert_distributed_finite(_all_finite(model.parameters()), device)
-    if rank == 0:
-        trajectory_mode = frozen_receipt["long_contract"][
-            "trajectory_anchor"
-        ]["mode"]
-        trajectory_probe = (
-            _trajectory_probe(
-                model,
-                optimizer,
-                TRAJECTORY_PROBE_UPDATES,
-            )
-            if trajectory_mode == FRESH_TRAJECTORY_MODE
-            else None
+    _distributed_verify_loader_source(
+        loader,
+        rank=rank,
+        full_hash_on_rank0=True,
+    )
+    trajectory_mode = frozen_receipt["long_contract"][
+        "trajectory_anchor"
+    ]["mode"]
+    trajectory_probe = (
+        _distributed_trajectory_probe(
+            model,
+            optimizer,
+            TRAJECTORY_PROBE_UPDATES,
+            rank=rank,
+            device=device,
+            sample_order_sha256=sample_order.hexdigest(),
+            sample_count=sample_count,
         )
+        if trajectory_mode == FRESH_TRAJECTORY_MODE
+        else None
+    )
+    if rank == 0:
         report = {
             "format": GATE_FORMAT,
             "status": "pass",
@@ -2234,6 +3036,8 @@ def _run_training(
     if rank == 0:
         _atomic_json(run_dir / "candidate_manifest.json", manifest)
     optimizer_updates = 0
+    probe_sample_order = hashlib.sha256()
+    probe_sample_count = 0
     started_unix = time.time()
     model.train()
     for epoch_index in range(TOTAL_EPOCHS):
@@ -2247,6 +3051,13 @@ def _run_training(
             )
         }
         for batch in loader:
+            if fresh_trajectory and optimizer_updates < TRAJECTORY_PROBE_UPDATES:
+                probe_sample_count += _record_sample_order(
+                    probe_sample_order,
+                    batch,
+                    rank=rank,
+                    optimizer_update=optimizer_updates + 1,
+                )
             metrics = one_optimizer_update(
                 model,
                 optimizer,
@@ -2256,47 +3067,30 @@ def _run_training(
             )
             optimizer_updates += 1
             if fresh_trajectory and optimizer_updates == TRAJECTORY_PROBE_UPDATES:
-                dist.barrier()
-                probe_result: list[Any] = [None]
-                if rank == 0:
-                    try:
-                        observed_probe = _trajectory_probe(
-                            model,
-                            optimizer,
-                            optimizer_updates,
-                        )
-                        matched_probe = _require_matching_trajectory_probe(
-                            expected_trajectory_probe,
-                            observed_probe,
-                        )
-                        probe_result[0] = {
-                            "status": "verified",
-                            "probe": matched_probe,
-                        }
-                    except BaseException as error:
-                        probe_result[0] = {
-                            "status": "failed",
-                            "error_type": type(error).__name__,
-                            "error": str(error),
-                        }
-                dist.broadcast_object_list(probe_result, src=0)
-                if (
-                    not isinstance(probe_result[0], dict)
-                    or probe_result[0].get("status") != "verified"
-                ):
-                    failure = (
-                        probe_result[0]
-                        if isinstance(probe_result[0], dict)
-                        else {}
-                    )
-                    raise AdaptationContractError(
-                        "fresh trajectory probe failed: "
-                        f"{failure.get('error_type')}: "
-                        f"{failure.get('error')}"
-                    )
+                _distributed_verify_loader_source(
+                    loader,
+                    rank=rank,
+                    # Rank-0 already content-hashed the exact pinned inode at
+                    # this process preflight.  Recheck inode/metadata here;
+                    # the mandatory second content hash is at strict finalize.
+                    full_hash_on_rank0=False,
+                )
+                observed_probe = _distributed_trajectory_probe(
+                    model,
+                    optimizer,
+                    optimizer_updates,
+                    rank=rank,
+                    device=device,
+                    sample_order_sha256=probe_sample_order.hexdigest(),
+                    sample_count=probe_sample_count,
+                )
+                matched_probe = _require_matching_trajectory_probe(
+                    expected_trajectory_probe,
+                    observed_probe,
+                )
                 if rank == 0:
                     manifest["trajectory_probe_verified"] = True
-                    manifest["trajectory_probe"] = probe_result[0]["probe"]
+                    manifest["trajectory_probe"] = matched_probe
                     _atomic_json(
                         run_dir / "candidate_manifest.json",
                         manifest,
@@ -2324,7 +3118,11 @@ def _run_training(
         }
         completed_epoch = epoch_index + 1
         if completed_epoch in CANDIDATE_EPOCHS:
-            dist.barrier()
+            _distributed_verify_loader_source(
+                loader,
+                rank=rank,
+                full_hash_on_rank0=False,
+            )
             if rank == 0:
                 _save_candidate(
                     model=model,
@@ -2407,6 +3205,11 @@ def _run_training(
                 },
             )
     _assert_distributed_finite(_all_finite(model.parameters()), device)
+    _distributed_verify_loader_source(
+        loader,
+        rank=rank,
+        full_hash_on_rank0=True,
+    )
     if rank == 0:
         if fresh_trajectory and manifest["trajectory_probe_verified"] is not True:
             raise AdaptationContractError(
@@ -2471,6 +3274,7 @@ def _run_training(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_args(args)
+    _prepare_deterministic_environment()
     rank, local_rank, world_size = _distributed_context()
 
     import torch
@@ -2486,10 +3290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(backend="nccl", init_method="env://")
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    _configure_deterministic_runtime(torch, seed=args.seed)
 
     run_dir = Path(args.output_root).resolve() / args.run_name
     try:
@@ -2602,7 +3403,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             throughput_receipt = validate_throughput_gate(
                 args, frozen_receipt=frozen_receipt
             )
-        loader, sampler = _create_dataloader(args, rank, world_size)
+        loader, sampler = _create_dataloader(
+            args,
+            rank,
+            world_size,
+            dataset_receipt,
+        )
         model = model.to(device)
         process_group = dist.new_group()
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(

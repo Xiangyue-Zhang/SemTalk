@@ -37,6 +37,35 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _probe(seed: str = "a") -> dict[str, object]:
+    ranks = []
+    for rank in range(ADAPT.WORLD_SIZE):
+        rank_hex = format(rank, "x")
+        ranks.append(
+            {
+                "rank": rank,
+                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+                "model_state_tensors": 1790,
+                "model_state_schema_sha256": seed * 64,
+                "model_state_semantic_sha256": "b" * 64,
+                "optimizer_state_semantic_sha256": "c" * 64,
+                "python_random_state_sha256": rank_hex * 64,
+                "numpy_random_state_sha256": "d" * 63 + rank_hex,
+                "torch_cpu_rng_state_sha256": "e" * 63 + rank_hex,
+                "torch_cuda_rng_state_sha256": "f" * 63 + rank_hex,
+                "sample_order_sha256": rank_hex * 63 + "1",
+                "sample_count": (
+                    ADAPT.TRAJECTORY_PROBE_UPDATES
+                    * ADAPT.LOCAL_BATCH_SIZE
+                ),
+            }
+        )
+    return ADAPT._assemble_trajectory_probe(
+        ranks,
+        optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
+    )
+
+
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
     def test_scratch_entrypoint_is_untouched_by_the_new_entrypoint(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -147,6 +176,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             expected_trajectory_anchor_sha256="b" * 64,
             trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
             loader_workers=4,
+            seed=43,
         )
         protocol = ADAPT.protocol_receipt(
             args,
@@ -175,6 +205,20 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             protocol["initialization"]["sha256"],
             "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc1d89603",
         )
+        self.assertEqual(
+            protocol["determinism"]["cublas_workspace_config"],
+            ":4096:8",
+        )
+        self.assertFalse(protocol["determinism"]["cudnn_benchmark"])
+        self.assertFalse(protocol["determinism"]["matmul_tf32"])
+
+    def test_runtime_source_forbids_benchmark_and_tf32_shortcuts(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("torch_module.use_deterministic_algorithms(True", source)
+        self.assertIn("torch_module.backends.cudnn.benchmark = False", source)
+        self.assertIn("torch_module.backends.cudnn.deterministic = True", source)
+        self.assertIn("torch_module.backends.cuda.matmul.allow_tf32 = False", source)
+        self.assertNotIn("torch.backends.cudnn.benchmark = True", source)
 
     def test_e30_and_speaker2_are_hard_rejected(self) -> None:
         for label in (
@@ -318,6 +362,18 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 for index, stage in enumerate(ADAPT.selected_contract.STAGES)
             },
             "global_verified_not_consumed": True,
+            "lmdb_inode_binding": {
+                "format": "semtalk_show_base_lmdb_inode_binding_v1",
+                "directory_identity": {},
+                "files": {},
+            },
+            "canonical_dataset_evidence": {
+                "split_counts": dict(ADAPT.EXPECTED_SPLIT_COUNTS),
+                "split_disjoint": True,
+                "exact_once": True,
+                "train_per_clip_ledger_exact": True,
+                "test_rows_used_as_training_samples": False,
+            },
         }
 
     def _fresh_long_args(self) -> argparse.Namespace:
@@ -489,6 +545,133 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
         lmdb.mkdir()
         (lmdb / "data.mdb").write_bytes(b"official-base-data")
         (lmdb / "lock.mdb").write_bytes(b"official-base-lock")
+        canonical_manifest_path = root / "canonical.jsonl"
+        canonical_summary_path = root / "canonical_summary.json"
+        canonical_lineage_path = root / "canonical_lineage.json"
+        source_receipt = {
+            "origin": ADAPT.EXPECTED_ORIGIN,
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+        }
+        lineage_contract = {
+            "source_receipt": source_receipt,
+            "source_audio_sample_rate": 22_000,
+            "hubert_target_sample_rate": 16_000,
+            "audio_channel_protocol": {"fixture": True},
+        }
+        lineage_contract_sha = ADAPT._canonical_file_payload_sha256(
+            lineage_contract
+        )
+        rows = []
+        per_clip = []
+        global_index = 0
+        total_raw = 0
+        total_usable = 0
+        total_dropped = 0
+        total_windows = 0
+        for split, count in ADAPT.EXPECTED_SPLIT_COUNTS.items():
+            for split_index in range(count):
+                clip_id = f"{split}-{split_index:05d}"
+                if split == "train":
+                    if split_index < 2052:
+                        frames = 270
+                    elif split_index == 2052:
+                        frames = 210
+                    else:
+                        frames = 240
+                else:
+                    frames = 240
+                speaker_id = split_index % 4
+                speaker = tuple(ADAPT.SHOW_SPEAKERS)[speaker_id]
+                canonical_sha = format(global_index % 16, "x") * 64
+                row = {
+                    "global_index": global_index,
+                    "split": split,
+                    "clip_id": clip_id,
+                    "speaker": speaker,
+                    "speaker_id": speaker_id,
+                    "frames": frames,
+                    "canonical_npz": f"/canonical/{clip_id}.npz",
+                    "canonical_npz_sha256": canonical_sha,
+                    "lineage_contract_sha256": lineage_contract_sha,
+                }
+                rows.append(row)
+                if split == "train":
+                    usable = (frames // 30) * 30
+                    dropped = frames - usable
+                    windows = max(
+                        0,
+                        (usable - ADAPT.POSE_LENGTH) // 20 + 1,
+                    )
+                    per_clip.append(
+                        {
+                            "clip_id": clip_id,
+                            "canonical_npz": row["canonical_npz"],
+                            "canonical_npz_sha256": canonical_sha,
+                            "audio_feature_npz": f"/audio/{clip_id}.npz",
+                            "audio_feature_npz_sha256": "f" * 64,
+                            "raw_frames": frames,
+                            "usable_frames": usable,
+                            "dropped_tail_frames": dropped,
+                            "windows": windows,
+                            "speaker_id": speaker_id,
+                        }
+                    )
+                    total_raw += frames
+                    total_usable += usable
+                    total_dropped += dropped
+                    total_windows += windows
+                global_index += 1
+        self.assertEqual(total_windows, ADAPT.EXPECTED_TRAIN_SAMPLES)
+        canonical_manifest_path.write_text(
+            "".join(
+                json.dumps(row, sort_keys=True) + "\n" for row in rows
+            ),
+            encoding="utf-8",
+        )
+        canonical_manifest_sha = _sha(canonical_manifest_path)
+        canonical_lineage = {
+            "final_manifest_sha256": canonical_manifest_sha,
+            "lineage_contract_sha256": lineage_contract_sha,
+            "lineage_contract": lineage_contract,
+        }
+        canonical_lineage_path.write_text(
+            json.dumps(canonical_lineage, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        canonical_summary = {
+            "status": "complete",
+            "schema_name": "semtalk-show-canonical-motion",
+            "schema_version": 1,
+            "manifest_sha256": canonical_manifest_sha,
+            "split_counts": dict(ADAPT.EXPECTED_SPLIT_COUNTS),
+            "clip_count": ADAPT.EXPECTED_CANONICAL_CLIPS,
+            "exact_once": True,
+            "finite": True,
+            "split_disjoint": True,
+            "lineage_sha256": ADAPT._canonical_file_payload_sha256(
+                canonical_lineage
+            ),
+            "lineage_contract_sha256": lineage_contract_sha,
+            "source_receipt_sha256": ADAPT._canonical_file_payload_sha256(
+                source_receipt
+            ),
+        }
+        canonical_summary_path.write_text(
+            json.dumps(canonical_summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        canonical_receipt = {
+            "manifest": str(canonical_manifest_path),
+            "manifest_sha256": canonical_manifest_sha,
+            "summary": str(canonical_summary_path),
+            "summary_sha256": _sha(canonical_summary_path),
+            "lineage": str(canonical_lineage_path),
+            "lineage_sha256": _sha(canonical_lineage_path),
+            "lineage_contract_sha256": lineage_contract_sha,
+            "source_receipt": source_receipt,
+        }
+
         lineage_path = root / "lineage.json"
         records = {}
         for stage, specification in ADAPT.OFFICIAL_PREREQUISITE_SPECS.items():
@@ -532,6 +715,11 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 "prerequisite_source": ADAPT.OFFICIAL_BASE_SOURCE,
             },
             "formal_checkpoints": records,
+            "canonical_manifest_sha256": {
+                str(canonical_manifest_path.resolve()): canonical_manifest_sha,
+            },
+            "canonical_receipt": canonical_receipt,
+            "entry_aggregate_sha256": "a" * 64,
         }
         lineage_path.write_text(
             json.dumps(lineage, indent=2, sort_keys=True) + "\n",
@@ -543,11 +731,17 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             "scope": "SemTalk Base only",
             "entries": ADAPT.EXPECTED_TRAIN_SAMPLES,
             "train_clips": ADAPT.EXPECTED_TRAIN_CLIPS,
+            "raw_frames": total_raw,
+            "usable_frames": total_usable,
+            "dropped_tail_frames": total_dropped,
             "lmdb": str(lmdb),
             "data_mdb_sha256": _sha(lmdb / "data.mdb"),
             "lock_mdb_sha256": _sha(lmdb / "lock.mdb"),
             "lineage_json": str(lineage_path),
             "lineage_json_sha256": _sha(lineage_path),
+            "skipped_short_clip_ids": [],
+            "entry_aggregate_sha256": "a" * 64,
+            "per_clip": per_clip,
         }
         summary_path = root / "summary.json"
         summary_path.write_text(
@@ -576,6 +770,75 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 set(receipt["formal_checkpoints"]),
                 {"face", "hands", "upper", "lower", "global"},
             )
+            self.assertTrue(
+                receipt["canonical_dataset_evidence"]["split_disjoint"]
+            )
+            self.assertEqual(
+                receipt["canonical_dataset_evidence"]["split_counts"],
+                ADAPT.EXPECTED_SPLIT_COUNTS,
+            )
+            self.assertEqual(
+                receipt["lmdb_inode_binding"]["files"]["data.mdb"][
+                    "sha256"
+                ],
+                receipt["data_mdb_sha256"],
+            )
+
+    def test_same_descriptor_bytes_are_both_hashed_and_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            original = b'{"version":1}\n'
+            replacement = b'{"version":2}\n'
+            path.write_bytes(original)
+            real_reader = ADAPT._read_regular_file_bytes
+
+            def read_then_replace(
+                value: Path, label: str
+            ) -> tuple[Path, bytes, dict[str, int]]:
+                result = real_reader(value, label)
+                path.write_bytes(replacement)
+                return result
+
+            with mock.patch.object(
+                ADAPT,
+                "_read_regular_file_bytes",
+                side_effect=read_then_replace,
+            ):
+                payload, _, _ = ADAPT._load_json_receipt(
+                    path,
+                    hashlib.sha256(original).hexdigest(),
+                    "race fixture",
+                )
+            self.assertEqual(payload, {"version": 1})
+            self.assertEqual(path.read_bytes(), replacement)
+
+    def test_lmdb_leaf_symlink_is_rejected_before_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "real.lmdb"
+            target.mkdir()
+            (target / "data.mdb").write_bytes(b"data")
+            (target / "lock.mdb").write_bytes(b"lock")
+            alias = root / "alias.lmdb"
+            alias.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT._verified_lmdb_receipt(alias)
+
+    def test_base_clip_ledger_must_match_canonical_train_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args, summary, _ = self._dataset_fixture(Path(temporary))
+            summary["per_clip"][0]["clip_id"] = "test-00000"
+            summary_path = Path(args.dataset_summary)
+            summary_path.write_text(
+                json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            args.expected_dataset_summary_sha256 = _sha(summary_path)
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "ledger",
+            ):
+                ADAPT.validate_dataset_receipts(args)
 
     def test_speaker2_or_nonofficial_vq_lineage_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -658,36 +921,35 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 )
 
     def test_fresh_trajectory_probe_is_byte_exact(self) -> None:
-        expected = {
-            "format": ADAPT.TRAJECTORY_PROBE_FORMAT,
-            "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
-            "model_state_tensors": 1790,
-            "model_state_schema_sha256": "a" * 64,
-            "model_state_semantic_sha256": "b" * 64,
-            "optimizer_state_semantic_sha256": "e" * 64,
-        }
+        expected = _probe()
         self.assertEqual(
             ADAPT._require_matching_trajectory_probe(expected, dict(expected)),
             expected,
         )
-        changed = dict(expected)
-        changed["model_state_semantic_sha256"] = "c" * 64
+        changed = json.loads(json.dumps(expected))
+        changed["ranks"][3]["sample_order_sha256"] = "9" * 64
         with self.assertRaisesRegex(
             ADAPT.AdaptationContractError,
             "does not reproduce",
         ):
             ADAPT._require_matching_trajectory_probe(expected, changed)
 
+    def test_all_rank_model_and_adam_consensus_is_mandatory(self) -> None:
+        probe = _probe()
+        ranks = json.loads(json.dumps(probe["ranks"]))
+        ranks[7]["optimizer_state_semantic_sha256"] = "9" * 64
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "model or Adam",
+        ):
+            ADAPT._assemble_trajectory_probe(
+                ranks,
+                optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
+            )
+
     def test_fresh_throughput_gate_carries_lineage_bound_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            probe = {
-                "format": ADAPT.TRAJECTORY_PROBE_FORMAT,
-                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
-                "model_state_tensors": 1790,
-                "model_state_schema_sha256": "a" * 64,
-                "model_state_semantic_sha256": "b" * 64,
-                "optimizer_state_semantic_sha256": "e" * 64,
-            }
+            probe = _probe()
             report = {
                 "format": ADAPT.GATE_FORMAT,
                 "status": "pass",
@@ -729,9 +991,9 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 },
             )
             self.assertEqual(receipt["trajectory_probe"], probe)
-            report["trajectory_probe"][
-                "model_state_semantic_sha256"
-            ] = "d" * 64
+            report["trajectory_probe"]["ranks"][2][
+                "torch_cuda_rng_state_sha256"
+            ] = "9" * 64
             changed_path = Path(temporary) / "changed-gate.json"
             changed_path.write_text(
                 json.dumps(report, sort_keys=True) + "\n",

@@ -17,6 +17,7 @@ from scripts.show_base import select_prerequisite_candidates as selector
 from scripts.show_base import selected_prerequisites as consumer
 from scripts.show_base import train_base_official_adapt_long as base_trainer
 from tests import test_prerequisite_val_selection_cpu as selector_fixture
+from tests import test_train_base_official_adapt_long_cpu as base_fixture
 
 
 class SelectedPrerequisiteBridgeTests(unittest.TestCase):
@@ -497,10 +498,13 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
             self.selection_sha,
         )
         fixture_root = self.root / "selected-base-dataset"
-        lmdb = fixture_root / "lmdb"
-        lmdb.mkdir(parents=True)
-        (lmdb / "data.mdb").write_bytes(b"selected-base-data")
-        (lmdb / "lock.mdb").write_bytes(b"selected-base-lock")
+        fixture_root.mkdir()
+        fixture_builder = base_fixture.OfficialBaseAdaptReceiptContracts(
+            methodName="test_official_all_speakers_dataset_lineage_is_accepted"
+        )
+        fixture_args, summary, lineage = fixture_builder._dataset_fixture(
+            fixture_root
+        )
         records = {}
         for stage in consumer.STAGES:
             selected = bridge["selected"][stage]
@@ -531,54 +535,17 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                 "all_model_state_tensors_finite": True,
                 "frozen_eval": True,
             }
-        lineage = {
-            "format": "semtalk_show_base_feature_lineage_v1",
-            "status": "complete",
-            "entries": base_trainer.EXPECTED_TRAIN_SAMPLES,
-            "train_clips": base_trainer.EXPECTED_TRAIN_CLIPS,
-            "protocol": {
-                "scope": "SemTalk Base only",
-                "split": "train",
-                "speakers": base_trainer.SHOW_SPEAKERS,
-                "window_length": base_trainer.POSE_LENGTH,
-                "stride": 20,
-                "in_word": "int64_all_zero_unused_placeholder",
-                "forbidden_components": [
-                    "ASR",
-                    "TextGrid",
-                    "vocabulary",
-                    "CLIP",
-                    "emotion",
-                    "semantic",
-                    "SemGate",
-                    "Sparse",
-                ],
-                "prerequisite_source": "show_val_selected_v1",
-            },
-            "formal_checkpoints": records,
-            "prerequisite_source_receipt": bridge,
-        }
-        lineage_path = fixture_root / "lineage.json"
+        lineage["protocol"]["prerequisite_source"] = (
+            "show_val_selected_v1"
+        )
+        lineage["formal_checkpoints"] = records
+        lineage["prerequisite_source_receipt"] = bridge
+        lineage_path = Path(fixture_args.lineage_manifest)
         selector_fixture.write_json(lineage_path, lineage)
-        summary = {
-            "format": "semtalk_show_base_lmdb_summary_v1",
-            "status": "complete",
-            "scope": "SemTalk Base only",
-            "entries": base_trainer.EXPECTED_TRAIN_SAMPLES,
-            "train_clips": base_trainer.EXPECTED_TRAIN_CLIPS,
-            "lmdb": str(lmdb.resolve()),
-            "data_mdb_sha256": hashlib.sha256(
-                (lmdb / "data.mdb").read_bytes()
-            ).hexdigest(),
-            "lock_mdb_sha256": hashlib.sha256(
-                (lmdb / "lock.mdb").read_bytes()
-            ).hexdigest(),
-            "lineage_json": str(lineage_path.resolve()),
-            "lineage_json_sha256": hashlib.sha256(
-                lineage_path.read_bytes()
-            ).hexdigest(),
-        }
-        summary_path = fixture_root / "summary.json"
+        summary["lineage_json_sha256"] = hashlib.sha256(
+            lineage_path.read_bytes()
+        ).hexdigest()
+        summary_path = Path(fixture_args.dataset_summary)
         selector_fixture.write_json(summary_path, summary)
         receipt = base_trainer.validate_dataset_receipts(
             argparse.Namespace(
@@ -590,7 +557,7 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                 expected_lineage_sha256=hashlib.sha256(
                     lineage_path.read_bytes()
                 ).hexdigest(),
-                train_lmdb=str(lmdb),
+                train_lmdb=fixture_args.train_lmdb,
                 prerequisite_selection_json=str(self.selection),
                 expected_prerequisite_selection_sha256=self.selection_sha,
             )
