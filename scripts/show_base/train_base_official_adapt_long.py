@@ -1612,6 +1612,8 @@ def protocol_receipt(
         },
         "precision": args.precision,
         "determinism": {
+            "python_hash_seed": str(args.seed),
+            "python_hash_seed_required_at_interpreter_start": True,
             "python_random_seed": args.seed,
             "numpy_random_seed": args.seed,
             "torch_cpu_seed": args.seed,
@@ -1626,6 +1628,10 @@ def protocol_receipt(
             "loader_generator_seed": args.seed,
             "loader_worker_seed": "torch_initial_seed_mod_2pow32",
             "multiprocessing_context": "fork",
+            "lmdb_worker_binding": (
+                "fork_inherited_pinned_data_fd_reverified_at_worker_init_"
+                "and_before_and_after_open"
+            ),
         },
         "forward_contract": {
             "forwards_per_optimizer_step": 1,
@@ -2694,7 +2700,14 @@ def _model_args() -> SimpleNamespace:
     )
 
 
-def _prepare_deterministic_environment() -> None:
+def _prepare_deterministic_environment(*, seed: int) -> None:
+    expected_hash_seed = str(seed)
+    observed_hash_seed = os.environ.get("PYTHONHASHSEED")
+    if observed_hash_seed != expected_hash_seed:
+        raise AdaptationContractError(
+            "PYTHONHASHSEED must be set before interpreter startup to "
+            f"{expected_hash_seed}, got {observed_hash_seed!r}"
+        )
     expected = ":4096:8"
     observed = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
     if observed not in {None, expected}:
@@ -2751,6 +2764,10 @@ def _seed_loader_worker(worker_id: int) -> None:
     worker_seed = int(torch.initial_seed() % (2**32))
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        raise AdaptationContractError("loader worker context is unavailable")
+    worker_info.dataset.assert_source_unchanged(full_hash=False)
 
 
 def _create_dataloader(
@@ -3274,7 +3291,7 @@ def _run_training(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_args(args)
-    _prepare_deterministic_environment()
+    _prepare_deterministic_environment(seed=args.seed)
     rank, local_rank, world_size = _distributed_context()
 
     import torch

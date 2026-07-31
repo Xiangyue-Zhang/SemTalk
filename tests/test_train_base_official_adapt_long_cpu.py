@@ -5,9 +5,12 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -18,6 +21,12 @@ SCRIPT = (
     / "scripts"
     / "show_base"
     / "train_base_official_adapt_long.py"
+)
+LAUNCHER = (
+    REPOSITORY
+    / "scripts"
+    / "show_base"
+    / "run_base_official_adapt_long.sh"
 )
 FRESH_SCHEDULE = (
     REPOSITORY
@@ -67,6 +76,12 @@ def _probe(seed: str = "a") -> dict[str, object]:
 
 
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
+    def test_launcher_binds_hash_seed_before_eight_rank_startup(self) -> None:
+        source = LAUNCHER.read_text(encoding="utf-8")
+        self.assertIn("export PYTHONHASHSEED=43", source)
+        self.assertIn("--nproc_per_node=8", source)
+        self.assertIn('"$script_dir/train_base_official_adapt_long.py"', source)
+
     def test_scratch_entrypoint_is_untouched_by_the_new_entrypoint(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn(
@@ -209,8 +224,19 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             protocol["determinism"]["cublas_workspace_config"],
             ":4096:8",
         )
+        self.assertEqual(protocol["determinism"]["python_hash_seed"], "43")
+        self.assertTrue(
+            protocol["determinism"][
+                "python_hash_seed_required_at_interpreter_start"
+            ]
+        )
         self.assertFalse(protocol["determinism"]["cudnn_benchmark"])
         self.assertFalse(protocol["determinism"]["matmul_tf32"])
+        self.assertEqual(
+            protocol["determinism"]["lmdb_worker_binding"],
+            "fork_inherited_pinned_data_fd_reverified_at_worker_init_"
+            "and_before_and_after_open",
+        )
 
     def test_runtime_source_forbids_benchmark_and_tf32_shortcuts(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -219,6 +245,167 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         self.assertIn("torch_module.backends.cudnn.deterministic = True", source)
         self.assertIn("torch_module.backends.cuda.matmul.allow_tf32 = False", source)
         self.assertNotIn("torch.backends.cudnn.benchmark = True", source)
+        self.assertIn(
+            "worker_info.dataset.assert_source_unchanged(full_hash=False)",
+            source,
+        )
+
+    def test_python_hash_seed_is_fail_closed_at_process_entry(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "PYTHONHASHSEED must be set before interpreter startup",
+            ):
+                ADAPT._prepare_deterministic_environment(seed=43)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONHASHSEED": "42",
+                "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT._prepare_deterministic_environment(seed=43)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTHONHASHSEED": "43",
+                "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+            },
+            clear=True,
+        ):
+            ADAPT._prepare_deterministic_environment(seed=43)
+
+    def test_lmdb_open_consumes_pinned_data_inode_during_rename_race(
+        self,
+    ) -> None:
+        """A swap-and-restore cannot redirect the leaf opened by LMDB."""
+
+        show_base_path = REPOSITORY / "dataloaders" / "show_base.py"
+        fake_lmdb = types.ModuleType("lmdb")
+        fake_lmdb.Environment = object
+        fake_numpy = types.ModuleType("numpy")
+        fake_torch = types.ModuleType("torch")
+        fake_torch.utils = types.SimpleNamespace(
+            data=types.SimpleNamespace(Dataset=object)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            lmdb_dir = Path(temporary) / "base.lmdb"
+            lmdb_dir.mkdir()
+            data_path = lmdb_dir / "data.mdb"
+            lock_path = lmdb_dir / "lock.mdb"
+            original = b"verified-original-data-inode"
+            replacement = b"adversarial-replacement-inode"
+            data_path.write_bytes(original)
+            lock_path.write_bytes(b"verified-lock")
+            _, binding = ADAPT._verified_lmdb_receipt(lmdb_dir)
+            opened: dict[str, object] = {}
+
+            class _FakeEnvironment:
+                def __init__(self) -> None:
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_environment = _FakeEnvironment()
+
+            def fake_open(path: str, **kwargs: object) -> object:
+                saved = lmdb_dir / "data.mdb.verified"
+                os.replace(data_path, saved)
+                data_path.write_bytes(replacement)
+                try:
+                    opened["path"] = path
+                    descriptor_path = Path(path)
+                    if not descriptor_path.exists():
+                        descriptor_path = Path(
+                            path.replace("/proc/self/fd/", "/dev/fd/")
+                        )
+                    opened["bytes"] = descriptor_path.read_bytes()
+                    opened["kwargs"] = kwargs
+                finally:
+                    data_path.unlink()
+                    os.replace(saved, data_path)
+                return fake_environment
+
+            fake_lmdb.open = fake_open
+            spec = importlib.util.spec_from_file_location(
+                "show_base_pinned_inode_test",
+                show_base_path,
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "lmdb": fake_lmdb,
+                    "numpy": fake_numpy,
+                    "torch": fake_torch,
+                },
+            ):
+                spec.loader.exec_module(module)
+
+            dataset = object.__new__(module._NPZLMDB)
+            dataset.path = lmdb_dir
+            dataset.required_fields = ()
+            dataset.expected_binding = binding
+            dataset._dirfd = None
+            dataset._datafd = None
+            dataset._env = None
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "require fork workers",
+                ):
+                    dataset.__getstate__()
+                try:
+                    if Path("/proc/self/fd").is_dir():
+                        environment = dataset._open()
+                    else:
+                        # Production is Linux-only.  On macOS, preserve the
+                        # /proc path passed to lmdb.open while the fake opener
+                        # dereferences its /dev/fd equivalent above.
+                        class _FormalProcPath:
+                            def __init__(self, value: str):
+                                self.value = value
+
+                            def exists(self) -> bool:
+                                return True
+
+                            def __str__(self) -> str:
+                                return self.value
+
+                        with mock.patch.object(module, "Path", _FormalProcPath):
+                            environment = dataset._open()
+                except RuntimeError as error:
+                    # Renaming the directory entry normally changes directory
+                    # metadata, so the post-open check must fail closed.
+                    self.assertIn("directory inode/metadata changed", str(error))
+                    self.assertTrue(fake_environment.closed)
+                else:
+                    # Filesystems with coarser metadata clocks may not expose
+                    # the swap, but LMDB still received the pinned leaf inode.
+                    environment.close()
+                self.assertEqual(opened["bytes"], original)
+                self.assertRegex(str(opened["path"]), r"^/proc/self/fd/\d+$")
+                self.assertFalse(opened["kwargs"]["subdir"])
+                self.assertFalse(opened["kwargs"]["lock"])
+                digest, identity = module._sha256_descriptor(dataset._datafd)
+                self.assertEqual(
+                    digest,
+                    binding["files"]["data.mdb"]["sha256"],
+                )
+                self.assertEqual(
+                    (identity["device"], identity["inode"]),
+                    (
+                        binding["files"]["data.mdb"]["identity"]["device"],
+                        binding["files"]["data.mdb"]["identity"]["inode"],
+                    ),
+                )
+            finally:
+                dataset.__del__()
 
     def test_e30_and_speaker2_are_hard_rejected(self) -> None:
         for label in (

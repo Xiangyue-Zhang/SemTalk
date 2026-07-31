@@ -161,6 +161,31 @@ def _stat_identity(value: os.stat_result) -> dict[str, int]:
     }
 
 
+def _sha256_descriptor(descriptor: int) -> tuple[str, dict[str, int]]:
+    """Hash a pinned regular-file descriptor without changing its offset."""
+
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("Base LMDB pinned descriptor is not a regular file")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < before.st_size:
+        block = os.pread(
+            descriptor,
+            min(8 * 1024 * 1024, before.st_size - offset),
+            offset,
+        )
+        if not block:
+            raise RuntimeError("Base LMDB descriptor ended while being rehashed")
+        digest.update(block)
+        offset += len(block)
+    after = os.fstat(descriptor)
+    identity = _stat_identity(before)
+    if _stat_identity(after) != identity:
+        raise RuntimeError("Base LMDB descriptor changed while being rehashed")
+    return digest.hexdigest(), identity
+
+
 class _NPZLMDB(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -174,6 +199,7 @@ class _NPZLMDB(torch.utils.data.Dataset):
         self.required_fields = required_fields
         self.expected_binding = expected_binding
         self._dirfd: int | None = None
+        self._datafd: int | None = None
         self._env: lmdb.Environment | None = None
         if expected_binding is not None:
             if (
@@ -188,6 +214,7 @@ class _NPZLMDB(torch.utils.data.Dataset):
             ):
                 raise RuntimeError("invalid immutable Base LMDB binding")
             self._ensure_dirfd()
+            self._ensure_datafd()
             self.assert_source_unchanged(full_hash=False)
         env = self._open()
         with env.begin(buffers=True) as txn:
@@ -211,13 +238,39 @@ class _NPZLMDB(torch.utils.data.Dataset):
     def _lmdb_open_path(self) -> str:
         if self.expected_binding is None:
             return str(self.path)
-        descriptor = self._ensure_dirfd()
+        descriptor = self._ensure_datafd()
         pinned = Path(f"/proc/self/fd/{descriptor}")
         if not pinned.exists():
             raise RuntimeError(
                 "formal immutable LMDB binding requires Linux /proc/self/fd"
             )
         return str(pinned)
+
+    def _ensure_datafd(self) -> int:
+        if self.expected_binding is None:
+            raise RuntimeError("pinned data.mdb requires an immutable binding")
+        if self._datafd is None:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                "data.mdb",
+                flags,
+                dir_fd=self._ensure_dirfd(),
+            )
+            try:
+                observed = os.fstat(descriptor)
+                if not stat.S_ISREG(observed.st_mode):
+                    raise RuntimeError("Base LMDB data.mdb is not a regular file")
+                expected = self.expected_binding["files"]["data.mdb"]
+                if _stat_identity(observed) != expected.get("identity"):
+                    raise RuntimeError(
+                        "Base LMDB data.mdb inode/metadata changed"
+                    )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            self._datafd = descriptor
+        return self._datafd
 
     def assert_source_unchanged(self, *, full_hash: bool) -> None:
         if self.expected_binding is None:
@@ -226,6 +279,17 @@ class _NPZLMDB(torch.utils.data.Dataset):
         observed_directory = _stat_identity(os.fstat(descriptor))
         if observed_directory != self.expected_binding["directory_identity"]:
             raise RuntimeError("Base LMDB directory inode/metadata changed")
+        pinned_data = self._ensure_datafd()
+        expected_data = self.expected_binding["files"]["data.mdb"]
+        pinned_identity = _stat_identity(os.fstat(pinned_data))
+        if pinned_identity != expected_data.get("identity"):
+            raise RuntimeError("pinned Base LMDB data.mdb inode/metadata changed")
+        if full_hash:
+            digest, identity = _sha256_descriptor(pinned_data)
+            if identity != pinned_identity:
+                raise RuntimeError("pinned Base LMDB data.mdb changed")
+            if digest != expected_data.get("sha256"):
+                raise RuntimeError("pinned Base LMDB data.mdb content hash changed")
         for filename in ("data.mdb", "lock.mdb"):
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -238,19 +302,13 @@ class _NPZLMDB(torch.utils.data.Dataset):
                     raise RuntimeError(
                         f"Base LMDB {filename} inode/metadata changed"
                     )
-                if full_hash:
-                    digest = hashlib.sha256()
-                    while True:
-                        block = os.read(file_descriptor, 8 * 1024 * 1024)
-                        if not block:
-                            break
-                        digest.update(block)
-                    after = os.fstat(file_descriptor)
-                    if _stat_identity(after) != identity:
+                if full_hash and filename == "lock.mdb":
+                    digest, after_identity = _sha256_descriptor(file_descriptor)
+                    if after_identity != identity:
                         raise RuntimeError(
                             f"Base LMDB {filename} changed while rehashed"
                         )
-                    if digest.hexdigest() != expected.get("sha256"):
+                    if digest != expected.get("sha256"):
                         raise RuntimeError(
                             f"Base LMDB {filename} content hash changed"
                         )
@@ -259,15 +317,23 @@ class _NPZLMDB(torch.utils.data.Dataset):
 
     def _open(self) -> lmdb.Environment:
         self.assert_source_unchanged(full_hash=False)
+        immutable_binding = self.expected_binding is not None
         env = lmdb.open(
             self._lmdb_open_path(),
             readonly=True,
             lock=False,
             readahead=False,
             max_readers=512,
-            subdir=True,
+            # With a formal binding, LMDB opens the already-verified leaf
+            # descriptor itself.  A directory-entry rename can no longer
+            # redirect consumption between precheck and lmdb.open().
+            subdir=not immutable_binding,
         )
-        self.assert_source_unchanged(full_hash=False)
+        try:
+            self.assert_source_unchanged(full_hash=False)
+        except BaseException:
+            env.close()
+            raise
         return env
 
     def _ensure_env(self) -> lmdb.Environment:
@@ -311,14 +377,23 @@ class _NPZLMDB(torch.utils.data.Dataset):
         return self.length
 
     def __getstate__(self) -> dict[str, Any]:
+        if self.expected_binding is not None:
+            raise RuntimeError(
+                "formal pinned Base LMDB datasets require fork workers; "
+                "pickling raw file descriptors is forbidden"
+            )
         state = self.__dict__.copy()
         state["_env"] = None
         return state
 
     def __del__(self) -> None:
-        if self._env is not None:
+        if getattr(self, "_env", None) is not None:
             self._env.close()
-        if self._dirfd is not None:
+            self._env = None
+        if getattr(self, "_datafd", None) is not None:
+            os.close(self._datafd)
+            self._datafd = None
+        if getattr(self, "_dirfd", None) is not None:
             os.close(self._dirfd)
             self._dirfd = None
 
