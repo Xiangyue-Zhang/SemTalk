@@ -128,6 +128,8 @@ class LongValidationFixture:
         }
         frozen_body = {
             "format": WATCHER.FROZEN_INPUTS_FORMAT,
+            "run_purpose": "formal_training",
+            "target_epochs": list(WATCHER.CANDIDATE_EPOCHS),
             "source": {
                 "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
                 "commit": "7d7a8d5b80009ae8e5da56a93e97e9249600a496",

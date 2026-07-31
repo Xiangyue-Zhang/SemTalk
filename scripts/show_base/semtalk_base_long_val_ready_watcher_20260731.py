@@ -29,7 +29,7 @@ TRAJECTORY_ANCHOR_SHA256 = (
     "e27c27a0da2793f44608b618d08356df0b60f55ae039434a228c50ff73028cf2"
 )
 TRAINER_ENTRYPOINT_SHA256 = (
-    "78fe3daf6be389c3c2d6150b39b41b76c52d2650fb77487c6ba7becc1186958f"
+    "649e5475499c817c0c5821fac873467381e765522ffd8b82c6349e0017216b7c"
 )
 READY_FORMAT = "semtalk_show_base_official_adapt_long_candidate_ready_v1"
 MANIFEST_FORMAT = "semtalk_show_base_official_adapt_long_manifest_v1"
@@ -455,6 +455,8 @@ def validate_frozen_inputs(
     frozen = strict_json(path)
     expected_frozen_keys = {
         "format",
+        "run_purpose",
+        "target_epochs",
         "source",
         "official_base",
         "speaker_initialization",
@@ -467,6 +469,13 @@ def validate_frozen_inputs(
         raise WatchContractError("frozen-input receipt schema changed")
     if frozen.get("format") != FROZEN_INPUTS_FORMAT:
         raise WatchContractError("frozen-input receipt format changed")
+    if (
+        frozen.get("run_purpose") != "formal_training"
+        or frozen.get("target_epochs") != list(CANDIDATE_EPOCHS)
+    ):
+        raise WatchContractError(
+            "frozen-input receipt is not the formal 400-epoch run"
+        )
     frozen_payload_sha = require_sha256(
         frozen.get("receipt_sha256"), "frozen-input receipt payload SHA"
     )

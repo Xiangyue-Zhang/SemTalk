@@ -145,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument(
+        "--short-quality-status",
+        nargs=4,
+        metavar=("PATH", "SHA256", "BYTES", "PAYLOAD_SHA256"),
+        required=True,
+    )
+    parser.add_argument(
         "--short-trajectory-output",
         type=Path,
         required=True,
@@ -223,9 +229,13 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         label="candidate-ready receipt",
         payload=True,
     )
-    ready, semantic_sha, short_checkpoints = (
-        selector.validate_candidate_ready_receipts(
+    _status, ready, semantic_sha, short_checkpoints = (
+        selector.validate_short_quality_training_bundle(
             args.mode,
+            _artifact4(
+                args.short_quality_status,
+                "short-quality status",
+            ),
             [candidate_ready[epoch] for epoch in selector.QUALITY_EPOCHS],
             topology_gate_spec_sha256=topology_gate["sha256"],
             quality_gate_spec_sha256=quality_gate["sha256"],

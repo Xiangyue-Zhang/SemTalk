@@ -322,6 +322,8 @@ def validate_candidate_ready_receipts(
     required = {
         "format",
         "status",
+        "run_purpose",
+        "target_epochs",
         "selection_eligible",
         "test_visible",
         "epoch",
@@ -349,6 +351,8 @@ def validate_candidate_ready_receipts(
     manifest_keys = {
         "format",
         "status",
+        "run_purpose",
+        "target_epochs",
         "candidate_epochs",
         "frozen_receipt_sha256",
         "schedule_sha256",
@@ -374,6 +378,7 @@ def validate_candidate_ready_receipts(
         "frozen_receipt_sha256",
         "trajectory_anchor_match",
         "trajectory_probe_verified",
+        "run_purpose",
     }
     expected_updates = int(contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"])
     throughput_keys = {
@@ -388,16 +393,13 @@ def validate_candidate_ready_receipts(
         "estimated_training_seconds",
         "trajectory_mode",
         "trajectory_probe",
-        "topology_selection",
-    }
-    topology_selection_keys = {
-        "path",
-        "sha256",
-        "selected",
-        "probe_report_sha256",
+        "gate_frozen_receipt_sha256",
+        "frozen_gate_compatibility_sha256",
     }
     frozen_keys = {
         "format",
+        "run_purpose",
+        "target_epochs",
         "source",
         "official_base",
         "speaker_initialization",
@@ -423,14 +425,18 @@ def validate_candidate_ready_receipts(
         expected_optimizer_updates = epoch * expected_updates
         if (
             set(payload) != required
-            or payload.get("format") != contract.READY_RECEIPT_FORMAT
+            or payload.get("format")
+            != contract.SHORT_QUALITY_READY_RECEIPT_FORMAT
             or payload.get("status") != "ready"
+            or payload.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
+            or payload.get("target_epochs") != list(QUALITY_EPOCHS)
             or payload.get("selection_eligible") is not False
             or payload.get("test_visible") is not False
             or payload.get("epoch") != epoch
             or payload.get("optimizer_updates")
             != expected_optimizer_updates
-            or payload.get("trajectory_anchor_match") is not True
+            or payload.get("trajectory_anchor_match") is not None
             or isinstance(payload.get("published_unix"), bool)
             or not isinstance(payload.get("published_unix"), (int, float))
             or not math.isfinite(float(payload["published_unix"]))
@@ -438,7 +444,10 @@ def validate_candidate_ready_receipts(
             or not isinstance(checkpoint_value, dict)
             or set(checkpoint_value) != checkpoint_keys
             or checkpoint_value.get("relative_path")
-            != f"candidates/base_official_adapt_epoch_{epoch:02d}.bin"
+            != (
+                "provisional_candidates/"
+                f"base_official_adapt_short_quality_epoch_{epoch:02d}.bin"
+            )
             or type(checkpoint_value.get("model_state_tensors")) is not int
             or checkpoint_value["model_state_tensors"] <= 0
             or re.fullmatch(
@@ -518,13 +527,16 @@ def validate_candidate_ready_receipts(
                 f"{label} manifest is not strict JSON"
             ) from error
         entries = manifest.get("entries")
-        expected_entry_epochs = list(contract.CANDIDATE_EPOCHS[: position + 1])
+        expected_entry_epochs = list(QUALITY_EPOCHS[: position + 1])
         if (
             set(manifest) != manifest_keys
-            or manifest.get("format") != contract.MANIFEST_FORMAT
+            or manifest.get("format")
+            != contract.SHORT_QUALITY_MANIFEST_FORMAT
             or manifest.get("status") != "running"
-            or manifest.get("candidate_epochs")
-            != list(contract.CANDIDATE_EPOCHS)
+            or manifest.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
+            or manifest.get("target_epochs") != list(QUALITY_EPOCHS)
+            or manifest.get("candidate_epochs") != list(QUALITY_EPOCHS)
             or manifest.get("frozen_receipt_sha256")
             != payload["frozen_receipt_sha256"]
             or manifest.get("schedule_sha256") != payload["schedule_sha256"]
@@ -563,7 +575,9 @@ def validate_candidate_ready_receipts(
             or entry.get("all_model_state_tensors_finite") is not True
             or entry.get("frozen_receipt_sha256")
             != payload["frozen_receipt_sha256"]
-            or entry.get("trajectory_anchor_match") is not True
+            or entry.get("trajectory_anchor_match") is not None
+            or entry.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
             or entry.get("trajectory_probe_verified") is not True
         ):
             raise TopologySelectionError(
@@ -593,6 +607,9 @@ def validate_candidate_ready_receipts(
             or set(frozen) != frozen_keys
             or frozen.get("format")
             != "semtalk_show_base_official_adapt_frozen_inputs_v1"
+            or frozen.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
+            or frozen.get("target_epochs") != list(QUALITY_EPOCHS)
             or frozen.get("receipt_sha256")
             != frozen_value["receipt_payload_sha256"]
             or frozen.get("receipt_sha256")
@@ -621,9 +638,16 @@ def validate_candidate_ready_receipts(
             != contract.FRESH_TRAJECTORY_MODE
             or throughput.get("trajectory_probe")
             != manifest.get("trajectory_probe")
-            or not isinstance(throughput.get("topology_selection"), dict)
-            or set(throughput["topology_selection"])
-            != topology_selection_keys
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(throughput.get("gate_frozen_receipt_sha256")),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(throughput.get("frozen_gate_compatibility_sha256")),
+            )
+            is None
         ):
             raise TopologySelectionError(
                 f"{label} frozen/topology authority changed"
@@ -648,30 +672,6 @@ def validate_candidate_ready_receipts(
                 str(throughput["sha256"]),
                 gate_spec_sha256=topology_gate_spec_sha256,
             )
-            selection_report, selection_path, selection_sha = (
-                contract._load_json_receipt(
-                    Path(
-                        str(throughput["topology_selection"]["path"])
-                    ),
-                    str(throughput["topology_selection"]["sha256"]),
-                    f"{label} topology selection",
-                )
-            )
-            normalized_selection = contract.validate_topology_selection(
-                SimpleNamespace(
-                    topology_selection_report=Path(
-                        str(throughput["topology_selection"]["path"])
-                    ),
-                    expected_topology_selection_sha256=str(
-                        throughput["topology_selection"]["sha256"]
-                    ),
-                    expected_topology_gate_spec_sha256=(
-                        topology_gate_spec_sha256
-                    ),
-                    topology_mode=mode,
-                ),
-                throughput_gate=throughput,
-            )
         except Exception as error:
             raise TopologySelectionError(
                 f"{label} frozen/topology authority changed"
@@ -691,7 +691,15 @@ def validate_candidate_ready_receipts(
             or normalized_probe["report_path"] != throughput["path"]
             or normalized_probe["report_sha256"] != throughput["sha256"]
             or full_probe.get("frozen_receipt_sha256")
-            != payload["frozen_receipt_sha256"]
+            != throughput["gate_frozen_receipt_sha256"]
+            or full_probe.get("frozen_gate_compatibility_sha256")
+            != throughput["frozen_gate_compatibility_sha256"]
+            or throughput["frozen_gate_compatibility_sha256"]
+            != contract._frozen_gate_compatibility_sha256(frozen)
+            or full_probe.get("topology_receipt_sha256")
+            != frozen.get("topology", {}).get("receipt_sha256")
+            or full_probe.get("topology_independent_input_sha256")
+            != contract._topology_independent_gate_semantic_sha256(frozen)
             or full_probe.get("updates_per_epoch") != expected_updates
             or full_probe.get("trajectory_mode")
             != contract.FRESH_TRAJECTORY_MODE
@@ -706,16 +714,6 @@ def validate_candidate_ready_receipts(
                 or float(throughput[key]) != float(full_probe.get(key))
                 for key in numeric_projection
             )
-            or normalized_selection != throughput["topology_selection"]
-            or selection_path
-            != Path(str(throughput["topology_selection"]["path"]))
-            or selection_sha != throughput["topology_selection"]["sha256"]
-            or selection_report.get("quality_gate_spec_sha256")
-            != quality_gate_spec_sha256
-            or selection_report.get("topology_independent_input_sha256")
-            != full_probe.get("topology_independent_input_sha256")
-            or normalized_selection["probe_report_sha256"].get(mode)
-            != throughput["sha256"]
             or re.fullmatch(
                 r"[0-9a-f]{64}",
                 str(full_probe.get("topology_independent_input_sha256")),
@@ -736,7 +734,9 @@ def validate_candidate_ready_receipts(
             ],
             "protocol": protocol,
             "throughput_gate_sha256": throughput["sha256"],
-            "topology_selection_sha256": normalized_selection["sha256"],
+            "frozen_gate_compatibility_sha256": throughput[
+                "frozen_gate_compatibility_sha256"
+            ],
         }
         if semantic_sha is None:
             semantic_sha = current_semantic
@@ -749,6 +749,247 @@ def validate_candidate_ready_receipts(
         checkpoints[epoch] = checkpoint
     assert semantic_sha is not None
     return ready_artifacts, semantic_sha, checkpoints
+
+
+def validate_short_quality_training_bundle(
+    mode: str,
+    value: Any,
+    candidate_ready_receipts: Sequence[Any],
+    *,
+    topology_gate_spec_sha256: str,
+    quality_gate_spec_sha256: str,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    str,
+    dict[int, dict[str, Any]],
+]:
+    """Validate one completed provisional e1/e2/e4/e8 trainer bundle."""
+
+    artifact, status = _artifact(
+        value,
+        f"{mode} short-quality training status",
+        payload=True,
+    )
+    assert status is not None
+    expected_updates = int(contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"])
+    required = {
+        "format",
+        "status",
+        "run_purpose",
+        "target_epochs",
+        "completed_epochs",
+        "optimizer_updates",
+        "updates_per_epoch",
+        "candidate_manifest_sha256",
+        "frozen_receipt_sha256",
+        "throughput_gate",
+        "world_size",
+        "local_batch_size",
+        "global_batch_size",
+        "all_training_state_finite",
+        "epoch_metrics_jsonl",
+        "epoch_metrics_sha256",
+        "epoch_metrics_records",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "trajectory_mode",
+        "trajectory_probe_verified",
+        "trajectory_probe",
+        "started_unix",
+        "completed_unix",
+        "candidate_manifest",
+        "epoch_metrics",
+        "candidate_ready_receipts",
+        "receipt_payload_sha256",
+    }
+    manifest_value = status.get("candidate_manifest")
+    metrics_value = status.get("epoch_metrics")
+    embedded_ready = status.get("candidate_ready_receipts")
+    if (
+        set(status) != required
+        or status.get("format") != contract.SHORT_QUALITY_STATUS_FORMAT
+        or status.get("status") != "complete"
+        or status.get("run_purpose")
+        != contract.RUN_PURPOSE_SHORT_QUALITY
+        or status.get("target_epochs") != list(QUALITY_EPOCHS)
+        or status.get("completed_epochs")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        or status.get("optimizer_updates")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS * expected_updates
+        or status.get("updates_per_epoch") != expected_updates
+        or status.get("world_size")
+        != contract.TOPOLOGY_SPECS[mode]["world_size"]
+        or status.get("local_batch_size")
+        != contract.TOPOLOGY_SPECS[mode]["local_batch_size"]
+        or status.get("global_batch_size")
+        != contract.TOPOLOGY_SPECS[mode]["global_batch_size"]
+        or status.get("all_training_state_finite") is not True
+        or status.get("epoch_metrics_records")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        or status.get("trajectory_mode")
+        != contract.FRESH_TRAJECTORY_MODE
+        or status.get("trajectory_probe_verified") is not True
+        or not isinstance(manifest_value, dict)
+        or set(manifest_value) != {"path", "sha256", "bytes"}
+        or not isinstance(metrics_value, dict)
+        or set(metrics_value) != {"path", "sha256", "bytes", "records"}
+        or metrics_value.get("records")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        or not isinstance(embedded_ready, list)
+    ):
+        raise TopologySelectionError(
+            f"{mode} provisional short-quality status changed"
+        )
+
+    ready, semantic_sha, checkpoints = validate_candidate_ready_receipts(
+        mode,
+        candidate_ready_receipts,
+        topology_gate_spec_sha256=topology_gate_spec_sha256,
+        quality_gate_spec_sha256=quality_gate_spec_sha256,
+    )
+    if embedded_ready != ready:
+        raise TopologySelectionError(
+            f"{mode} provisional candidate-ready authority changed"
+        )
+    manifest_artifact, _ = _artifact(
+        manifest_value,
+        f"{mode} final short-quality manifest",
+    )
+    metrics_artifact, _ = _artifact(
+        {
+            key: metrics_value[key]
+            for key in ("path", "sha256", "bytes")
+        },
+        f"{mode} short-quality metrics",
+    )
+    if (
+        status["candidate_manifest_sha256"]
+        != manifest_artifact["sha256"]
+        or status["epoch_metrics_jsonl"] != metrics_artifact["path"]
+        or status["epoch_metrics_sha256"] != metrics_artifact["sha256"]
+    ):
+        raise TopologySelectionError(
+            f"{mode} provisional output identity changed"
+        )
+    manifest_path = Path(str(manifest_artifact["path"]))
+    try:
+        manifest = contract._strict_json_bytes(
+            manifest_path.read_bytes(),
+            f"{mode} final short-quality manifest",
+        )
+    except Exception as error:
+        raise TopologySelectionError(
+            f"{mode} final short-quality manifest is invalid"
+        ) from error
+    manifest_required = {
+        "format",
+        "status",
+        "run_purpose",
+        "target_epochs",
+        "candidate_epochs",
+        "frozen_receipt_sha256",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "throughput_gate",
+        "trajectory_mode",
+        "trajectory_probe_verified",
+        "trajectory_probe",
+        "entries",
+        "entries_sha256",
+        "completed_epochs",
+        "optimizer_updates",
+    }
+    entries = manifest.get("entries")
+    if (
+        set(manifest) != manifest_required
+        or manifest.get("format")
+        != contract.SHORT_QUALITY_MANIFEST_FORMAT
+        or manifest.get("status") != "complete"
+        or manifest.get("run_purpose")
+        != contract.RUN_PURPOSE_SHORT_QUALITY
+        or manifest.get("target_epochs") != list(QUALITY_EPOCHS)
+        or manifest.get("candidate_epochs") != list(QUALITY_EPOCHS)
+        or manifest.get("completed_epochs")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        or manifest.get("optimizer_updates")
+        != contract.SHORT_QUALITY_TOTAL_EPOCHS * expected_updates
+        or manifest.get("frozen_receipt_sha256")
+        != status["frozen_receipt_sha256"]
+        or manifest.get("schedule_sha256") != status["schedule_sha256"]
+        or manifest.get("trajectory_anchor_sha256")
+        != status["trajectory_anchor_sha256"]
+        or manifest.get("throughput_gate") != status["throughput_gate"]
+        or manifest.get("trajectory_probe") != status["trajectory_probe"]
+        or manifest.get("trajectory_probe_verified") is not True
+        or not isinstance(entries, list)
+        or [entry.get("epoch") for entry in entries]
+        != list(QUALITY_EPOCHS)
+        or manifest.get("entries_sha256")
+        != contract.canonical_json_sha256(entries)
+    ):
+        raise TopologySelectionError(
+            f"{mode} final short-quality manifest changed"
+        )
+    for epoch, entry in zip(QUALITY_EPOCHS, entries):
+        checkpoint = checkpoints[epoch]
+        if (
+            entry.get("checkpoint_sha256") != checkpoint["sha256"]
+            or entry.get("checkpoint_bytes") != checkpoint["bytes"]
+            or entry.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
+        ):
+            raise TopologySelectionError(
+                f"{mode} final short-quality checkpoint changed"
+            )
+
+    rows = _strict_jsonl_rows(
+        metrics_artifact,
+        f"{mode} short-quality metrics",
+    )
+    metric_keys = {*contract.LOSS_COMPONENTS, "total", "gradient_norm_preclip"}
+    for epoch, row in enumerate(rows, 1):
+        metrics = row.get("metrics") if isinstance(row, dict) else None
+        if (
+            set(row)
+            != {
+                "format",
+                "run_purpose",
+                "target_epochs",
+                "epoch",
+                "optimizer_updates",
+                "updates_per_epoch",
+                "learning_rate",
+                "metrics",
+                "all_finite",
+                "completed_unix",
+            }
+            or row.get("format")
+            != contract.SHORT_QUALITY_EPOCH_METRIC_FORMAT
+            or row.get("run_purpose")
+            != contract.RUN_PURPOSE_SHORT_QUALITY
+            or row.get("target_epochs") != list(QUALITY_EPOCHS)
+            or row.get("epoch") != epoch
+            or row.get("optimizer_updates") != epoch * expected_updates
+            or row.get("updates_per_epoch") != expected_updates
+            or row.get("all_finite") is not True
+            or not isinstance(metrics, dict)
+            or set(metrics) != metric_keys
+            or any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                for item in metrics.values()
+            )
+        ):
+            raise TopologySelectionError(
+                f"{mode} short-quality metrics are not exact e1..e8"
+            )
+    if len(rows) != contract.SHORT_QUALITY_TOTAL_EPOCHS:
+        raise TopologySelectionError(
+            f"{mode} short-quality metrics are not exact e1..e8"
+        )
+    return artifact, ready, semantic_sha, checkpoints
 
 
 def validate_short_trajectory_receipt(

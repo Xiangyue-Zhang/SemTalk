@@ -107,6 +107,8 @@ def _probe(seed: str = "a") -> dict[str, object]:
 def _gate_report(
     *,
     frozen_sha256: str,
+    frozen_compatibility_sha256: str,
+    topology_independent_input_sha256: str,
     topology_receipt_sha256: str,
     trajectory_mode: str,
     trajectory_probe: object,
@@ -122,8 +124,13 @@ def _gate_report(
         "topology_mode": mode,
         "topology_classification": spec["classification"],
         "topology_gate_spec_sha256": _sha(TOPOLOGY_GATE_SPEC),
-        "topology_independent_input_sha256": "9" * 64,
+        "topology_independent_input_sha256": (
+            topology_independent_input_sha256
+        ),
         "frozen_receipt_sha256": frozen_sha256,
+        "frozen_gate_compatibility_sha256": (
+            frozen_compatibility_sha256
+        ),
         "topology_receipt_sha256": topology_receipt_sha256,
         "node_count": spec["node_count"],
         "local_world_size": spec["local_world_size"],
@@ -209,6 +216,55 @@ def _base_cli() -> list[str]:
         "--local-batch-size", "64",
         "--learning-rate", "0.00003",
     ]
+
+
+def _frozen_gate_fixture(
+    *,
+    receipt_sha256: str,
+    topology_receipt_sha256: str,
+    trajectory_mode: str,
+    run_purpose: str,
+    target_epochs: list[int],
+) -> dict[str, object]:
+    return {
+        "format": "semtalk_show_base_official_adapt_frozen_inputs_v1",
+        "run_purpose": run_purpose,
+        "target_epochs": target_epochs,
+        "source": {
+            "origin": ADAPT.EXPECTED_ORIGIN,
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean": True,
+            "entrypoint_sha256": "3" * 64,
+        },
+        "official_base": {"sha256": ADAPT.OFFICIAL_BASE_SPEC["sha256"]},
+        "speaker_initialization": {"speaker_rows": [0, 1, 2, 3]},
+        "dataset": {
+            "data_mdb_sha256": "4" * 64,
+            "prerequisite_selection": {"sha256": "6" * 64},
+            "selected_prerequisite_sha256": {
+                "face": "7" * 64,
+                "upper": "8" * 64,
+                "hands": "9" * 64,
+                "lower": "a" * 64,
+                "global": "b" * 64,
+            },
+        },
+        "protocol": {
+            "forward_contract": {"official": True},
+            "loss": {"official": True},
+            "precision": "bf16",
+            "target_dataset": "SHOW",
+            "target_speaker_scope": "All",
+            "vq_models_in_training_graph": False,
+        },
+        "long_contract": {
+            "schedule": {"sha256": "5" * 64},
+            "trajectory_anchor": {"mode": trajectory_mode},
+        },
+        "topology": {"receipt_sha256": topology_receipt_sha256},
+        "receipt_sha256": receipt_sha256,
+    }
 
 
 def _topology_selection_inputs(
@@ -824,6 +880,120 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         with self.assertRaises(ADAPT.AdaptationContractError):
             ADAPT.validate_args(args)
 
+    def test_short_quality_requires_gate_not_topology_selection_w8_w16(
+        self,
+    ) -> None:
+        parser = ADAPT.build_parser()
+        for mode in (ADAPT.W8_GLOBAL512_MODE, ADAPT.W16_GLOBAL512_MODE):
+            with self.subTest(mode=mode):
+                specification = ADAPT.TOPOLOGY_SPECS[mode]
+                args = parser.parse_args(_base_cli())
+                args.mode = ADAPT.SHORT_QUALITY_MODE
+                args.epochs = ADAPT.SHORT_QUALITY_TOTAL_EPOCHS
+                args.topology_mode = mode
+                args.local_batch_size = specification["local_batch_size"]
+                args.learning_rate = specification["learning_rate"]
+                args.precision = specification["precision"]
+                args.throughput_gate_report = "/sealed/throughput.json"
+                args.expected_throughput_gate_sha256 = "d" * 64
+                args.topology_selection_report = None
+                args.expected_topology_selection_sha256 = None
+                with mock.patch.object(
+                    ADAPT.os,
+                    "uname",
+                    return_value=types.SimpleNamespace(
+                        nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+                    ),
+                ):
+                    ADAPT.validate_args(args)
+                self.assertEqual(
+                    ADAPT._run_purpose(args),
+                    ADAPT.RUN_PURPOSE_SHORT_QUALITY,
+                )
+                self.assertEqual(
+                    ADAPT._target_epochs(args),
+                    list(ADAPT.SHORT_QUALITY_EPOCHS),
+                )
+
+    def test_short_quality_rejects_selection_and_non_e8_target(self) -> None:
+        parser = ADAPT.build_parser()
+        args = parser.parse_args(_base_cli())
+        args.mode = ADAPT.SHORT_QUALITY_MODE
+        args.epochs = ADAPT.SHORT_QUALITY_TOTAL_EPOCHS
+        args.throughput_gate_report = "/sealed/throughput.json"
+        args.expected_throughput_gate_sha256 = "d" * 64
+        args.topology_selection_report = "/forbidden/selection.json"
+        args.expected_topology_selection_sha256 = "e" * 64
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "forbids topology selection",
+            ):
+                ADAPT.validate_args(args)
+            args.topology_selection_report = None
+            args.expected_topology_selection_sha256 = None
+            args.epochs = ADAPT.TOTAL_EPOCHS
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "exactly 8 epochs",
+            ):
+                ADAPT.validate_args(args)
+
+    def test_formal_train_without_topology_selection_is_rejected(self) -> None:
+        parser = ADAPT.build_parser()
+        args = parser.parse_args(_base_cli())
+        args.mode = "train"
+        args.throughput_gate_report = "/sealed/throughput.json"
+        args.expected_throughput_gate_sha256 = "d" * 64
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "formal training requires one topology selected",
+            ):
+                ADAPT.validate_args(args)
+
+    def test_frozen_receipt_declares_run_purpose_and_target_epochs(self) -> None:
+        receipt = ADAPT._frozen_receipt(
+            source={"source": True},
+            official_base={"official": True},
+            speaker_initialization={"speaker": True},
+            dataset={"dataset": True},
+            protocol={"protocol": True},
+            long_contract={"contract": True},
+            topology={"topology": True},
+            run_purpose=ADAPT.RUN_PURPOSE_SHORT_QUALITY,
+            target_epochs=ADAPT.SHORT_QUALITY_EPOCHS,
+        )
+        self.assertEqual(
+            receipt["run_purpose"],
+            ADAPT.RUN_PURPOSE_SHORT_QUALITY,
+        )
+        self.assertEqual(
+            receipt["target_epochs"],
+            list(ADAPT.SHORT_QUALITY_EPOCHS),
+        )
+        self.assertEqual(
+            receipt["receipt_sha256"],
+            ADAPT.canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in receipt.items()
+                    if key != "receipt_sha256"
+                }
+            ),
+        )
     def test_train_argument_contract_allows_sealed_w1(self) -> None:
         parser = ADAPT.build_parser()
         args = parser.parse_args(_base_cli())
@@ -834,6 +1004,8 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         args.precision = "fp32"
         args.topology_selection_report = "/sealed/topology-selection.json"
         args.expected_topology_selection_sha256 = "d" * 64
+        args.throughput_gate_report = "/sealed/throughput.json"
+        args.expected_throughput_gate_sha256 = "e" * 64
         with mock.patch.object(
             ADAPT.os,
             "uname",
@@ -1673,11 +1845,34 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             with self.assertRaises(ADAPT.AdaptationContractError):
                 ADAPT.validate_dataset_receipts(args)
 
-    def test_throughput_gate_must_bind_exact_frozen_receipt(self) -> None:
+    def test_throughput_gate_binds_semantics_across_distinct_run_purposes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            gate_frozen = _frozen_gate_fixture(
+                receipt_sha256="a" * 64,
+                topology_receipt_sha256="t" * 64,
+                trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
+                run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
+                target_epochs=[],
+            )
+            training_frozen = {
+                **gate_frozen,
+                "receipt_sha256": "b" * 64,
+                "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
+                "target_epochs": list(ADAPT.SHORT_QUALITY_EPOCHS),
+            }
             report = _gate_report(
                 frozen_sha256="a" * 64,
+                frozen_compatibility_sha256=(
+                    ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
+                ),
+                topology_independent_input_sha256=(
+                    ADAPT._topology_independent_gate_semantic_sha256(
+                        gate_frozen
+                    )
+                ),
                 topology_receipt_sha256="t" * 64,
                 trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
                 trajectory_probe=None,
@@ -1699,30 +1894,30 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             )
             receipt = ADAPT.validate_throughput_gate(
                 args,
-                frozen_receipt={
-                    "receipt_sha256": "a" * 64,
-                    "topology": {"receipt_sha256": "t" * 64},
-                    "long_contract": {
-                        "trajectory_anchor": {
-                            "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
-                        }
-                    },
-                },
+                frozen_receipt=training_frozen,
             )
             self.assertEqual(receipt["samples_per_second"], 1024.0)
-            with self.assertRaises(ADAPT.AdaptationContractError):
-                ADAPT.validate_throughput_gate(
-                    args,
-                    frozen_receipt={
-                        "receipt_sha256": "b" * 64,
-                        "topology": {"receipt_sha256": "t" * 64},
-                        "long_contract": {
-                            "trajectory_anchor": {
-                                "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
-                            }
-                        },
-                    },
-                )
+            changed_receipts = []
+            changed = json.loads(json.dumps(training_frozen))
+            changed["source"]["commit"] = "9" * 40
+            changed_receipts.append(changed)
+            changed = json.loads(json.dumps(training_frozen))
+            changed["dataset"]["data_mdb_sha256"] = "9" * 64
+            changed_receipts.append(changed)
+            changed = json.loads(json.dumps(training_frozen))
+            changed["dataset"]["selected_prerequisite_sha256"]["face"] = (
+                "0" * 64
+            )
+            changed_receipts.append(changed)
+            changed = json.loads(json.dumps(training_frozen))
+            changed["topology"]["receipt_sha256"] = "9" * 64
+            changed_receipts.append(changed)
+            for changed in changed_receipts:
+                with self.assertRaises(ADAPT.AdaptationContractError):
+                    ADAPT.validate_throughput_gate(
+                        args,
+                        frozen_receipt=changed,
+                    )
 
     def test_fresh_trajectory_probe_is_byte_exact(self) -> None:
         expected = _probe()
@@ -1755,8 +1950,23 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             _activate(ADAPT.W8_GLOBAL512_MODE)
             probe = _probe()
+            gate_frozen = _frozen_gate_fixture(
+                receipt_sha256="c" * 64,
+                topology_receipt_sha256="u" * 64,
+                trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
+                run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
+                target_epochs=[],
+            )
             report = _gate_report(
                 frozen_sha256="c" * 64,
+                frozen_compatibility_sha256=(
+                    ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
+                ),
+                topology_independent_input_sha256=(
+                    ADAPT._topology_independent_gate_semantic_sha256(
+                        gate_frozen
+                    )
+                ),
                 topology_receipt_sha256="u" * 64,
                 trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
                 trajectory_probe=probe,
@@ -1778,15 +1988,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             )
             receipt = ADAPT.validate_throughput_gate(
                 args,
-                frozen_receipt={
-                    "receipt_sha256": "c" * 64,
-                    "topology": {"receipt_sha256": "u" * 64},
-                    "long_contract": {
-                        "trajectory_anchor": {
-                            "mode": ADAPT.FRESH_TRAJECTORY_MODE,
-                        }
-                    },
-                },
+                frozen_receipt=gate_frozen,
             )
             self.assertEqual(receipt["trajectory_probe"], probe)
             report["trajectory_probe"]["ranks"][2][
@@ -1808,15 +2010,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             args.expected_throughput_gate_sha256 = _sha(changed_path)
             changed = ADAPT.validate_throughput_gate(
                 args,
-                frozen_receipt={
-                    "receipt_sha256": "c" * 64,
-                    "topology": {"receipt_sha256": "u" * 64},
-                    "long_contract": {
-                        "trajectory_anchor": {
-                            "mode": ADAPT.FRESH_TRAJECTORY_MODE,
-                        }
-                    },
-                },
+                frozen_receipt=gate_frozen,
             )
             with self.assertRaises(ADAPT.AdaptationContractError):
                 ADAPT._require_matching_trajectory_probe(

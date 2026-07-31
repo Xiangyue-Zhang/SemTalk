@@ -23,6 +23,13 @@ The executable modes are:
     400-epoch trajectory on a sparse, pre-registered candidate grid.  A fresh
     lineage repeats the first 70 updates and must reproduce the gate's model
     state before any candidate may be published.
+
+``short_quality``
+    Require the matching throughput receipt, but deliberately do not consume
+    a topology-selection receipt.  Restart from the official Base checkpoint
+    and publish only the provisional e1/e2/e4/e8 validation candidates needed
+    to decide that topology.  These artifacts use a separate namespace and
+    cannot be consumed as a final 400-epoch training bundle.
 """
 
 from __future__ import annotations
@@ -159,6 +166,12 @@ CANDIDATE_EPOCHS = (
     1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80, 100, 120, 140, 160,
     180, 200, 240, 280, 320, 360, 400,
 )
+SHORT_QUALITY_TOTAL_EPOCHS = 8
+SHORT_QUALITY_EPOCHS = (1, 2, 4, 8)
+SHORT_QUALITY_MODE = "short_quality"
+RUN_PURPOSE_THROUGHPUT = "topology_throughput_gate"
+RUN_PURPOSE_SHORT_QUALITY = "topology_short_quality"
+RUN_PURPOSE_FORMAL_TRAINING = "formal_training"
 TRAJECTORY_ANCHOR_EPOCHS = (1, 2, 4, 8, 16, 32, 40)
 RESUME_EPOCHS = (40, 80, 120, 160, 200, 240, 280, 320, 360, 400)
 OFFICIAL_W1_REFERENCE_MODE = "official_w1_b64_reference"
@@ -271,6 +284,21 @@ THROUGHPUT_TIMED_UPDATES = 50
 CHECKPOINT_FORMAT = "semtalk_show_base_official_adapt_checkpoint_v1"
 MANIFEST_FORMAT = "semtalk_show_base_official_adapt_long_manifest_v1"
 STATUS_FORMAT = "semtalk_show_base_official_adapt_long_status_v1"
+SHORT_QUALITY_CHECKPOINT_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_checkpoint_v1"
+)
+SHORT_QUALITY_MANIFEST_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_manifest_v1"
+)
+SHORT_QUALITY_STATUS_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_status_v1"
+)
+SHORT_QUALITY_READY_RECEIPT_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_candidate_ready_v1"
+)
+SHORT_QUALITY_EPOCH_METRIC_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_epoch_metric_v1"
+)
 GATE_FORMAT = "semtalk_show_base_official_adapt_long_throughput_gate_v1"
 TOPOLOGY_GATE_SPEC_FORMAT = "semtalk_show_base_topology_gate_spec_v1"
 TOPOLOGY_SELECTION_FORMAT = "semtalk_show_base_topology_selection_v1"
@@ -302,6 +330,26 @@ LOSS_COMPONENTS = tuple(
 
 class AdaptationContractError(RuntimeError):
     """Raised before work begins when an immutable contract is violated."""
+
+
+def _run_purpose(args: argparse.Namespace) -> str:
+    if args.mode == "throughput_gate":
+        return RUN_PURPOSE_THROUGHPUT
+    if args.mode == SHORT_QUALITY_MODE:
+        return RUN_PURPOSE_SHORT_QUALITY
+    if args.mode == "train":
+        return RUN_PURPOSE_FORMAL_TRAINING
+    raise AdaptationContractError("unknown Base run purpose")
+
+
+def _target_epochs(args: argparse.Namespace) -> list[int]:
+    if args.mode == "throughput_gate":
+        return []
+    if args.mode == SHORT_QUALITY_MODE:
+        return list(SHORT_QUALITY_EPOCHS)
+    if args.mode == "train":
+        return list(CANDIDATE_EPOCHS)
+    raise AdaptationContractError("unknown Base target epoch contract")
 
 
 def _activate_topology(args: argparse.Namespace) -> dict[str, Any]:
@@ -2753,12 +2801,21 @@ def _save_candidate(
     frozen_receipt: Mapping[str, Any],
     contract_receipts: Mapping[str, Any],
     manifest: dict[str, Any],
+    provisional: bool,
 ) -> None:
-    if epoch not in CANDIDATE_EPOCHS:
+    candidate_epochs = (
+        SHORT_QUALITY_EPOCHS if provisional else CANDIDATE_EPOCHS
+    )
+    if epoch not in candidate_epochs:
         raise AdaptationContractError(f"epoch {epoch} is not a candidate")
     _finite_model_and_optimizer(model, optimizer)
-    filename = f"base_official_adapt_epoch_{epoch:02d}.bin"
-    checkpoint_path = run_dir / "candidates" / filename
+    if provisional:
+        filename = f"base_official_adapt_short_quality_epoch_{epoch:02d}.bin"
+        checkpoint_relative = f"provisional_candidates/{filename}"
+    else:
+        filename = f"base_official_adapt_epoch_{epoch:02d}.bin"
+        checkpoint_relative = f"candidates/{filename}"
+    checkpoint_path = run_dir / checkpoint_relative
     if checkpoint_path.exists() or checkpoint_path.is_symlink():
         raise AdaptationContractError(f"candidate already exists: {checkpoint_path}")
     model_state = {
@@ -2792,7 +2849,11 @@ def _save_candidate(
                 f"{expected_anchor['model_state_semantic_sha256']}"
             )
     audit = {
-        "format": CHECKPOINT_FORMAT,
+        "format": (
+            SHORT_QUALITY_CHECKPOINT_FORMAT
+            if provisional
+            else CHECKPOINT_FORMAT
+        ),
         "completed_epochs": epoch,
         "optimizer_updates": optimizer_updates,
         "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
@@ -2807,6 +2868,9 @@ def _save_candidate(
             True if fresh_trajectory else None
         ),
     }
+    if provisional:
+        audit["run_purpose"] = RUN_PURPOSE_SHORT_QUALITY
+        audit["target_epochs"] = list(candidate_epochs)
     _atomic_torch_save(
         checkpoint_path,
         {
@@ -2815,36 +2879,56 @@ def _save_candidate(
         },
     )
     checkpoint_sha = sha256_file(checkpoint_path)
-    manifest["entries"].append(
-        {
-            "epoch": epoch,
-            "optimizer_updates": optimizer_updates,
-            "checkpoint": f"candidates/{filename}",
-            "checkpoint_sha256": checkpoint_sha,
-            "checkpoint_bytes": checkpoint_path.stat().st_size,
-            "checkpoint_container_schema": ["audit", "model_state"],
-            "model_state_tensors": len(model_state),
-            "model_state_schema_sha256": _state_schema_sha256(model_state),
-            "model_state_semantic_sha256": semantic_sha,
-            "all_model_state_tensors_finite": True,
-            "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
-            "trajectory_anchor_match": anchor_match,
-            "trajectory_probe_verified": (
-                True if fresh_trajectory else None
-            ),
-        }
-    )
+    manifest_entry = {
+        "epoch": epoch,
+        "optimizer_updates": optimizer_updates,
+        "checkpoint": checkpoint_relative,
+        "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_bytes": checkpoint_path.stat().st_size,
+        "checkpoint_container_schema": ["audit", "model_state"],
+        "model_state_tensors": len(model_state),
+        "model_state_schema_sha256": _state_schema_sha256(model_state),
+        "model_state_semantic_sha256": semantic_sha,
+        "all_model_state_tensors_finite": True,
+        "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+        "trajectory_anchor_match": anchor_match,
+        "trajectory_probe_verified": (
+            True if fresh_trajectory else None
+        ),
+    }
+    if provisional:
+        manifest_entry["run_purpose"] = RUN_PURPOSE_SHORT_QUALITY
+    manifest["entries"].append(manifest_entry)
     manifest["entries_sha256"] = canonical_json_sha256(manifest["entries"])
-    _atomic_json(run_dir / "candidate_manifest.json", manifest)
-    live_manifest_path = run_dir / "candidate_manifest.json"
+    manifest_name = (
+        "short_quality_candidate_manifest.json"
+        if provisional
+        else "candidate_manifest.json"
+    )
+    snapshot_directory = (
+        "short_quality_candidate_manifest_snapshots"
+        if provisional
+        else "candidate_manifest_snapshots"
+    )
+    receipt_directory = (
+        "short_quality_candidate_receipts"
+        if provisional
+        else "candidate_receipts"
+    )
+    _atomic_json(run_dir / manifest_name, manifest)
+    live_manifest_path = run_dir / manifest_name
     manifest_snapshot_path = (
         run_dir
-        / "candidate_manifest_snapshots"
+        / snapshot_directory
         / f"epoch-{epoch:04d}.json"
     )
     _write_new_json(manifest_snapshot_path, manifest)
     ready_body = {
-        "format": READY_RECEIPT_FORMAT,
+        "format": (
+            SHORT_QUALITY_READY_RECEIPT_FORMAT
+            if provisional
+            else READY_RECEIPT_FORMAT
+        ),
         "status": "ready",
         "selection_eligible": False,
         "test_visible": False,
@@ -2852,7 +2936,7 @@ def _save_candidate(
         "optimizer_updates": optimizer_updates,
         "candidate_checkpoint": {
             "path": str(checkpoint_path.resolve(strict=True)),
-            "relative_path": f"candidates/{filename}",
+            "relative_path": checkpoint_relative,
             "sha256": checkpoint_sha,
             "bytes": checkpoint_path.stat().st_size,
             "model_state_tensors": len(model_state),
@@ -2887,8 +2971,11 @@ def _save_candidate(
         "trajectory_anchor_match": anchor_match,
         "published_unix": time.time(),
     }
+    if provisional:
+        ready_body["run_purpose"] = RUN_PURPOSE_SHORT_QUALITY
+        ready_body["target_epochs"] = list(candidate_epochs)
     _write_new_json(
-        run_dir / "candidate_receipts" / f"epoch-{epoch:04d}.json",
+        run_dir / receipt_directory / f"epoch-{epoch:04d}.json",
         {
             **ready_body,
             "receipt_payload_sha256": canonical_json_sha256(ready_body),
@@ -3052,7 +3139,7 @@ def validate_throughput_gate(
 ) -> dict[str, Any]:
     if not args.throughput_gate_report or not args.expected_throughput_gate_sha256:
         raise AdaptationContractError(
-            "train mode requires a hash-pinned throughput gate report"
+            "training mode requires a hash-pinned throughput gate report"
         )
     report, path, observed_sha = _load_json_receipt(
         Path(args.throughput_gate_report),
@@ -3062,6 +3149,9 @@ def validate_throughput_gate(
     trajectory_mode = frozen_receipt["long_contract"][
         "trajectory_anchor"
     ]["mode"]
+    frozen_compatibility_sha256 = _frozen_gate_compatibility_sha256(
+        frozen_receipt
+    )
     if (
         report.get("format") != GATE_FORMAT
         or report.get("status") != "pass"
@@ -3072,8 +3162,15 @@ def validate_throughput_gate(
         != args.expected_topology_gate_spec_sha256
         or not isinstance(report.get("topology_independent_input_sha256"), str)
         or len(report["topology_independent_input_sha256"]) != 64
-        or report.get("frozen_receipt_sha256")
-        != frozen_receipt["receipt_sha256"]
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(report.get("frozen_receipt_sha256")),
+        )
+        is None
+        or report.get("frozen_gate_compatibility_sha256")
+        != frozen_compatibility_sha256
+        or report.get("topology_independent_input_sha256")
+        != _topology_independent_gate_semantic_sha256(frozen_receipt)
         or report.get("topology_receipt_sha256")
         != frozen_receipt["topology"]["receipt_sha256"]
         or report.get("node_count") != NODE_COUNT
@@ -3156,6 +3253,12 @@ def validate_throughput_gate(
         ),
         "trajectory_mode": trajectory_mode,
         "trajectory_probe": trajectory_probe,
+        "gate_frozen_receipt_sha256": report[
+            "frozen_receipt_sha256"
+        ],
+        "frozen_gate_compatibility_sha256": (
+            frozen_compatibility_sha256
+        ),
     }
 
 
@@ -3265,7 +3368,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.allow_abbrev = False
     parser.add_argument(
         "--mode",
-        choices=("throughput_gate", "train"),
+        choices=("throughput_gate", SHORT_QUALITY_MODE, "train"),
         required=True,
     )
     parser.add_argument("--official-base-checkpoint", required=True)
@@ -3386,7 +3489,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise AdaptationContractError(
             "local batch size differs from the selected topology"
         )
-    if args.epochs != TOTAL_EPOCHS:
+    expected_epochs = (
+        SHORT_QUALITY_TOTAL_EPOCHS
+        if args.mode == SHORT_QUALITY_MODE
+        else TOTAL_EPOCHS
+    )
+    if args.epochs != expected_epochs:
+        if args.mode == SHORT_QUALITY_MODE:
+            raise AdaptationContractError(
+                "provisional short-quality adaptation must run exactly "
+                f"{SHORT_QUALITY_TOTAL_EPOCHS} epochs"
+            )
         raise AdaptationContractError(
             f"long official adaptation must run exactly {TOTAL_EPOCHS} epochs"
         )
@@ -3410,8 +3523,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise AdaptationContractError(
             "throughput_gate mode cannot consume a previous gate"
         )
+    if args.mode == SHORT_QUALITY_MODE and (
+        args.throughput_gate_report is None
+        or args.expected_throughput_gate_sha256 is None
+        or args.topology_selection_report is not None
+        or args.expected_topology_selection_sha256 is not None
+    ):
+        raise AdaptationContractError(
+            "short_quality requires one hash-pinned topology throughput gate "
+            "and forbids topology selection"
+        )
     if args.mode == "train" and (
-        args.topology_selection_report is None
+        args.throughput_gate_report is None
+        or args.expected_throughput_gate_sha256 is None
+        or args.topology_selection_report is None
         or args.expected_topology_selection_sha256 is None
     ):
         raise AdaptationContractError(
@@ -3700,9 +3825,13 @@ def _frozen_receipt(
     protocol: Mapping[str, Any],
     long_contract: Mapping[str, Any],
     topology: Mapping[str, Any],
+    run_purpose: str,
+    target_epochs: Sequence[int],
 ) -> dict[str, Any]:
     payload = {
         "format": "semtalk_show_base_official_adapt_frozen_inputs_v1",
+        "run_purpose": run_purpose,
+        "target_epochs": list(target_epochs),
         "source": dict(source),
         "official_base": dict(official_base),
         "speaker_initialization": dict(speaker_initialization),
@@ -3713,6 +3842,34 @@ def _frozen_receipt(
     }
     payload["receipt_sha256"] = canonical_json_sha256(payload)
     return payload
+
+
+def _frozen_gate_compatibility_sha256(
+    frozen_receipt: Mapping[str, Any],
+) -> str:
+    """Bind a gate to training semantics while excluding its run purpose.
+
+    Throughput measurement, provisional quality training, and the eventual
+    formal trajectory are three separate immutable runs.  Their full frozen
+    receipts must therefore state different purposes and target epochs.  This
+    projection removes exactly those run-local declarations (plus the
+    self-hash), while retaining every source, dataset, objective, topology,
+    and rendezvous binding needed to replay the gate safely.
+    """
+
+    required = {"run_purpose", "target_epochs", "receipt_sha256"}
+    if not isinstance(frozen_receipt, Mapping) or not required.issubset(
+        frozen_receipt
+    ):
+        raise AdaptationContractError(
+            "frozen Base receipt lacks explicit run purpose/target epochs"
+        )
+    payload = {
+        key: value
+        for key, value in frozen_receipt.items()
+        if key not in required
+    }
+    return canonical_json_sha256(payload)
 
 
 def _percentile(values: Sequence[float], probability: float) -> float:
@@ -3993,6 +4150,9 @@ def _run_throughput_gate(
                 _topology_independent_gate_semantic_sha256(frozen_receipt)
             ),
             "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+            "frozen_gate_compatibility_sha256": (
+                _frozen_gate_compatibility_sha256(frozen_receipt)
+            ),
             "topology_receipt_sha256": frozen_receipt["topology"][
                 "receipt_sha256"
             ],
@@ -4133,6 +4293,30 @@ def _run_training(
     import torch
     import torch.distributed as dist
 
+    provisional = args.mode == SHORT_QUALITY_MODE
+    if args.mode not in {SHORT_QUALITY_MODE, "train"}:
+        raise AdaptationContractError(
+            "candidate training requires short_quality or train mode"
+        )
+    target_total_epochs = (
+        SHORT_QUALITY_TOTAL_EPOCHS if provisional else TOTAL_EPOCHS
+    )
+    target_candidate_epochs = (
+        SHORT_QUALITY_EPOCHS if provisional else CANDIDATE_EPOCHS
+    )
+    run_purpose = (
+        RUN_PURPOSE_SHORT_QUALITY
+        if provisional
+        else RUN_PURPOSE_FORMAL_TRAINING
+    )
+    manifest_name = (
+        "short_quality_candidate_manifest.json"
+        if provisional
+        else "candidate_manifest.json"
+    )
+    status_name = (
+        "short_quality_status.json" if provisional else "status.json"
+    )
     trajectory_mode = contract_receipts["trajectory_anchor"]["mode"]
     fresh_trajectory = trajectory_mode == FRESH_TRAJECTORY_MODE
     expected_trajectory_probe = throughput_receipt.get(
@@ -4144,9 +4328,13 @@ def _run_training(
             label="throughput trajectory probe",
         )
     manifest: dict[str, Any] = {
-        "format": MANIFEST_FORMAT,
+        "format": (
+            SHORT_QUALITY_MANIFEST_FORMAT
+            if provisional
+            else MANIFEST_FORMAT
+        ),
         "status": "running",
-        "candidate_epochs": list(CANDIDATE_EPOCHS),
+        "candidate_epochs": list(target_candidate_epochs),
         "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
         "schedule_sha256": contract_receipts["schedule"]["sha256"],
         "trajectory_anchor_sha256": contract_receipts[
@@ -4159,14 +4347,17 @@ def _run_training(
         "entries": [],
         "entries_sha256": canonical_json_sha256([]),
     }
+    if provisional:
+        manifest["run_purpose"] = run_purpose
+        manifest["target_epochs"] = list(target_candidate_epochs)
     if rank == 0:
-        _atomic_json(run_dir / "candidate_manifest.json", manifest)
+        _atomic_json(run_dir / manifest_name, manifest)
     optimizer_updates = 0
     probe_sample_order = hashlib.sha256()
     probe_sample_count = 0
     started_unix = time.time()
     model.train()
-    for epoch_index in range(TOTAL_EPOCHS):
+    for epoch_index in range(target_total_epochs):
         sampler.set_epoch(epoch_index)
         epoch_sums = {
             name: 0.0
@@ -4219,7 +4410,7 @@ def _run_training(
                     manifest["trajectory_probe_verified"] = True
                     manifest["trajectory_probe"] = matched_probe
                     _atomic_json(
-                        run_dir / "candidate_manifest.json",
+                        run_dir / manifest_name,
                         manifest,
                     )
                 dist.barrier()
@@ -4244,7 +4435,7 @@ def _run_training(
             for index, key in enumerate(epoch_sums)
         }
         completed_epoch = epoch_index + 1
-        if completed_epoch in CANDIDATE_EPOCHS:
+        if completed_epoch in target_candidate_epochs:
             _distributed_verify_loader_source(
                 loader,
                 rank=rank,
@@ -4260,9 +4451,10 @@ def _run_training(
                     frozen_receipt=frozen_receipt,
                     contract_receipts=contract_receipts,
                     manifest=manifest,
+                    provisional=provisional,
                 )
             dist.barrier()
-        if completed_epoch in RESUME_EPOCHS:
+        if not provisional and completed_epoch in RESUME_EPOCHS:
             local_rng_state = {
                 "rank": rank,
                 "python_random_state": random.getstate(),
@@ -4296,7 +4488,11 @@ def _run_training(
             dist.barrier()
         if rank == 0:
             metric_record = {
-                "format": "semtalk_show_base_long_epoch_metric_v1",
+                "format": (
+                    SHORT_QUALITY_EPOCH_METRIC_FORMAT
+                    if provisional
+                    else "semtalk_show_base_long_epoch_metric_v1"
+                ),
                 "epoch": completed_epoch,
                 "optimizer_updates": optimizer_updates,
                 "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
@@ -4310,27 +4506,39 @@ def _run_training(
                 ),
                 "completed_unix": time.time(),
             }
+            if provisional:
+                metric_record["run_purpose"] = run_purpose
+                metric_record["target_epochs"] = list(
+                    target_candidate_epochs
+                )
             _append_epoch_metric(
                 run_dir / "epoch_metrics.jsonl",
                 metric_record,
             )
-            _atomic_json(
-                run_dir / "status.json",
-                {
-                    "format": STATUS_FORMAT,
-                    "status": "running",
-                    "completed_epochs": completed_epoch,
-                    "optimizer_updates": optimizer_updates,
-                    "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
-                    "last_epoch_metrics": epoch_metrics,
-                    "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
-                    "candidate_manifest_sha256": sha256_file(
-                        run_dir / "candidate_manifest.json"
-                    ),
-                    "started_unix": started_unix,
-                    "updated_unix": time.time(),
-                },
-            )
+            running_status = {
+                "format": (
+                    SHORT_QUALITY_STATUS_FORMAT
+                    if provisional
+                    else STATUS_FORMAT
+                ),
+                "status": "running",
+                "completed_epochs": completed_epoch,
+                "optimizer_updates": optimizer_updates,
+                "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+                "last_epoch_metrics": epoch_metrics,
+                "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+                "candidate_manifest_sha256": sha256_file(
+                    run_dir / manifest_name
+                ),
+                "started_unix": started_unix,
+                "updated_unix": time.time(),
+            }
+            if provisional:
+                running_status["run_purpose"] = run_purpose
+                running_status["target_epochs"] = list(
+                    target_candidate_epochs
+                )
+            _atomic_json(run_dir / status_name, running_status)
     _assert_distributed_finite(_all_finite(model.parameters()), device)
     _distributed_verify_loader_source(
         loader,
@@ -4343,59 +4551,110 @@ def _run_training(
                 "fresh Base trajectory gate was not verified"
             )
         if [entry["epoch"] for entry in manifest["entries"]] != list(
-            CANDIDATE_EPOCHS
+            target_candidate_epochs
         ):
             raise AdaptationContractError("candidate set is incomplete")
         manifest["status"] = "complete"
-        manifest["completed_epochs"] = TOTAL_EPOCHS
+        manifest["completed_epochs"] = target_total_epochs
         manifest["optimizer_updates"] = optimizer_updates
         manifest["entries_sha256"] = canonical_json_sha256(manifest["entries"])
-        _atomic_json(run_dir / "candidate_manifest.json", manifest)
-        _atomic_json(
-            run_dir / "status.json",
-            {
-                "format": STATUS_FORMAT,
-                "status": "complete",
-                "completed_epochs": TOTAL_EPOCHS,
-                "optimizer_updates": optimizer_updates,
-                "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
-                "candidate_manifest_sha256": sha256_file(
-                    run_dir / "candidate_manifest.json"
-                ),
-                "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
-                "throughput_gate": dict(throughput_receipt),
-                "world_size": WORLD_SIZE,
-                "local_batch_size": LOCAL_BATCH_SIZE,
-                "global_batch_size": GLOBAL_BATCH_SIZE,
-                "all_training_state_finite": True,
-                "epoch_metrics_jsonl": str(
-                    (run_dir / "epoch_metrics.jsonl").resolve(strict=True)
-                ),
-                "epoch_metrics_sha256": sha256_file(
-                    run_dir / "epoch_metrics.jsonl"
-                ),
-                "epoch_metrics_records": TOTAL_EPOCHS,
-                "schedule_sha256": contract_receipts["schedule"]["sha256"],
-                "trajectory_anchor_sha256": contract_receipts[
-                    "trajectory_anchor"
-                ]["sha256"],
-                "trajectory_mode": trajectory_mode,
-                "trajectory_probe_verified": manifest[
-                    "trajectory_probe_verified"
-                ],
-                "trajectory_probe": manifest["trajectory_probe"],
-                "resume_receipt": str(
-                    (
-                        run_dir / "resume" / "latest_resume.json"
-                    ).resolve(strict=True)
-                ),
-                "resume_receipt_sha256": sha256_file(
+        _atomic_json(run_dir / manifest_name, manifest)
+        status_payload: dict[str, Any] = {
+            "format": (
+                SHORT_QUALITY_STATUS_FORMAT
+                if provisional
+                else STATUS_FORMAT
+            ),
+            "status": "complete",
+            "completed_epochs": target_total_epochs,
+            "optimizer_updates": optimizer_updates,
+            "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "candidate_manifest_sha256": sha256_file(
+                run_dir / manifest_name
+            ),
+            "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+            "throughput_gate": dict(throughput_receipt),
+            "world_size": WORLD_SIZE,
+            "local_batch_size": LOCAL_BATCH_SIZE,
+            "global_batch_size": GLOBAL_BATCH_SIZE,
+            "all_training_state_finite": True,
+            "epoch_metrics_jsonl": str(
+                (run_dir / "epoch_metrics.jsonl").resolve(strict=True)
+            ),
+            "epoch_metrics_sha256": sha256_file(
+                run_dir / "epoch_metrics.jsonl"
+            ),
+            "epoch_metrics_records": target_total_epochs,
+            "schedule_sha256": contract_receipts["schedule"]["sha256"],
+            "trajectory_anchor_sha256": contract_receipts[
+                "trajectory_anchor"
+            ]["sha256"],
+            "trajectory_mode": trajectory_mode,
+            "trajectory_probe_verified": manifest[
+                "trajectory_probe_verified"
+            ],
+            "trajectory_probe": manifest["trajectory_probe"],
+            "started_unix": started_unix,
+            "completed_unix": time.time(),
+        }
+        if provisional:
+            status_payload["run_purpose"] = run_purpose
+            status_payload["target_epochs"] = list(
+                target_candidate_epochs
+            )
+        if not provisional:
+            status_payload["resume_receipt"] = str(
+                (
                     run_dir / "resume" / "latest_resume.json"
-                ),
-                "started_unix": started_unix,
-                "completed_unix": time.time(),
-            },
-        )
+                ).resolve(strict=True)
+            )
+            status_payload["resume_receipt_sha256"] = sha256_file(
+                run_dir / "resume" / "latest_resume.json"
+            )
+        else:
+            final_manifest_path = (run_dir / manifest_name).resolve(
+                strict=True
+            )
+            metrics_path = (run_dir / "epoch_metrics.jsonl").resolve(
+                strict=True
+            )
+            ready_receipts: list[dict[str, Any]] = []
+            for epoch in SHORT_QUALITY_EPOCHS:
+                path = (
+                    run_dir
+                    / "short_quality_candidate_receipts"
+                    / f"epoch-{epoch:04d}.json"
+                ).resolve(strict=True)
+                ready_payload = _strict_json_bytes(
+                    path.read_bytes(),
+                    f"short-quality e{epoch} candidate receipt",
+                )
+                ready_receipts.append(
+                    {
+                        "path": str(path),
+                        "sha256": sha256_file(path),
+                        "bytes": path.stat().st_size,
+                        "receipt_payload_sha256": ready_payload[
+                            "receipt_payload_sha256"
+                        ],
+                    }
+                )
+            status_payload["candidate_manifest"] = {
+                "path": str(final_manifest_path),
+                "sha256": sha256_file(final_manifest_path),
+                "bytes": final_manifest_path.stat().st_size,
+            }
+            status_payload["epoch_metrics"] = {
+                "path": str(metrics_path),
+                "sha256": sha256_file(metrics_path),
+                "bytes": metrics_path.stat().st_size,
+                "records": SHORT_QUALITY_TOTAL_EPOCHS,
+            }
+            status_payload["candidate_ready_receipts"] = ready_receipts
+            status_payload["receipt_payload_sha256"] = (
+                canonical_json_sha256(status_payload)
+            )
+        _atomic_json(run_dir / status_name, status_payload)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4587,6 +4846,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             protocol=protocol,
             long_contract=contract_receipts,
             topology=topology_receipt,
+            run_purpose=_run_purpose(args),
+            target_epochs=_target_epochs(args),
         )
         frozen_hashes: list[Any] = [None for _ in range(world_size)]
         dist.all_gather_object(
@@ -4601,16 +4862,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         dist.barrier()
 
         throughput_receipt: dict[str, Any] = {}
-        if args.mode == "train":
+        if args.mode in {SHORT_QUALITY_MODE, "train"}:
             throughput_receipt = validate_throughput_gate(
                 args, frozen_receipt=frozen_receipt
             )
-            throughput_receipt["topology_selection"] = (
-                validate_topology_selection(
-                    args,
-                    throughput_gate=throughput_receipt,
+            if args.mode == "train":
+                throughput_receipt["topology_selection"] = (
+                    validate_topology_selection(
+                        args,
+                        throughput_gate=throughput_receipt,
+                    )
                 )
-            )
         loader, sampler = _create_dataloader(
             args,
             rank,
@@ -4671,16 +4933,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except BaseException as error:
         if rank == 0 and run_dir.is_dir():
-            _atomic_json(
-                run_dir / "failure.json",
-                {
-                    "format": STATUS_FORMAT,
-                    "status": "failed",
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "failed_unix": time.time(),
-                },
-            )
+            failure_payload = {
+                "format": (
+                    SHORT_QUALITY_STATUS_FORMAT
+                    if args.mode == SHORT_QUALITY_MODE
+                    else STATUS_FORMAT
+                ),
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "failed_unix": time.time(),
+            }
+            if args.mode == SHORT_QUALITY_MODE:
+                failure_payload["run_purpose"] = _run_purpose(args)
+                failure_payload["target_epochs"] = _target_epochs(args)
+            _atomic_json(run_dir / "failure.json", failure_payload)
         raise
     finally:
         if dist.is_initialized():
