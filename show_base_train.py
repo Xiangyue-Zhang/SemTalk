@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import random
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -33,12 +34,25 @@ import torch.distributed as dist
 from loguru import logger
 
 from utils import config, logger_tools, other_tools
+from utils.show_official_transfer import load_official_model_state
 from utils.lower_target_cache import (
     RECEIPT_KEY as LOWER_TARGET_CACHE_RECEIPT_KEY,
     attach_lower_target_cache_receipt,
     canonical_json_sha256 as lower_target_cache_receipt_sha256,
     validate_activation_args as validate_lower_target_cache_activation,
     verify_lower_target_cache_resume_receipt,
+)
+from utils.rvq_distributed import (
+    REPRESENTATION_STAGES,
+    RVQ_STAGES,
+    assert_rvq_rank_state,
+    initialize_loaded_rvq_ema,
+    representation_ddp_receipt,
+    validate_representation_ddp_receipt,
+)
+from utils.smplx_training import (
+    clip_aligned_spans,
+    parse_smplx_helper_devices,
 )
 
 
@@ -47,6 +61,95 @@ FORMAL_SMPLX_SHA256 = (
     "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
 )
 FORMAL_SMPLX_STAGES = frozenset({"face", "hands", "upper", "lower"})
+SMPLX_TRAINING_POOL_GATE_FORMAT = (
+    "semtalk_show_smplx_sharded_local_loss_formal_gate_v1"
+)
+SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_FORMAT = (
+    "semtalk_show_smplx_target_offload_formal_gate_v1"
+)
+SMPLX_TRAINING_POOL_GATE_HARNESS_SHA256 = (
+    "01c77aa005039f9936f667b8b97052084be3e3364f64be402b53df383ed7ae2d"
+)
+SMPLX_TRAINING_POOL_GATE_ADAPTER_SHA256 = (
+    "5b3ac7fdeb4ca680036998159f64db7369430d4cc0e5852a49436d97f04aeeba"
+)
+SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_HARNESS_SHA256 = (
+    "5423ed9a5a8076e23e72ffaad3104f94c81ea5b2cc7d48aec32d50c10e6772de"
+)
+SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_ADAPTER_SHA256 = (
+    "2fd00b05eec9f68267ab74d36d9a074a2692465f55e422ed2c6477c25821a269"
+)
+SMPLX_TRAINING_POOL_IMPLEMENTATION_FILES = frozenset(
+    {
+        "show_base_train.py",
+        "utils/smplx_training.py",
+        "utils/config.py",
+        "aeface_trainer.py",
+        "ae_trainer.py",
+        "aelower_trainer.py",
+    }
+)
+SMPLX_TRAINING_POOL_GATE_MIN_SPEEDUP = 1.50
+SMPLX_TRAINING_POOL_GATE_BOUNDED_TOLERANCES = {
+    "model": {"atol": 5e-6, "rtol": 2e-5},
+    "grads": {"atol": 2e-6, "rtol": 2e-5},
+    "optimizer": {"atol": 5e-6, "rtol": 2e-5},
+    "rvq_ema": {"atol": 5e-6, "rtol": 2e-5},
+    "tracker": {"atol": 5e-6, "rtol": 2e-5},
+}
+SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY = "smplx_training_pool_gate"
+SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY = (
+    "smplx_training_pool_runtime_evidence"
+)
+SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_FORMAT = (
+    "semtalk_show_smplx_sharded_local_loss_runtime_evidence_v1"
+)
+SMPLX_TRAINING_POOL_TARGET_OFFLOAD_RUNTIME_EVIDENCE_FORMAT = (
+    "semtalk_show_smplx_target_offload_runtime_evidence_v1"
+)
+SMPLX_TRAINING_POOL_MODE_SPECS = {
+    "target_offload": {
+        "gate_format": SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_FORMAT,
+        "harness_sha256": (
+            SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_HARNESS_SHA256
+        ),
+        "adapter_sha256": (
+            SMPLX_TRAINING_POOL_TARGET_OFFLOAD_GATE_ADAPTER_SHA256
+        ),
+        "runtime_evidence_format": (
+            SMPLX_TRAINING_POOL_TARGET_OFFLOAD_RUNTIME_EVIDENCE_FORMAT
+        ),
+        "partition": (
+            "primary_stock_full_batch_reconstruction_and_"
+            "helper_full_batch_target"
+        ),
+        "transfer_to_primary": "detached_target_full_outputs_only",
+        "minimum_speedup": 1.03,
+        "cross_mode_comparison": "cross_mode_byte_exact",
+        "cross_mode_final": "byte_exact",
+        "receipt_cross_mode": "byte_exact",
+    },
+    "sharded_local_loss": {
+        "gate_format": SMPLX_TRAINING_POOL_GATE_FORMAT,
+        "harness_sha256": SMPLX_TRAINING_POOL_GATE_HARNESS_SHA256,
+        "adapter_sha256": SMPLX_TRAINING_POOL_GATE_ADAPTER_SHA256,
+        "runtime_evidence_format": (
+            SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_FORMAT
+        ),
+        "partition": "balanced_contiguous_whole_clips",
+        "transfer_to_primary": (
+            "differentiable_scalar_numerators_only"
+        ),
+        "minimum_speedup": SMPLX_TRAINING_POOL_GATE_MIN_SPEEDUP,
+        "cross_mode_comparison": "cross_mode_bounded",
+        "cross_mode_final": (
+            "bounded_float_exact_discrete_rng_and_smplx"
+        ),
+        "receipt_cross_mode": (
+            "bounded_float_exact_discrete_rng_and_smplx"
+        ),
+    },
+}
 LOWER_TARGET_CACHE_GATE_FORMAT = (
     "semtalk_show_lower_target_cache_formal_gate_v1"
 )
@@ -68,6 +171,7 @@ LOWER_TARGET_BACKEND_RECEIPT_KEYS = {
     "receipt_sha256",
 }
 BASE_CANDIDATE_INTERVAL_EPOCHS = 10
+REPRESENTATION_CANDIDATE_INTERVAL_EPOCHS = 20
 BASE_CANDIDATE_TRANSACTION_FILENAME = "base_candidate_transaction.json"
 BASE_CANDIDATE_STAGING_FILENAME = ".base_candidate_checkpoint.staging"
 
@@ -178,6 +282,238 @@ def _payload_sha256(payload: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _smplx_training_pool_mode_spec(mode: Any) -> dict[str, Any]:
+    spec = SMPLX_TRAINING_POOL_MODE_SPECS.get(mode)
+    if not isinstance(spec, dict):
+        raise RuntimeError(
+            "formal SMPL-X pooling mode must be target_offload or "
+            "sharded_local_loss"
+        )
+    return spec
+
+
+def _validate_smplx_training_pool_helpers(
+    mode: str,
+    helpers: tuple[int, ...],
+) -> None:
+    if mode == "target_offload":
+        if helpers != (1,):
+            raise RuntimeError(
+                "target_offload requires exactly logical helper 1"
+            )
+        return
+    if (
+        mode != "sharded_local_loss"
+        or len(helpers) < 2
+        or helpers != tuple(range(1, len(helpers) + 1))
+    ):
+        raise RuntimeError(
+            "sharded_local_loss requires at least two contiguous logical "
+            "helpers starting at 1"
+        )
+
+
+def _smplx_training_pool_topology(
+    mode: str,
+    helpers: tuple[int, ...],
+) -> dict[str, Any]:
+    spec = _smplx_training_pool_mode_spec(mode)
+    _validate_smplx_training_pool_helpers(mode, helpers)
+    visible_device_count = len(helpers) + 1
+    return {
+        "format": "semtalk_smplx_training_pool_topology_v1",
+        "pool_runtime_format": "semtalk_smplx_training_pool_v2",
+        "mode": mode,
+        "primary_device": 0,
+        "helper_devices": list(helpers),
+        "replica_devices": list(range(visible_device_count)),
+        "visible_device_count": visible_device_count,
+        "partition": spec["partition"],
+        "transfer_to_primary": spec["transfer_to_primary"],
+    }
+
+
+def _validate_smplx_training_pool_last_forward(
+    last_forward: Any,
+    *,
+    formal_stage: str,
+    topology: dict[str, Any],
+) -> None:
+    mode = topology.get("mode")
+    if not isinstance(last_forward, dict):
+        raise RuntimeError("SMPL-X pool last-forward evidence is invalid")
+    if mode == "target_offload":
+        required_keys = {
+            "stage",
+            "total_rows",
+            "clip_length",
+            "total_clips",
+            "helpers",
+            "reconstruction_device",
+            "reconstruction_execution",
+            "target_device",
+            "target_execution",
+            "transfer_to_primary",
+            "output_keys",
+        }
+        expected_output_keys = (
+            ["joints"] if formal_stage == "lower" else ["vertices"]
+        )
+        if (
+            set(last_forward) != required_keys
+            or last_forward.get("stage") != formal_stage
+            or last_forward.get("helpers") != [1]
+            or topology.get("helper_devices") != [1]
+            or last_forward.get("reconstruction_device") != 0
+            or last_forward.get("reconstruction_execution")
+            != "stock_full_batch_primary_current_stream"
+            or last_forward.get("target_device") != 1
+            or last_forward.get("target_execution")
+            != "detached_full_batch_helper"
+            or last_forward.get("transfer_to_primary")
+            != "detached_target_full_outputs_only"
+            or last_forward.get("output_keys") != expected_output_keys
+        ):
+            raise RuntimeError(
+                "SMPL-X target_offload last-forward path is invalid"
+            )
+        total_rows = _require_exact_audit_int(
+            last_forward.get("total_rows"),
+            "SMPL-X pool last_forward total_rows",
+        )
+        clip_length = _require_exact_audit_int(
+            last_forward.get("clip_length"),
+            "SMPL-X pool last_forward clip_length",
+        )
+        total_clips = _require_exact_audit_int(
+            last_forward.get("total_clips"),
+            "SMPL-X pool last_forward total_clips",
+        )
+        if (
+            total_rows <= 0
+            or clip_length <= 0
+            or total_rows % clip_length
+            or total_clips != total_rows // clip_length
+        ):
+            raise RuntimeError(
+                "SMPL-X target_offload last-forward dimensions are invalid"
+            )
+        return
+
+    if mode != "sharded_local_loss":
+        raise RuntimeError("unsupported SMPL-X pool runtime evidence mode")
+    required_keys = {
+        "stage",
+        "total_rows",
+        "clip_length",
+        "total_clips",
+        "helpers",
+        "spans",
+        "component_counts",
+        "aggregation",
+    }
+    if (
+        set(last_forward) != required_keys
+        or last_forward.get("stage") != formal_stage
+        or last_forward.get("helpers") != topology.get("helper_devices")
+        or last_forward.get("aggregation")
+        != "ordered_numerator_sum_over_exact_global_count"
+    ):
+        raise RuntimeError("SMPL-X pool last-forward evidence is invalid")
+    total_rows = _require_exact_audit_int(
+        last_forward.get("total_rows"),
+        "SMPL-X pool last_forward total_rows",
+    )
+    clip_length = _require_exact_audit_int(
+        last_forward.get("clip_length"),
+        "SMPL-X pool last_forward clip_length",
+    )
+    total_clips = _require_exact_audit_int(
+        last_forward.get("total_clips"),
+        "SMPL-X pool last_forward total_clips",
+    )
+    helpers = topology.get("helper_devices")
+    if (
+        total_rows <= 0
+        or clip_length <= 0
+        or total_rows % clip_length
+        or total_clips != total_rows // clip_length
+        or not isinstance(helpers, list)
+    ):
+        raise RuntimeError("SMPL-X pool last-forward dimensions are invalid")
+    expected_spans = [
+        {
+            "device": device,
+            "row_start": row_start,
+            "row_end": row_end,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+        }
+        for device, (
+            row_start,
+            row_end,
+            clip_start,
+            clip_end,
+        ) in zip(
+            helpers,
+            clip_aligned_spans(
+                total_rows,
+                clip_length,
+                len(helpers),
+            ),
+        )
+    ]
+    if last_forward.get("spans") != expected_spans:
+        raise RuntimeError("SMPL-X pool last-forward spans are not exact")
+
+    component_counts = last_forward.get("component_counts")
+    expected_components = (
+        {"ver", "foot"}
+        if formal_stage == "lower"
+        else {"ver", "ver_vel", "ver_acc"}
+    )
+    if (
+        not isinstance(component_counts, dict)
+        or set(component_counts) != expected_components
+        or any(
+            not isinstance(counts, list)
+            or len(counts) != len(helpers)
+            or any(type(count) is not int or count <= 0 for count in counts)
+            for counts in component_counts.values()
+        )
+    ):
+        raise RuntimeError(
+            "SMPL-X pool last-forward component counts are invalid"
+        )
+    for shard_index, span in enumerate(expected_spans):
+        local_rows = span["row_end"] - span["row_start"]
+        ver_count = component_counts["ver"][shard_index]
+        if (
+            local_rows <= 0
+            or ver_count % local_rows
+            or (ver_count // local_rows) % 3
+        ):
+            raise RuntimeError(
+                "SMPL-X pool vertex/joint count is not row aligned"
+            )
+        per_row = ver_count // local_rows
+        if formal_stage == "lower":
+            if component_counts["foot"][shard_index] != local_rows * 12:
+                raise RuntimeError(
+                    "SMPL-X pool lower foot count is not exact"
+                )
+        elif (
+            per_row <= 6
+            or component_counts["ver_vel"][shard_index]
+            != local_rows * (per_row - 3)
+            or component_counts["ver_acc"][shard_index]
+            != local_rows * (per_row - 6)
+        ):
+            raise RuntimeError(
+                "SMPL-X pool vertex derivative counts are not exact"
+            )
 
 
 def _json_document_sha256(payload: dict[str, Any]) -> str:
@@ -446,6 +782,1812 @@ def _config_fingerprint(args: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _require_lowercase_sha256(value: Any, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(
+            f"{label} must be exactly 64 lowercase hexadecimal digits"
+        )
+    return value
+
+
+def _validate_target_offload_preliminary_numerical_gate(
+    receipt: Any,
+    *,
+    smplx_asset_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Reopen and revalidate the target gate's preliminary numeric proof."""
+    required_receipt_keys = {
+        "classification",
+        "authorization",
+        "files",
+        "format",
+        "batch",
+        "clips",
+        "frames",
+        "vertices_loss_six_input_gradients_byte_exact",
+        "runner_status",
+    }
+    file_labels = {
+        "numerical report",
+        "numerical script",
+        "numerical runner status",
+    }
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != required_receipt_keys
+        or receipt.get("classification")
+        != "preliminary_not_source_bound"
+        or receipt.get("authorization") is not False
+        or not isinstance(receipt.get("files"), dict)
+        or set(receipt["files"]) != file_labels
+        or not isinstance(smplx_asset_receipt, dict)
+        or smplx_asset_receipt.get("sha256") != FORMAL_SMPLX_SHA256
+    ):
+        raise RuntimeError(
+            "target_offload preliminary numerical receipt is invalid"
+        )
+
+    files: dict[str, dict[str, str]] = {}
+    for label in sorted(file_labels):
+        record = receipt["files"].get(label)
+        path_value = record.get("path") if isinstance(record, dict) else None
+        expected_sha = (
+            record.get("sha256") if isinstance(record, dict) else None
+        )
+        path = Path(path_value) if type(path_value) is str else Path()
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "sha256"}
+            or not path.is_absolute()
+            or path != path.resolve()
+            or path.is_symlink()
+            or not path.is_file()
+            or type(expected_sha) is not str
+            or _sha256(path)
+            != _require_lowercase_sha256(
+                expected_sha,
+                f"target_offload {label} SHA",
+            )
+        ):
+            raise RuntimeError(
+                f"target_offload preliminary {label} differs"
+            )
+        files[label] = {
+            "path": str(path),
+            "sha256": expected_sha,
+        }
+
+    with Path(files["numerical report"]["path"]).open(
+        encoding="utf-8"
+    ) as handle:
+        numerical = json.load(handle)
+    comparisons = (
+        numerical.get("comparisons")
+        if isinstance(numerical, dict)
+        else None
+    )
+    gradient_names = {
+        "body_pose",
+        "expression",
+        "global_orient",
+        "jaw_pose",
+        "left_hand_pose",
+        "right_hand_pose",
+    }
+
+    def exact_numeric(record: Any, label: str) -> None:
+        if (
+            not isinstance(record, dict)
+            or record.get("dtype") != "torch.float32"
+            or record.get("equal") is not True
+            or record.get("max_abs") != 0.0
+            or record.get("mismatch_count") != 0
+        ):
+            raise RuntimeError(
+                "target_offload preliminary numerical result differs: "
+                f"{label}"
+            )
+
+    if (
+        not isinstance(numerical, dict)
+        or numerical.get("format")
+        != "semtalk_smplx_full_batch_grad_quick_gate_v1"
+        or numerical.get("status") != "pass"
+        or numerical.get("asset_sha256") != FORMAL_SMPLX_SHA256
+        or numerical.get("batch") != 64 * 64
+        or numerical.get("clips") != 64
+        or numerical.get("frames") != 64
+        or numerical.get("device_names") != ["NVIDIA H200"] * 8
+        or not isinstance(comparisons, dict)
+        or not isinstance(comparisons.get("input_gradients"), dict)
+        or set(comparisons["input_gradients"]) != gradient_names
+    ):
+        raise RuntimeError(
+            "target_offload preliminary numerical schema differs"
+        )
+    exact_numeric(comparisons.get("vertices"), "vertices")
+    exact_numeric(comparisons.get("loss"), "loss")
+    for name in sorted(gradient_names):
+        exact_numeric(comparisons["input_gradients"][name], name)
+
+    asset_value = smplx_asset_receipt.get("path")
+    asset_path = Path(asset_value) if type(asset_value) is str else Path()
+    if (
+        not asset_path.is_absolute()
+        or asset_path != asset_path.resolve()
+        or asset_path.is_symlink()
+        or not asset_path.is_file()
+        or asset_path.name != FORMAL_SMPLX_FILENAME
+        or _sha256(asset_path) != FORMAL_SMPLX_SHA256
+        or len(asset_path.parents) < 3
+    ):
+        raise RuntimeError(
+            "target_offload preliminary SMPL-X asset binding differs"
+        )
+    asset_root = asset_path.parents[2]
+    if (
+        asset_path
+        != asset_root
+        / "smplx_models"
+        / "smplx"
+        / FORMAL_SMPLX_FILENAME
+    ):
+        raise RuntimeError(
+            "target_offload preliminary SMPL-X asset layout differs"
+        )
+    with Path(files["numerical runner status"]["path"]).open(
+        encoding="utf-8"
+    ) as handle:
+        runner_status = json.load(handle)
+    expected_command = [
+        "/usr/bin/python3.12",
+        files["numerical script"]["path"],
+        "--asset-root",
+        str(asset_root),
+        "--report",
+        files["numerical report"]["path"],
+        "--clips",
+        "64",
+        "--frames",
+        "64",
+    ]
+    restored = (
+        runner_status.get("restored_guards")
+        if isinstance(runner_status, dict)
+        else None
+    )
+    if (
+        not isinstance(runner_status, dict)
+        or runner_status.get("state") != "finished"
+        or runner_status.get("return_code") != 0
+        or runner_status.get("error") is not None
+        or runner_status.get("cleanup_error") is not None
+        or runner_status.get("restore_error") is not None
+        or runner_status.get("received_signal") is not None
+        or runner_status.get("command") != expected_command
+        or type(runner_status.get("wrapper_pid")) is not int
+        or runner_status["wrapper_pid"] <= 1
+        or type(runner_status.get("child_pid")) is not int
+        or runner_status["child_pid"] <= 1
+        or not isinstance(restored, dict)
+        or set(restored) != {str(index) for index in range(8)}
+        or len(set(restored.values())) != 8
+        or any(
+            type(pid) is not int or pid <= 1
+            for pid in restored.values()
+        )
+    ):
+        raise RuntimeError(
+            "target_offload preliminary guarded-runner receipt differs"
+        )
+    derived_receipt = {
+        "classification": "preliminary_not_source_bound",
+        "authorization": False,
+        "files": files,
+        "format": numerical["format"],
+        "batch": numerical["batch"],
+        "clips": numerical["clips"],
+        "frames": numerical["frames"],
+        "vertices_loss_six_input_gradients_byte_exact": True,
+        "runner_status": {
+            "wrapper_pid": runner_status["wrapper_pid"],
+            "child_pid": runner_status["child_pid"],
+            "return_code": runner_status["return_code"],
+            "restored_guards": restored,
+        },
+    }
+    if receipt != derived_receipt:
+        raise RuntimeError(
+            "target_offload preliminary receipt does not match its files"
+        )
+    return {
+        "asset_root": str(asset_root),
+        "files": files,
+        "receipt": copy.deepcopy(derived_receipt),
+    }
+
+
+def _validate_smplx_training_pool_device_matrix(
+    args: Any,
+    *,
+    world_size: int,
+    cuda_available: bool,
+    visible_device_count: int,
+) -> None:
+    """Fail closed before any model or process-group initialization."""
+
+    if type(world_size) is not int:
+        raise RuntimeError("world_size must be an exact integer")
+    if not cuda_available:
+        raise RuntimeError("formal SHOW training requires CUDA")
+    if type(visible_device_count) is not int:
+        raise RuntimeError("visible CUDA device count must be an exact integer")
+
+    stage = getattr(args, "formal_stage", None)
+    mode = getattr(args, "smplx_training_pool_mode", None)
+    try:
+        helpers = parse_smplx_helper_devices(
+            getattr(args, "smplx_training_helper_devices", "")
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "invalid --smplx_training_helper_devices"
+        ) from error
+    gate_values = (
+        getattr(args, "smplx_training_pool_gate_report", None),
+        getattr(
+            args,
+            "expected_smplx_training_pool_gate_sha256",
+            None,
+        ),
+    )
+    gate_supplied = any(value not in {None, ""} for value in gate_values)
+
+    if stage in REPRESENTATION_STAGES:
+        expected_world_size = 1 if stage == "global" else None
+        if stage in RVQ_STAGES and world_size not in {2, 4}:
+            raise RuntimeError(
+                "formal SHOW RVQ training requires world_size 2 or 4"
+            )
+        if expected_world_size is not None and world_size != expected_world_size:
+            raise RuntimeError("formal Global training requires world_size 1")
+        if visible_device_count != world_size:
+            raise RuntimeError(
+                "formal representation training requires one visible CUDA "
+                "device per local rank"
+            )
+        if mode != "disabled" or helpers or gate_supplied:
+            raise RuntimeError(
+                "DDP representation training forbids detached SMPL-X pools"
+            )
+        return
+
+    if stage in FORMAL_SMPLX_STAGES:
+        if mode == "disabled":
+            if helpers:
+                raise RuntimeError(
+                    "formal stock SMPL-X training forbids helper devices"
+                )
+            if gate_supplied:
+                raise RuntimeError(
+                    "formal stock SMPL-X training forbids pool gate arguments"
+                )
+            if visible_device_count != 1:
+                raise RuntimeError(
+                    "formal stock SMPL-X training requires exactly one "
+                    "visible CUDA device"
+                )
+            return
+        _smplx_training_pool_mode_spec(mode)
+        _validate_smplx_training_pool_helpers(mode, helpers)
+        if visible_device_count != len(helpers) + 1:
+            raise RuntimeError(
+                f"{mode} requires exactly primary+helpers visible"
+            )
+        if not all(type(value) is str and bool(value) for value in gate_values):
+            raise RuntimeError(
+                f"{mode} requires an explicit topology-specific "
+                "formal gate report and expected SHA-256"
+            )
+        return
+
+    if stage != "base":
+        raise RuntimeError(
+            "disabled SMPL-X pooling is restricted to formal global/Base "
+            "training"
+        )
+    if mode != "disabled":
+        raise RuntimeError(
+            "SMPL-X pooling is restricted to face/hands/upper/lower "
+            "target_offload or sharded_local_loss training"
+        )
+    if helpers:
+        raise RuntimeError("disabled SMPL-X pooling forbids helper devices")
+    if gate_supplied:
+        raise RuntimeError(
+            "disabled or non-VQ training forbids SMPL-X pool gate arguments"
+        )
+    if world_size != 1 or visible_device_count != 1:
+        raise RuntimeError(
+            "disabled and global/Base formal tasks require exactly one "
+            "visible CUDA device"
+        )
+
+
+def _formal_module_cuda_devices(module: Any) -> set[int]:
+    if not isinstance(module, torch.nn.Module):
+        raise RuntimeError("SMPL-X pool replica must be a torch module")
+    tensors = tuple(module.parameters()) + tuple(module.buffers())
+    if not tensors:
+        raise RuntimeError("SMPL-X pool replica has no auditable tensors")
+    if any(
+        tensor.device.type != "cuda" or tensor.device.index is None
+        for tensor in tensors
+    ):
+        raise RuntimeError("SMPL-X pool replica contains non-CUDA tensors")
+    return {int(tensor.device.index) for tensor in tensors}
+
+
+def _validate_smplx_training_pool_trainer_runtime(
+    args: Any,
+    trainer: Any,
+    *,
+    gate_receipt: dict[str, Any] | None,
+) -> None:
+    """Prove that the trainer instantiated the gate-authorized pool."""
+
+    requested_mode = getattr(
+        args,
+        "smplx_training_pool_mode",
+        None,
+    )
+    trainer_mode = getattr(
+        trainer,
+        "smplx_parallel_mode",
+        "disabled",
+    )
+    trainer_pool = getattr(trainer, "smplx_parallel_pool", None)
+    pool_alias = getattr(trainer, "smplx_pool", None)
+    stage = getattr(args, "formal_stage", None)
+    if requested_mode == "disabled":
+        if stage not in {*FORMAL_SMPLX_STAGES, "global", "base"}:
+            raise RuntimeError("invalid formal stock SMPL-X stage")
+        if (
+            gate_receipt is not None
+            or trainer_mode != "disabled"
+            or trainer_pool is not None
+            or pool_alias is not None
+        ):
+            raise RuntimeError(
+                "disabled SMPL-X pooling produced a trainer pool or receipt"
+            )
+        return
+
+    requested_helpers = parse_smplx_helper_devices(
+        getattr(args, "smplx_training_helper_devices", "")
+    )
+    _smplx_training_pool_mode_spec(requested_mode)
+    _validate_smplx_training_pool_helpers(
+        requested_mode,
+        requested_helpers,
+    )
+    visible_device_count = len(requested_helpers) + 1
+    expected_devices = {0, *requested_helpers}
+    if (
+        stage not in FORMAL_SMPLX_STAGES
+        or not isinstance(gate_receipt, dict)
+        or gate_receipt.get("formal_stage") != stage
+        or gate_receipt.get("mode") != requested_mode
+        or gate_receipt.get("helper_devices")
+        != list(requested_helpers)
+        or trainer_mode != requested_mode
+        or trainer_pool is None
+        or trainer_pool is not pool_alias
+    ):
+        raise RuntimeError(
+            "trainer SMPL-X pool does not match the authorized gate"
+        )
+    pool = trainer_pool
+    replicas = getattr(pool, "replicas", None)
+    models = getattr(pool, "models", None)
+    streams = getattr(pool, "streams", None)
+    gate_modules_method = getattr(pool, "gate_replica_modules", None)
+    runtime_receipt_method = getattr(pool, "runtime_receipt", None)
+    if (
+        getattr(pool, "mode", None) != requested_mode
+        or type(getattr(pool, "primary_device", None)) is not int
+        or pool.primary_device != 0
+        or getattr(pool, "helper_devices", None) != requested_helpers
+        or not isinstance(replicas, dict)
+        or set(replicas) != expected_devices
+        or models is not replicas
+        or not isinstance(streams, dict)
+        or set(streams) != expected_devices
+        or any(stream is None for stream in streams.values())
+        or not callable(gate_modules_method)
+        or not callable(runtime_receipt_method)
+    ):
+        raise RuntimeError("trainer SMPL-X pool topology is invalid")
+    helper_modules = gate_modules_method()
+    if (
+        type(helper_modules) is not tuple
+        or len(helper_modules) != len(requested_helpers)
+        or any(
+            module is not replicas[device]
+            for module, device in zip(helper_modules, requested_helpers)
+        )
+        or getattr(trainer, "smplx", None) is not replicas[0]
+        or len({id(module) for module in replicas.values()})
+        != visible_device_count
+    ):
+        raise RuntimeError(
+            "trainer SMPL-X helper replica exposure is inconsistent"
+        )
+
+    replica_parameter_ids: set[int] = set()
+    for device, module in replicas.items():
+        if _formal_module_cuda_devices(module) != {device}:
+            raise RuntimeError(
+                f"trainer SMPL-X replica is not isolated on logical{device}"
+            )
+        if any(parameter.requires_grad for parameter in module.parameters()):
+            raise RuntimeError("trainer SMPL-X replicas must remain frozen")
+        current_parameter_ids = {
+            id(parameter) for parameter in module.parameters()
+        }
+        if current_parameter_ids & replica_parameter_ids:
+            raise RuntimeError("trainer SMPL-X replicas share parameters")
+        replica_parameter_ids.update(current_parameter_ids)
+
+    training_parameter_ids = {
+        id(parameter) for parameter in trainer.model.parameters()
+    }
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in trainer.opt.param_groups
+        for parameter in group["params"]
+    }
+    if (
+        replica_parameter_ids & training_parameter_ids
+        or replica_parameter_ids & optimizer_parameter_ids
+    ):
+        raise RuntimeError(
+            "trainer SMPL-X replica leaked into the trainable model/optimizer"
+        )
+
+    runtime = gate_receipt.get("runtime")
+    actual_names = [
+        torch.cuda.get_device_name(device)
+        for device in range(visible_device_count)
+    ]
+    actual_runtime = {
+        "visible_device_count": torch.cuda.device_count(),
+        "device_names": actual_names,
+        "torch": str(torch.__version__),
+        "cuda": str(torch.version.cuda),
+        "cudnn": torch.backends.cudnn.version(),
+    }
+    topology = gate_receipt.get("topology")
+    pool_runtime = runtime_receipt_method()
+    expected_topology = _smplx_training_pool_topology(
+        requested_mode,
+        requested_helpers,
+    )
+    if (
+        torch.cuda.current_device() != 0
+        or actual_runtime["visible_device_count"] != visible_device_count
+        or actual_names != ["NVIDIA H200"] * visible_device_count
+        or runtime != actual_runtime
+        or topology != expected_topology
+        or gate_receipt.get("topology_sha256")
+        != _payload_sha256(expected_topology)
+        or not isinstance(pool_runtime, dict)
+        or pool_runtime.get("format")
+        != expected_topology["pool_runtime_format"]
+        or pool_runtime.get("mode") != expected_topology["mode"]
+        or pool_runtime.get("primary_device") != 0
+        or pool_runtime.get("helper_devices")
+        != expected_topology["helper_devices"]
+        or pool_runtime.get("replica_devices")
+        != expected_topology["replica_devices"]
+        or pool_runtime.get("partition")
+        != expected_topology["partition"]
+        or pool_runtime.get("transfer_to_primary")
+        != expected_topology["transfer_to_primary"]
+        or pool_runtime.get("last_forward") is not None
+        or (
+            requested_mode == "target_offload"
+            and pool_runtime.get("completed_forward_pairs") != 0
+        )
+        or (
+            requested_mode != "target_offload"
+            and "completed_forward_pairs" in pool_runtime
+        )
+    ):
+        raise RuntimeError(
+            "trainer SMPL-X runtime differs from the formal gate runtime"
+        )
+
+
+def _attach_smplx_training_pool_gate_receipt(
+    payload: dict[str, Any],
+    receipt: dict[str, Any] | None,
+) -> None:
+    if SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY in payload:
+        raise RuntimeError("duplicate SMPL-X training pool gate receipt")
+    if receipt is not None:
+        payload[SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY] = copy.deepcopy(
+            receipt
+        )
+
+
+def _verify_smplx_training_pool_gate_resume_receipt(
+    payload: dict[str, Any],
+    expected_receipt: dict[str, Any] | None,
+) -> None:
+    observed_present = SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY in payload
+    expected_present = expected_receipt is not None
+    if (
+        observed_present != expected_present
+        or (
+            expected_present
+            and payload.get(SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY)
+            != expected_receipt
+        )
+    ):
+        raise RuntimeError(
+            "resume SMPL-X training pool gate receipt does not match"
+        )
+
+
+def _smplx_training_pool_gate_overlay(
+    receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if receipt is None:
+        return {}
+    return {
+        SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY: copy.deepcopy(receipt)
+    }
+
+
+def _validate_smplx_training_pool_runtime_evidence(
+    receipt: Any,
+    *,
+    formal_stage: str,
+    gate_receipt: dict[str, Any] | None,
+    expected_optimizer_updates: int | None = None,
+) -> dict[str, Any] | None:
+    """Validate proof that production executed the authorized local-loss path."""
+    if formal_stage not in FORMAL_SMPLX_STAGES:
+        if receipt is not None:
+            raise RuntimeError(
+                "global/Base must not carry SMPL-X pool runtime evidence"
+            )
+        return None
+    if gate_receipt is None and receipt is None:
+        return None
+    if not isinstance(gate_receipt, dict):
+        raise RuntimeError(
+            "SMPL-X pool runtime evidence requires its formal gate receipt"
+        )
+    required_keys = {
+        "format",
+        "formal_stage",
+        "mode",
+        "gate_report_sha256",
+        "gate_topology_sha256",
+        "source_binding",
+        "pool_runtime",
+        "receipt_sha256",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != required_keys:
+        raise RuntimeError("SMPL-X pool runtime evidence schema is invalid")
+    receipt_body = dict(receipt)
+    receipt_sha256 = receipt_body.pop("receipt_sha256")
+    mode = gate_receipt.get("mode")
+    spec = _smplx_training_pool_mode_spec(mode)
+    if (
+        receipt.get("format")
+        != spec["runtime_evidence_format"]
+        or receipt.get("formal_stage") != formal_stage
+        or receipt.get("mode") != mode
+        or receipt.get("gate_report_sha256") != gate_receipt.get("sha256")
+        or receipt.get("gate_topology_sha256")
+        != gate_receipt.get("topology_sha256")
+        or receipt.get("source_binding")
+        != gate_receipt.get("source_binding")
+        or receipt_sha256 != _payload_sha256(receipt_body)
+    ):
+        raise RuntimeError(
+            "SMPL-X pool runtime evidence is not gate/source bound"
+        )
+
+    topology = gate_receipt.get("topology")
+    runtime = receipt.get("pool_runtime")
+    runtime_keys = {
+        "format",
+        "mode",
+        "primary_device",
+        "helper_devices",
+        "replica_devices",
+        "partition",
+        "transfer_to_primary",
+        "last_forward",
+    }
+    if mode == "target_offload":
+        runtime_keys.add("completed_forward_pairs")
+    if (
+        not isinstance(topology, dict)
+        or not isinstance(runtime, dict)
+        or set(runtime) != runtime_keys
+        or runtime.get("format") != topology.get("pool_runtime_format")
+        or runtime.get("mode") != topology.get("mode")
+        or runtime.get("primary_device") != topology.get("primary_device")
+        or runtime.get("helper_devices") != topology.get("helper_devices")
+        or runtime.get("replica_devices") != topology.get("replica_devices")
+        or runtime.get("partition") != topology.get("partition")
+        or runtime.get("transfer_to_primary")
+        != topology.get("transfer_to_primary")
+    ):
+        raise RuntimeError(
+            "SMPL-X pool runtime evidence topology differs from its gate"
+        )
+    if mode == "target_offload":
+        completed_forward_pairs = _require_exact_audit_int(
+            runtime.get("completed_forward_pairs"),
+            "SMPL-X target_offload completed_forward_pairs",
+        )
+        if completed_forward_pairs < 0:
+            raise RuntimeError(
+                "SMPL-X target_offload completed_forward_pairs is negative"
+            )
+        if (
+            expected_optimizer_updates is not None
+            and completed_forward_pairs
+            != _require_exact_audit_int(
+                expected_optimizer_updates,
+                "SMPL-X target_offload expected optimizer updates",
+            )
+        ):
+            raise RuntimeError(
+                "SMPL-X target_offload forward count differs from optimizer "
+                "updates"
+            )
+
+    last_forward = runtime.get("last_forward")
+    _validate_smplx_training_pool_last_forward(
+        last_forward,
+        formal_stage=formal_stage,
+        topology=topology,
+    )
+    return copy.deepcopy(receipt)
+
+
+def _current_smplx_training_pool_runtime_evidence(
+    trainer: Any,
+    *,
+    formal_stage: str,
+    gate_receipt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if (
+        formal_stage not in FORMAL_SMPLX_STAGES
+        or gate_receipt is None
+    ):
+        return _validate_smplx_training_pool_runtime_evidence(
+            None,
+            formal_stage=formal_stage,
+            gate_receipt=gate_receipt,
+        )
+    pool = getattr(trainer, "smplx_pool", None)
+    runtime_method = getattr(pool, "runtime_receipt", None)
+    if not callable(runtime_method):
+        raise RuntimeError("SMPL-X pool runtime evidence is unavailable")
+    mode = gate_receipt.get("mode")
+    spec = _smplx_training_pool_mode_spec(mode)
+    pool_runtime = runtime_method()
+    if not isinstance(pool_runtime, dict):
+        raise RuntimeError("SMPL-X pool runtime receipt is not an object")
+    if mode == "target_offload":
+        last_forward = pool_runtime.get("last_forward")
+        if (
+            not isinstance(last_forward, dict)
+            or last_forward.get("stage") != formal_stage
+        ):
+            raise RuntimeError(
+                "target_offload pool last-forward evidence is unavailable"
+            )
+    body = {
+        "format": spec["runtime_evidence_format"],
+        "formal_stage": formal_stage,
+        "mode": mode,
+        "gate_report_sha256": gate_receipt.get("sha256"),
+        "gate_topology_sha256": gate_receipt.get("topology_sha256"),
+        "source_binding": copy.deepcopy(gate_receipt.get("source_binding")),
+        "pool_runtime": pool_runtime,
+    }
+    receipt = {**body, "receipt_sha256": _payload_sha256(body)}
+    return _validate_smplx_training_pool_runtime_evidence(
+        receipt,
+        formal_stage=formal_stage,
+        gate_receipt=gate_receipt,
+    )
+
+
+def _restore_smplx_training_pool_runtime_evidence(
+    trainer: Any,
+    payload: dict[str, Any],
+    *,
+    gate_receipt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY not in payload:
+        raise RuntimeError(
+            "resume is missing SMPL-X pool runtime evidence"
+        )
+    receipt = _validate_smplx_training_pool_runtime_evidence(
+        payload.get(SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY),
+        formal_stage=trainer.args.formal_stage,
+        gate_receipt=gate_receipt,
+        expected_optimizer_updates=payload.get("optimizer_updates"),
+    )
+    if (
+        receipt is not None
+        and receipt.get("mode") == "target_offload"
+    ):
+        pool = getattr(trainer, "smplx_pool", None)
+        restore_method = getattr(
+            pool,
+            "restore_completed_forward_pairs",
+            None,
+        )
+        if not callable(restore_method):
+            raise RuntimeError(
+                "target_offload pool cannot restore completed forward pairs"
+            )
+        restore_method(
+            receipt["pool_runtime"]["completed_forward_pairs"]
+        )
+    trainer.smplx_training_pool_runtime_evidence = copy.deepcopy(receipt)
+    return receipt
+
+
+def _smplx_training_pool_runtime_evidence_overlay(
+    receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY: copy.deepcopy(receipt)
+    }
+
+
+def _formal_smplx_training_pool_gate_receipt(
+    args: Any,
+    *,
+    current_source: dict[str, str],
+    representation: dict[str, Any],
+    smplx_asset_receipt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the source-bound, self-contained H200 pool gate."""
+
+    mode = getattr(args, "smplx_training_pool_mode", None)
+    report_value = getattr(
+        args,
+        "smplx_training_pool_gate_report",
+        None,
+    )
+    expected_value = getattr(
+        args,
+        "expected_smplx_training_pool_gate_sha256",
+        None,
+    )
+    stage = getattr(args, "formal_stage", None)
+    if mode == "disabled":
+        if stage not in {*FORMAL_SMPLX_STAGES, "global", "base"}:
+            raise RuntimeError("invalid formal stock SMPL-X stage")
+        if report_value not in {None, ""} or expected_value not in {None, ""}:
+            raise RuntimeError(
+                "disabled SMPL-X pooling forbids formal gate arguments"
+            )
+        return None
+    try:
+        helpers = parse_smplx_helper_devices(
+            getattr(args, "smplx_training_helper_devices", "")
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "invalid topology-specific SMPL-X helper devices"
+        ) from error
+    spec = _smplx_training_pool_mode_spec(mode)
+    _validate_smplx_training_pool_helpers(mode, helpers)
+    if stage not in FORMAL_SMPLX_STAGES:
+        raise RuntimeError(
+            f"{mode} gate requires a formal RVQ stage"
+        )
+    if type(report_value) is not str or not report_value:
+        raise RuntimeError(
+            f"{mode} requires --smplx_training_pool_gate_report"
+        )
+    gate_format = spec["gate_format"]
+    helper_list = list(helpers)
+    helper_csv = ",".join(str(device) for device in helpers)
+    visible_device_count = len(helpers) + 1
+    expected_sha = _require_lowercase_sha256(
+        expected_value,
+        "expected SMPL-X training pool gate SHA-256",
+    )
+    report_input = Path(report_value)
+    if report_input.is_symlink() or not report_input.is_file():
+        raise RuntimeError(
+            "SMPL-X training pool gate report must be a regular file"
+        )
+    report_path = report_input.resolve()
+    report_sha = _sha256(report_path)
+    if report_sha != expected_sha:
+        raise RuntimeError("SMPL-X training pool gate report SHA mismatch")
+    with report_path.open(encoding="utf-8") as handle:
+        report = json.load(handle)
+    if not isinstance(report, dict):
+        raise RuntimeError("SMPL-X training pool gate report must be an object")
+
+    scope = report.get("scope")
+    protocol = report.get("protocol")
+    preflight = report.get("preflight")
+    semantic_common = report.get("semantic_common")
+    equivalence = report.get("equivalence")
+    performance = report.get("performance")
+    children = report.get("children")
+    guarded_ancestry = report.get("guarded_ancestry")
+    report_topology = report.get("topology")
+    if (
+        set(report)
+        != {
+            "format",
+            "status",
+            "authorization",
+            "scope",
+            "topology",
+            "protocol",
+            "preflight",
+            "semantic_common",
+            "equivalence",
+            "performance",
+            "guarded_ancestry",
+            "children",
+            "started_unix",
+            "completed_unix",
+        }
+        or report.get("format") != gate_format
+        or report.get("status") != "pass"
+        or report.get("authorization") is not True
+        or not isinstance(scope, dict)
+        or scope.get("stage") != args.formal_stage
+        or scope.get("dataset") != "show_base"
+        or scope.get("speaker_scope") != "All"
+        or scope.get("speaker_ids") != [0, 1, 2, 3]
+        or scope.get("forbidden")
+        != ["speaker2-only", "SemGate", "sparse motion"]
+        or not isinstance(protocol, dict)
+        or protocol.get("candidate_mode") != mode
+        or protocol.get("helper_devices") != helper_list
+        or protocol.get("visible_device_count") != visible_device_count
+        or (
+            mode == "sharded_local_loss"
+            and protocol.get("bounded_tolerances")
+            != SMPLX_TRAINING_POOL_GATE_BOUNDED_TOLERANCES
+        )
+        or (
+            mode == "target_offload"
+            and protocol.get("bounded_tolerances") is not None
+        )
+        or report_topology
+        != {
+            "primary_device": 0,
+            "helper_devices": helper_list,
+            "visible_device_count": visible_device_count,
+            "device_name": "NVIDIA H200",
+        }
+        or _require_exact_audit_int(
+            protocol.get("equivalence_updates"),
+            "SMPL-X pool gate equivalence_updates",
+        )
+        != 2
+        or protocol.get("abba")
+        != ["stock", "candidate", "candidate", "stock"]
+        or _require_exact_audit_int(
+            protocol.get("warmup"),
+            "SMPL-X pool gate warmup",
+        )
+        != 5
+        or _require_exact_audit_int(
+            protocol.get("measured"),
+            "SMPL-X pool gate measured",
+        )
+        != 25
+        or not isinstance(preflight, dict)
+        or not isinstance(semantic_common, dict)
+        or not isinstance(equivalence, dict)
+        or not isinstance(performance, dict)
+        or not isinstance(children, list)
+        or len(children) != 8
+        or not isinstance(guarded_ancestry, list)
+        or len(guarded_ancestry) < 3
+    ):
+        raise RuntimeError("SMPL-X training pool gate schema is incomplete")
+
+    minimum = protocol.get("minimum_speedup")
+    if (
+        isinstance(minimum, bool)
+        or not isinstance(minimum, Real)
+        or not np.isfinite(float(minimum))
+        or float(minimum) != spec["minimum_speedup"]
+    ):
+        raise RuntimeError(
+            "SMPL-X pool gate minimum speedup differs from its mode contract"
+        )
+    minimum = float(minimum)
+
+    gate_source = preflight.get("source")
+    required_source_keys = {
+        "origin",
+        "commit",
+        "tree",
+        "implementation_files",
+        "reference_gate",
+        "reference_gate_sha256",
+        "adapter",
+        "adapter_sha256",
+        "harness_sha256",
+        "coordinator",
+    }
+    if (
+        preflight.get("format") != gate_format
+        or preflight.get("stage") != args.formal_stage
+        or preflight.get("candidate_mode") != mode
+        or preflight.get("helper_devices") != helper_list
+        or preflight.get("real_show_all") is not True
+        or preflight.get("preliminary_numerical_gate", {}).get(
+            "authorization"
+        )
+        is not False
+        or not isinstance(gate_source, dict)
+        or set(gate_source) != required_source_keys
+        or gate_source.get("harness_sha256")
+        != spec["harness_sha256"]
+        or gate_source.get("adapter_sha256")
+        != spec["adapter_sha256"]
+        or {
+            key: gate_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+        != {
+            key: current_source.get(key)
+            for key in ("origin", "commit", "tree")
+        }
+    ):
+        raise RuntimeError("SMPL-X pool gate source/stage binding differs")
+    preliminary_binding: dict[str, Any] | None = None
+    if mode == "target_offload":
+        preliminary_binding = (
+            _validate_target_offload_preliminary_numerical_gate(
+                preflight.get("preliminary_numerical_gate"),
+                smplx_asset_receipt=smplx_asset_receipt,
+            )
+        )
+    for label in (
+        "reference_gate_sha256",
+        "adapter_sha256",
+        "harness_sha256",
+    ):
+        _require_lowercase_sha256(
+            gate_source.get(label),
+            f"SMPL-X pool gate {label}",
+        )
+    implementation_files = gate_source.get("implementation_files")
+    if (
+        not isinstance(implementation_files, dict)
+        or set(implementation_files)
+        != SMPLX_TRAINING_POOL_IMPLEMENTATION_FILES
+    ):
+        raise RuntimeError(
+            "SMPL-X pool gate implementation file set differs"
+        )
+    repository = Path(__file__).resolve().parent
+    for relative_value, observed_sha in implementation_files.items():
+        if type(relative_value) is not str:
+            raise RuntimeError("invalid SMPL-X pool implementation path")
+        relative = Path(relative_value)
+        current_path = repository / relative
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or current_path.is_symlink()
+            or not current_path.is_file()
+            or _sha256(current_path)
+            != _require_lowercase_sha256(
+                observed_sha,
+                f"SMPL-X pool implementation SHA {relative_value}",
+            )
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool implementation binding differs: {relative_value}"
+            )
+    coordinator = gate_source.get("coordinator")
+    coordinator_path_value = (
+        coordinator.get("path")
+        if isinstance(coordinator, dict)
+        else None
+    )
+    coordinator_sha = (
+        coordinator.get("sha256")
+        if isinstance(coordinator, dict)
+        else None
+    )
+    source_coordinator_identity = (
+        coordinator.get("identity")
+        if isinstance(coordinator, dict)
+        else None
+    )
+    coordinator_path = (
+        Path(coordinator_path_value)
+        if type(coordinator_path_value) is str
+        else Path()
+    )
+    if (
+        not isinstance(coordinator, dict)
+        or set(coordinator) != {"path", "sha256", "identity"}
+        or not coordinator_path.is_absolute()
+        or coordinator_path != coordinator_path.resolve()
+        or coordinator_path.is_symlink()
+        or not coordinator_path.is_file()
+        or _sha256(coordinator_path)
+        != _require_lowercase_sha256(
+            coordinator_sha,
+            "SMPL-X pool coordinator SHA",
+        )
+        or not isinstance(source_coordinator_identity, dict)
+    ):
+        raise RuntimeError("SMPL-X pool coordinator source binding differs")
+
+    expected_representation = {
+        "lmdb": str(Path(representation["lmdb"]).resolve()),
+        "data_sha256": representation["data_sha256"],
+        "summary": str(Path(representation["summary"]).resolve()),
+        "summary_sha256": representation["summary_sha256"],
+        "lineage": str(Path(representation["lineage"]).resolve()),
+        "lineage_sha256": representation["lineage_sha256"],
+        "entry_aggregate_sha256": representation[
+            "entry_aggregate_sha256"
+        ],
+    }
+    for key in (
+        "data_sha256",
+        "summary_sha256",
+        "lineage_sha256",
+        "entry_aggregate_sha256",
+    ):
+        _require_lowercase_sha256(
+            expected_representation[key],
+            f"current representation {key}",
+        )
+    runtime = semantic_common.get("runtime")
+    if (
+        semantic_common.get("format") != gate_format
+        or semantic_common.get("source") != gate_source
+        or semantic_common.get("stage") != args.formal_stage
+        or semantic_common.get("dataset") != "show_base"
+        or semantic_common.get("speaker_scope") != "All"
+        or semantic_common.get("speaker_ids") != [0, 1, 2, 3]
+        or _require_exact_audit_int(
+            semantic_common.get("batch_size"),
+            "SMPL-X pool gate batch_size",
+        )
+        != 64
+        or _require_exact_audit_int(
+            semantic_common.get("frames"),
+            "SMPL-X pool gate frames",
+        )
+        != 64
+        or semantic_common.get("representation")
+        != expected_representation
+        or smplx_asset_receipt is None
+        or semantic_common.get("smplx_asset_sha256")
+        != smplx_asset_receipt.get("sha256")
+        or semantic_common.get("preliminary_full_batch_numerical_gate")
+        != preflight.get("preliminary_numerical_gate")
+        or not isinstance(runtime, dict)
+        or runtime.get("device_names")
+        != ["NVIDIA H200"] * visible_device_count
+        or type(runtime.get("torch")) is not str
+        or not runtime["torch"]
+        or type(runtime.get("cuda")) is not str
+        or not runtime["cuda"]
+        or type(runtime.get("cudnn")) is not int
+        or runtime["cudnn"] <= 0
+        or type(runtime.get("visible")) is not str
+    ):
+        raise RuntimeError(
+            "SMPL-X pool gate semantic/runtime/representation binding differs"
+        )
+    visible_devices = runtime["visible"].split(",")
+    if (
+        len(visible_devices) != visible_device_count
+        or any(not value for value in visible_devices)
+        or len(set(visible_devices)) != visible_device_count
+    ):
+        raise RuntimeError(
+            "SMPL-X pool gate runtime does not bind the exact requested H200 "
+            "topology"
+        )
+
+    public_identity = guarded_ancestry[0]
+    if (
+        not isinstance(public_identity, dict)
+        or type(public_identity.get("pid")) is not int
+        or public_identity["pid"] <= 1
+    ):
+        raise RuntimeError("SMPL-X pool gate public ancestry is invalid")
+    public_pid = public_identity["pid"]
+    coordinator_identity = guarded_ancestry[1]
+    runner_identity = guarded_ancestry[2]
+    if (
+        not isinstance(coordinator_identity, dict)
+        or not isinstance(runner_identity, dict)
+        or not isinstance(coordinator_identity.get("argv"), list)
+        or not isinstance(runner_identity.get("argv"), list)
+    ):
+        raise RuntimeError(
+            "SMPL-X pool coordinator/guarded-runner ancestry is invalid"
+        )
+    if (
+        type(coordinator_identity.get("pid")) is not int
+        or coordinator_identity["pid"] <= 1
+        or coordinator_identity.get("ppid") != runner_identity.get("pid")
+        or str(coordinator_path)
+        not in coordinator_identity.get("argv", [])
+        or public_identity.get("ppid") != coordinator_identity["pid"]
+        or "/tmp/globaldiff_guarded_runner.py"
+        not in runner_identity["argv"]
+        or source_coordinator_identity != coordinator_identity
+    ):
+        raise RuntimeError(
+            "SMPL-X pool coordinator/guarded-runner ancestry differs"
+        )
+
+    def cli_values(argv: list[str], flag: str) -> list[str]:
+        values: list[str] = []
+        for index, item in enumerate(argv):
+            if item == flag:
+                if index + 1 >= len(argv):
+                    raise RuntimeError(
+                        f"SMPL-X pool gate child has dangling {flag}"
+                    )
+                values.append(argv[index + 1])
+            elif item.startswith(flag + "="):
+                values.append(item.split("=", 1)[1])
+        return values
+
+    def cli_value(argv: list[str], flag: str) -> str:
+        values = cli_values(argv, flag)
+        if len(values) != 1:
+            raise RuntimeError(
+                f"SMPL-X pool gate child requires exactly one {flag}"
+            )
+        return values[0]
+
+    runner_gpus = cli_value(runner_identity["argv"], "--gpus")
+    runner_gpu_values = runner_gpus.split(",")
+    if (
+        any(not value or not value.isdecimal() for value in runner_gpu_values)
+        or len(set(runner_gpu_values)) != len(runner_gpu_values)
+        or (
+            mode == "target_offload"
+            and runner_gpu_values
+            != [str(index) for index in range(8)]
+        )
+    ):
+        raise RuntimeError(
+            "SMPL-X pool guarded-runner GPU argv is invalid"
+        )
+
+    expected_children = [
+        ("equivalence-stock-0", "equivalence", "stock"),
+        ("equivalence-candidate-0", "equivalence", "candidate"),
+        ("equivalence-stock-1", "equivalence", "stock"),
+        ("equivalence-candidate-1", "equivalence", "candidate"),
+        ("benchmark-0-stock", "benchmark", "stock"),
+        ("benchmark-1-candidate", "benchmark", "candidate"),
+        ("benchmark-2-candidate", "benchmark", "candidate"),
+        ("benchmark-3-stock", "benchmark", "stock"),
+    ]
+    child_results: list[dict[str, Any]] = []
+    process_identities: set[tuple[int, str]] = set()
+    child_pids: set[int] = set()
+    result_shas: list[str] = []
+    harness_path: Path | None = None
+    for sequence, (child, expected_child) in enumerate(
+        zip(children, expected_children)
+    ):
+        expected_name, expected_kind, expected_mode = expected_child
+        if not isinstance(child, dict):
+            raise RuntimeError("SMPL-X pool gate child receipt is not an object")
+        argv = child.get("argv")
+        pid = child.get("pid")
+        result_value = child.get("result_path")
+        result_expected_sha = _require_lowercase_sha256(
+            child.get("result_sha256"),
+            f"SMPL-X pool gate child {sequence} result SHA",
+        )
+        if (
+            child.get("sequence") != sequence
+            or child.get("name") != expected_name
+            or child.get("kind") != expected_kind
+            or child.get("mode") != expected_mode
+            or type(pid) is not int
+            or pid <= 1
+            or pid in child_pids
+            or child.get("return_code") != 0
+            or not isinstance(argv, list)
+            or len(argv) < 2
+            or any(type(item) is not str for item in argv)
+            or child.get("argv_sha256")
+            != hashlib.sha256(
+                b"\0".join(item.encode() for item in argv) + b"\0"
+            ).hexdigest()
+            or type(result_value) is not str
+            or not result_value
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool gate child {sequence} command is invalid"
+            )
+        child_pids.add(pid)
+        candidate_harness = Path(argv[1])
+        if harness_path is None:
+            harness_path = candidate_harness
+        if (
+            candidate_harness != harness_path
+            or candidate_harness.is_symlink()
+            or not candidate_harness.is_file()
+            or _sha256(candidate_harness.resolve())
+            != gate_source["harness_sha256"]
+        ):
+            raise RuntimeError("SMPL-X pool gate harness binding differs")
+        if (
+            cli_value(argv, "--stage") != args.formal_stage
+            or cli_value(argv, "--candidate-mode") != mode
+            or cli_value(argv, "--helper-devices") != helper_csv
+            or Path(cli_value(argv, "--representation-lmdb")).resolve()
+            != Path(expected_representation["lmdb"])
+            or Path(cli_value(argv, "--representation-summary")).resolve()
+            != Path(expected_representation["summary"])
+            or Path(cli_value(argv, "--representation-lineage")).resolve()
+            != Path(expected_representation["lineage"])
+            or cli_value(argv, "--expected-representation-data-sha256")
+            != expected_representation["data_sha256"]
+            or cli_value(argv, "--expected-representation-summary-sha256")
+            != expected_representation["summary_sha256"]
+            or cli_value(argv, "--expected-representation-lineage-sha256")
+            != expected_representation["lineage_sha256"]
+            or cli_value(
+                argv,
+                "--expected-representation-entry-aggregate-sha256",
+            )
+            != expected_representation["entry_aggregate_sha256"]
+            or cli_value(argv, "--expected-smplx-asset-sha256")
+            != smplx_asset_receipt["sha256"]
+            or cli_value(argv, "--expected-source-commit")
+            != current_source["commit"]
+            or cli_value(argv, "--expected-source-tree")
+            != current_source["tree"]
+            or cli_value(argv, "--expected-device-name") != "NVIDIA H200"
+            or cli_value(argv, "--expected-visible-device-count")
+            != str(visible_device_count)
+            or cli_value(argv, "--runner-gpus") != runner_gpus
+            or (
+                mode == "target_offload"
+                and (
+                    preliminary_binding is None
+                    or Path(cli_value(argv, "--asset-root")).resolve()
+                    != Path(preliminary_binding["asset_root"])
+                    or Path(
+                        cli_value(argv, "--numerical-gate-report")
+                    ).resolve()
+                    != Path(
+                        preliminary_binding["files"][
+                            "numerical report"
+                        ]["path"]
+                    )
+                    or cli_value(
+                        argv,
+                        "--expected-numerical-gate-report-sha256",
+                    )
+                    != preliminary_binding["files"][
+                        "numerical report"
+                    ]["sha256"]
+                    or Path(
+                        cli_value(argv, "--numerical-gate-script")
+                    ).resolve()
+                    != Path(
+                        preliminary_binding["files"][
+                            "numerical script"
+                        ]["path"]
+                    )
+                    or cli_value(
+                        argv,
+                        "--expected-numerical-gate-script-sha256",
+                    )
+                    != preliminary_binding["files"][
+                        "numerical script"
+                    ]["sha256"]
+                    or Path(
+                        cli_value(
+                            argv,
+                            "--numerical-gate-runner-status",
+                        )
+                    ).resolve()
+                    != Path(
+                        preliminary_binding["files"][
+                            "numerical runner status"
+                        ]["path"]
+                    )
+                    or cli_value(
+                        argv,
+                        "--expected-numerical-gate-runner-status-sha256",
+                    )
+                    != preliminary_binding["files"][
+                        "numerical runner status"
+                    ]["sha256"]
+                )
+            )
+            or cli_value(argv, "--expected-runner-pid")
+            != str(runner_identity["pid"])
+            or cli_value(argv, "--expected-runner-starttime")
+            != str(runner_identity["starttime"])
+            or cli_value(argv, "--expected-runner-argv-sha256")
+            != runner_identity["argv_sha256"]
+            or cli_value(argv, "--coordinator-pid")
+            != str(coordinator_identity["pid"])
+            or Path(cli_value(argv, "--coordinator-script")).resolve()
+            != coordinator_path
+            or cli_value(
+                argv,
+                "--expected-coordinator-script-sha256",
+            )
+            != coordinator_sha
+            or cli_value(
+                argv,
+                "--expected-coordinator-starttime",
+            )
+            != str(coordinator_identity["starttime"])
+            or cli_value(
+                argv,
+                "--expected-coordinator-argv-sha256",
+            )
+            != coordinator_identity["argv_sha256"]
+            or float(cli_value(argv, "--minimum-speedup")) != minimum
+            or Path(cli_value(argv, "--output-root")).resolve()
+            != report_path.parent
+            or cli_value(argv, "--internal-mode") != expected_name
+            or cli_value(argv, "--internal-parent-pid") != str(public_pid)
+            or set(cli_values(argv, "--implementation-file"))
+            != set(implementation_files)
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool gate child {sequence} input binding differs"
+            )
+        adapter_path = Path(cli_value(argv, "--adapter"))
+        if (
+            adapter_path.resolve()
+            != Path(str(gate_source["adapter"])).resolve()
+            or adapter_path.is_symlink()
+            or not adapter_path.is_file()
+            or _sha256(adapter_path.resolve()) != gate_source["adapter_sha256"]
+        ):
+            raise RuntimeError("SMPL-X pool gate adapter binding differs")
+
+        result_input = Path(result_value)
+        if result_input.is_symlink() or not result_input.is_file():
+            raise RuntimeError(
+                f"SMPL-X pool gate child {sequence} result is unavailable"
+            )
+        result_path = result_input.resolve()
+        if (
+            result_path.name != "result.json"
+            or result_path.parent
+            != Path(cli_value(argv, "--snapshot-dir")).resolve()
+            or _sha256(result_path) != result_expected_sha
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool gate child {sequence} result SHA/path differs"
+            )
+        with result_path.open(encoding="utf-8") as handle:
+            result = json.load(handle)
+        ancestry = result.get("ancestry") if isinstance(result, dict) else None
+        semantic = result.get("semantic") if isinstance(result, dict) else None
+        child_identity = ancestry[0] if isinstance(ancestry, list) and ancestry else None
+        if (
+            not isinstance(result, dict)
+            or result.get("format") != gate_format
+            or result.get("status") != "pass"
+            or result.get("kind") != expected_kind
+            or result.get("mode") != expected_mode
+            or not isinstance(semantic, dict)
+            or semantic.get("common") != semantic_common
+            or semantic.get("mode", {}).get("label") != expected_mode
+            or semantic.get("mode", {}).get("smplx_parallel_mode")
+            != (
+                "disabled"
+                if expected_mode == "stock"
+                else mode
+            )
+            or semantic.get("mode", {}).get("helper_devices")
+            != ([] if expected_mode == "stock" else helper_list)
+            or not isinstance(ancestry, list)
+            or ancestry[1:] != guarded_ancestry
+            or not isinstance(child_identity, dict)
+            or child_identity.get("pid") != pid
+            or child_identity.get("ppid") != public_pid
+            or child_identity.get("argv") != argv
+            or child_identity.get("argv_sha256")
+            != child["argv_sha256"]
+            or type(child_identity.get("starttime")) is not str
+            or not child_identity["starttime"]
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool gate child {sequence} result binding differs"
+            )
+        identity = (pid, child_identity["starttime"])
+        if identity in process_identities:
+            raise RuntimeError("SMPL-X pool gate children are not fresh")
+        process_identities.add(identity)
+        result_shas.append(result_expected_sha)
+        child_results.append(result)
+
+    reference_gate_path = Path(str(gate_source["reference_gate"]))
+    if (
+        reference_gate_path.is_symlink()
+        or not reference_gate_path.is_file()
+        or _sha256(reference_gate_path.resolve())
+        != gate_source["reference_gate_sha256"]
+    ):
+        raise RuntimeError("SMPL-X pool reference gate binding differs")
+
+    def validate_equivalence_proof(proof: Any, label: str) -> None:
+        repeat = label in {"stock_repeat", "candidate_repeat"}
+        expected_comparison = (
+            "repeat_byte_exact"
+            if repeat
+            else spec["cross_mode_comparison"]
+        )
+        expected_final = (
+            "byte_exact"
+            if repeat
+            else spec["cross_mode_final"]
+        )
+        if (
+            not isinstance(proof, dict)
+            or set(proof)
+            != {
+                "status",
+                "real_batches_exact",
+                "comparison",
+                "states",
+                "numeric_scope",
+                "initial_byte_exact",
+                "two_complete_updates_and_final",
+            }
+            or proof.get("status") != "pass"
+            or proof.get("real_batches_exact") is not True
+            or proof.get("comparison") != expected_comparison
+            or proof.get("numeric_scope")
+            != (
+                "loss_tracker_gradients_model_optimizer_scheduler_"
+                "rvq_ema_rng"
+            )
+            or proof.get("initial_byte_exact") is not True
+            or proof.get("two_complete_updates_and_final")
+            != expected_final
+            or set(proof.get("states", {}))
+            != {"initial", "step_1", "step_2", "final"}
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool equivalence proof {label} is incomplete"
+            )
+        for state_name, state in proof["states"].items():
+            exact = (
+                repeat
+                or state_name == "initial"
+                or mode == "target_offload"
+            )
+            if not isinstance(state, dict) or state.get("pass") is not True:
+                raise RuntimeError(
+                    f"SMPL-X pool equivalence {label}.{state_name} differs"
+                )
+            if exact:
+                if (
+                    set(state) != {"comparison", "pass", "canonical_sha256"}
+                    or state.get("comparison") != "byte_exact"
+                ):
+                    raise RuntimeError(
+                        f"SMPL-X pool exact proof {label}.{state_name} differs"
+                    )
+                _require_lowercase_sha256(
+                    state.get("canonical_sha256"),
+                    f"SMPL-X pool equivalence {label}.{state_name} SHA",
+                )
+                continue
+            if (
+                set(state)
+                != {
+                    "comparison",
+                    "pass",
+                    "tolerances",
+                    "exact_nodes",
+                    "all_floating_values_within_tolerance",
+                    "rng_indices_scheduler_smplx_and_nonfloating_exact",
+                }
+                or state.get("comparison")
+                != "bounded_float_exact_discrete_rng_and_smplx"
+                or state.get("all_floating_values_within_tolerance")
+                is not True
+                or state.get(
+                    "rng_indices_scheduler_smplx_and_nonfloating_exact"
+                )
+                is not True
+                or type(state.get("exact_nodes")) is not int
+                or state["exact_nodes"] < 0
+                or set(state.get("tolerances", {}))
+                != set(SMPLX_TRAINING_POOL_GATE_BOUNDED_TOLERANCES)
+            ):
+                raise RuntimeError(
+                    f"SMPL-X pool bounded proof {label}.{state_name} differs"
+                )
+            for category, expected_tolerance in (
+                SMPLX_TRAINING_POOL_GATE_BOUNDED_TOLERANCES.items()
+            ):
+                observed = state["tolerances"][category]
+                if (
+                    not isinstance(observed, dict)
+                    or set(observed)
+                    != {
+                        "atol",
+                        "rtol",
+                        "floating_nodes",
+                        "elements",
+                        "bitwise_mismatch_elements",
+                        "max_abs",
+                        "max_normalized_error",
+                    }
+                    or observed.get("atol") != expected_tolerance["atol"]
+                    or observed.get("rtol") != expected_tolerance["rtol"]
+                    or type(observed.get("floating_nodes")) is not int
+                    or observed["floating_nodes"] < 0
+                    or type(observed.get("elements")) is not int
+                    or observed["elements"] < 0
+                    or type(observed.get("bitwise_mismatch_elements")) is not int
+                    or observed["bitwise_mismatch_elements"] < 0
+                    or observed["bitwise_mismatch_elements"]
+                    > observed["elements"]
+                    or isinstance(observed.get("max_abs"), bool)
+                    or not isinstance(observed.get("max_abs"), Real)
+                    or not np.isfinite(float(observed["max_abs"]))
+                    or float(observed["max_abs"]) < 0.0
+                    or isinstance(
+                        observed.get("max_normalized_error"),
+                        bool,
+                    )
+                    or not isinstance(
+                        observed.get("max_normalized_error"),
+                        Real,
+                    )
+                    or not np.isfinite(
+                        float(observed["max_normalized_error"])
+                    )
+                    or float(observed["max_normalized_error"]) < 0.0
+                    or float(observed["max_normalized_error"])
+                    > 1.0 + 1e-12
+                ):
+                    raise RuntimeError(
+                        "SMPL-X pool bounded tolerance evidence differs: "
+                        f"{label}.{state_name}.{category}"
+                    )
+
+    expected_proofs = {
+        "stock_repeat",
+        "candidate_repeat",
+        "stock_candidate_0",
+        "stock_candidate_1",
+    }
+    if set(equivalence) != expected_proofs:
+        raise RuntimeError("SMPL-X pool equivalence proof set differs")
+    for proof_name in sorted(expected_proofs):
+        validate_equivalence_proof(equivalence[proof_name], proof_name)
+    for result in child_results[:4]:
+        if (
+            result.get("optimizer_steps") != 2
+            or result.get("formal_updates") != 2
+            or result.get("scheduler_steps") != 1
+            or len(result.get("batches", [])) != 2
+            or set(result.get("states", {}))
+            != {"initial", "step_1", "step_2", "final"}
+        ):
+            raise RuntimeError(
+                "SMPL-X pool equivalence child update evidence differs"
+            )
+
+    benchmark_results = child_results[4:]
+    expected_order = ["stock", "candidate", "candidate", "stock"]
+    if (
+        performance.get("order") != expected_order
+        or performance.get("fresh_processes") != 4
+        or [result.get("mode") for result in benchmark_results]
+        != expected_order
+    ):
+        raise RuntimeError("SMPL-X pool ABBA benchmark order differs")
+    for result in benchmark_results:
+        timing = result.get("timing")
+        if (
+            result.get("optimizer_steps") != 30
+            or result.get("formal_updates") != 30
+            or result.get("scheduler_steps") != 1
+            or not isinstance(timing, dict)
+            or timing.get("warmup") != 5
+            or timing.get("measured") != 25
+            or len(timing.get("wall_seconds", [])) != 25
+            or len(timing.get("cuda_seconds", [])) != 25
+            or len(timing.get("batches", [])) != 30
+        ):
+            raise RuntimeError(
+                "SMPL-X pool benchmark child timing evidence differs"
+            )
+        for key in ("wall_seconds", "cuda_seconds"):
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not np.isfinite(float(value))
+                or float(value) <= 0.0
+                for value in timing[key]
+            ):
+                raise RuntimeError(
+                    f"SMPL-X pool benchmark {key} is invalid"
+                )
+
+    performance_receipt: dict[str, Any] = {}
+    for report_key, timing_key in (
+        ("wall", "wall_seconds"),
+        ("cuda", "cuda_seconds"),
+    ):
+        metric = performance.get(report_key)
+        stock = [
+            float(value)
+            for result in benchmark_results
+            if result["mode"] == "stock"
+            for value in result["timing"][timing_key]
+        ]
+        candidate = [
+            float(value)
+            for result in benchmark_results
+            if result["mode"] == "candidate"
+            for value in result["timing"][timing_key]
+        ]
+        stock_median = statistics.median(stock)
+        candidate_median = statistics.median(candidate)
+        pooled_speedup = stock_median / candidate_median
+        paired_speedups = [
+            statistics.median(
+                benchmark_results[0]["timing"][timing_key]
+            )
+            / statistics.median(
+                benchmark_results[1]["timing"][timing_key]
+            ),
+            statistics.median(
+                benchmark_results[3]["timing"][timing_key]
+            )
+            / statistics.median(
+                benchmark_results[2]["timing"][timing_key]
+            ),
+        ]
+        if (
+            not isinstance(metric, dict)
+            or metric.get("pass") is not True
+            or float(metric.get("minimum_required", float("nan")))
+            != minimum
+            or float(metric.get("stock_median_seconds", float("nan")))
+            != stock_median
+            or float(metric.get("candidate_median_seconds", float("nan")))
+            != candidate_median
+            or float(metric.get("pooled_speedup", float("nan")))
+            != pooled_speedup
+            or metric.get("paired_speedups") != paired_speedups
+            or pooled_speedup < minimum
+            or min(paired_speedups) < minimum
+        ):
+            raise RuntimeError(
+                f"SMPL-X pool {report_key} speedup evidence differs"
+            )
+        performance_receipt[report_key] = {
+            "pooled_speedup": pooled_speedup,
+            "paired_speedups": paired_speedups,
+        }
+
+    started = report.get("started_unix")
+    completed = report.get("completed_unix")
+    if (
+        isinstance(started, bool)
+        or not isinstance(started, Real)
+        or isinstance(completed, bool)
+        or not isinstance(completed, Real)
+        or not np.isfinite(float(started))
+        or not np.isfinite(float(completed))
+        or float(completed) < float(started)
+    ):
+        raise RuntimeError("SMPL-X pool gate timestamps are invalid")
+
+    topology = _smplx_training_pool_topology(mode, helpers)
+    return {
+        "format": gate_format,
+        "status": "pass",
+        "authorization": True,
+        "path": str(report_path),
+        "sha256": report_sha,
+        "formal_stage": args.formal_stage,
+        "mode": mode,
+        "helper_devices": helper_list,
+        "topology": topology,
+        "topology_sha256": _payload_sha256(topology),
+        "source_binding": {
+            key: current_source[key] for key in ("origin", "commit", "tree")
+        },
+        "gate_artifacts": {
+            "harness_sha256": gate_source["harness_sha256"],
+            "adapter_sha256": gate_source["adapter_sha256"],
+            "coordinator_sha256": coordinator_sha,
+        },
+        "representation": {
+            key: expected_representation[key]
+            for key in (
+                "data_sha256",
+                "summary_sha256",
+                "lineage_sha256",
+                "entry_aggregate_sha256",
+            )
+        },
+        "smplx_asset_sha256": smplx_asset_receipt["sha256"],
+        "semantic_common_sha256": _payload_sha256(semantic_common),
+        "runtime": {
+            "visible_device_count": visible_device_count,
+            "device_names": runtime["device_names"],
+            "torch": runtime["torch"],
+            "cuda": runtime["cuda"],
+            "cudnn": runtime["cudnn"],
+        },
+        "equivalence": {
+            "proofs": sorted(expected_proofs),
+            "repeat_byte_exact": True,
+            "cross_mode": spec["receipt_cross_mode"],
+            **(
+                {
+                    "bounded_tolerances": copy.deepcopy(
+                        SMPLX_TRAINING_POOL_GATE_BOUNDED_TOLERANCES
+                    )
+                }
+                if mode == "sharded_local_loss"
+                else {}
+            ),
+        },
+        "performance": {
+            "minimum_speedup": minimum,
+            **performance_receipt,
+        },
+        "children": {
+            "count": 8,
+            "fresh_processes": 8,
+            "result_sha256": result_shas,
+        },
+    }
+
+
 def _formal_lower_target_cache_gate_receipt(
     args: Any,
     *,
@@ -543,6 +2685,7 @@ def _formal_lower_target_cache_gate_receipt(
         "seth": 2,
         "conan": 3,
     }
+    input_source_binding = None
     scope = report.get("scope")
     protocol = report.get("protocol")
     equivalence = report.get("equivalence")
@@ -1040,6 +3183,7 @@ def _dataset_receipt(
     else:
         representation_format = summary.get("format")
         representation_protocol = summary.get("protocol")
+        representation_source = summary.get("source_receipt")
         if (
             representation_format
             != "semtalk_show_representation_lmdb_v2_global_foot"
@@ -1085,16 +3229,27 @@ def _dataset_receipt(
             raise RuntimeError(
                 "invalid Global-foot fastpath representation receipt"
             )
-        if {
-            key: summary.get("source_receipt", {}).get(key)
-            for key in ("origin", "commit", "tree")
-        } != {
-            key: current_source.get(key)
-            for key in ("origin", "commit", "tree")
-        }:
-            raise RuntimeError(
-                "representation/training source receipt mismatch"
+        if (
+            not isinstance(representation_source, dict)
+            or representation_source.get("origin")
+            != "git@github.com:Xiangyue-Zhang/SemTalk.git"
+            or any(
+                not isinstance(representation_source.get(key), str)
+                or len(representation_source[key]) != 40
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in representation_source[key]
+                )
+                for key in ("commit", "tree")
             )
+        ):
+            raise RuntimeError(
+                "invalid representation producer source receipt"
+            )
+        input_source_binding = {
+            key: representation_source[key]
+            for key in ("origin", "commit", "tree")
+        }
         expected_fastpath = (
             representation_format.endswith("_v2_global_foot")
             and args.formal_stage == "global"
@@ -1161,10 +3316,7 @@ def _dataset_receipt(
                 key: parity.get("source_receipt", {}).get(key)
                 for key in ("origin", "commit", "tree")
             }
-            != {
-                key: current_source.get(key)
-                for key in ("origin", "commit", "tree")
-            }
+            != input_source_binding
         ):
             raise RuntimeError("invalid Global parity bundle")
         checker_path = (
@@ -1176,8 +3328,6 @@ def _dataset_receipt(
         if (
             checker_path.is_symlink()
             or not checker_path.is_file()
-            or Path(str(parity.get("checker", ""))).resolve()
-            != checker_path
             or parity.get("checker_sha256") != _sha256(checker_path)
         ):
             raise RuntimeError("Global parity checker source mismatch")
@@ -1478,6 +3628,24 @@ def _dataset_receipt(
         current_source=current_source,
         smplx_asset_receipt=smplx_asset_receipt,
     )
+    smplx_training_pool_gate_receipt = (
+        _formal_smplx_training_pool_gate_receipt(
+            args,
+            current_source=current_source,
+            representation={
+                "lmdb": str(lmdb_path),
+                "data_sha256": data_sha,
+                "summary": str(summary_path),
+                "summary_sha256": _sha256(summary_path),
+                "lineage": str(lineage_path),
+                "lineage_sha256": _sha256(lineage_path),
+                "entry_aggregate_sha256": summary.get(
+                    "entry_aggregate_sha256"
+                ),
+            },
+            smplx_asset_receipt=smplx_asset_receipt,
+        )
+    )
     receipt = {
         "summary": str(summary_path),
         "summary_sha256": _sha256(summary_path),
@@ -1494,6 +3662,12 @@ def _dataset_receipt(
         "smplx_asset": smplx_asset_receipt,
         "global_fastpath_parity": parity_receipt,
     }
+    if input_source_binding is not None:
+        receipt["input_source_binding"] = input_source_binding
+    _attach_smplx_training_pool_gate_receipt(
+        receipt,
+        smplx_training_pool_gate_receipt,
+    )
     attach_lower_target_cache_receipt(
         receipt,
         lower_target_cache_receipt,
@@ -1561,8 +3735,23 @@ def _tracker_snapshot(trainer: Any) -> dict[str, dict[str, float | int]]:
     return snapshot
 
 
+def _trainer_distributed_receipt(
+    trainer: Any,
+    *,
+    world_size: int,
+) -> dict[str, Any]:
+    return representation_ddp_receipt(
+        formal_stage=trainer.args.formal_stage,
+        world_size=world_size,
+        local_batch_size=int(trainer.args.batch_size),
+        train_samples=len(trainer.train_data),
+        updates_per_epoch=trainer.train_length,
+        seed=int(trainer.args.random_seed),
+    )
+
+
 def _rvq_ema_state(model: torch.nn.Module) -> dict[str, dict[str, Any]]:
-    """Capture rank-local EMA state omitted by QuantizeEMAReset.state_dict()."""
+    """Capture legacy EMA state omitted by QuantizeEMAReset.state_dict()."""
     state: dict[str, dict[str, Any]] = {}
     for name, module in model.named_modules():
         if module.__class__.__name__ != "QuantizeEMAReset":
@@ -1650,12 +3839,20 @@ def _rvq_ema_invariant_errors(model: torch.nn.Module) -> list[str]:
     return errors
 
 
-def _validate_formal_stage(args: Any) -> None:
+def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
+    representation_stage = args.formal_stage in REPRESENTATION_STAGES
+    global_batch_size = 256 if representation_stage else 64
+    local_batch_size = (
+        global_batch_size // world_size
+        if args.formal_stage in RVQ_STAGES
+        else global_batch_size
+    )
     common = {
         "dataset": "show_base",
         "training_speakers": [0, 1, 2, 3],
         "ori_joints": "beat_smplx_joints",
-        "batch_size": 64,
+        "batch_size": local_batch_size,
+        "global_batch_size": global_batch_size,
         "pose_length": 64,
         "pre_frames": 4,
         "stride": 20,
@@ -1695,7 +3892,7 @@ def _validate_formal_stage(args: Any) -> None:
         "deterministic": True,
         "benchmark": True,
         "cudnn_enabled": True,
-        "log_period": 1_988,
+        "log_period": 497 if representation_stage else 1_988,
         "save_every": 5,
         "use_lower_target_joints_cache": False,
     }
@@ -1713,11 +3910,11 @@ def _validate_formal_stage(args: Any) -> None:
             "rec_pos_weight": 1.0,
             "rec_ver_weight": 1.0,
             "grad_norm": 0.0,
-            "epochs": 600,
+            "epochs": 200,
             "random_seed": 2021,
             "lr_base": 3e-4,
             "decay_epochs": 780,
-            "final_ckpt_name": "rvq_face_600.bin",
+            "final_ckpt_name": "show_ft_face_200.bin",
         },
         "hands": {
             "model": "rvq",
@@ -1732,11 +3929,11 @@ def _validate_formal_stage(args: Any) -> None:
             "rec_pos_weight": 1.0,
             "rec_ver_weight": 1.0,
             "grad_norm": 0.0,
-            "epochs": 500,
+            "epochs": 200,
             "random_seed": 2021,
             "lr_base": 3e-4,
             "decay_epochs": 780,
-            "final_ckpt_name": "rvq_hands_500.bin",
+            "final_ckpt_name": "show_ft_hands_200.bin",
         },
         "upper": {
             "model": "rvq",
@@ -1751,11 +3948,11 @@ def _validate_formal_stage(args: Any) -> None:
             "rec_pos_weight": 1.0,
             "rec_ver_weight": 1.0,
             "grad_norm": 0.0,
-            "epochs": 500,
+            "epochs": 200,
             "random_seed": 2021,
             "lr_base": 3e-4,
             "decay_epochs": 9999,
-            "final_ckpt_name": "rvq_upper_500.bin",
+            "final_ckpt_name": "show_ft_upper_200.bin",
         },
         "lower": {
             "model": "rvq",
@@ -1770,11 +3967,11 @@ def _validate_formal_stage(args: Any) -> None:
             "rec_pos_weight": 1.0,
             "rec_ver_weight": 1.0,
             "grad_norm": 0.0,
-            "epochs": 600,
+            "epochs": 200,
             "random_seed": 2021,
             "lr_base": 3e-4,
             "decay_epochs": 780,
-            "final_ckpt_name": "rvq_lower_600.bin",
+            "final_ckpt_name": "show_ft_lower_200.bin",
             "use_lower_target_joints_cache": False,
         },
         "global": {
@@ -1790,11 +3987,11 @@ def _validate_formal_stage(args: Any) -> None:
             "rec_pos_weight": 1.0,
             "rec_ver_weight": 1.0,
             "grad_norm": 0.0,
-            "epochs": 1700,
+            "epochs": 200,
             "random_seed": 2021,
             "lr_base": 3e-4,
             "decay_epochs": 780,
-            "final_ckpt_name": "last_1700_foot.bin",
+            "final_ckpt_name": "show_ft_global_200.bin",
         },
         "base": {
             "model": "semtalk",
@@ -1845,7 +4042,8 @@ def _validate_formal_stage(args: Any) -> None:
         )
     if args.load_ckpt not in {None, ""}:
         raise RuntimeError(
-            "formal SHOW training must start from scratch; --load_ckpt is forbidden"
+            "formal SHOW training forbids unaudited --load_ckpt; use the "
+            "strict --initial-model-checkpoint path"
         )
     if args.d_name is not None:
         raise RuntimeError("formal Base-only training forbids a discriminator")
@@ -1891,7 +4089,8 @@ def _load_resume(
         != world_size
     ):
         raise RuntimeError(
-            f"resume world_size={payload['world_size']} does not match {world_size}"
+            f"resume world_size={payload['world_size']} does not match "
+            f"{world_size}"
         )
     if (
         _require_exact_audit_int(
@@ -1917,6 +4116,15 @@ def _load_resume(
         != trainer.args.batch_size
     ):
         raise RuntimeError("resume batch size does not match current config")
+    validate_representation_ddp_receipt(
+        payload.get("distributed_training_receipt"),
+        formal_stage=trainer.args.formal_stage,
+        world_size=world_size,
+        local_batch_size=int(trainer.args.batch_size),
+        train_samples=len(trainer.train_data),
+        updates_per_epoch=trainer.train_length,
+        seed=int(trainer.args.random_seed),
+    )
     if payload["config_sha256"] != config_sha256:
         raise RuntimeError("resume training config fingerprint does not match")
     if payload.get("lineage_manifest_sha256") != lineage_sha256:
@@ -1931,9 +4139,39 @@ def _load_resume(
         raise RuntimeError("resume SMPL-X asset receipt does not match")
     if payload.get("source_receipt_sha256") != source_receipt_sha256:
         raise RuntimeError("resume source checkout fingerprint does not match")
+    if payload.get("initialization_receipt") != getattr(
+        trainer,
+        "initialization_receipt",
+        None,
+    ):
+        raise RuntimeError("resume official initialization receipt mismatch")
+    if payload.get("rvq_ema_prior_receipt") != getattr(
+        trainer,
+        "rvq_ema_prior_receipt",
+        None,
+    ):
+        raise RuntimeError("resume RVQ EMA-prior receipt mismatch")
+    trainer.latest_representation_candidate = (
+        _validate_representation_candidate_receipt(
+            trainer,
+            payload.get("latest_representation_candidate"),
+            completed_epochs=completed_epochs,
+        )
+    )
     verify_lower_target_cache_resume_receipt(
         payload,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
+    _verify_smplx_training_pool_gate_resume_receipt(
+        payload,
+        dataset_receipt.get(SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY),
+    )
+    _restore_smplx_training_pool_runtime_evidence(
+        trainer,
+        payload,
+        gate_receipt=dataset_receipt.get(
+            SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+        ),
     )
     _verify_lower_target_backend_resume_receipt(
         payload,
@@ -2055,6 +4293,12 @@ def _load_resume(
         _restore_rvq_ema_state(trainer.model, payload["rvq_ema_state"])
     elif payload.get("rvq_ema_state"):
         raise RuntimeError("non-RVQ model received unexpected RVQ EMA state")
+    if trainer.args.formal_stage in RVQ_STAGES:
+        state_receipt = assert_rvq_rank_state(trainer.model)
+        if payload.get("rvq_rank_state_receipt") != state_receipt:
+            raise RuntimeError(
+                "resume RVQ rank-state receipt does not match restored state"
+            )
     trainer.opt.load_state_dict(payload["optimizer_state"])
     trainer.opt_s.load_state_dict(payload["scheduler_state"])
     trainer._restore_formal_optimizer_updates(optimizer_updates)
@@ -2125,6 +4369,8 @@ def _save_resume(
     candidate_manifest_entries_sha256: str,
     last_metrics: dict[str, dict[str, float | int]],
     started_unix: float,
+    distributed_training_receipt: dict[str, Any],
+    rvq_rank_state_receipt: dict[str, Any] | None,
 ) -> None:
     completed_epochs = _require_exact_audit_int(
         completed_epochs,
@@ -2191,6 +4437,18 @@ def _save_resume(
         )
     ):
         raise RuntimeError("invalid Base candidate manifest SHA binding")
+    runtime_evidence = _validate_smplx_training_pool_runtime_evidence(
+        getattr(
+            trainer,
+            "smplx_training_pool_runtime_evidence",
+            None,
+        ),
+        formal_stage=trainer.args.formal_stage,
+        gate_receipt=dataset_receipt.get(
+            SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+        ),
+        expected_optimizer_updates=optimizer_updates,
+    )
     payload = {
         "format": "semtalk_show_train_resume_v5",
         "completed_epochs": completed_epochs,
@@ -2198,6 +4456,17 @@ def _save_resume(
         "train_samples": train_samples,
         "updates_per_epoch": updates_per_epoch,
         "batch_size": batch_size,
+        "distributed_training_receipt": distributed_training_receipt,
+        "rvq_rank_state_receipt": rvq_rank_state_receipt,
+        "initialization_receipt": copy.deepcopy(
+            getattr(trainer, "initialization_receipt", None)
+        ),
+        "rvq_ema_prior_receipt": copy.deepcopy(
+            getattr(trainer, "rvq_ema_prior_receipt", None)
+        ),
+        "latest_representation_candidate": copy.deepcopy(
+            getattr(trainer, "latest_representation_candidate", None)
+        ),
         "config_sha256": config_sha256,
         "lineage_manifest_sha256": lineage_sha256,
         "dataset_summary_sha256": dataset_summary_sha256,
@@ -2218,10 +4487,15 @@ def _save_resume(
         "optimizer_state": trainer.opt.state_dict(),
         "scheduler_state": trainer.opt_s.state_dict(),
         "rng_states": rng_states,
+        SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY: runtime_evidence,
     }
     attach_lower_target_cache_receipt(
         payload,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
+    _attach_smplx_training_pool_gate_receipt(
+        payload,
+        dataset_receipt.get(SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY),
     )
     _attach_lower_target_backend_receipt(
         payload,
@@ -2243,6 +4517,8 @@ def _model_payload(
     source_receipt: dict[str, str],
     optimizer_updates: int,
     candidate_manifest_receipt: dict[str, Any] | None,
+    distributed_training_receipt: dict[str, Any],
+    rvq_rank_state_receipt: dict[str, Any] | None,
 ) -> dict[str, Any]:
     optimizer_updates = _require_exact_audit_int(
         optimizer_updates,
@@ -2254,9 +4530,30 @@ def _model_payload(
                 candidate_manifest_receipt.get(key),
                 f"model audit Base candidate manifest {key}",
             )
+    runtime_evidence = _validate_smplx_training_pool_runtime_evidence(
+        getattr(
+            trainer,
+            "smplx_training_pool_runtime_evidence",
+            None,
+        ),
+        formal_stage=formal_stage,
+        gate_receipt=dataset_receipt.get(
+            SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+        ),
+        expected_optimizer_updates=optimizer_updates,
+    )
+    pool_gate_receipt = dataset_receipt.get(
+        SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+    )
+    pool_mode = (
+        pool_gate_receipt.get("mode")
+        if isinstance(pool_gate_receipt, dict)
+        else "disabled"
+    )
     audit = {
         "format": "semtalk_show_model_v2",
         "formal_stage": formal_stage,
+        "smplx_training_pool_mode": pool_mode,
         "config_sha256": config_sha256,
         "lineage_manifest_sha256": lineage_sha256,
         "dataset_summary_sha256": dataset_receipt["summary_sha256"],
@@ -2266,11 +4563,27 @@ def _model_payload(
         "source_receipt": source_receipt,
         "source_receipt_sha256": _payload_sha256(source_receipt),
         "optimizer_updates": optimizer_updates,
+        "distributed_training_receipt": distributed_training_receipt,
+        "rvq_rank_state_receipt": rvq_rank_state_receipt,
+        "initialization_receipt": copy.deepcopy(
+            getattr(trainer, "initialization_receipt", None)
+        ),
+        "rvq_ema_prior_receipt": copy.deepcopy(
+            getattr(trainer, "rvq_ema_prior_receipt", None)
+        ),
+        "latest_representation_candidate": copy.deepcopy(
+            getattr(trainer, "latest_representation_candidate", None)
+        ),
         "base_candidate_manifest": candidate_manifest_receipt,
+        SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY: runtime_evidence,
     }
     attach_lower_target_cache_receipt(
         audit,
         dataset_receipt.get(LOWER_TARGET_CACHE_RECEIPT_KEY),
+    )
+    _attach_smplx_training_pool_gate_receipt(
+        audit,
+        dataset_receipt.get(SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY),
     )
     _attach_lower_target_backend_receipt(
         audit,
@@ -2302,6 +4615,7 @@ def _base_candidate_audit(
     return {
         "format": "semtalk_show_base_candidate_model_v1",
         "formal_stage": "base",
+        "smplx_training_pool_mode": "disabled",
         "candidate_epoch": epoch,
         "optimizer_updates": optimizer_updates,
         "config_sha256": config_sha256,
@@ -3533,6 +5847,144 @@ def _verify_or_write_final(
     return _sha256(path)
 
 
+def _save_representation_candidate(
+    trainer: Any,
+    checkpoint_dir: Path,
+    *,
+    completed_epochs: int,
+    config_sha256: str,
+    lineage_sha256: str,
+    dataset_receipt: dict[str, Any],
+    source_receipt: dict[str, str],
+    distributed_training_receipt: dict[str, Any],
+    rvq_rank_state_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if trainer.args.formal_stage not in REPRESENTATION_STAGES:
+        raise RuntimeError(
+            "representation candidate is forbidden outside representation stages"
+        )
+    if (
+        completed_epochs <= 0
+        or completed_epochs % REPRESENTATION_CANDIDATE_INTERVAL_EPOCHS
+    ):
+        raise RuntimeError("representation candidate epoch is not registered")
+    optimizer_updates = _require_exact_audit_int(
+        trainer.formal_optimizer_updates,
+        "representation candidate optimizer updates",
+    )
+    expected_updates = completed_epochs * trainer.train_length
+    if optimizer_updates != expected_updates:
+        raise RuntimeError("representation candidate update count mismatch")
+    filename = (
+        f"{trainer.args.formal_stage}_epoch_{completed_epochs:04d}"
+        f"_step_{optimizer_updates:09d}.bin"
+    )
+    path = checkpoint_dir / "representation_candidates" / filename
+    audit = {
+        "format": "semtalk_show_representation_candidate_v1",
+        "formal_stage": trainer.args.formal_stage,
+        "completed_epochs": completed_epochs,
+        "optimizer_updates": optimizer_updates,
+        "config_sha256": config_sha256,
+        "lineage_manifest_sha256": lineage_sha256,
+        "dataset_receipt_sha256": _payload_sha256(dataset_receipt),
+        "source_receipt": source_receipt,
+        "source_receipt_sha256": _payload_sha256(source_receipt),
+        "initialization_receipt": copy.deepcopy(
+            trainer.initialization_receipt
+        ),
+        "rvq_ema_prior_receipt": copy.deepcopy(
+            trainer.rvq_ema_prior_receipt
+        ),
+        "distributed_training_receipt": distributed_training_receipt,
+        "rvq_rank_state_receipt": rvq_rank_state_receipt,
+        "selection_status": "offline_validation_pending",
+    }
+    checkpoint_sha256 = _verify_or_write_final(
+        path,
+        {
+            "model_state": trainer.model.state_dict(),
+            "audit": audit,
+        },
+    )
+    return {
+        "path": str(path),
+        "sha256": checkpoint_sha256,
+        "completed_epochs": completed_epochs,
+        "optimizer_updates": optimizer_updates,
+        "selection_status": "offline_validation_pending",
+    }
+
+
+def _validate_representation_candidate_receipt(
+    trainer: Any,
+    receipt: Any,
+    *,
+    completed_epochs: int,
+) -> dict[str, Any] | None:
+    if trainer.args.formal_stage not in REPRESENTATION_STAGES:
+        if receipt is not None:
+            raise RuntimeError(
+                "non-representation resume has a representation candidate"
+            )
+        return None
+    expected_epoch = (
+        completed_epochs // REPRESENTATION_CANDIDATE_INTERVAL_EPOCHS
+    ) * REPRESENTATION_CANDIDATE_INTERVAL_EPOCHS
+    if expected_epoch == 0:
+        if receipt is not None:
+            raise RuntimeError(
+                "representation candidate exists before its first boundary"
+            )
+        return None
+    if not isinstance(receipt, dict):
+        raise RuntimeError(
+            "resume is missing its latest representation candidate receipt"
+        )
+    expected_updates = expected_epoch * trainer.train_length
+    expected_path = (
+        Path(trainer.checkpoint_path)
+        / "representation_candidates"
+        / (
+            f"{trainer.args.formal_stage}_epoch_{expected_epoch:04d}"
+            f"_step_{expected_updates:09d}.bin"
+        )
+    )
+    if (
+        set(receipt)
+        != {
+            "path",
+            "sha256",
+            "completed_epochs",
+            "optimizer_updates",
+            "selection_status",
+        }
+        or Path(receipt["path"]).resolve() != expected_path.resolve()
+        or _require_exact_audit_int(
+            receipt["completed_epochs"],
+            "representation candidate completed_epochs",
+        )
+        != expected_epoch
+        or _require_exact_audit_int(
+            receipt["optimizer_updates"],
+            "representation candidate optimizer_updates",
+        )
+        != expected_updates
+        or receipt["selection_status"] != "offline_validation_pending"
+    ):
+        raise RuntimeError("invalid latest representation candidate receipt")
+    if expected_path.is_symlink() or not expected_path.is_file():
+        raise RuntimeError(
+            "latest representation candidate checkpoint is unavailable"
+        )
+    observed_sha256 = _sha256(expected_path)
+    if receipt["sha256"] != observed_sha256:
+        raise RuntimeError(
+            "latest representation candidate checkpoint SHA-256 mismatch"
+        )
+    return copy.deepcopy(receipt)
+
+
 def main() -> None:
     args = config.parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -3542,6 +5994,17 @@ def main() -> None:
     args.ddp = world_size > 1
     args.gpus = list(range(world_size)) if args.ddp else [0]
     args.skip_test_init = True
+    expected_global_batch_size = (
+        256 if args.formal_stage in REPRESENTATION_STAGES else 64
+    )
+    expected_updates_per_epoch = (
+        497 if args.formal_stage in REPRESENTATION_STAGES else 1_988
+    )
+    if args.global_batch_size not in {0, expected_global_batch_size}:
+        raise RuntimeError(
+            "formal SHOW training has an invalid stage-specific global batch"
+        )
+    args.global_batch_size = expected_global_batch_size
 
     if not args.train_only:
         raise RuntimeError("show_base_train.py requires --train_only true")
@@ -3549,11 +6012,11 @@ def main() -> None:
         raise RuntimeError("formal training requires --strict_finite true")
     if (
         args.expected_train_samples != 127_286
-        or args.expected_updates_per_epoch != 1_988
+        or args.expected_updates_per_epoch != expected_updates_per_epoch
     ):
         raise RuntimeError(
             "formal training requires exactly 127286 samples and "
-            "1988 optimizer updates per epoch"
+            f"{expected_updates_per_epoch} optimizer updates per epoch"
         )
     if not args.lineage_manifest:
         raise RuntimeError("formal training requires --lineage_manifest")
@@ -3579,15 +6042,12 @@ def main() -> None:
         BASE_CANDIDATE_STAGING_FILENAME,
     }:
         raise RuntimeError("--final_ckpt_name collides with a reserved artifact")
-    if world_size != 1:
-        raise RuntimeError(
-            "formal SHOW reproduction training is single-GPU per model: RVQ EMA "
-            "is rank-local and Base has unused branches plus multiple forwards"
-        )
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            "each formal model task must receive exactly one isolated visible GPU"
-        )
+    _validate_smplx_training_pool_device_matrix(
+        args,
+        world_size=world_size,
+        cuda_available=torch.cuda.is_available(),
+        visible_device_count=torch.cuda.device_count(),
+    )
 
     stage_key = (args.model, args.g_name, args.trainer, bool(args.train_rvq))
     allowed_stages = {
@@ -3602,7 +6062,17 @@ def main() -> None:
             "formal SHOW training only permits the five representation models "
             f"and semtalk_base; received {stage_key!r}"
         )
-    _validate_formal_stage(args)
+    if args.formal_stage in REPRESENTATION_STAGES:
+        if not args.initial_model_checkpoint:
+            raise RuntimeError(
+                "formal representation fine-tuning requires "
+                "--initial-model-checkpoint"
+            )
+    elif args.initial_model_checkpoint:
+        raise RuntimeError(
+            "formal Base training forbids --initial-model-checkpoint"
+        )
+    _validate_formal_stage(args, world_size=world_size)
     lower_target_cache_enabled = validate_lower_target_cache_activation(args)
     if os.environ.get("PYTHONHASHSEED") != str(args.random_seed):
         raise RuntimeError(
@@ -3619,14 +6089,71 @@ def main() -> None:
             smplx_asset_receipt=initial_smplx_asset_receipt,
         )
     )
+    initial_dataset_receipt = _dataset_receipt(
+        args,
+        train_samples=args.expected_train_samples,
+        current_source=source_receipt,
+        lower_target_cache_receipt=None,
+        lower_target_backend_receipt=lower_target_backend_receipt,
+    )
+    initial_pool_gate_receipt = initial_dataset_receipt.get(
+        SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+    )
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", init_method="env://")
     logger_tools.set_args_and_logger(args, rank)
     other_tools.set_random_seed(args)
+    if world_size > 1:
+        distributed_seed = int(args.random_seed) + rank
+        random.seed(distributed_seed)
+        np.random.seed(distributed_seed)
+        torch.manual_seed(distributed_seed)
+        torch.cuda.manual_seed_all(distributed_seed)
 
     trainer = __import__(
         f"{args.trainer}_trainer", fromlist=["something"]
     ).CustomTrainer(args)
+    initialization_receipt = None
+    rvq_ema_prior_receipt = None
+    if args.formal_stage in REPRESENTATION_STAGES:
+        trainable_model = getattr(trainer.model, "module", trainer.model)
+        initialization_receipt = load_official_model_state(
+            torch,
+            stage=args.formal_stage,
+            checkpoint=Path(args.initial_model_checkpoint),
+            model=trainable_model,
+        )
+        if args.formal_stage in RVQ_STAGES:
+            rvq_ema_prior_receipt = initialize_loaded_rvq_ema(
+                trainer.model
+            )
+        gathered_initialization = [None] * world_size
+        dist.all_gather_object(
+            gathered_initialization,
+            {
+                "checkpoint": initialization_receipt,
+                "rvq_ema_prior": rvq_ema_prior_receipt,
+            },
+        )
+        if any(
+            item != gathered_initialization[0]
+            for item in gathered_initialization
+        ):
+            raise RuntimeError(
+                "official initialization receipt differs across ranks"
+            )
+    trainer.initialization_receipt = copy.deepcopy(
+        initialization_receipt
+    )
+    trainer.rvq_ema_prior_receipt = copy.deepcopy(
+        rvq_ema_prior_receipt
+    )
+    trainer.latest_representation_candidate = None
+    _validate_smplx_training_pool_trainer_runtime(
+        args,
+        trainer,
+        gate_receipt=initial_pool_gate_receipt,
+    )
     lower_target_cache_receipt = getattr(
         trainer,
         "lower_target_cache_receipt",
@@ -3701,6 +6228,15 @@ def main() -> None:
             f"updates/epoch {updates_per_epoch} != expected "
             f"{args.expected_updates_per_epoch}"
         )
+    distributed_training_receipt = _trainer_distributed_receipt(
+        trainer,
+        world_size=world_size,
+    )
+    rvq_rank_state_receipt = (
+        assert_rvq_rank_state(trainer.model)
+        if args.formal_stage in RVQ_STAGES
+        else None
+    )
     dataset_receipt = _dataset_receipt(
         args,
         train_samples=train_samples,
@@ -3708,8 +6244,10 @@ def main() -> None:
         lower_target_cache_receipt=lower_target_cache_receipt,
         lower_target_backend_receipt=lower_target_backend_receipt,
     )
-    if dataset_receipt.get("smplx_asset") != initial_smplx_asset_receipt:
-        raise RuntimeError("formal SMPL-X asset changed while initializing trainer")
+    if dataset_receipt != initial_dataset_receipt:
+        raise RuntimeError(
+            "formal dataset/gate receipt changed while initializing trainer"
+        )
 
     checkpoint_dir = Path(trainer.checkpoint_path)
     status_path = checkpoint_dir / "formal_training_status.json"
@@ -3785,6 +6323,15 @@ def main() -> None:
             dataset_receipt=dataset_receipt,
             source_receipt_sha256=source_receipt_sha,
         )
+    smplx_runtime_evidence = copy.deepcopy(
+        getattr(
+            trainer,
+            "smplx_training_pool_runtime_evidence",
+            None,
+        )
+    )
+    if requested_resume is None:
+        trainer.smplx_training_pool_runtime_evidence = None
     if start_epoch < 0 or start_epoch > args.epochs:
         raise RuntimeError(f"invalid resume epoch {start_epoch}")
     expected_start_updates = start_epoch * updates_per_epoch
@@ -3817,6 +6364,8 @@ def main() -> None:
         )
     elif current_candidate_count != committed_candidate_count:
         raise RuntimeError("initial Base candidate entry count mismatch")
+    if args.formal_stage in RVQ_STAGES:
+        rvq_rank_state_receipt = assert_rvq_rank_state(trainer.model)
     candidate_manifest_receipt = _base_candidate_manifest_receipt(
         candidate_manifest_path,
         candidate_manifest_sha,
@@ -3835,6 +6384,7 @@ def main() -> None:
                 "model": args.g_name,
                 "trainer": args.trainer,
                 "formal_stage": args.formal_stage,
+                "smplx_training_pool_mode": args.smplx_training_pool_mode,
                 "epochs": args.epochs,
                 "start_epoch": start_epoch,
                 "world_size": world_size,
@@ -3842,9 +6392,26 @@ def main() -> None:
                 "updates_per_epoch": updates_per_epoch,
                 "optimizer_updates": trainer.formal_optimizer_updates,
                 "batch_size": args.batch_size,
+                "distributed_training_receipt": (
+                    distributed_training_receipt
+                ),
+                "rvq_rank_state_receipt": rvq_rank_state_receipt,
+                "initialization_receipt": initialization_receipt,
+                "rvq_ema_prior_receipt": rvq_ema_prior_receipt,
+                "latest_representation_candidate": (
+                    trainer.latest_representation_candidate
+                ),
                 "lineage_manifest_sha256": lineage_sha,
                 "dataset_receipt": dataset_receipt,
                 "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                **_smplx_training_pool_gate_overlay(
+                    dataset_receipt.get(
+                        SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+                    )
+                ),
+                **_smplx_training_pool_runtime_evidence_overlay(
+                    smplx_runtime_evidence
+                ),
                 **(
                     {
                         LOWER_TARGET_CACHE_RECEIPT_KEY:
@@ -3882,6 +6449,86 @@ def main() -> None:
                     f"epoch={epoch} before={updates_before_epoch} "
                     f"after={updates_after_epoch} expected_delta={updates_per_epoch}"
                 )
+            observed_runtime_evidence = (
+                _current_smplx_training_pool_runtime_evidence(
+                    trainer,
+                    formal_stage=args.formal_stage,
+                    gate_receipt=dataset_receipt.get(
+                        SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+                    ),
+                )
+            )
+            pool_gate_receipt = dataset_receipt.get(
+                SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+            )
+            if (
+                isinstance(pool_gate_receipt, dict)
+                and pool_gate_receipt.get("mode") == "target_offload"
+            ):
+                if not isinstance(observed_runtime_evidence, dict):
+                    raise RuntimeError(
+                        "target_offload runtime evidence is unavailable"
+                    )
+                observed_pairs = _require_exact_audit_int(
+                    observed_runtime_evidence["pool_runtime"].get(
+                        "completed_forward_pairs"
+                    ),
+                    "target_offload completed forward pairs after epoch",
+                )
+                previous_pairs = 0
+                if smplx_runtime_evidence is not None:
+                    previous_pairs = _require_exact_audit_int(
+                        smplx_runtime_evidence["pool_runtime"].get(
+                            "completed_forward_pairs"
+                        ),
+                        "target_offload completed forward pairs before epoch",
+                    )
+                    previous_stable = copy.deepcopy(
+                        smplx_runtime_evidence
+                    )
+                    observed_stable = copy.deepcopy(
+                        observed_runtime_evidence
+                    )
+                    previous_stable.pop("receipt_sha256")
+                    observed_stable.pop("receipt_sha256")
+                    previous_stable["pool_runtime"].pop(
+                        "completed_forward_pairs"
+                    )
+                    observed_stable["pool_runtime"].pop(
+                        "completed_forward_pairs"
+                    )
+                    if previous_stable != observed_stable:
+                        raise RuntimeError(
+                            "production target_offload runtime evidence "
+                            "changed outside its forward counter"
+                        )
+                if (
+                    previous_pairs != updates_before_epoch
+                    or observed_pairs != updates_after_epoch
+                    or observed_pairs - previous_pairs
+                    != updates_per_epoch
+                ):
+                    raise RuntimeError(
+                        "target_offload forward-count delta differs from "
+                        "optimizer-update delta"
+                    )
+                _validate_smplx_training_pool_runtime_evidence(
+                    observed_runtime_evidence,
+                    formal_stage=args.formal_stage,
+                    gate_receipt=pool_gate_receipt,
+                    expected_optimizer_updates=updates_after_epoch,
+                )
+            elif (
+                smplx_runtime_evidence is not None
+                and observed_runtime_evidence != smplx_runtime_evidence
+            ):
+                raise RuntimeError(
+                    "production SMPL-X pool runtime evidence changed"
+                )
+            smplx_runtime_evidence = observed_runtime_evidence
+            trainer.smplx_training_pool_runtime_evidence = copy.deepcopy(
+                smplx_runtime_evidence
+            )
             last_metrics = _tracker_snapshot(trainer)
 
             if args.strict_finite:
@@ -3895,12 +6542,63 @@ def main() -> None:
                     raise FloatingPointError(
                         "non-finite training state: " + ", ".join(bad[:20])
                     )
+            if args.formal_stage in RVQ_STAGES:
+                rvq_rank_state_receipt = assert_rvq_rank_state(
+                    trainer.model
+                )
 
             completed_epochs = epoch + 1
             expected_total_updates = completed_epochs * updates_per_epoch
             if updates_after_epoch != expected_total_updates:
                 raise RuntimeError(
                     "formal cumulative actual optimizer update count mismatch"
+                )
+            if (
+                args.formal_stage in REPRESENTATION_STAGES
+                and completed_epochs
+                % REPRESENTATION_CANDIDATE_INTERVAL_EPOCHS
+                == 0
+            ):
+                candidate_result: list[dict[str, Any] | None] = [None]
+                if rank == 0:
+                    try:
+                        candidate_result[0] = {
+                            "ok": True,
+                            "receipt": _save_representation_candidate(
+                                trainer,
+                                checkpoint_dir,
+                                completed_epochs=completed_epochs,
+                                config_sha256=config_sha,
+                                lineage_sha256=lineage_sha,
+                                dataset_receipt=dataset_receipt,
+                                source_receipt=source_receipt,
+                                distributed_training_receipt=(
+                                    distributed_training_receipt
+                                ),
+                                rvq_rank_state_receipt=(
+                                    rvq_rank_state_receipt
+                                ),
+                            ),
+                        }
+                    except Exception as candidate_error:
+                        candidate_result[0] = {
+                            "ok": False,
+                            "error_type": type(candidate_error).__name__,
+                            "error": str(candidate_error),
+                        }
+                if args.ddp:
+                    dist.broadcast_object_list(candidate_result, src=0)
+                candidate_message = candidate_result[0]
+                if (
+                    not isinstance(candidate_message, dict)
+                    or candidate_message.get("ok") is not True
+                ):
+                    raise RuntimeError(
+                        "rank-zero representation candidate save failed: "
+                        f"{candidate_message!r}"
+                    )
+                trainer.latest_representation_candidate = copy.deepcopy(
+                    candidate_message["receipt"]
                 )
             if (
                 args.formal_stage == "base"
@@ -4007,6 +6705,10 @@ def main() -> None:
                         ),
                         last_metrics=last_metrics,
                         started_unix=started_at,
+                        distributed_training_receipt=(
+                            distributed_training_receipt
+                        ),
+                        rvq_rank_state_receipt=rvq_rank_state_receipt,
                     )
                     if (
                         args.formal_stage == "base"
@@ -4029,17 +6731,43 @@ def main() -> None:
                             "model": args.g_name,
                             "trainer": args.trainer,
                             "formal_stage": args.formal_stage,
+                            "smplx_training_pool_mode": (
+                                args.smplx_training_pool_mode
+                            ),
                             "epochs": args.epochs,
                             "completed_epochs": completed_epochs,
                             "world_size": world_size,
                             "train_samples": train_samples,
                             "updates_per_epoch": updates_per_epoch,
                             "batch_size": args.batch_size,
+                            "distributed_training_receipt": (
+                                distributed_training_receipt
+                            ),
+                            "rvq_rank_state_receipt": (
+                                rvq_rank_state_receipt
+                            ),
+                            "initialization_receipt": (
+                                initialization_receipt
+                            ),
+                            "rvq_ema_prior_receipt": (
+                                rvq_ema_prior_receipt
+                            ),
+                            "latest_representation_candidate": (
+                                trainer.latest_representation_candidate
+                            ),
                             "optimizer_updates": trainer.formal_optimizer_updates,
                             "lineage_manifest_sha256": lineage_sha,
                             "dataset_receipt": dataset_receipt,
                             "smplx_asset_receipt": dataset_receipt.get(
                                 "smplx_asset"
+                            ),
+                            **_smplx_training_pool_gate_overlay(
+                                dataset_receipt.get(
+                                    SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+                                )
+                            ),
+                            **_smplx_training_pool_runtime_evidence_overlay(
+                                smplx_runtime_evidence
                             ),
                             **(
                                 {
@@ -4146,6 +6874,10 @@ def main() -> None:
                     candidate_manifest_receipt=(
                         candidate_manifest_receipt
                     ),
+                    distributed_training_receipt=(
+                        distributed_training_receipt
+                    ),
+                    rvq_rank_state_receipt=rvq_rank_state_receipt,
                 ),
             )
             _atomic_json(
@@ -4156,16 +6888,36 @@ def main() -> None:
                     "model": args.g_name,
                     "trainer": args.trainer,
                     "formal_stage": args.formal_stage,
+                    "smplx_training_pool_mode": (
+                        args.smplx_training_pool_mode
+                    ),
                     "epochs": args.epochs,
                     "completed_epochs": args.epochs,
                     "world_size": world_size,
                     "train_samples": train_samples,
                     "updates_per_epoch": updates_per_epoch,
                     "batch_size": args.batch_size,
+                    "distributed_training_receipt": (
+                        distributed_training_receipt
+                    ),
+                    "rvq_rank_state_receipt": rvq_rank_state_receipt,
+                    "initialization_receipt": initialization_receipt,
+                    "rvq_ema_prior_receipt": rvq_ema_prior_receipt,
+                    "latest_representation_candidate": (
+                        trainer.latest_representation_candidate
+                    ),
                     "optimizer_updates": trainer.formal_optimizer_updates,
                     "lineage_manifest_sha256": lineage_sha,
                     "dataset_receipt": dataset_receipt,
                     "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                    **_smplx_training_pool_gate_overlay(
+                        dataset_receipt.get(
+                            SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+                        )
+                    ),
+                    **_smplx_training_pool_runtime_evidence_overlay(
+                        smplx_runtime_evidence
+                    ),
                     **(
                         {
                             LOWER_TARGET_CACHE_RECEIPT_KEY:
@@ -4202,15 +6954,35 @@ def main() -> None:
                     "model": args.g_name,
                     "trainer": args.trainer,
                     "formal_stage": args.formal_stage,
+                    "smplx_training_pool_mode": (
+                        args.smplx_training_pool_mode
+                    ),
                     "epochs": args.epochs,
                     "world_size": world_size,
                     "train_samples": train_samples,
                     "updates_per_epoch": updates_per_epoch,
                     "optimizer_updates": trainer.formal_optimizer_updates,
                     "batch_size": args.batch_size,
+                    "distributed_training_receipt": (
+                        distributed_training_receipt
+                    ),
+                    "rvq_rank_state_receipt": rvq_rank_state_receipt,
+                    "initialization_receipt": initialization_receipt,
+                    "rvq_ema_prior_receipt": rvq_ema_prior_receipt,
+                    "latest_representation_candidate": (
+                        trainer.latest_representation_candidate
+                    ),
                     "lineage_manifest_sha256": lineage_sha,
                     "dataset_receipt": dataset_receipt,
                     "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
+                    **_smplx_training_pool_gate_overlay(
+                        dataset_receipt.get(
+                            SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
+                        )
+                    ),
+                    **_smplx_training_pool_runtime_evidence_overlay(
+                        smplx_runtime_evidence
+                    ),
                     **(
                         {
                             LOWER_TARGET_CACHE_RECEIPT_KEY:

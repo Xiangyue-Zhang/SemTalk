@@ -1,8 +1,84 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from einops import rearrange
 import numpy as np
+
+
+def _distributed_ready():
+    return dist.is_available() and dist.is_initialized()
+
+
+def _all_reduce_sum_(tensor):
+    """Sum a detached EMA statistic over the active process group."""
+
+    if _distributed_ready() and dist.get_world_size() > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor
+
+
+def _global_prefix_rows(x, limit):
+    """Return the first global rows without gathering the whole latent batch."""
+
+    if not _distributed_ready() or dist.get_world_size() == 1:
+        return x[:limit]
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    local_count = torch.tensor(
+        [x.shape[0]],
+        device=x.device,
+        dtype=torch.int64,
+    )
+    gathered_counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+    dist.all_gather(gathered_counts, local_count)
+    counts = [int(value.item()) for value in gathered_counts]
+
+    # The formal W2/W4 recipe has at least one full codebook of latent rows on
+    # rank zero. This fast path broadcasts only 256 rows rather than gathering
+    # every rank's complete latent batch.
+    if counts[0] >= limit:
+        prefix = (
+            x[:limit].clone()
+            if rank == 0
+            else torch.empty(
+                limit,
+                x.shape[1],
+                device=x.device,
+                dtype=x.dtype,
+            )
+        )
+        return _broadcast_from_rank_zero_(prefix)
+
+    required = []
+    remaining = limit
+    for count in counts:
+        take = min(count, remaining)
+        required.append(take)
+        remaining -= take
+    width = max(required)
+    local = torch.zeros(
+        width,
+        x.shape[1],
+        device=x.device,
+        dtype=x.dtype,
+    )
+    if required[rank]:
+        local[:required[rank]].copy_(x[:required[rank]])
+    gathered = [torch.empty_like(local) for _ in range(world_size)]
+    dist.all_gather(gathered, local)
+    return torch.cat(
+        [rows[:take] for rows, take in zip(gathered, required) if take],
+        dim=0,
+    )
+
+
+def _broadcast_from_rank_zero_(tensor):
+    if _distributed_ready() and dist.get_world_size() > 1:
+        dist.broadcast(tensor, src=0)
+    return tensor
+
+
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
 
@@ -192,7 +268,14 @@ class QuantizeEMAReset(nn.Module):
         self.init = False
         self.code_sum = None
         self.code_count = None
-        self.register_buffer('codebook', torch.zeros(self.nb_code, self.code_dim, requires_grad=False).cuda())
+        self.register_buffer(
+            'codebook',
+            torch.zeros(
+                self.nb_code,
+                self.code_dim,
+                requires_grad=False,
+            ),
+        )
 
     def _tile(self, x):
         nb_code_x, code_dim = x.shape
@@ -206,8 +289,17 @@ class QuantizeEMAReset(nn.Module):
         return out
 
     def init_codebook(self, x):
-        out = self._tile(x)
-        self.codebook = out[:self.nb_code]
+        global_x = _global_prefix_rows(x, self.nb_code)
+        if not _distributed_ready() or dist.get_rank() == 0:
+            initial = self._tile(global_x)[:self.nb_code].clone()
+        else:
+            initial = torch.empty(
+                self.nb_code,
+                self.code_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        self.codebook = _broadcast_from_rank_zero_(initial)
         self.code_sum = self.codebook.clone()
         self.code_count = torch.ones(self.nb_code, device=self.codebook.device)
         self.init = True
@@ -241,6 +333,7 @@ class QuantizeEMAReset(nn.Module):
         code_onehot.scatter_(0, code_idx.view(1, code_idx.shape[0]), 1)
 
         code_count = code_onehot.sum(dim=-1)  # nb_code
+        _all_reduce_sum_(code_count)
         prob = code_count / torch.sum(code_count)
         perplexity = torch.exp(-torch.sum(prob * torch.log(prob + 1e-7)))
         return perplexity
@@ -252,9 +345,8 @@ class QuantizeEMAReset(nn.Module):
 
         code_sum = torch.matmul(code_onehot, x) # nb_code, c
         code_count = code_onehot.sum(dim=-1) # nb_code
-
-        out = self._tile(x)
-        code_rand = out[:self.nb_code]
+        _all_reduce_sum_(code_sum)
+        _all_reduce_sum_(code_count)
 
         # Update centres
         self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
@@ -262,7 +354,21 @@ class QuantizeEMAReset(nn.Module):
 
         usage = (self.code_count.view(self.nb_code, 1) >= 1.0).float()
         code_update = self.code_sum.view(self.nb_code, self.code_dim) / self.code_count.view(self.nb_code, 1)
-        self.codebook = usage * code_update + (1-usage) * code_rand
+        if bool((usage == 0).any().item()):
+            global_x = _global_prefix_rows(x, self.nb_code)
+            if not _distributed_ready() or dist.get_rank() == 0:
+                code_rand = self._tile(global_x)[:self.nb_code].clone()
+            else:
+                code_rand = torch.empty(
+                    self.nb_code,
+                    self.code_dim,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+            _broadcast_from_rank_zero_(code_rand)
+            self.codebook = usage * code_update + (1-usage) * code_rand
+        else:
+            self.codebook = code_update
 
 
         prob = code_count / torch.sum(code_count)
@@ -317,6 +423,7 @@ class QuantizeEMAReset2D(nn.Module):
         self.register_buffer('codebook', torch.randn(nb_code, code_dim))  # (nb_code, code_dim)
         self.register_buffer('code_sum', torch.zeros(nb_code, code_dim))
         self.register_buffer('code_count', torch.ones(nb_code))
+        self._codebook_synced = False
 
     def preprocess(self, x):
         """
@@ -345,6 +452,11 @@ class QuantizeEMAReset2D(nn.Module):
             perplexity: scalar
         """
         B, C, J, T = x.shape
+        if not self._codebook_synced:
+            _broadcast_from_rank_zero_(self.codebook)
+            _broadcast_from_rank_zero_(self.code_sum)
+            _broadcast_from_rank_zero_(self.code_count)
+            self._codebook_synced = True
 
         # Flatten (B, C, J, T) -> (B * J * T, C)
         x_flattened = self.preprocess(x)
@@ -391,6 +503,8 @@ class QuantizeEMAReset2D(nn.Module):
         one_hot = F.one_hot(code_idx, self.nb_code).float()  # (N, nb_code)
         code_sum = torch.matmul(one_hot.t(), x)  # (nb_code, C)
         code_count = one_hot.sum(dim=0)  # (nb_code,)
+        _all_reduce_sum_(code_sum)
+        _all_reduce_sum_(code_count)
 
         self.code_sum = self.mu * self.code_sum + (1 - self.mu) * code_sum
         self.code_count = self.mu * self.code_count + (1 - self.mu) * code_count
@@ -409,6 +523,7 @@ class QuantizeEMAReset2D(nn.Module):
         """
         one_hot = F.one_hot(code_idx, self.nb_code).float()
         code_count = one_hot.sum(dim=0)  # (nb_code,)
+        _all_reduce_sum_(code_count)
         prob = code_count / torch.sum(code_count)
         perplexity = torch.exp(-torch.sum(prob * torch.log(prob + 1e-7)))
         return perplexity

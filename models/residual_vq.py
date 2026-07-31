@@ -53,6 +53,16 @@ class ResidualVQ(nn.Module):
 
         self.quantize_dropout_cutoff_index = quantize_dropout_cutoff_index
         self.quantize_dropout_prob = quantize_dropout_prob
+        # Converting CUDA finite checks to Python booleans forces the host to
+        # synchronize with the device.  The legacy path did that twice for
+        # each of the six residual quantizers on every optimizer update.
+        # Formal training already performs strict epoch-level tensor/state
+        # audits, so retain the per-layer diagnostics only as an explicit
+        # debugging mode.
+        args = kwargs.get("args")
+        self.check_finite_every_step = bool(
+            getattr(args, "rvq_check_finite_every_step", False)
+        )
 
             
     @property
@@ -128,7 +138,10 @@ class ResidualVQ(nn.Module):
             quantized_out += quantized
             embed_indices, loss, perplexity = rest
 
-            if torch.isnan(quantized).any() or torch.isinf(quantized).any():
+            if (
+                self.check_finite_every_step
+                and not torch.isfinite(quantized).all()
+            ):
                 print(f"NaN or Inf detected in quantizer output at layer {quantizer_index}")
 
             all_indices.append(embed_indices)
@@ -139,7 +152,10 @@ class ResidualVQ(nn.Module):
         all_losses = sum(all_losses) / len(all_losses)
         all_perplexity = sum(all_perplexity) / len(all_perplexity)
 
-        if torch.isnan(all_losses).any() or torch.isinf(all_losses).any():
+        if (
+            self.check_finite_every_step
+            and not torch.isfinite(all_losses).all()
+        ):
             print("NaN or Inf detected in accumulated quantizer losses")
 
         ret = (quantized_out, all_indices, all_losses, all_perplexity)

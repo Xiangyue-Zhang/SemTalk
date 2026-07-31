@@ -22,6 +22,7 @@ from utils import config, logger_tools, other_tools, metric
 from utils.project_paths import smplx_model_dir
 from utils import rotation_conversions as rc
 from utils.smplx_training import (
+    build_smplx_training_pool,
     freeze_smplx_for_training,
     smplx_target_forward,
 )
@@ -56,6 +57,31 @@ class CustomTrainer(train.BaseTrainer):
         ).cuda().eval()
         if getattr(args, "train_only", False):
             self.smplx = freeze_smplx_for_training(self.smplx)
+        if (
+            lower_target_cache_enabled
+            and getattr(
+                args,
+                "smplx_training_pool_mode",
+                "disabled",
+            )
+            != "disabled"
+        ):
+            raise RuntimeError(
+                "SMPL-X training pooling and lower target cache are "
+                "mutually exclusive"
+            )
+        self.smplx_pool = build_smplx_training_pool(
+            self.args,
+            self.smplx,
+            optimizer=self.opt,
+            training_model=self.model,
+        )
+        self.smplx_parallel_mode = getattr(
+            self.args,
+            "smplx_training_pool_mode",
+            "disabled",
+        )
+        self.smplx_parallel_pool = self.smplx_pool
         self.lower_target_joints_cache = None
         self.lower_target_cache_receipt = None
         if lower_target_cache_enabled:
@@ -169,65 +195,130 @@ class CustomTrainer(train.BaseTrainer):
                 rec_pose = rc.matrix_to_axis_angle(rec_pose).reshape(bs*n, j*3)
                 rec_pose = self.inverse_selection_tensor(rec_pose, self.train_data.joint_mask, rec_pose.shape[0])
                 tar_pose = self.inverse_selection_tensor(tar_pose, self.train_data.joint_mask, tar_pose.shape[0])
-                vertices_rec = self.smplx(
-                    betas=tar_beta.reshape(bs*n, 300), 
-                    transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3), 
-                    expression=tar_exps.reshape(bs*n, 100), 
-                    jaw_pose=rec_pose[:, 66:69], 
-                    global_orient=rec_pose[:,:3], 
-                    body_pose=rec_pose[:,3:21*3+3], 
-                    left_hand_pose=rec_pose[:,25*3:40*3], 
-                    right_hand_pose=rec_pose[:,40*3:55*3], 
-                    return_verts=False,
-                    return_joints=True,
-                    return_shaped=False,
-                    leye_pose=tar_pose[:, 69:72], 
-                    reye_pose=tar_pose[:, 72:75],
-                )
-                if self.lower_target_joints_cache is None:
-                    vertices_tar = smplx_target_forward(
-                        self.smplx,
+                model_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
+                static_idx = (model_contact > 0.95).detach()
+                if self.smplx_pool is None:
+                    vertices_rec = self.smplx(
                         betas=tar_beta.reshape(bs*n, 300),
                         transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3),
                         expression=tar_exps.reshape(bs*n, 100),
-                        jaw_pose=tar_pose[:, 66:69],
-                        global_orient=tar_pose[:,:3],
-                        body_pose=tar_pose[:,3:21*3+3],
-                        left_hand_pose=tar_pose[:,25*3:40*3],
-                        right_hand_pose=tar_pose[:,40*3:55*3],
+                        jaw_pose=rec_pose[:, 66:69],
+                        global_orient=rec_pose[:,:3],
+                        body_pose=rec_pose[:,3:21*3+3],
+                        left_hand_pose=rec_pose[:,25*3:40*3],
+                        right_hand_pose=rec_pose[:,40*3:55*3],
                         return_verts=False,
                         return_joints=True,
+                        return_shaped=False,
                         leye_pose=tar_pose[:, 69:72],
                         reye_pose=tar_pose[:, 72:75],
                     )
-                    target_joints = vertices_tar["joints"]
+                if self.lower_target_joints_cache is None:
+                    if self.smplx_pool is None:
+                        vertices_tar = smplx_target_forward(
+                            self.smplx,
+                            betas=tar_beta.reshape(bs*n, 300),
+                            transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3),
+                            expression=tar_exps.reshape(bs*n, 100),
+                            jaw_pose=tar_pose[:, 66:69],
+                            global_orient=tar_pose[:,:3],
+                            body_pose=tar_pose[:,3:21*3+3],
+                            left_hand_pose=tar_pose[:,25*3:40*3],
+                            right_hand_pose=tar_pose[:,40*3:55*3],
+                            return_verts=False,
+                            return_joints=True,
+                            leye_pose=tar_pose[:, 69:72],
+                            reye_pose=tar_pose[:, 72:75],
+                        )
+                    else:
+                        rec_smplx_kwargs = dict(
+                            betas=tar_beta.reshape(bs*n, 300),
+                            transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3),
+                            expression=tar_exps.reshape(bs*n, 100),
+                            jaw_pose=rec_pose[:, 66:69],
+                            global_orient=rec_pose[:,:3],
+                            body_pose=rec_pose[:,3:21*3+3],
+                            left_hand_pose=rec_pose[:,25*3:40*3],
+                            right_hand_pose=rec_pose[:,40*3:55*3],
+                            return_verts=False,
+                            return_joints=True,
+                            return_shaped=False,
+                            leye_pose=tar_pose[:, 69:72],
+                            reye_pose=tar_pose[:, 72:75],
+                        )
+                        target_smplx_kwargs = dict(
+                            betas=tar_beta.reshape(bs*n, 300),
+                            transl=tar_trans.reshape(bs*n, 3)-tar_trans.reshape(bs*n, 3),
+                            expression=tar_exps.reshape(bs*n, 100),
+                            jaw_pose=tar_pose[:, 66:69],
+                            global_orient=tar_pose[:,:3],
+                            body_pose=tar_pose[:,3:21*3+3],
+                            left_hand_pose=tar_pose[:,25*3:40*3],
+                            right_hand_pose=tar_pose[:,40*3:55*3],
+                            return_verts=False,
+                            return_joints=True,
+                            leye_pose=tar_pose[:, 69:72],
+                            reye_pose=tar_pose[:, 72:75],
+                        )
+                        if self.smplx_pool.mode == "sharded_local_loss":
+                            local_smplx_losses = (
+                                self.smplx_pool.forward_local_losses(
+                                    stage="lower",
+                                    rec_kwargs=rec_smplx_kwargs,
+                                    target_kwargs=target_smplx_kwargs,
+                                    clip_length=n,
+                                    static_mask=static_idx,
+                                )
+                            )
+                        else:
+                            vertices_rec, vertices_tar = (
+                                self.smplx_pool.forward_pair(
+                                    stage="lower",
+                                    rec_kwargs=rec_smplx_kwargs,
+                                    target_kwargs=target_smplx_kwargs,
+                                    clip_length=n,
+                                    output_keys=("joints",),
+                                )
+                            )
+                    if (
+                        self.smplx_pool is None
+                        or self.smplx_pool.mode != "sharded_local_loss"
+                    ):
+                        target_joints = vertices_tar["joints"]
                 else:
                     target_joints = (
                         self.lower_target_joints_cache.index_select(
                             dict_data["sample_index"]
                         ).reshape(bs*n, 127, 3)
                     )
-                joints_rec = vertices_rec['joints']
-                # print(joints_rec.shape)
-                joints_rec = joints_rec.reshape(bs, n, -1, 3)
-                vectices_loss = self.vectices_loss(
-                    vertices_rec["joints"],
-                    target_joints,
-                )
-                foot_idx = [7, 8, 10, 11]
-                model_contact = net_out["rec_pose"][:, :, j*6+3:j*6+7]
-                # find static indices consistent with model's own predictions
-                static_idx = model_contact > 0.95  # N x S x 4
-                # print(model_contact,static_idx)
-                model_feet = joints_rec[:, :, foot_idx]  # foot positions (N, S, 4, 3)
-                model_foot_v = torch.zeros_like(model_feet)
-                model_foot_v[:, :-1] = (
-                    model_feet[:, 1:, :, :] - model_feet[:, :-1, :, :]
-                )  # (N, S-1, 4, 3)
-                model_foot_v[~static_idx] = 0
-                foot_loss = self.vel_loss(
-                    model_foot_v, torch.zeros_like(model_foot_v)
-                )
+                if (
+                    self.smplx_pool is not None
+                    and self.smplx_pool.mode == "sharded_local_loss"
+                ):
+                    vectices_loss = local_smplx_losses["ver"]
+                    foot_loss = local_smplx_losses["foot"]
+                else:
+                    joints_rec = vertices_rec["joints"].reshape(
+                        bs,
+                        n,
+                        -1,
+                        3,
+                    )
+                    vectices_loss = self.vectices_loss(
+                        vertices_rec["joints"],
+                        target_joints,
+                    )
+                    foot_idx = [7, 8, 10, 11]
+                    model_feet = joints_rec[:, :, foot_idx]
+                    model_foot_v = torch.zeros_like(model_feet)
+                    model_foot_v[:, :-1] = (
+                        model_feet[:, 1:] - model_feet[:, :-1]
+                    )
+                    model_foot_v[~static_idx] = 0
+                    foot_loss = self.vel_loss(
+                        model_foot_v,
+                        torch.zeros_like(model_foot_v),
+                    )
                 self._track_train(
                     "foot",
                     foot_loss,

@@ -54,6 +54,13 @@ def parse_args():
     parser.add("--num_workers", type=int, default="16")
     parser.add("--resume", type=str, default="")
     parser.add("--resume_state", type=str, default="")
+    parser.add(
+        "--initial-model-checkpoint",
+        "--initial_model_checkpoint",
+        dest="initial_model_checkpoint",
+        type=str,
+        default="",
+    )
     parser.add("--run_name", type=str, default=None)
     parser.add("--formal_stage", type=str, default=None)
     parser.add("--train_only", default=False, type=str2bool)
@@ -73,6 +80,36 @@ def parse_args():
         "--use_lower_target_joints_cache",
         default=False,
         type=str2bool,
+    )
+    parser.add(
+        "--smplx_training_pool_mode",
+        default="disabled",
+        choices=(
+            "disabled",
+            "target_offload",
+            "full_batch_dual",
+            "sharded_local_loss",
+        ),
+        type=str,
+    )
+    parser.add(
+        "--smplx_training_helper_devices",
+        default="",
+        type=str,
+        help=(
+            "explicit comma-separated logical CUDA helpers; logical0 is "
+            "always the RVQ/VAE primary"
+        ),
+    )
+    parser.add(
+        "--smplx_training_pool_gate_report",
+        default=None,
+        type=str,
+    )
+    parser.add(
+        "--expected_smplx_training_pool_gate_sha256",
+        default=None,
+        type=str,
     )
     parser.add("--lower_target_joints_cache", default=None, type=str)
     parser.add(
@@ -118,6 +155,24 @@ def parse_args():
     parser.add("--expected_train_samples", default=0, type=int)
     parser.add("--expected_updates_per_epoch", default=0, type=int)
     parser.add("--strict_finite", default=True, type=str2bool)
+    parser.add(
+        "--rvq_check_finite_every_step",
+        default=False,
+        type=str2bool,
+        help=(
+            "debug-only synchronous finite checks inside every RVQ layer; "
+            "formal training uses the strict epoch audit instead"
+        ),
+    )
+    parser.add(
+        "--global_batch_size",
+        default=0,
+        type=int,
+        help=(
+            "optimizer/global EMA batch size; 0 preserves the legacy local "
+            "batch-size scaling outside the formal DDP launcher"
+        ),
+    )
     parser.add("--lr", type=float, default="0.0001")
     parser.add("--sched_step", type=int, default="3000")
 

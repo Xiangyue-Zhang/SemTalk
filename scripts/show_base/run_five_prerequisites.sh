@@ -3,8 +3,17 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
 # This launcher must itself run as the child of /tmp/globaldiff_guarded_runner.py
-# with physical GPUs 0..7 reserved.  It assigns one isolated GPU to each of the
-# five independent representation models.
+# with physical GPUs 0..7 reserved.  The required fixed partition is selected
+# by SEMTALK_FORMAL_PARTITION:
+#
+#   master: Face=0..3; Hands=4..7; Global starts on the first released group
+#   worker: Upper=0..3; Lower=4..7
+#
+# Every RVQ is one single-node W4 DDP job with local batch 64 and locked global
+# batch 256, matching the proven All-Speakers prerequisite exposure topology.
+# Global retains its exact W1 fastpath with batch 256 and overlaps the slower
+# master RVQ after the first four-GPU group is released. No NCCL process group
+# crosses the master/worker node boundary.
 
 usage() {
     printf '%s\n' \
@@ -28,6 +37,7 @@ parity_bundle=$9
 parity_sha256=${10}
 resume_mode=false
 formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
+official_vq_root=${SEMTALK_OFFICIAL_VQ_ROOT:-/local-ssd/xiangyuezhang/semtalk_all_speakers_full_vq_20260730/pretrained_vq}
 if [[ $# -eq 11 ]]; then
     if [[ ${11} != "--resume" ]]; then
         usage
@@ -35,6 +45,21 @@ if [[ $# -eq 11 ]]; then
     fi
     resume_mode=true
 fi
+
+formal_partition=${SEMTALK_FORMAL_PARTITION:-}
+case "$formal_partition" in
+    master)
+        active_stages=(face hands global)
+        ;;
+    worker)
+        active_stages=(upper lower)
+        ;;
+    *)
+        printf '%s\n' \
+            "SEMTALK_FORMAL_PARTITION must be exactly master or worker" >&2
+        exit 2
+        ;;
+esac
 
 for required in "$repo_root/show_base_train.py" "$python_bin" "$rep_summary" \
     "$lineage" "$parity_bundle"; do
@@ -47,6 +72,33 @@ if [[ ! -d "$rep_lmdb" ]]; then
     printf 'missing representation LMDB: %s\n' "$rep_lmdb" >&2
     exit 1
 fi
+declare -A official_filename=(
+    [face]=rvq_face_600.bin
+    [hands]=rvq_hands_500.bin
+    [upper]=rvq_upper_500.bin
+    [lower]=rvq_lower_600.bin
+    [global]=last_1700_foot.bin
+)
+declare -A official_sha256=(
+    [face]=31b04c88456a25f4d57841c0cb507b4c856daccb3875878d06545110a6152127
+    [hands]=08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a38055ca47a539b03e436
+    [upper]=05101461e75b4e9b687ef30437585d56969c6a13d0047b91000b31d88d08ac17
+    [lower]=2bb43d10e5f32d13d21e6b85580a1b70d36e407c8552a7e62f99c171ae4efce8
+    [global]=6e6f88abd98ccbe2c52102b937067f4ade0aa307d6e1dac8e127e19e0144ee12
+)
+for stage in "${active_stages[@]}"; do
+    checkpoint="$official_vq_root/${official_filename[$stage]}"
+    if [[ ! -f "$checkpoint" || -L "$checkpoint" ]]; then
+        printf 'missing regular official %s checkpoint: %s\n' \
+            "$stage" "$checkpoint" >&2
+        exit 1
+    fi
+    if [[ "$(sha256sum "$checkpoint" | awk '{print $1}')" != \
+          "${official_sha256[$stage]}" ]]; then
+        printf 'official %s checkpoint SHA-256 mismatch\n' "$stage" >&2
+        exit 1
+    fi
+done
 if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf 'unsafe run id: %s\n' "$run_id" >&2
     exit 1
@@ -187,8 +239,8 @@ digest = digest_state.hexdigest()
 if digest != summary["data_mdb_sha256"]:
     raise SystemExit("representation data.mdb SHA mismatch")
 entries = require_exact_int(summary.get("entries"), "representation entries")
-updates = entries // 64
-if entries != 127_286 or updates != 1_988:
+updates = entries // 256
+if entries != 127_286 or updates != 497:
     raise SystemExit(
         f"formal representation accounting mismatch: {entries=} {updates=}"
     )
@@ -197,7 +249,7 @@ PY
 )
 
 mkdir -p "$output_root/logs/$run_id"
-for stage in face hands upper lower global; do
+for stage in "${active_stages[@]}"; do
     stage_dir="$output_root/$stage/custom/${run_id}_${stage}"
     if [[ "$resume_mode" == false && -e "$stage_dir" ]]; then
         printf 'refusing to reuse stage output: %s\n' "$stage" >&2
@@ -430,11 +482,15 @@ trap 'on_signal 143' TERM
 
 launch_stage() {
     local stage=$1
-    local gpu=$2
+    local physical_gpus=$2
     local port=$3
     local config=$4
     local final_name=$5
     local epochs=$6
+    local pool_mode=${7:-disabled}
+    local helper_devices=${8:-}
+    local gate_report=${9:-}
+    local gate_sha256=${10:-}
     local stage_out="$output_root/$stage/"
     local stage_run="${run_id}_${stage}"
     local stage_dir="$stage_out/custom/$stage_run"
@@ -442,8 +498,30 @@ launch_stage() {
     local parity_args=()
     local smplx_args=()
     local lower_backend_args=()
+    local -a stage_gpus=()
     local log_path="$output_root/logs/$run_id/$stage.log"
     mkdir -p "$stage_out"
+
+    IFS=, read -r -a stage_gpus <<<"$physical_gpus"
+    if [[ "$pool_mode" == disabled ]]; then
+        local expected_world_size=4
+        if [[ "$stage" == global ]]; then
+            expected_world_size=1
+        fi
+        if [[ ${#stage_gpus[@]} -ne $expected_world_size ]]; then
+            printf '%s requires exactly %s physical GPUs\n' \
+                "$stage" "$expected_world_size" >&2
+            return 1
+        fi
+        if [[ -n "$helper_devices" || -n "$gate_report" || \
+              -n "$gate_sha256" ]]; then
+            printf '%s stock path forbids helper/gate inputs\n' "$stage" >&2
+            return 1
+        fi
+    else
+        printf 'unsupported stage pool mode: %s\n' "$pool_mode" >&2
+        return 1
+    fi
 
     if [[ "$resume_mode" == true ]]; then
         if [[ ! -f "$stage_dir/latest_resume.pt" ]]; then
@@ -462,6 +540,7 @@ launch_stage() {
     else
         smplx_args=(
             --expected_smplx_asset_sha256 "$formal_smplx_sha256"
+            --smplx_training_pool_mode disabled
         )
     fi
     if [[ "$stage" == lower ]]; then
@@ -472,7 +551,7 @@ launch_stage() {
 
     launch_registration_in_progress=true
     (
-        export CUDA_VISIBLE_DEVICES="$gpu"
+        export CUDA_VISIBLE_DEVICES="$physical_gpus"
         export MASTER_ADDR=127.0.0.1
         export MASTER_PORT="$port"
         export PYTHONHASHSEED=2021
@@ -484,7 +563,7 @@ launch_stage() {
         fi
         cd "$repo_root"
         exec "$python_bin" -m torch.distributed.run \
-            --nproc_per_node=1 \
+            --nproc_per_node="${#stage_gpus[@]}" \
             --master_addr=127.0.0.1 \
             --master_port="$port" \
             show_base_train.py \
@@ -505,7 +584,12 @@ launch_stage() {
             --dataset_summary "$rep_summary" \
             --expected_train_samples "$train_samples" \
             --expected_updates_per_epoch "$updates_per_epoch" \
+            --batch_size "$((256 / ${#stage_gpus[@]}))" \
+            --global_batch_size 256 \
+            --initial-model-checkpoint \
+                "$official_vq_root/${official_filename[$stage]}" \
             --strict_finite true \
+            --rvq_check_finite_every_step false \
             --save_every 5 \
             --log_period "$updates_per_epoch" \
             --loader_workers "${SEMTALK_LOADER_WORKERS:-4}" \
@@ -553,13 +637,25 @@ launch_stage() {
     pending_pid=
 }
 
-launch_stage face 0 29611 configs/cnn_vqvae_face_30.yaml rvq_face_600.bin 600
-launch_stage hands 1 29612 configs/cnn_vqvae_hands_30.yaml rvq_hands_500.bin 500
-launch_stage upper 2 29613 configs/cnn_vqvae_upper_30.yaml rvq_upper_500.bin 500
-launch_stage lower 3 29614 configs/cnn_vqvae_lower_30.yaml rvq_lower_600.bin 600
-launch_stage global 4 29615 configs/cnn_vqvae_lower_foot_30.yaml last_1700_foot.bin 1700
+if [[ "$formal_partition" == master ]]; then
+    launch_stage \
+        face 0,1,2,3 29611 configs/cnn_vqvae_face_30.yaml \
+        show_ft_face_200.bin 200 disabled
+    launch_stage \
+        hands 4,5,6,7 29612 configs/cnn_vqvae_hands_30.yaml \
+        show_ft_hands_200.bin 200 disabled
+else
+    launch_stage \
+        upper 0,1,2,3 29613 configs/cnn_vqvae_upper_30.yaml \
+        show_ft_upper_200.bin 200 disabled
+    launch_stage \
+        lower 4,5,6,7 29614 configs/cnn_vqvae_lower_30.yaml \
+        show_ft_lower_200.bin 200 disabled
+fi
 
 overall_rc=0
+global_launched=false
+wait_for_active() {
 while ((${#active_pids[@]} > 0)); do
     finished_pid=
     set +e
@@ -570,7 +666,7 @@ while ((${#active_pids[@]} > 0)); do
         printf 'wait -n returned without an exact child PID\n' >&2
         overall_rc=1
         terminate_children
-        break
+        return 1
     fi
     name=${child_name_by_pid[$finished_pid]:-unknown}
     remaining=()
@@ -588,6 +684,30 @@ while ((${#active_pids[@]} > 0)); do
         break
     fi
     printf 'stage complete: %s pid=%s\n' "$name" "$finished_pid"
+    if [[ "$formal_partition" == master && \
+          "$global_launched" == false && \
+          ( "$name" == face || "$name" == hands ) ]]; then
+        global_gpu=0
+        if [[ "$name" == hands ]]; then
+            global_gpu=4
+        fi
+        if ! launch_stage \
+            global "$global_gpu" 29615 \
+            configs/cnn_vqvae_lower_foot_30.yaml \
+            show_ft_global_200.bin 200 disabled; then
+            printf 'failed to launch global after %s completed\n' \
+                "$name" >&2
+            overall_rc=1
+            terminate_children
+            break
+        fi
+        global_launched=true
+        printf 'global launched on released GPU %s after %s\n' \
+            "$global_gpu" "$name"
+    fi
 done
+}
+
+wait_for_active || true
 trap - EXIT INT TERM
 exit "$overall_rc"

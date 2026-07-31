@@ -70,17 +70,31 @@ class BaseTrainer(object):
             self.train_data = __import__(f"dataloaders.{args.dataset}", fromlist=["something"]).CustomDataset(args, "train")
         else:
             self.train_data = __import__(f"dataloaders.{args.dataset}", fromlist=["something"]).LMDBNPZDataset(args, "train")
-        
+
+        self.train_sampler = (
+            torch.utils.data.distributed.DistributedSampler(
+                self.train_data,
+                num_replicas=dist.get_world_size(),
+                rank=self.rank,
+                shuffle=True,
+                seed=int(args.random_seed),
+                drop_last=True,
+            )
+            if args.ddp
+            else None
+        )
         self.train_loader = torch.utils.data.DataLoader(
             self.train_data, 
             batch_size=args.batch_size,  
-            shuffle=False if args.ddp else True,
+            shuffle=self.train_sampler is None,
             num_workers=args.loader_workers,
             drop_last=True,
             pin_memory=bool(getattr(args, "train_only", False)),
-            sampler=torch.utils.data.distributed.DistributedSampler(self.train_data) if args.ddp else None, 
+            sampler=self.train_sampler,
         )
         self.train_length = len(self.train_loader)
+        self.local_batch_size = int(args.batch_size)
+        self.global_batch_size = self.local_batch_size * dist.get_world_size()
         logger.info(f"Init train dataloader success")
        
         if self.rank == 0 and not getattr(args, "skip_test_init", False):

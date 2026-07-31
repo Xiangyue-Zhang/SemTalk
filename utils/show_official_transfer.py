@@ -32,6 +32,18 @@ OFFICIAL_CHECKPOINTS: dict[str, dict[str, str]] = {
             "31b04c88456a25f4d57841c0cb507b4c856daccb3875878d06545110a6152127"
         ),
     },
+    "hands": {
+        "filename": "rvq_hands_500.bin",
+        "sha256": (
+            "08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a38055ca47a539b03e436"
+        ),
+    },
+    "upper": {
+        "filename": "rvq_upper_500.bin",
+        "sha256": (
+            "05101461e75b4e9b687ef30437585d56969c6a13d0047b91000b31d88d08ac17"
+        ),
+    },
     "lower": {
         "filename": "rvq_lower_600.bin",
         "sha256": (

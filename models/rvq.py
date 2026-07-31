@@ -652,6 +652,9 @@ class RVQVAE(nn.Module):
         # exit()
         self.code_dim = code_dim
         self.num_code = nb_code
+        self.check_finite_every_step = bool(
+            getattr(args, "rvq_check_finite_every_step", False)
+        )
 
         # self.quant = args.quantizer
         self.encoder = Encoder(input_width,
@@ -725,10 +728,16 @@ class RVQVAE(nn.Module):
         # print('code_idx shape', code_idx.shape)
         # print('code_idx:', code_idx[0, :, 1])
         # exit()
-        if torch.isnan(x_quantized).any() or torch.isinf(x_quantized).any():
+        if (
+            self.check_finite_every_step
+            and not torch.isfinite(x_quantized).all()
+        ):
             print("NaN or Inf detected in quantized encoding")
 
-        if torch.isnan(commit_loss).any() or torch.isinf(commit_loss).any():
+        if (
+            self.check_finite_every_step
+            and not torch.isfinite(commit_loss).all()
+        ):
             print("NaN or Inf detected in commit loss")
         # print('x_quantized:', x_quantized.shape)
         # exit()

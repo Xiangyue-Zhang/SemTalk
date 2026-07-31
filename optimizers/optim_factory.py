@@ -45,9 +45,13 @@ def optimizer_kwargs(args, lr_weight):
     """ args/argparse to kwargs helper
     Convert optimizer args in argparse args or args like object to keyword args for updated create fn.
     """
+    global_batch_size = int(getattr(args, "global_batch_size", 0))
+    optimizer_batch_size = (
+        global_batch_size if global_batch_size > 0 else int(args.batch_size)
+    )
     kwargs = dict(
         optimizer_name=args.opt,
-        learning_rate=args.lr_base*args.batch_size/128*lr_weight,
+        learning_rate=args.lr_base*optimizer_batch_size/128*lr_weight,
         weight_decay=args.weight_decay,
         momentum=args.momentum)
     if getattr(args, "opt_eps", None) is not None:
