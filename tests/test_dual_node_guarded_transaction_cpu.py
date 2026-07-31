@@ -19,6 +19,27 @@ HELPER = REPOSITORY / "scripts" / "show_base" / "dual_node_guarded_transaction.p
 LAUNCHER = REPOSITORY / "scripts" / "show_base" / "run_dual_node_guarded_transaction.sh"
 PYTHON = str(Path(sys.executable).resolve())
 
+CPU_HEARTBEAT_MS = 250
+CPU_STALE_MS = 1500
+CPU_PREPARE_TIMEOUT_MS = 5000
+CPU_DECISION_TIMEOUT_MS = 5000
+CPU_ARM_TIMEOUT_MS = 5000
+CPU_START_TIMEOUT_MS = 5000
+CPU_COMPLETION_TIMEOUT_MS = 8000
+CPU_SHUTDOWN_GRACE_MS = 2500
+CPU_COORDINATOR_EXIT_TIMEOUT_SECONDS = (
+    max(
+        CPU_PREPARE_TIMEOUT_MS,
+        CPU_DECISION_TIMEOUT_MS,
+        CPU_ARM_TIMEOUT_MS,
+        CPU_START_TIMEOUT_MS,
+        CPU_COMPLETION_TIMEOUT_MS,
+    )
+    / 1000.0
+    + max(2.0, 3.0 * CPU_SHUTDOWN_GRACE_MS / 1000.0 + 1.0)
+    + 1.0
+)
+
 HARNESS = r"""
 import json
 import os
@@ -322,21 +343,21 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             "--max-restarts",
             "0",
             "--heartbeat-ms",
-            "250",
+            str(CPU_HEARTBEAT_MS),
             "--stale-ms",
-            "1500",
+            str(CPU_STALE_MS),
             "--prepare-timeout-ms",
-            "5000",
+            str(CPU_PREPARE_TIMEOUT_MS),
             "--decision-timeout-ms",
-            "5000",
+            str(CPU_DECISION_TIMEOUT_MS),
             "--arm-timeout-ms",
-            "5000",
+            str(CPU_ARM_TIMEOUT_MS),
             "--start-timeout-ms",
-            "5000",
+            str(CPU_START_TIMEOUT_MS),
             "--completion-timeout-ms",
-            "8000",
+            str(CPU_COMPLETION_TIMEOUT_MS),
             "--shutdown-grace-ms",
-            "2500",
+            str(CPU_SHUTDOWN_GRACE_MS),
         ]
         for name in allow_env or []:
             arguments.extend(["--allow-env", name])
@@ -428,7 +449,15 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         node0 = self._start(commands[1], extra_environment=environments[1])
         return node0, node1
 
-    def _wait_for(self, path: Path, timeout: float = 4.0) -> None:
+    @staticmethod
+    def _wait_process(process: subprocess.Popen[str]) -> int:
+        return process.wait(timeout=CPU_COORDINATOR_EXIT_TIMEOUT_SECONDS)
+
+    def _wait_for(
+        self,
+        path: Path,
+        timeout: float = CPU_COORDINATOR_EXIT_TIMEOUT_SECONDS,
+    ) -> None:
         deadline = time.monotonic() + timeout
         while not path.exists():
             if time.monotonic() >= deadline:
@@ -581,8 +610,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_success_uses_armed_go_result_and_final_receipts(self) -> None:
         transaction_root = self.root / "success_tx"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self.assertFalse((transaction_root / "OUTCOME.json").exists())
         self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
         self.assertFalse((transaction_root / "FINAL.rank1.json").exists())
@@ -632,8 +661,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         node0 = self._start(
             self._command(0, transaction_root, configuration, common_sha256=common)
         )
-        self.assertNotEqual(node1.wait(timeout=4), 0)
-        self.assertNotEqual(node0.wait(timeout=4), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -664,8 +693,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "decision_unix_ns": time.time_ns(),
             },
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertEqual(
             json.loads((transaction_root / "DECISION.json").read_text())["status"],
             "ABORT",
@@ -693,8 +722,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             transaction_root,
             self._configuration(rc0=7, seconds1=0.8),
         )
-        self.assertEqual(node0.wait(timeout=6), 4, node0.stderr.read())
-        self.assertNotEqual(node1.wait(timeout=6), 0)
+        self.assertEqual(self._wait_process(node0), 4, node0.stderr.read())
+        self.assertNotEqual(self._wait_process(node1), 0)
         result = json.loads((transaction_root / "WORKLOAD_RESULT.rank0.json").read_text())
         self.assertEqual((result["status"], result["workload_returncode"]), ("WORKLOAD_FAILED", 7))
         self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
@@ -712,8 +741,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self._wait_for(transaction_root / "STARTED.rank0.json")
         self._wait_for(transaction_root / "STARTED.rank1.json")
         node1.terminate()
-        self.assertNotEqual(node1.wait(timeout=5), 0)
-        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
         self.assertEqual(
             json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
             "FAILED",
@@ -727,7 +756,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         )
         self._wait_for(transaction_root / "WORKLOAD_RESULT.rank0.json")
         os.kill(node1.pid, signal.SIGSTOP)
-        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
         result = json.loads((transaction_root / "WORKLOAD_RESULT.rank0.json").read_text())
         self.assertEqual(result["status"], "COMPLETED")
         self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
@@ -737,7 +766,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         )
         os.kill(node1.pid, signal.SIGCONT)
         node1.terminate()
-        node1.wait(timeout=5)
+        self._wait_process(node1)
 
     def test_descendant_cannot_outlive_successful_group_leader(self) -> None:
         transaction_root = self.root / "descendant_cleanup"
@@ -753,8 +782,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         from scripts.show_base import dual_node_guarded_transaction as module
 
         identities = [module._proc_identity(pid) for pid in pids]
-        self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             living = []
@@ -786,8 +815,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         from scripts.show_base import dual_node_guarded_transaction as module
 
         identities = [module._proc_identity(pid) for pid in pids]
-        self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         for rank, (pid, identity) in enumerate(zip(pids, identities)):
             cleanup = json.loads(
                 (transaction_root / f"CLEANUP.rank{rank}.json").read_text()
@@ -830,8 +859,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         # are adopted by the transaction supervisor.
         time.sleep(0.2)
         node1.terminate()
-        self.assertNotEqual(node1.wait(timeout=6), 0)
-        self.assertNotEqual(node0.wait(timeout=6), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
         deadline = time.monotonic() + 2
         living = pids
         while living and time.monotonic() < deadline:
@@ -898,8 +927,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self._command(0, transaction_root, configuration),
             extra_environment=environment,
         )
-        self.assertNotEqual(node0.wait(timeout=6), 0)
-        self.assertNotEqual(node1.wait(timeout=6), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         failure = json.loads((transaction_root / "OUTCOME.json").read_text())
         self.assertEqual(failure["status"], "FAILED")
         self.assertIn("sequence", failure["reason"])
@@ -927,8 +956,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "result_unix_ns": time.time_ns(),
             },
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertEqual(
             json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
             "FAILED",
@@ -946,8 +975,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         moved = self.root / "moved_namespace"
         parent.rename(moved)
         parent.mkdir(mode=0o700)
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse(transaction_root.exists())
 
     def test_same_run_id_under_two_namespace_parents_cannot_join(self) -> None:
@@ -973,8 +1002,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 expected_parent_sha256=deployment_parent_pin,
             )
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((parent0 / "same_run" / "OUTCOME.json").exists())
         self.assertFalse((parent1 / "same_run" / "OUTCOME.json").exists())
 
@@ -998,8 +1027,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_duplicate_root_never_overwrites_decision(self) -> None:
         transaction_root = self.root / "duplicate"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0)
-        self.assertEqual(node1.wait(timeout=6), 0)
+        self.assertEqual(self._wait_process(node0), 0)
+        self.assertEqual(self._wait_process(node1), 0)
         before = (transaction_root / "DECISION.json").read_bytes()
         duplicate = subprocess.run(
             self._command(0, transaction_root, self._configuration()),
@@ -1014,8 +1043,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_peer_cannot_claim_another_canonical_namespace_parent(self) -> None:
         transaction_root = self.root / "mount_evidence"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0)
-        self.assertEqual(node1.wait(timeout=6), 0)
+        self.assertEqual(self._wait_process(node0), 0)
+        self.assertEqual(self._wait_process(node1), 0)
         prepared = json.loads((transaction_root / "PREPARED.rank1.json").read_text())
         prepared["transaction_root"] = "/different/local/efs/mount/mount_evidence"
         from scripts.show_base import dual_node_guarded_transaction as module
@@ -1050,8 +1079,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 workload_inputs={"fresh_test_authority": authority},
                 allow_env=["SEMTALK_TEST_BOUND_ENV"],
             )
-            self.assertEqual(node0.wait(timeout=6), 0)
-            self.assertEqual(node1.wait(timeout=6), 0)
+            self.assertEqual(self._wait_process(node0), 0)
+            self.assertEqual(self._wait_process(node1), 0)
         finally:
             if previous is None:
                 os.environ.pop("SEMTALK_TEST_BOUND_ENV", None)
@@ -1093,8 +1122,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self._configuration(),
             workload_inputs={"not_allowlisted": authority},
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -1122,7 +1151,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 self._start([PYTHON, "-c", HARNESS, *arguments])
             )
         for process in processes:
-            self.assertNotEqual(process.wait(timeout=5), 0)
+            self.assertNotEqual(self._wait_process(process), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -1146,8 +1175,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self._wait_for(transaction_root / "PREPARED.rank0.json")
         self._wait_for(transaction_root / "PREPARED.rank1.json")
         authority.write_text('{"version":2}\n', encoding="utf-8")
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -1180,8 +1209,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         replacement = authority.with_name("replacement.json")
         replacement.write_text(v2, encoding="utf-8")
         replacement.replace(authority)
-        self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self.assertEqual(authority.read_text(encoding="utf-8"), v2)
         for rank in (0, 1):
             observed = self.root / "markers" / f"authority.rank{rank}"
@@ -1225,8 +1254,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                         encoded_alias,
                     ],
                 )
-                self.assertNotEqual(node0.wait(timeout=5), 0)
-                self.assertNotEqual(node1.wait(timeout=5), 0)
+                self.assertNotEqual(self._wait_process(node0), 0)
+                self.assertNotEqual(self._wait_process(node1), 0)
                 self.assertFalse(
                     (self.root / "markers" / "started.rank0").exists()
                 )
@@ -1250,8 +1279,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             venv_python,
             self._configuration(record_runtime=True),
         )
-        self.assertEqual(node0.wait(timeout=8), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=8), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         portable = json.loads(
             (transaction_root / "PREPARED.rank0.json").read_text()
         )["portable"]
@@ -1287,8 +1316,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         replacement = venv_root / "pyvenv.cfg.replacement"
         replacement.write_bytes(cfg.read_bytes())
         replacement.replace(cfg)
-        self.assertNotEqual(node0.wait(timeout=8), 0)
-        self.assertNotEqual(node1.wait(timeout=8), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
         decision = transaction_root / "DECISION.json"
@@ -1309,8 +1338,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         replacement = venv_python.with_name("python.replacement")
         replacement.symlink_to("/bin/sh")
         replacement.replace(venv_python)
-        self.assertNotEqual(node0.wait(timeout=8), 0)
-        self.assertNotEqual(node1.wait(timeout=8), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -1325,8 +1354,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self._configuration(),
             workload_inputs={"fresh_test_authority": alias},
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
@@ -1341,16 +1370,16 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             venv_python,
             self._configuration(record_runtime=True),
         )
-        self.assertNotEqual(node0.wait(timeout=5), 0)
-        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
         self.assertFalse((transaction_root / "PREPARED.rank0.json").exists())
         self.assertFalse((transaction_root / "PREPARED.rank1.json").exists())
 
     def test_finalizer_file_failure_never_publishes_success_outcome(self) -> None:
         transaction_root = self.root / "finalizer_file_failure"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self._finish_runner_receipts(transaction_root)
         environment = os.environ.copy()
         environment["SEMTALK_TEST_FINAL_PUBLISH_FAIL"] = "FINAL.rank1.json"
@@ -1382,8 +1411,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_concurrent_finalizers_publish_one_terminal_outcome(self) -> None:
         transaction_root = self.root / "concurrent_finalizers"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self._finish_runner_receipts(transaction_root)
         finalizers = [
             subprocess.Popen(
@@ -1418,8 +1447,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_finalizer_rejects_runner_restore_error_before_final_files(self) -> None:
         transaction_root = self.root / "restore_failure"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self._finish_runner_receipts(transaction_root)
         status = self.status_paths[1]
         payload = json.loads(status.read_text())
@@ -1440,8 +1469,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_finalizer_rejects_hardlinked_outer_evidence(self) -> None:
         transaction_root = self.root / "hardlinked_outer_evidence"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self._finish_runner_receipts(transaction_root)
         self.log_paths[1].unlink()
         os.link(self.log_paths[0], self.log_paths[1])
@@ -1461,8 +1490,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_replay_is_read_only_and_detects_runner_status_replacement(self) -> None:
         transaction_root = self.root / "read_only_replay"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
-        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
         self._finalize(transaction_root)
         before = {
             path.name: path.read_bytes()
@@ -1503,8 +1532,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
     def test_decision_and_outcome_validators_reject_extra_or_wrong_semantics(self) -> None:
         transaction_root = self.root / "validator_exactness"
         node0, node1 = self._run_pair(transaction_root)
-        self.assertEqual(node0.wait(timeout=6), 0)
-        self.assertEqual(node1.wait(timeout=6), 0)
+        self.assertEqual(self._wait_process(node0), 0)
+        self.assertEqual(self._wait_process(node1), 0)
         self._finalize(transaction_root)
         from scripts.show_base import dual_node_guarded_transaction as module
 
