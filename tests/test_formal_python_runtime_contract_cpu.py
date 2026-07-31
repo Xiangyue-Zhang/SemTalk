@@ -130,7 +130,7 @@ class FormalPythonRuntimeContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [str(python), str(python)])
 
-    def test_optional_pyvenv_executable_field_must_match_base_interpreter(self) -> None:
+    def test_optional_pyvenv_executable_field_must_match_supplied_target(self) -> None:
         with tempfile.TemporaryDirectory(prefix="semtalk-python-contract-") as raw:
             root = Path(raw).resolve()
             python = self._new_venv(root)
@@ -187,10 +187,12 @@ class FormalPythonLauncherStaticTests(unittest.TestCase):
             "sys.prefix",
             "sys.exec_prefix",
             "sys.base_prefix",
+            "Path(expected).resolve(strict=True)",
             "pyvenv.cfg",
             '"numpy", "torch", "scipy", "einops", "smplx", "transformers", "lmdb"',
         ):
             self.assertIn(token, source)
+        self.assertNotIn("sys._base_executable", source)
 
 
 if __name__ == "__main__":

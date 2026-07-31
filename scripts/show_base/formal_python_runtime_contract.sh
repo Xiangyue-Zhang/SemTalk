@@ -125,15 +125,17 @@ if configuration["include-system-site-packages"].casefold() not in {"true", "fal
 if configuration["version"] != platform.python_version():
     fail("pyvenv.cfg Python version does not match the running interpreter")
 
-base_executable = Path(str(getattr(sys, "_base_executable", "")))
 configured_home = Path(configuration["home"])
-if not base_executable.is_absolute() or not configured_home.is_absolute():
+if not Path(expected).is_absolute() or not configured_home.is_absolute():
     fail("base executable identity is not absolute")
 try:
-    resolved_base_executable = base_executable.resolve(strict=True)
+    resolved_base_executable = Path(expected).resolve(strict=True)
     resolved_home = configured_home.resolve(strict=True)
-    if resolved_home != resolved_base_executable.parent.resolve(strict=True):
-        fail("pyvenv.cfg home does not match sys._base_executable")
+    resolved_home_executable = (
+        resolved_home / resolved_base_executable.name
+    ).resolve(strict=True)
+    if resolved_home_executable != resolved_base_executable:
+        fail("pyvenv.cfg home does not match the supplied executable target")
     # Python 3.9 creates legitimate pyvenv.cfg files without ``executable``.
     # Newer versions include it; when present it is an additional exact bind.
     configured_executable_value = configuration.get("executable")
@@ -142,7 +144,7 @@ try:
         if not configured_executable.is_absolute():
             fail("pyvenv.cfg executable is not absolute")
         if configured_executable.resolve(strict=True) != resolved_base_executable:
-            fail("pyvenv.cfg executable does not match sys._base_executable")
+            fail("pyvenv.cfg executable does not match the supplied executable target")
 except OSError as exc:
     fail(f"base executable identity is unavailable: {exc}")
 
