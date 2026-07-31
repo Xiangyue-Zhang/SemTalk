@@ -968,14 +968,47 @@ class ContinuationWaveAdapterTests(unittest.TestCase):
     def test_adapter_recursively_replays_e220_before_e240(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            first = authorize(fixture())
+            audit = {
+                "format": "test_training_audit_v1",
+                "portable_identity": {
+                    "commit": OID_C,
+                    "tree": OID_D,
+                },
+            }
+            audit_sha = wave.val_contract.canonical_payload_sha256(audit)
+            first_data = fixture()
+            for stage in wave.STAGES:
+                first_data["stage_plans"][stage]["new_source"][
+                    "source_receipt_sha256"
+                ] = audit_sha
+            first = authorize(first_data)
             recursive = recursive_fixture(first)
             values = adapter_fixture(
                 root,
                 data=recursive,
                 predecessor=first,
             )
+            values["candidate_index"]["segmented_union"] = {
+                "format": "test_segmented_union_v1"
+            }
+            for stage in wave.STAGES:
+                source = values["candidate_index"]["source_receipts"][
+                    stage
+                ]
+                source["training_audit"] = copy.deepcopy(audit)
+                # The union wrapper receipt is intentionally distinct from
+                # the preceding wave's new-source training-audit receipt.
+                source["receipt_payload_sha256"] = SHA_D
             receipt = self.run_adapter(values, root)
+            drifted = copy.deepcopy(values)
+            drifted["stage_plans"]["face"]["old_source"][
+                "source_receipt_sha256"
+            ] = SHA_D
+            with self.assertRaisesRegex(
+                wave.ContinuationWaveError,
+                "differs from candidate index",
+            ):
+                self.run_adapter(drifted, root)
         self.assertEqual(receipt["boundary_epoch"], 220)
         self.assertEqual(receipt["target_epoch"], 240)
         self.assertTrue(

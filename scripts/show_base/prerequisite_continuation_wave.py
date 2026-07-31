@@ -1898,12 +1898,25 @@ def authorize_wave_from_replayed_inputs(
             raise ContinuationWaveError(
                 f"{stage} portable source identity is unavailable"
             )
+        # The legacy e20..e200 index predates segmented continuations and
+        # identifies its frozen wrapper receipt.  A segmented union's terminal
+        # source is exactly the preceding wave's ``new_source`` training-audit
+        # receipt, so recursive e220->e240 replay must preserve that SHA rather
+        # than silently substituting the wrapper hash created at union time.
+        source_receipt_sha256 = source.get("receipt_payload_sha256")
+        if "segmented_union" in candidate_index:
+            training_audit = source.get("training_audit")
+            if not isinstance(training_audit, dict):
+                raise ContinuationWaveError(
+                    f"{stage} segmented source training audit is unavailable"
+                )
+            source_receipt_sha256 = val_contract.canonical_payload_sha256(
+                training_audit
+            )
         expected_old_source = {
             "commit": portable.get("commit"),
             "tree": portable.get("tree"),
-            "source_receipt_sha256": source.get(
-                "receipt_payload_sha256"
-            ),
+            "source_receipt_sha256": source_receipt_sha256,
         }
         expected_old_source = _validate_source(
             expected_old_source,

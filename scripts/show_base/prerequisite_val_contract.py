@@ -101,6 +101,9 @@ CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v1"
 PARTIAL_CANDIDATE_INDEX_FORMAT = (
     "semtalk_show_prerequisite_nonglobal_candidate_index_v1"
 )
+SEGMENTED_UNION_FORMAT = (
+    "semtalk_show_prerequisite_segmented_candidate_union_v1"
+)
 SHARD_FORMAT = "semtalk_show_prerequisite_val_shard_v1"
 STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
@@ -1540,6 +1543,153 @@ def validate_candidate_index(
                 )
             ):
                 raise ContractError(f"{stage} candidate file changed")
+    segmented = payload.get("segmented_union")
+    if segmented is not None:
+        segmented = exact_keys(
+            segmented,
+            (
+                "format",
+                "status",
+                "prior_candidate_index",
+                "continuation_waves",
+                "candidate_segment_chain",
+                "receipt_payload_sha256",
+            ),
+            "segmented candidate union",
+        )
+        segmented_unsigned = dict(segmented)
+        segmented_claimed = segmented_unsigned.pop(
+            "receipt_payload_sha256"
+        )
+        if (
+            segmented["format"] != SEGMENTED_UNION_FORMAT
+            or segmented["status"] != "complete"
+            or require_sha256(
+                segmented_claimed,
+                "segmented candidate union payload SHA",
+            )
+            != canonical_payload_sha256(segmented_unsigned)
+        ):
+            raise ContractError("segmented candidate union protocol mismatch")
+
+        def validate_binding(value: Any, label: str) -> dict[str, Any]:
+            binding = exact_keys(
+                value,
+                ("path", "sha256", "bytes", "receipt_payload_sha256"),
+                label,
+            )
+            artifact_path = regular_file(binding["path"], label)
+            artifact_sha = require_sha256(binding["sha256"], f"{label} SHA")
+            artifact_bytes = require_exact_int(
+                binding["bytes"], f"{label} bytes"
+            )
+            require_sha256(
+                binding["receipt_payload_sha256"],
+                f"{label} payload SHA",
+            )
+            if (
+                artifact_bytes <= 0
+                or artifact_path.stat().st_size != artifact_bytes
+                or sha256_file(artifact_path) != artifact_sha
+            ):
+                raise ContractError(f"{label} changed")
+            return dict(binding)
+
+        prior = validate_binding(
+            segmented["prior_candidate_index"],
+            "prior candidate index",
+        )
+        if path is not None and prior["path"] == str(path):
+            raise ContractError("segmented candidate index is self-referential")
+        waves = segmented["continuation_waves"]
+        if not isinstance(waves, list) or not waves:
+            raise ContractError("segmented candidate union has no waves")
+        normalized_waves = [
+            validate_binding(value, f"continuation wave {index}")
+            for index, value in enumerate(waves)
+        ]
+        if len({value["path"] for value in normalized_waves}) != len(waves):
+            raise ContractError("segmented continuation wave path was reused")
+        chains = segmented["candidate_segment_chain"]
+        if not isinstance(chains, dict) or set(chains) != set(expected_stages):
+            raise ContractError("segmented candidate chain coverage mismatch")
+        for stage in expected_stages:
+            chain = chains[stage]
+            if not isinstance(chain, list) or not chain:
+                raise ContractError(f"{stage} segmented chain is empty")
+            expected_start = REQUIRED_CANDIDATE_EPOCHS[0]
+            predecessor: str | None = None
+            covered: list[int] = []
+            runs: set[str] = set()
+            for index, raw_segment in enumerate(chain):
+                segment = exact_keys(
+                    raw_segment,
+                    (
+                        "run_path",
+                        "start_epoch",
+                        "end_epoch",
+                        "candidate_epochs",
+                        "predecessor_segment_id",
+                        "segment_id",
+                    ),
+                    f"{stage} segment {index}",
+                )
+                run_path = Path(segment["run_path"])
+                start = require_exact_int(
+                    segment["start_epoch"], f"{stage} segment start"
+                )
+                end = require_exact_int(
+                    segment["end_epoch"], f"{stage} segment end"
+                )
+                epochs = segment["candidate_epochs"]
+                if (
+                    not run_path.is_absolute()
+                    or ".." in run_path.parts
+                    or str(run_path) != segment["run_path"]
+                    or segment["run_path"] in runs
+                    or start != expected_start
+                    or end < start
+                    or not isinstance(epochs, list)
+                    or epochs != list(range(start, end + 1, 20))
+                    or segment["predecessor_segment_id"] != predecessor
+                ):
+                    raise ContractError(f"{stage} segmented chain mismatch")
+                expected_id = canonical_payload_sha256(
+                    {
+                        key: value
+                        for key, value in segment.items()
+                        if key != "segment_id"
+                    }
+                )
+                if (
+                    require_sha256(
+                        segment["segment_id"],
+                        f"{stage} segment ID",
+                    )
+                    != expected_id
+                ):
+                    raise ContractError(f"{stage} segment ID changed")
+                runs.add(segment["run_path"])
+                covered.extend(epochs)
+                predecessor = segment["segment_id"]
+                expected_start = end + 20
+            if covered != list(schedule):
+                raise ContractError(f"{stage} segmented schedule mismatch")
+            for entry in stages[stage]:
+                matching = [
+                    segment
+                    for segment in chain
+                    if entry["epoch"] in segment["candidate_epochs"]
+                ]
+                if (
+                    len(matching) != 1
+                    or Path(entry["checkpoint"]).parent
+                    != Path(matching[0]["run_path"])
+                    / "representation_candidates"
+                ):
+                    raise ContractError(
+                        f"{stage} candidate escapes its immutable segment"
+                    )
     if path is not None:
         regular_file(path, "candidate index")
     return payload
