@@ -692,7 +692,7 @@ class ReleasedCheckpointPrimitiveTests(unittest.TestCase):
             link.symlink_to(target)
             with self.assertRaisesRegex(
                 INFERENCE.InferenceContractError,
-                "non-symlink",
+                "must not be a symlink",
             ):
                 INFERENCE._load_released_model_state_only(
                     link,

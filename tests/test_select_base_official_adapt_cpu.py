@@ -37,6 +37,12 @@ FEATURES = importlib.util.module_from_spec(FEATURE_SPEC)
 FEATURE_SPEC.loader.exec_module(FEATURES)
 
 
+def _canonical_temporary_directory() -> tempfile.TemporaryDirectory[str]:
+    return tempfile.TemporaryDirectory(
+        dir=Path(tempfile.gettempdir()).resolve()
+    )
+
+
 def _write_json(path: Path, value: object) -> str:
     path.write_text(
         json.dumps(
@@ -900,7 +906,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
                     )
 
     def test_parent_symlink_cannot_hide_resolved_test_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             actual_parent = root / "actual-test"
             actual_val = actual_parent / "val"
@@ -911,7 +917,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
             safe_parent.symlink_to(actual_parent, target_is_directory=True)
             with self.assertRaisesRegex(
                 SELECTOR.SelectionContractError,
-                "test-labeled",
+                "canonical with no symlink ancestor",
             ):
                 SELECTOR.require_directory(
                     str(safe_parent / "val"),
@@ -919,7 +925,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
                 )
             with self.assertRaisesRegex(
                 SELECTOR.SelectionContractError,
-                "test-labeled",
+                "canonical with no symlink ancestor",
             ):
                 SELECTOR._validate_output_file_receipt(
                     {
@@ -983,7 +989,7 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
         self.assertIn("val) formal_expected_clips=1715", launcher)
         self.assertIn("test) formal_expected_clips=1708", launcher)
 
-    def test_audio_launcher_rejects_wrong_val_count_before_inputs(self) -> None:
+    def test_audio_launcher_rejects_unguarded_direct_invocation(self) -> None:
         launcher = ROOT / "scripts/show_base/run_audio_cache_8shard.sh"
         arguments = [
             "/missing/repo",
@@ -1010,16 +1016,26 @@ class BaseValSelectorStaticContracts(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(
-            "formal val audio clip count must be 1715",
+        self.assertEqual(result.returncode, 1)
+        self.assertRegex(
             result.stderr,
+            (
+                "guarded runner process is unavailable|"
+                "requires direct parent /tmp/globaldiff_guarded_runner.py"
+            ),
+        )
+        launcher_source = launcher.read_text(encoding="utf-8")
+        self.assertLess(
+            launcher_source.index(
+                "semtalk_require_exact_guarded_runner_all_gpus"
+            ),
+            launcher_source.index("formal_expected_clips=1715"),
         )
 
     def test_audio_builder_accepts_only_authenticated_val_view_receipt(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             manifest_sha = hashlib.sha256(
                 fixture.canonical_path.read_bytes()
@@ -1059,7 +1075,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
     def test_complete_fixture_selects_minimum_fgd_with_earliest_tie(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(
                 Path(temporary),
                 materialize_inference_outputs=True,
@@ -1120,7 +1136,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
     def test_main_atomically_creates_and_never_overwrites_selection(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             fixture = SelectionFixture(
                 root,
@@ -1138,7 +1154,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 SELECTOR.main(fixture.argv(output))
 
     def test_main_rejects_e30_labeled_output_before_publication(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             fixture = SelectionFixture(root)
             output = root / "e30" / "selected.json"
@@ -1149,7 +1165,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_wrong_candidate_epoch_order_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(
                 Path(temporary),
                 materialize_inference_outputs=True,
@@ -1169,7 +1185,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_unlisted_epoch_30_candidate_file_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             (
                 fixture.run
@@ -1183,7 +1199,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 fixture.bundle()
 
     def test_boolean_candidate_epoch_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             manifest = json.loads(
                 fixture.manifest_path.read_text(encoding="utf-8")
@@ -1206,7 +1222,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 fixture.bundle()
 
     def test_frozen_source_with_e30_path_is_hard_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             frozen = json.loads(
                 fixture.frozen_path.read_text(encoding="utf-8")
@@ -1222,7 +1238,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 SELECTOR._validate_frozen_inputs(frozen)
 
     def test_nonfinite_fgd_and_inexact_coverage_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             report = fixture.report(1)
             report["metrics"]["fgd"] = float("inf")
@@ -1261,7 +1277,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_validation_report_requires_exact_fgd_only_metrics(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             report = fixture.report(1)
             self.assertEqual(set(report["metrics"]), {"fgd"})
@@ -1294,7 +1310,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
     def test_pinned_evaluator_or_autoencoder_mismatch_is_rejected(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             report = fixture.report(1)
             report["provenance"]["evaluator"]["sha256"] = "0" * 64
@@ -1334,7 +1350,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_diffsheg_report_rejects_e30_labeled_input_path(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             report = fixture.report(1)
             report["inputs"]["prediction_dir"] = "/withdrawn/e30/val"
@@ -1357,7 +1373,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_candidate_report_cannot_be_reused_for_another_epoch(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(
                 Path(temporary),
                 materialize_inference_outputs=True,
@@ -1390,7 +1406,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
     def test_inference_lineage_must_bind_its_candidate_sha_and_epoch(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             measurement_path = fixture.measurement_paths[0]
             measurement = json.loads(
@@ -1427,7 +1443,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_canonical_output_id_collision_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             rows = copy.deepcopy(fixture.canonical_rows)
             first_sequence = str(rows[0]["clip_id"]).split("/")[-1]
@@ -1448,7 +1464,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 SELECTOR._canonical_coverage(payload, "collision fixture")
 
     def test_audio_feature_file_hash_is_reopened(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             val_inputs = json.loads(
                 fixture.val_inputs_path.read_text(encoding="utf-8")
@@ -1468,7 +1484,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_any_canonical_test_row_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             rows = list(fixture.canonical_rows)
             rows[0] = {**rows[0], "split": "test"}
@@ -1492,7 +1508,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                 )
 
     def test_any_audio_test_row_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             val_inputs = json.loads(
                 fixture.val_inputs_path.read_text(encoding="utf-8")
@@ -1520,7 +1536,7 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
     def test_test_visible_measurement_is_rejected_before_selection(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             fixture = SelectionFixture(Path(temporary))
             first = fixture.measurement_paths[0]
             measurement = json.loads(first.read_text(encoding="utf-8"))

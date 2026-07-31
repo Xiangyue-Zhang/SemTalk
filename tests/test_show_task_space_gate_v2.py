@@ -19,6 +19,12 @@ sys.modules[SPEC.name] = gate
 SPEC.loader.exec_module(gate)
 
 
+def _canonical_temporary_directory() -> tempfile.TemporaryDirectory[str]:
+    return tempfile.TemporaryDirectory(
+        dir=Path(tempfile.gettempdir()).resolve()
+    )
+
+
 def error_summary(value: float, count: int = 12) -> dict[str, object]:
     return {
         "count": count,
@@ -121,7 +127,7 @@ class CandidateLineageTest(unittest.TestCase):
         return path, hashlib.sha256(path.read_bytes()).hexdigest(), payloads
 
     def test_adapted_weights_are_external_exact_and_lineage_is_complete(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             path, digest, payloads = self._write_candidate(root)
             manifest, lineage = gate.load_candidate_lineage(path, digest)
@@ -143,14 +149,14 @@ class CandidateLineageTest(unittest.TestCase):
             gate.verify_receipt_payload_hash(lineage, "candidate lineage")
 
     def test_weight_bytes_are_rehashed_and_adaptation_requires_receipt(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             path, digest, _ = self._write_candidate(root)
             (root / "face.bin").write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"):
                 gate.load_candidate_lineage(path, digest)
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             path, _, _ = self._write_candidate(root)
             manifest = json.loads(path.read_text())
@@ -161,7 +167,7 @@ class CandidateLineageTest(unittest.TestCase):
                 gate.load_candidate_lineage(path, digest)
 
     def test_candidate_manifest_requires_all_six_weights(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             path, _, _ = self._write_candidate(root)
             manifest = json.loads(path.read_text())
@@ -245,7 +251,7 @@ class TaskSpaceMetricContractTest(unittest.TestCase):
         )
 
     def test_canonical_coverage_is_recomputed_exactly_per_split(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             splits = ("train", "val", "val", "test")
             rows = []
@@ -376,7 +382,7 @@ class SplitAndOneShotTest(unittest.TestCase):
         )
 
     def test_only_passing_validation_decision_can_be_locked(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             lineage = self._lineage(root)
             for split, passed in (("test", True), ("val", False)):
@@ -417,7 +423,7 @@ class SplitAndOneShotTest(unittest.TestCase):
             self.assertEqual(lock["test_measurements_authorized"], 1)
 
     def test_test_claim_is_atomic_one_shot_and_candidate_bound(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _canonical_temporary_directory() as temporary:
             root = Path(temporary)
             lineage = self._lineage(root)
             claim_path = root / "test-once-claim.json"

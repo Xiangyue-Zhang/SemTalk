@@ -235,7 +235,14 @@ class LowerLiveBackendReceiptTest(unittest.TestCase):
             / "show_base"
             / "run_five_prerequisites.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("if [[ $# -ne 10 && $# -ne 11 ]]", launcher)
+        self.assertIn(
+            "if [[ $# -ne 10 && $# -ne 11 && $# -ne 13 ]]",
+            launcher,
+        )
+        self.assertIn(
+            "--continuation-wave WAVE_JSON WAVE_SHA256",
+            launcher,
+        )
         self.assertNotIn("LOWER_TARGET_CACHE", launcher)
         self.assertNotIn("lower_target_manifest", launcher)
         self.assertNotIn("lower_target_checker", launcher)

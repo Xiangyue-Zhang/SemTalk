@@ -6,21 +6,26 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - minimal CPU-only environments
+    torch = None
 
-from utils.smplx_training import (
-    SmplxTrainingPool,
-    build_smplx_training_pool,
-    clip_aligned_spans,
-    combine_local_loss_parts,
-    parse_smplx_helper_devices,
-    smplx_local_loss_numerators,
-)
+if torch is not None:
+    from utils.smplx_training import (
+        SmplxTrainingPool,
+        build_smplx_training_pool,
+        clip_aligned_spans,
+        combine_local_loss_parts,
+        parse_smplx_helper_devices,
+        smplx_local_loss_numerators,
+    )
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipIf(torch is None, "optional torch dependency is unavailable")
 class SmplxTrainingPoolCpuTest(unittest.TestCase):
     def test_clip_aligned_spans_are_balanced_complete_and_ordered(self) -> None:
         self.assertEqual(
