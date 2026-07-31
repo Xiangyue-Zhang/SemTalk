@@ -2007,7 +2007,9 @@ def adapter_stage_plans_from_wave(
             "new_run_path": new["run_path"],
             "old_source": dict(old["source"]),
             "new_source": dict(new["source"]),
+            "old_host": old["host"],
             "new_host": new["host"],
+            "old_smplx_asset": copy.deepcopy(old["smplx_asset"]),
             "new_smplx_asset": copy.deepcopy(new["smplx_asset"]),
             "new_source_repository": new["source_ancestry"][
                 "repository_path"
