@@ -1,0 +1,42 @@
+{
+  "format": "semtalk_show_base_long_trajectory_anchor_v1",
+  "source_candidate_manifest": "/efs/xiangyuezhang/semtalk_show_base_official_adapt_train_20260730_2236_5b5c8dc/official_all_show_base_e40/candidate_manifest.json",
+  "source_candidate_manifest_sha256": "d559e26d5589005458e5bc169450e265591f6d4c9b2da242ebb69dc6395658ca",
+  "entries": {
+    "1": {
+      "checkpoint_sha256": "36b08f889a74c3d2352bbc857c0b4c1bae97aeac25995e81dd7b0c690e0180fa",
+      "model_state_semantic_sha256": "27f34a614c3f8e925518ada6d4f84e62bd467efa4dd031d9b7633a5255fef8db",
+      "tensor_count": 1790
+    },
+    "2": {
+      "checkpoint_sha256": "1c98ccb91727e5018e9517c2975c9013a873d071a90855de605a9c4c8b222aa9",
+      "model_state_semantic_sha256": "459d4b98d6e48607c8c740aa644bd77fe7eee463c3f31e2125ca48bf817a5a49",
+      "tensor_count": 1790
+    },
+    "4": {
+      "checkpoint_sha256": "3edb6ade6de05bb5c8d5e337d35c2a1ee9e6de092a10dfd5196af6d6286bac99",
+      "model_state_semantic_sha256": "6c860de009ca802d9141ac2299d624c5774135e29638135759aa50e69239fb9a",
+      "tensor_count": 1790
+    },
+    "8": {
+      "checkpoint_sha256": "bed46a2fd0efe17149e1c4eec127c7477e2eb12c44bb31d0572948fdbf86d3df",
+      "model_state_semantic_sha256": "77b671f34622f7ab677cfc43f9d9ce94757fb9357c4bdd55f80daa442d6e099e",
+      "tensor_count": 1790
+    },
+    "16": {
+      "checkpoint_sha256": "8819a5233afedbc6de01aa5d618fb7de1c6a17ce2293cff3f62542be9cc04bb4",
+      "model_state_semantic_sha256": "9dfe9f36cb72b596e64f12fa87d73dbb7dacf87187981d8578dc752966a3042c",
+      "tensor_count": 1790
+    },
+    "32": {
+      "checkpoint_sha256": "d3b274904a10b9f8ac0be8ebffcc4487c91e2e6caf75a0ab17c927eca97f5811",
+      "model_state_semantic_sha256": "1a78daae707ad1173d4d17cb55eecf61b85dfa65666ac3c20220842639129cb3",
+      "tensor_count": 1790
+    },
+    "40": {
+      "checkpoint_sha256": "027523157e81291082243b93e3b8cd57adba57e421fd2862dd6db83feb3d3e6d",
+      "model_state_semantic_sha256": "3a937c663f559c4db13b6cef7e6ef9f0619f8909101416bb63cd1696e9d212f4",
+      "tensor_count": 1790
+    }
+  }
+}
