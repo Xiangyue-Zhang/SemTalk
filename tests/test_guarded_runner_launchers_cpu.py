@@ -141,6 +141,7 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
             "torch.distributed.run",
             "run_base_inference.py",
             "run_lower_target_cache_builder.py",
+            "dual_node_guarded_transaction.py",
         )
         launchers = []
         for path in sorted(directory.glob("run_*.sh")):
@@ -167,6 +168,7 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
                 "run_base_released_all_speakers_inference.sh",
                 "run_base_training.sh",
                 "run_canonical_cache_8shard.sh",
+                "run_dual_node_guarded_transaction.sh",
                 "run_five_prerequisites.sh",
                 "run_lower_target_cache_builder_guarded.sh",
                 "run_prerequisite_val_8shard.sh",
