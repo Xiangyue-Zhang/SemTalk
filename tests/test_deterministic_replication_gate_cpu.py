@@ -87,9 +87,24 @@ class GateFixture:
             self.model_files[stage] = path
         self.model_bundle = self._model_bundle()
         self.source_closure = self._source_closure()
+        self._write_parent_val_authority()
         self.subset_path = root / "gate-subset.json"
         self.subset_rows = self._subset_rows()
-        _write_json(self.subset_path, self.subset_rows)
+        self.subset_payload = _with_payload_sha(
+            {
+                "format": GATE.SUBSET_FORMAT,
+                "payload_hash_algorithm": GATE.PAYLOAD_HASH_ALGORITHM,
+                "status": "frozen",
+                "split": "val",
+                "test_visible": False,
+                "parent_authority": self.parent_authority,
+                "selection_algorithm": (
+                    "first_per_speaker_prefer_distinct_frame_length_v1"
+                ),
+                "rows": self.subset_rows,
+            }
+        )
+        _write_json(self.subset_path, self.subset_payload)
         self.subset_artifact = _artifact(self.subset_path)
         self.seed_paths: list[Path] = []
         self.seed_shas: list[str] = []
@@ -167,22 +182,122 @@ class GateFixture:
             "bundle_sha256": GATE.canonical_json_sha256(checkpoints),
         }
 
-    def _subset_rows(self) -> list[dict[str, object]]:
-        lengths = (64, 88, 121, 88)
-        return [
+    def _write_parent_val_authority(self) -> None:
+        lengths = (64, 88, 121, 96)
+        canonical_rows = []
+        for position in range(GATE.EXPECTED_VAL_CLIPS):
+            speaker = GATE.EXPECTED_SPEAKERS[
+                position % len(GATE.EXPECTED_SPEAKERS)
+            ]
+            canonical_rows.append(
+                {
+                    "global_index": (
+                        GATE.EXPECTED_VAL_GLOBAL_INDEX_START + position
+                    ),
+                    "clip_id": (
+                        f"{speaker}/video-{position}/sequence-{position}"
+                    ),
+                    "split": "val",
+                    "frames": lengths[position % len(lengths)],
+                    "canonical_npz": f"/frozen/val/{position}.npz",
+                }
+            )
+        self.canonical_rows = canonical_rows
+        canonical_path = self.root / "canonical-val.jsonl"
+        canonical_path.write_text(
+            "".join(
+                json.dumps(
+                    row,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+                for row in canonical_rows
+            ),
+            encoding="utf-8",
+        )
+        canonical_artifact = _artifact(canonical_path)
+        lineage_path = self.root / "canonical-lineage.json"
+        lineage = _with_payload_sha(
             {
-                "gate_position": index,
-                "canonical_position": index * 10,
-                "global_index": 100 + index,
-                "source_clip_id": f"{speaker}/video/clip-{index}",
-                "canonical_clip_id": f"{speaker}__video__clip-{index}",
-                "speaker": speaker,
-                "frames": lengths[index],
-                "canonical_row_sha256": str(index + 1) * 64,
-                "audio_row_sha256": str(index + 5) * 64,
+                "format": "canonical-val-lineage-v1",
+                "status": "complete",
+                "split": "val",
+                "test_visible": False,
+                "clip_count": GATE.EXPECTED_VAL_CLIPS,
+                "manifest_sha256": canonical_artifact["sha256"],
+                "projection": {
+                    "operation": "filter_exact_split",
+                    "split": "val",
+                    "test_rows_materialized": False,
+                },
             }
-            for index, speaker in enumerate(GATE.EXPECTED_SPEAKERS)
-        ]
+        )
+        _write_json(lineage_path, lineage)
+        lineage_artifact = _artifact(
+            lineage_path,
+            payload_sha=lineage["receipt_payload_sha256"],
+        )
+        val_inputs_path = self.root / "val-inputs.json"
+        val_inputs = _with_payload_sha(
+            {
+                "format": "val-inputs-v1",
+                "status": "frozen",
+                "split": "val",
+                "test_visible": False,
+                "expected_clip_count": GATE.EXPECTED_VAL_CLIPS,
+                "canonical_manifest": {
+                    "path": canonical_artifact["path"],
+                    "sha256": canonical_artifact["sha256"],
+                },
+                "canonical_lineage": {
+                    "path": lineage_artifact["path"],
+                    "sha256": lineage_artifact["sha256"],
+                    "receipt_payload_sha256": lineage_artifact[
+                        "receipt_payload_sha256"
+                    ],
+                },
+            }
+        )
+        _write_json(val_inputs_path, val_inputs)
+        val_inputs_artifact = _artifact(
+            val_inputs_path,
+            payload_sha=val_inputs["receipt_payload_sha256"],
+        )
+        self.parent_authority = {
+            "val_inputs_receipt": val_inputs_artifact,
+            "canonical_manifest": canonical_artifact,
+            "canonical_lineage": lineage_artifact,
+            "expected_clip_count": GATE.EXPECTED_VAL_CLIPS,
+            "global_index_start": GATE.EXPECTED_VAL_GLOBAL_INDEX_START,
+            "global_index_stop_exclusive": (
+                GATE.EXPECTED_VAL_GLOBAL_INDEX_STOP
+            ),
+        }
+
+    def _subset_rows(self) -> list[dict[str, object]]:
+        rows = []
+        for index, speaker in enumerate(GATE.EXPECTED_SPEAKERS):
+            parent = self.canonical_rows[index]
+            rows.append(
+                {
+                    "gate_position": index,
+                    "canonical_position": index,
+                    "global_index": parent["global_index"],
+                    "source_clip_id": parent["clip_id"],
+                    "canonical_clip_id": (
+                        f"{speaker}__sequence-{index}"
+                    ),
+                    "speaker": speaker,
+                    "frames": parent["frames"],
+                    "canonical_row_sha256": (
+                        GATE.canonical_json_sha256(parent)
+                    ),
+                    "audio_row_sha256": str(index + 5) * 64,
+                }
+            )
+        return rows
 
     @staticmethod
     def _rng_state(seed: int, position: int) -> dict[str, str]:
@@ -227,6 +342,7 @@ class GateFixture:
         return _with_payload_sha(
             {
                 "format": GATE.SEED_RUN_FORMAT,
+                "payload_hash_algorithm": GATE.PAYLOAD_HASH_ALGORITHM,
                 "status": "complete",
                 "split": "val",
                 "test_visible": False,
@@ -349,6 +465,18 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             ),
             receipt,
         )
+        pure_receipt = (
+            GATE.build_distribution_receipt_from_validated_artifacts(
+                gate_artifact=receipt["validation_gate"],
+                prediction_manifest_artifact=manifest_artifact,
+                prediction_records=records,
+            )
+        )
+        self.assertEqual(pure_receipt, receipt)
+        self.assertEqual(
+            receipt["payload_hash_algorithm"],
+            GATE.PAYLOAD_HASH_ALGORITHM,
+        )
 
     def test_rng_consumption_fails_closed(self) -> None:
         def mutate(value: dict[str, object]) -> None:
@@ -407,9 +535,13 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             self.build()
 
     def test_gate_requires_four_speakers_and_multiple_lengths(self) -> None:
-        rows = copy.deepcopy(self.fixture.subset_rows)
-        rows[-1]["speaker"] = "oliver"
-        _write_json(self.fixture.subset_path, rows)
+        subset = copy.deepcopy(self.fixture.subset_payload)
+        subset["rows"][-1]["speaker"] = "oliver"
+        subset.pop("receipt_payload_sha256")
+        subset["receipt_payload_sha256"] = (
+            GATE.canonical_json_sha256(subset)
+        )
+        _write_json(self.fixture.subset_path, subset)
         self.fixture.subset_artifact = _artifact(self.fixture.subset_path)
 
         def mutate(value: dict[str, object]) -> None:
@@ -420,6 +552,87 @@ class DeterministicReplicationGateTests(unittest.TestCase):
         with self.assertRaisesRegex(
             GATE.ReplicationGateError,
             "gate subset row",
+        ):
+            self.build()
+
+    def test_parent_test_row_relabel_fails_closed(self) -> None:
+        canonical_path = Path(
+            self.fixture.parent_authority["canonical_manifest"]["path"]
+        )
+        rows = copy.deepcopy(self.fixture.canonical_rows)
+        rows[0]["split"] = "test"
+        canonical_path.write_text(
+            "".join(
+                json.dumps(
+                    row,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+        canonical_artifact = _artifact(canonical_path)
+        self.fixture.parent_authority["canonical_manifest"] = (
+            canonical_artifact
+        )
+        subset = copy.deepcopy(self.fixture.subset_payload)
+        subset["parent_authority"]["canonical_manifest"] = (
+            canonical_artifact
+        )
+        subset.pop("receipt_payload_sha256")
+        subset["receipt_payload_sha256"] = GATE.canonical_json_sha256(
+            subset
+        )
+        _write_json(self.fixture.subset_path, subset)
+        self.fixture.subset_artifact = _artifact(self.fixture.subset_path)
+
+        def mutate(value: dict[str, object]) -> None:
+            value["subset_manifest"] = self.fixture.subset_artifact
+
+        self.fixture.rewrite_seed(0, mutate)
+        self.fixture.rewrite_seed(1, mutate)
+        with self.assertRaisesRegex(
+            GATE.ReplicationGateError,
+            "val-input receipt does not bind",
+        ):
+            self.build()
+
+    def test_parent_manifest_swap_fails_closed(self) -> None:
+        swapped_path = self.root / "swapped-val.jsonl"
+        swapped_rows = list(reversed(self.fixture.canonical_rows))
+        swapped_path.write_text(
+            "".join(
+                json.dumps(
+                    row,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+                for row in swapped_rows
+            ),
+            encoding="utf-8",
+        )
+        subset = copy.deepcopy(self.fixture.subset_payload)
+        subset["parent_authority"]["canonical_manifest"] = _artifact(
+            swapped_path
+        )
+        subset.pop("receipt_payload_sha256")
+        subset["receipt_payload_sha256"] = GATE.canonical_json_sha256(
+            subset
+        )
+        _write_json(self.fixture.subset_path, subset)
+        self.fixture.subset_artifact = _artifact(self.fixture.subset_path)
+
+        def mutate(value: dict[str, object]) -> None:
+            value["subset_manifest"] = self.fixture.subset_artifact
+
+        self.fixture.rewrite_seed(0, mutate)
+        self.fixture.rewrite_seed(1, mutate)
+        with self.assertRaisesRegex(
+            GATE.ReplicationGateError,
+            "val-input receipt does not bind",
         ):
             self.build()
 
@@ -471,6 +684,54 @@ class DeterministicReplicationGateTests(unittest.TestCase):
         ):
             GATE.validate_distribution_receipt(
                 receipt,
+                expected_gate_artifact=receipt["validation_gate"],
+                expected_prediction_manifest=manifest_artifact,
+                expected_prediction_records=records,
+            )
+
+    def test_distribution_payload_hash_or_schema_tampering_is_rejected(
+        self,
+    ) -> None:
+        gate = self.build()
+        gate_path = self.root / "gate.json"
+        gate_sha = _write_json(gate_path, gate)
+        manifest_path = self.root / "predictions.jsonl"
+        manifest_path.write_bytes(b'{"clip":"a"}\n')
+        manifest_artifact = _artifact(manifest_path)
+        records = [
+            {
+                "canonical_clip_id": "clip-a",
+                "prediction_sha256": "a" * 64,
+                "prediction_bytes": 1,
+            }
+        ]
+        receipt = GATE.build_distribution_receipt(
+            gate_path=gate_path,
+            expected_gate_sha256=gate_sha,
+            prediction_manifest_artifact=manifest_artifact,
+            prediction_records=records,
+            expected_scope="validation_candidate_family",
+        )
+        bad_hash = copy.deepcopy(receipt)
+        bad_hash["receipt_payload_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            GATE.ReplicationGateError,
+            "payload SHA-256 mismatch",
+        ):
+            GATE.validate_distribution_receipt(
+                bad_hash,
+                expected_gate_artifact=receipt["validation_gate"],
+                expected_prediction_manifest=manifest_artifact,
+                expected_prediction_records=records,
+            )
+        bad_schema = copy.deepcopy(receipt)
+        bad_schema.pop("payload_hash_algorithm")
+        with self.assertRaisesRegex(
+            GATE.ReplicationGateError,
+            "schema mismatch",
+        ):
+            GATE.validate_distribution_receipt(
+                bad_schema,
                 expected_gate_artifact=receipt["validation_gate"],
                 expected_prediction_manifest=manifest_artifact,
                 expected_prediction_records=records,

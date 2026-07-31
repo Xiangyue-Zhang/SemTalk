@@ -38,10 +38,15 @@ sys.dont_write_bytecode = True
 FORMAT = "semtalk_show_deterministic_replication_gate_v1"
 SEED_RUN_FORMAT = "semtalk_show_deterministic_seed_run_v1"
 DISTRIBUTION_FORMAT = "semtalk_show_deterministic_distribution_receipt_v1"
+PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_v1"
 PROTOCOL = "deterministic_replication_of_single_prediction_v1"
 REPLICATION_ALGORITHM = "logical_reference_v1"
 EXPECTED_SEEDS = (0, 15)
 EXPECTED_SPEAKERS = ("oliver", "chemistry", "seth", "conan")
+EXPECTED_VAL_CLIPS = 1_715
+EXPECTED_VAL_GLOBAL_INDEX_START = 13_687
+EXPECTED_VAL_GLOBAL_INDEX_STOP = 15_402
+SUBSET_FORMAT = "semtalk_show_deterministic_gate_subset_v1"
 EXPECTED_NPZ_FIELDS = (
     "betas",
     "poses",
@@ -169,6 +174,12 @@ def _strict_json_bytes(payload: bytes, label: str) -> Any:
 def _regular_file(path: Path, label: str) -> Path:
     if not path.is_absolute():
         raise ReplicationGateError(f"{label} must be absolute")
+    for component in path.parts:
+        normalized = component.casefold()
+        if normalized in {"test", "tests", "testset", "testsets"}:
+            raise ReplicationGateError(
+                f"{label} must not expose a test-labelled path"
+            )
     try:
         mode = os.lstat(path).st_mode
     except OSError as error:
@@ -178,6 +189,49 @@ def _regular_file(path: Path, label: str) -> Path:
             f"{label} must be a regular non-symlink file"
         )
     return path.resolve(strict=True)
+
+
+def _canonical_clip_id(source_clip_id: str) -> str:
+    pieces = source_clip_id.split("/")
+    if len(pieces) != 3 or any(not piece for piece in pieces):
+        raise ReplicationGateError(
+            f"invalid canonical SHOW source clip ID: {source_clip_id!r}"
+        )
+    speaker, _video, sequence = pieces
+    if (
+        speaker not in EXPECTED_SPEAKERS
+        or "__" in speaker
+        or "/" in sequence
+        or sequence in {"", ".", ".."}
+        or "\x00" in sequence
+    ):
+        raise ReplicationGateError(
+            f"unsafe canonical SHOW source clip ID: {source_clip_id!r}"
+        )
+    return f"{speaker}__{sequence}"
+
+
+def _strict_jsonl_bytes(payload: bytes, label: str) -> list[dict[str, Any]]:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ReplicationGateError(
+            f"{label} is not UTF-8: {error}"
+        ) from error
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        value = _strict_json_bytes(
+            line.encode("utf-8"),
+            f"{label}:{line_number}",
+        )
+        if not isinstance(value, dict):
+            raise ReplicationGateError(
+                f"{label}:{line_number} must be an object"
+            )
+        rows.append(value)
+    return rows
 
 
 def _artifact(
@@ -420,7 +474,155 @@ def _validate_subset_manifest(
         "replication-gate subset manifest",
     )
     payload = _strict_json_bytes(path.read_bytes(), str(path))
-    if not isinstance(payload, list) or len(payload) != len(EXPECTED_SPEAKERS):
+    subset = _exact_mapping(
+        payload,
+        {
+            "format",
+            "payload_hash_algorithm",
+            "status",
+            "split",
+            "test_visible",
+            "parent_authority",
+            "selection_algorithm",
+            "rows",
+            "receipt_payload_sha256",
+        },
+        "gate subset manifest",
+    )
+    _payload_hash(subset, "gate subset manifest")
+    if (
+        subset["format"] != SUBSET_FORMAT
+        or subset["payload_hash_algorithm"] != PAYLOAD_HASH_ALGORITHM
+        or subset["status"] != "frozen"
+        or subset["split"] != "val"
+        or subset["test_visible"] is not False
+        or subset["selection_algorithm"]
+        != "first_per_speaker_prefer_distinct_frame_length_v1"
+    ):
+        raise ReplicationGateError(
+            "gate subset is not the frozen validation-only protocol"
+        )
+    parent = _exact_mapping(
+        subset["parent_authority"],
+        {
+            "val_inputs_receipt",
+            "canonical_manifest",
+            "canonical_lineage",
+            "expected_clip_count",
+            "global_index_start",
+            "global_index_stop_exclusive",
+        },
+        "gate subset parent authority",
+    )
+    if (
+        _require_int(
+            parent["expected_clip_count"],
+            "parent expected clip count",
+        )
+        != EXPECTED_VAL_CLIPS
+        or _require_int(
+            parent["global_index_start"],
+            "parent val global-index start",
+        )
+        != EXPECTED_VAL_GLOBAL_INDEX_START
+        or _require_int(
+            parent["global_index_stop_exclusive"],
+            "parent val global-index stop",
+        )
+        != EXPECTED_VAL_GLOBAL_INDEX_STOP
+    ):
+        raise ReplicationGateError(
+            "gate parent authority does not bind the exact SHOW val domain"
+        )
+    val_inputs_artifact, val_inputs_path = _artifact(
+        parent["val_inputs_receipt"],
+        "gate parent val-input receipt",
+        payload_sha=True,
+    )
+    canonical_artifact, canonical_path = _artifact(
+        parent["canonical_manifest"],
+        "gate parent canonical val manifest",
+    )
+    lineage_artifact, lineage_path = _artifact(
+        parent["canonical_lineage"],
+        "gate parent canonical val lineage",
+        payload_sha=True,
+    )
+    val_inputs = _strict_json_bytes(
+        val_inputs_path.read_bytes(),
+        str(val_inputs_path),
+    )
+    if not isinstance(val_inputs, dict):
+        raise ReplicationGateError("parent val-input receipt is not an object")
+    _payload_hash(val_inputs, "parent val-input receipt")
+    if (
+        val_inputs.get("split") != "val"
+        or val_inputs.get("test_visible") is not False
+        or val_inputs.get("expected_clip_count") != EXPECTED_VAL_CLIPS
+        or val_inputs.get("receipt_payload_sha256")
+        != val_inputs_artifact["receipt_payload_sha256"]
+        or not isinstance(val_inputs.get("canonical_manifest"), dict)
+        or val_inputs["canonical_manifest"].get("path")
+        != canonical_artifact["path"]
+        or val_inputs["canonical_manifest"].get("sha256")
+        != canonical_artifact["sha256"]
+        or not isinstance(val_inputs.get("canonical_lineage"), dict)
+        or val_inputs["canonical_lineage"].get("path")
+        != lineage_artifact["path"]
+        or val_inputs["canonical_lineage"].get("sha256")
+        != lineage_artifact["sha256"]
+    ):
+        raise ReplicationGateError(
+            "gate parent val-input receipt does not bind canonical val "
+            "manifest/lineage"
+        )
+    lineage = _strict_json_bytes(
+        lineage_path.read_bytes(),
+        str(lineage_path),
+    )
+    if not isinstance(lineage, dict):
+        raise ReplicationGateError(
+            "parent canonical val lineage is not an object"
+        )
+    _payload_hash(lineage, "parent canonical val lineage")
+    if (
+        lineage.get("split") != "val"
+        or lineage.get("test_visible") is not False
+        or lineage.get("clip_count") != EXPECTED_VAL_CLIPS
+        or lineage.get("manifest_sha256")
+        != canonical_artifact["sha256"]
+        or lineage.get("receipt_payload_sha256")
+        != lineage_artifact["receipt_payload_sha256"]
+        or not isinstance(lineage.get("projection"), dict)
+        or lineage["projection"].get("split") != "val"
+        or lineage["projection"].get("test_rows_materialized") is not False
+    ):
+        raise ReplicationGateError(
+            "gate canonical lineage is not a validation-only projection"
+        )
+    canonical_rows = _strict_jsonl_bytes(
+        canonical_path.read_bytes(),
+        str(canonical_path),
+    )
+    if len(canonical_rows) != EXPECTED_VAL_CLIPS:
+        raise ReplicationGateError(
+            "gate parent canonical manifest does not contain 1715 val rows"
+        )
+    for position, parent_row in enumerate(canonical_rows):
+        if (
+            parent_row.get("split") != "val"
+            or parent_row.get("global_index")
+            != EXPECTED_VAL_GLOBAL_INDEX_START + position
+        ):
+            raise ReplicationGateError(
+                "gate parent canonical manifest includes a relabelled/test "
+                "row or leaves the exact validation global-index domain"
+            )
+    payload_rows = subset["rows"]
+    if (
+        not isinstance(payload_rows, list)
+        or len(payload_rows) != len(EXPECTED_SPEAKERS)
+    ):
         raise ReplicationGateError(
             "gate subset must contain exactly four validation clips"
         )
@@ -436,7 +638,7 @@ def _validate_subset_manifest(
         "audio_row_sha256",
     }
     rows: list[dict[str, Any]] = []
-    for expected_position, row in enumerate(payload):
+    for expected_position, row in enumerate(payload_rows):
         item = _exact_mapping(
             row,
             expected_keys,
@@ -469,6 +671,28 @@ def _validate_subset_manifest(
             "canonical row SHA-256",
         )
         _require_sha256(item["audio_row_sha256"], "audio row SHA-256")
+        canonical_position = item["canonical_position"]
+        if canonical_position >= len(canonical_rows):
+            raise ReplicationGateError(
+                "gate subset canonical position is outside parent manifest"
+            )
+        parent_row = canonical_rows[canonical_position]
+        parent_clip_id = parent_row.get("clip_id")
+        if (
+            canonical_json_sha256(parent_row)
+            != item["canonical_row_sha256"]
+            or parent_row.get("split") != "val"
+            or parent_row.get("global_index") != item["global_index"]
+            or parent_row.get("frames") != item["frames"]
+            or parent_clip_id != item["source_clip_id"]
+            or not isinstance(parent_clip_id, str)
+            or parent_clip_id.split("/", 1)[0] != item["speaker"]
+            or _canonical_clip_id(parent_clip_id)
+            != item["canonical_clip_id"]
+        ):
+            raise ReplicationGateError(
+                "gate subset row differs from its frozen parent val row"
+            )
         rows.append(dict(item))
     if len({row["frames"] for row in rows}) < 2:
         raise ReplicationGateError(
@@ -493,6 +717,7 @@ def _validate_seed_run(
         payload,
         {
             "format",
+            "payload_hash_algorithm",
             "status",
             "split",
             "test_visible",
@@ -512,6 +737,7 @@ def _validate_seed_run(
     claimed_payload = _payload_hash(run, "seed-run receipt")
     if (
         run["format"] != SEED_RUN_FORMAT
+        or run["payload_hash_algorithm"] != PAYLOAD_HASH_ALGORITHM
         or run["status"] != "complete"
         or run["split"] != "val"
         or run["test_visible"] is not False
@@ -765,9 +991,21 @@ def build_gate(
             }
         )
     subset_path = Path(runs[0]["subset_manifest"]["path"])
-    subset = _strict_json_bytes(subset_path.read_bytes(), str(subset_path))
+    subset_payload = _strict_json_bytes(
+        subset_path.read_bytes(),
+        str(subset_path),
+    )
+    if not isinstance(subset_payload, dict) or not isinstance(
+        subset_payload.get("rows"),
+        list,
+    ):
+        raise ReplicationGateError(
+            "fresh gate subset payload lacks rows"
+        )
+    subset = subset_payload["rows"]
     result: dict[str, Any] = {
         "format": FORMAT,
+        "payload_hash_algorithm": PAYLOAD_HASH_ALGORITHM,
         "status": "pass",
         "split": "val",
         "test_visible": False,
@@ -825,6 +1063,7 @@ def load_gate(
         payload,
         {
             "format",
+            "payload_hash_algorithm",
             "status",
             "split",
             "test_visible",
@@ -844,6 +1083,7 @@ def load_gate(
     claimed = _payload_hash(gate, "replication gate")
     if (
         gate["format"] != FORMAT
+        or gate["payload_hash_algorithm"] != PAYLOAD_HASH_ALGORITHM
         or gate["status"] != "pass"
         or gate["split"] != "val"
         or gate["test_visible"] is not False
@@ -936,6 +1176,58 @@ def build_distribution_receipt(
         prediction_manifest_artifact,
         "prediction manifest",
     )
+    return build_distribution_receipt_from_validated_artifacts(
+        gate_artifact=gate_artifact,
+        prediction_manifest_artifact=manifest_artifact,
+        prediction_records=prediction_records,
+    )
+
+
+def build_distribution_receipt_from_validated_artifacts(
+    *,
+    gate_artifact: Mapping[str, Any],
+    prediction_manifest_artifact: Mapping[str, Any],
+    prediction_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the sole canonical logical-slot receipt from validated artifacts.
+
+    Callers must first replay the gate with :func:`load_gate`.  This public
+    pure constructor exists so metric adapters and selectors share the exact
+    same schema and payload-hash implementation rather than reimplementing it.
+    """
+
+    normalized_gate = _exact_mapping(
+        dict(gate_artifact),
+        {"path", "sha256", "bytes", "receipt_payload_sha256"},
+        "validated replication-gate artifact",
+    )
+    normalized_manifest = _exact_mapping(
+        dict(prediction_manifest_artifact),
+        {"path", "sha256", "bytes"},
+        "validated prediction-manifest artifact",
+    )
+    _require_sha256(
+        normalized_gate["sha256"],
+        "validated replication-gate file SHA-256",
+    )
+    _require_sha256(
+        normalized_gate["receipt_payload_sha256"],
+        "validated replication-gate payload SHA-256",
+    )
+    _require_sha256(
+        normalized_manifest["sha256"],
+        "validated prediction-manifest SHA-256",
+    )
+    _require_int(
+        normalized_gate["bytes"],
+        "validated replication-gate bytes",
+        minimum=1,
+    )
+    _require_int(
+        normalized_manifest["bytes"],
+        "validated prediction-manifest bytes",
+        minimum=1,
+    )
     _normalized, prediction_digest = prediction_artifact_manifest(
         prediction_records
     )
@@ -948,6 +1240,7 @@ def build_distribution_receipt(
     ]
     result: dict[str, Any] = {
         "format": DISTRIBUTION_FORMAT,
+        "payload_hash_algorithm": PAYLOAD_HASH_ALGORITHM,
         "protocol": PROTOCOL,
         "independent_samples": False,
         "deterministic_delta_distribution": True,
@@ -960,10 +1253,10 @@ def build_distribution_receipt(
         "face_slot": FACE_SLOT,
         "diffsheg_slot": DIFFSHEG_SLOT,
         "slot_artifact_policy": "same_prediction_sha256",
-        "prediction_manifest": manifest_artifact,
+        "prediction_manifest": normalized_manifest,
         "prediction_artifact_manifest_sha256": prediction_digest,
         "logical_slot_bindings": logical_bindings,
-        "validation_gate": gate_artifact,
+        "validation_gate": normalized_gate,
         "variation_exact_zero": True,
     }
     result["receipt_payload_sha256"] = canonical_json_sha256(result)
@@ -981,6 +1274,7 @@ def validate_distribution_receipt(
         value,
         {
             "format",
+            "payload_hash_algorithm",
             "protocol",
             "independent_samples",
             "deterministic_delta_distribution",
@@ -1017,6 +1311,7 @@ def validate_distribution_receipt(
     ]
     exact = {
         "format": DISTRIBUTION_FORMAT,
+        "payload_hash_algorithm": PAYLOAD_HASH_ALGORITHM,
         "protocol": PROTOCOL,
         "independent_samples": False,
         "deterministic_delta_distribution": True,
