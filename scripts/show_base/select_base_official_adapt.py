@@ -164,11 +164,11 @@ BASE_PRODUCER_SOURCE = {
 }
 VAL_INFERENCE_SOURCE = {
     "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "8da5c0dc4e9694319d742609ae145476c5408399",
-    "tree": "3e3a451eda15f28b3309a66faba6d55ccdb58e6f",
+    "commit": "94e33213455d3c3b1fe71ac87a3b16334e63c479",
+    "tree": "8f4ba28543b49cb1e04b3e8aaaaf4ee932ecf6d8",
     "entrypoint": "run_base_inference.py",
     "entrypoint_sha256": (
-        "d1f5da319d76c0b0190db479327c8c31774efe3f5e1222ad0f35e556d78d59ab"
+        "ff4c86f065a2924ab1a7088584507f2163d4afba25ae7fb024d137df23204e0c"
     ),
 }
 
