@@ -1634,14 +1634,14 @@ def validate_val_inference_lineage(
     )
     clip_artifact, clip_path, clip_payload = _verify_artifact(
         lineage["clip_manifest"],
-        f"epoch {epoch} TalkSHOW released2 clip manifest",
+        f"epoch {epoch} canonical evaluation clip manifest",
     )
     reject_test_path(final_path, "final inference manifest")
-    reject_test_path(clip_path, "TalkSHOW released2 clip manifest")
+    reject_test_path(clip_path, "canonical evaluation clip manifest")
     if final_path.name != "final_manifest.jsonl":
         raise SelectionContractError("final inference manifest basename mismatch")
-    if clip_path.name != "talkshow_eval_clip_ids.txt":
-        raise SelectionContractError("TalkSHOW released2 clip manifest basename mismatch")
+    if clip_path.name != "diffsheg_eval_clip_ids.txt":
+        raise SelectionContractError("DiffSHEG clip manifest basename mismatch")
 
     expected_rows = expected_coverage.get("_ordered_clips")
     if (

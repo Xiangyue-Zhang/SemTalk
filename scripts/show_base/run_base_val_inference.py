@@ -2033,7 +2033,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             clip_payload = "".join(
                 f"{row['canonical_clip_id']}\n" for row in final_rows
             ).encode("utf-8")
-            clip_stage = stage / "talkshow_eval_clip_ids.txt"
+            clip_stage = stage / "diffsheg_eval_clip_ids.txt"
             manifest_stage = stage / "final_manifest.jsonl"
             _write_inside_generation(clip_stage, clip_payload)
             _write_inside_generation(
