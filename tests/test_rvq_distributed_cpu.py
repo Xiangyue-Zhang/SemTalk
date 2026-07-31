@@ -15,6 +15,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on minimal hosts.
     mp = None
 
 
+REPOSITORY = Path(__file__).resolve().parents[1]
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -124,6 +127,18 @@ def _rvq_w4_worker(rank: int, world_size: int, port: int, output: str) -> None:
             torch.save(gathered, output)
     finally:
         dist.destroy_process_group()
+
+
+class RVQRankZeroLoggingContractTest(unittest.TestCase):
+    def test_only_rank_zero_enters_training_log_path(self) -> None:
+        source = (REPOSITORY / "train.py").read_text(encoding="utf-8")
+        function_start = source.index(
+            "    def _should_log_train(self, iteration):"
+        )
+        function_end = source.index("\n    def ", function_start + 1)
+        function_source = source[function_start:function_end]
+        self.assertIn("if self.rank != 0:", function_source)
+        self.assertIn("return False", function_source)
 
 
 @unittest.skipIf(torch is None, "PyTorch is unavailable")

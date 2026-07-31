@@ -251,6 +251,8 @@ class BaseTrainer(object):
         self._formal_train_metric_counts.clear()
 
     def _should_log_train(self, iteration):
+        if self.rank != 0:
+            return False
         if getattr(self.args, "train_only", False):
             completed = int(iteration) + 1
             return (
