@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -26,11 +27,27 @@ module._CPU_TEST_MODE = True
 
 def fake_runner(status_path, log_path):
     identity = module._proc_identity(os.getppid())
+    command = ["/test/fake-transaction-coordinator"]
+    argv = [
+        sys.executable,
+        module.EXPECTED_RUNNER,
+        "--gpus",
+        module.EXPECTED_RUNNER_GPUS,
+        "--status",
+        status_path,
+        "--log",
+        log_path,
+        "--",
+        *command,
+    ]
     identity.update({
         "path": module.EXPECTED_RUNNER,
         "sha256": "e" * 64,
         "status_path": status_path,
         "log_path": log_path,
+        "argv": argv,
+        "command": command,
+        "command_argv_sha256": module._argv_sha256(command),
     })
     return identity, "e" * 64
 
@@ -48,6 +65,14 @@ def fake_source(args):
 
 module._runner_evidence = fake_runner
 module._source_evidence = fake_source
+
+if os.environ.get("SEMTALK_TEST_FINAL_PUBLISH_FAIL"):
+    original_publish = module.TransactionDirectory.publish_immutable
+    def failing_publish(self, name, payload):
+        if name == os.environ["SEMTALK_TEST_FINAL_PUBLISH_FAIL"]:
+            raise OSError("injected finalizer publication failure")
+        return original_publish(self, name, payload)
+    module.TransactionDirectory.publish_immutable = failing_publish
 
 if os.environ.get("SEMTALK_TEST_ARM_DELAY"):
     original_spawn = module.Coordinator._spawn_supervisor
@@ -101,10 +126,16 @@ time.sleep(20)
         descendant,
         str(descendant_path),
         "ignore" if entry.get("ignore_term") else "default",
-    ])
+    ], start_new_session=bool(entry.get("setsid")))
     deadline = time.monotonic() + 1.0
     while not descendant_path.exists() and time.monotonic() < deadline:
         time.sleep(0.005)
+if entry.get("read_authority"):
+    option_index = sys.argv.index("--fresh-test-authority")
+    observed = Path(sys.argv[option_index + 1]).read_text(encoding="utf-8")
+    (marker_root / f"authority.rank{rank}").write_text(observed, encoding="utf-8")
+    if observed != entry["expected_authority"]:
+        sys.exit(91)
 time.sleep(float(entry.get("seconds", 0.05)))
 sys.exit(int(entry.get("rc", 0)))
 """
@@ -114,6 +145,10 @@ def argv_sha256(argv: list[str]) -> str:
     return hashlib.sha256(
         b"\0".join(os.fsencode(token) for token in argv) + b"\0"
     ).hexdigest()
+
+
+def namespace_parent_sha256(path: Path) -> str:
+    return hashlib.sha256(os.fsencode(str(path.resolve())) + b"\0").hexdigest()
 
 
 class DualNodeGuardedTransactionTest(unittest.TestCase):
@@ -159,6 +194,9 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         rc1: int = 0,
         descendants: bool = False,
         ignore_term: bool = False,
+        setsid: bool = False,
+        read_authority: bool = False,
+        expected_authority: str = "",
     ) -> dict[str, object]:
         return {
             "marker_root": str(self.root / "markers"),
@@ -167,12 +205,18 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "rc": rc0,
                 "spawn_descendant": descendants,
                 "ignore_term": ignore_term,
+                "setsid": setsid,
+                "read_authority": read_authority,
+                "expected_authority": expected_authority,
             },
             "1": {
                 "seconds": seconds1,
                 "rc": rc1,
                 "spawn_descendant": descendants,
                 "ignore_term": ignore_term,
+                "setsid": setsid,
+                "read_authority": read_authority,
+                "expected_authority": expected_authority,
             },
         }
 
@@ -187,10 +231,18 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         workload_suffix: list[str] | None = None,
         workload_inputs: dict[str, Path] | None = None,
         allow_env: list[str] | None = None,
+        expected_parent_sha256: str | None = None,
     ) -> list[str]:
         peer = 1 - rank
         config_text = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
         workload = [PYTHON, "-c", WORKLOAD, config_text]
+        for logical_id, path in sorted((workload_inputs or {}).items()):
+            workload.extend(
+                [
+                    "--fresh-test-authority",
+                    str(path),
+                ]
+            )
         if workload_suffix:
             workload.extend(workload_suffix)
         common_sha256 = common_sha256 or argv_sha256(workload)
@@ -199,6 +251,11 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             str(transaction_root),
             "--run-id",
             run_id or transaction_root.name,
+            "--deployment-id",
+            "cpu-two-node",
+            "--expected-namespace-parent-sha256",
+            expected_parent_sha256
+            or namespace_parent_sha256(transaction_root.parent),
             "--source-commit",
             "a" * 40,
             "--source-tree",
@@ -294,6 +351,38 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             time.sleep(0.01)
 
     @staticmethod
+    def _pid_is_live(
+        pid: int,
+        expected_identity: dict[str, object] | None = None,
+    ) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        status = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if not status or status.startswith("Z"):
+            return False
+        if expected_identity is not None:
+            from scripts.show_base import dual_node_guarded_transaction as module
+
+            try:
+                observed = module._proc_identity(pid)
+            except module.TransactionError:
+                return False
+            return (
+                observed["starttime_ticks"]
+                == expected_identity["starttime_ticks"]
+                and observed["argv_sha256"]
+                == expected_identity["argv_sha256"]
+            )
+        return True
+
+    @staticmethod
     def _publish_artifact(path: Path, payload: dict[str, object]) -> None:
         raw = (
             json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -305,11 +394,111 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         os.link(temporary, path)
         temporary.unlink()
 
+    def _finish_runner_receipts(self, transaction_root: Path) -> None:
+        for rank in (0, 1):
+            prepared = json.loads(
+                (transaction_root / f"PREPARED.rank{rank}.json").read_text()
+            )
+            runner = prepared["runner"]
+            status = {
+                "state": "finished",
+                "return_code": 0,
+                "error": None,
+                "cleanup_error": None,
+                "restore_error": None,
+                "received_signal": None,
+                "command": runner["command"],
+                "wrapper_pid": runner["pid"],
+                "child_pid": prepared["coordinator"]["pid"],
+                "restored_guards": {
+                    str(index): 90000 + rank * 100 + index
+                    for index in range(8)
+                },
+            }
+            Path(runner["status_path"]).write_text(
+                json.dumps(status, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            Path(runner["log_path"]).write_text(
+                f"rank {rank} guarded runner restored\n",
+                encoding="utf-8",
+            )
+
+    def _control_command(
+        self,
+        command: str,
+        transaction_root: Path,
+        *,
+        outcome_sha256: str | None = None,
+    ) -> list[str]:
+        bootstrap = json.loads(
+            (transaction_root / "TRANSACTION.json").read_text()
+        )
+        portable = bootstrap["portable"]
+        result = [
+            PYTHON,
+            "-c",
+            HARNESS,
+            command,
+            "--transaction-root",
+            str(transaction_root),
+            "--run-id",
+            transaction_root.name,
+            "--deployment-id",
+            "cpu-two-node",
+            "--expected-namespace-parent-sha256",
+            namespace_parent_sha256(transaction_root.parent),
+            "--expected-portable-sha256",
+            bootstrap["portable_sha256"],
+            "--source-commit",
+            portable["source_commit"],
+            "--source-tree",
+            portable["source_tree"],
+        ]
+        if outcome_sha256 is not None:
+            result.extend(["--expected-outcome-sha256", outcome_sha256])
+        return result
+
+    def _finalize(self, transaction_root: Path) -> dict[str, object]:
+        self._finish_runner_receipts(transaction_root)
+        result = subprocess.run(
+            self._control_command("finalize", transaction_root),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def _replay(self, transaction_root: Path) -> dict[str, object]:
+        outcome_sha = hashlib.sha256(
+            (transaction_root / "OUTCOME.json").read_bytes()
+        ).hexdigest()
+        result = subprocess.run(
+            self._control_command(
+                "replay",
+                transaction_root,
+                outcome_sha256=outcome_sha,
+            ),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def test_success_uses_armed_go_result_and_final_receipts(self) -> None:
         transaction_root = self.root / "success_tx"
         node0, node1 = self._run_pair(transaction_root)
         self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
         self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self.assertFalse((transaction_root / "OUTCOME.json").exists())
+        self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
+        self.assertFalse((transaction_root / "FINAL.rank1.json").exists())
+        finalized = self._finalize(transaction_root)
+        self.assertEqual(finalized["status"], "FINALIZED_SUCCEEDED")
         decision = json.loads((transaction_root / "DECISION.json").read_text())
         self.assertEqual(set(decision), {
             "schema", "status", "rank", "portable_sha256", "reason", "bindings",
@@ -330,7 +519,10 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             )
             final = json.loads((transaction_root / f"FINAL.rank{rank}.json").read_text())
             self.assertEqual((result["status"], result["workload_returncode"]), ("COMPLETED", 0))
-            self.assertEqual((final["status"], final["coordinator_returncode"]), ("SUCCEEDED", 0))
+            self.assertEqual(final["status"], "SUCCEEDED")
+            self.assertIn("restored_guards_by_gpu", final["outer_guarded_runner"]["guard_evidence"])
+        replay = self._replay(transaction_root)
+        self.assertEqual(replay["status"], "REPLAYED_SUCCEEDED")
 
     def test_actual_argv_must_equal_common_digest_before_spawn(self) -> None:
         transaction_root = self.root / "argv_mismatch"
@@ -406,7 +598,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self.assertRegex(result.stderr, "guarded|Linux /proc|exact")
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
 
-    def test_nonzero_result_has_exact_status_and_final_rc(self) -> None:
+    def test_nonzero_result_has_exact_status_and_no_false_final(self) -> None:
         transaction_root = self.root / "failed_workload"
         node0, node1 = self._run_pair(
             transaction_root,
@@ -415,12 +607,8 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self.assertEqual(node0.wait(timeout=6), 4, node0.stderr.read())
         self.assertNotEqual(node1.wait(timeout=6), 0)
         result = json.loads((transaction_root / "WORKLOAD_RESULT.rank0.json").read_text())
-        final = json.loads((transaction_root / "FINAL.rank0.json").read_text())
         self.assertEqual((result["status"], result["workload_returncode"]), ("WORKLOAD_FAILED", 7))
-        self.assertEqual(
-            (final["status"], final["coordinator_returncode"]),
-            ("WORKLOAD_FAILED", 4),
-        )
+        self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
         self.assertEqual(
             json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
             "FAILED",
@@ -452,10 +640,12 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         os.kill(node1.pid, signal.SIGSTOP)
         self.assertNotEqual(node0.wait(timeout=5), 0)
         result = json.loads((transaction_root / "WORKLOAD_RESULT.rank0.json").read_text())
-        final = json.loads((transaction_root / "FINAL.rank0.json").read_text())
         self.assertEqual(result["status"], "COMPLETED")
-        self.assertEqual(final["status"], "ABORTED")
-        self.assertEqual(final["coordinator_returncode"], 3)
+        self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
+        self.assertNotEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
         os.kill(node1.pid, signal.SIGCONT)
         node1.terminate()
         node1.wait(timeout=5)
@@ -471,21 +661,141 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self._wait_for(marker0)
         self._wait_for(marker1)
         pids = [int(marker0.read_text()), int(marker1.read_text())]
+        from scripts.show_base import dual_node_guarded_transaction as module
+
+        identities = [module._proc_identity(pid) for pid in pids]
         self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
         self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             living = []
-            for pid in pids:
-                try:
-                    os.kill(pid, 0)
+            for pid, identity in zip(pids, identities):
+                if self._pid_is_live(pid, identity):
                     living.append(pid)
-                except ProcessLookupError:
-                    pass
             if not living:
                 break
             time.sleep(0.02)
         self.assertFalse(living, f"escaped descendants: {living}")
+
+    def test_setsid_descendant_is_tracked_killed_and_proved_absent(self) -> None:
+        transaction_root = self.root / "setsid_descendant_cleanup"
+        node0, node1 = self._run_pair(
+            transaction_root,
+            self._configuration(
+                descendants=True,
+                ignore_term=True,
+                setsid=True,
+            ),
+        )
+        markers = [
+            self.root / "markers" / f"descendant.rank{rank}"
+            for rank in (0, 1)
+        ]
+        for marker in markers:
+            self._wait_for(marker)
+        pids = [int(marker.read_text()) for marker in markers]
+        from scripts.show_base import dual_node_guarded_transaction as module
+
+        identities = [module._proc_identity(pid) for pid in pids]
+        self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
+        for rank, (pid, identity) in enumerate(zip(pids, identities)):
+            cleanup = json.loads(
+                (transaction_root / f"CLEANUP.rank{rank}.json").read_text()
+            )
+            self.assertEqual(cleanup["proof"]["live_after"], [])
+            self.assertEqual(
+                cleanup["proof"]["observed_consecutive_empty_censuses"],
+                3,
+            )
+            self.assertTrue(
+                any(record["pid"] == pid for record in cleanup["proof"]["tracked"])
+            )
+            self.assertFalse(self._pid_is_live(pid, identity))
+
+    def test_peer_abort_also_cleans_setsid_descendants(self) -> None:
+        transaction_root = self.root / "setsid_peer_abort"
+        node0, node1 = self._run_pair(
+            transaction_root,
+            self._configuration(
+                seconds0=8.0,
+                seconds1=8.0,
+                descendants=True,
+                ignore_term=True,
+                setsid=True,
+            ),
+        )
+        markers = [
+            self.root / "markers" / f"descendant.rank{rank}"
+            for rank in (0, 1)
+        ]
+        for marker in markers:
+            self._wait_for(marker)
+        pids = [int(marker.read_text()) for marker in markers]
+        from scripts.show_base import dual_node_guarded_transaction as module
+
+        identities = [module._proc_identity(pid) for pid in pids]
+        # macOS has no PR_SET_CHILD_SUBREAPER; allow the CPU-test census to
+        # observe the already-escaped sessions before triggering peer abort.
+        # Formal Linux does not need this delay because orphaned descendants
+        # are adopted by the transaction supervisor.
+        time.sleep(0.2)
+        node1.terminate()
+        self.assertNotEqual(node1.wait(timeout=6), 0)
+        self.assertNotEqual(node0.wait(timeout=6), 0)
+        deadline = time.monotonic() + 2
+        living = pids
+        while living and time.monotonic() < deadline:
+            living = []
+            for pid, identity in zip(pids, identities):
+                if self._pid_is_live(pid, identity):
+                    living.append(pid)
+            time.sleep(0.02)
+        details = subprocess.run(
+            [
+                "/bin/ps",
+                "-p",
+                ",".join(map(str, pids)),
+                "-o",
+                "pid=,ppid=,pgid=,sess=,stat=,lstart=,command=",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        self.assertFalse(
+            living,
+            f"setsid descendants survived abort: {living}; details={details}",
+        )
+        self.assertNotEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
+
+    def test_pid_reuse_starttime_change_is_never_signalled(self) -> None:
+        from scripts.show_base import dual_node_guarded_transaction as module
+
+        tracker = module._DescendantTracker(100, 200, 300)
+        old = {
+            "pid": 444,
+            "ppid": 200,
+            "pgid": 200,
+            "sid": 100,
+            "starttime_ticks": 10,
+            "argv_sha256": "a" * 64,
+        }
+        reused = {
+            **old,
+            "ppid": 1,
+            "starttime_ticks": 11,
+            "argv_sha256": "b" * 64,
+        }
+        tracker._remember(old)
+        with mock.patch.object(module, "_process_table", return_value={444: reused}), mock.patch.object(
+            module.os, "kill"
+        ) as kill:
+            tracker.signal_live(signal.SIGKILL)
+        kill.assert_not_called()
 
     def test_replayed_lower_heartbeat_sequence_aborts_both_nodes(self) -> None:
         transaction_root = self.root / "heartbeat_replay"
@@ -551,6 +861,34 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self.assertNotEqual(node1.wait(timeout=5), 0)
         self.assertFalse(transaction_root.exists())
 
+    def test_same_run_id_under_two_namespace_parents_cannot_join(self) -> None:
+        parent0 = self.root / "deployment_parent0"
+        parent1 = self.root / "deployment_parent1"
+        parent0.mkdir(mode=0o700)
+        parent1.mkdir(mode=0o700)
+        configuration = self._configuration(seconds0=8.0, seconds1=8.0)
+        deployment_parent_pin = namespace_parent_sha256(parent0)
+        node1 = self._start(
+            self._command(
+                1,
+                parent1 / "same_run",
+                configuration,
+                expected_parent_sha256=deployment_parent_pin,
+            )
+        )
+        node0 = self._start(
+            self._command(
+                0,
+                parent0 / "same_run",
+                configuration,
+                expected_parent_sha256=deployment_parent_pin,
+            )
+        )
+        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertFalse((parent0 / "same_run" / "OUTCOME.json").exists())
+        self.assertFalse((parent1 / "same_run" / "OUTCOME.json").exists())
+
     def test_run_id_is_bound_to_root_basename(self) -> None:
         transaction_root = self.root / "actual_name"
         result = subprocess.run(
@@ -584,20 +922,20 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self.assertNotEqual(duplicate.returncode, 0)
         self.assertEqual((transaction_root / "DECISION.json").read_bytes(), before)
 
-    def test_peer_mount_path_is_node_local_evidence(self) -> None:
+    def test_peer_cannot_claim_another_canonical_namespace_parent(self) -> None:
         transaction_root = self.root / "mount_evidence"
         node0, node1 = self._run_pair(transaction_root)
         self.assertEqual(node0.wait(timeout=6), 0)
         self.assertEqual(node1.wait(timeout=6), 0)
         prepared = json.loads((transaction_root / "PREPARED.rank1.json").read_text())
         prepared["transaction_root"] = "/different/local/efs/mount/mount_evidence"
-        prepared["node_local_filesystem"] = {"st_dev": 987654321, "st_ino": 123456789}
         from scripts.show_base import dual_node_guarded_transaction as module
 
         validator = object.__new__(module.Coordinator)
         validator.portable = prepared["portable"]
         validator.portable_sha256 = prepared["portable_sha256"]
-        validator._validate_prepared(prepared, 1)
+        with self.assertRaises(module.PeerAbort):
+            validator._validate_prepared(prepared, 1)
 
     def test_workload_input_content_and_allowlisted_environment_are_portable(self) -> None:
         authority = self.root / "fresh_test_authority.json"
@@ -642,6 +980,62 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "SEMTALK_TEST_BOUND_ENV": "fresh-authority-v1",
             },
         )
+        binding = portable["workload"]["input_bindings"][
+            "fresh_test_authority"
+        ]
+        self.assertEqual(binding["option"], "--fresh-test-authority")
+        self.assertRegex(binding["exec_path"], r"^/(?:proc/self|dev)/fd/\d+$")
+        for rank in (0, 1):
+            started = json.loads(
+                (transaction_root / f"STARTED.rank{rank}.json").read_text()
+            )
+            inherited = started["workload"]["passed_input_fds"][
+                "fresh_test_authority"
+            ]
+            self.assertEqual(inherited["passed_fd"], binding["passed_fd"])
+            self.assertEqual(inherited["sha256"], binding["sha256"])
+
+    def test_unknown_input_id_is_rejected_before_spawn(self) -> None:
+        authority = self.root / "unknown-input.json"
+        authority.write_text('{"version":1}\n', encoding="utf-8")
+        transaction_root = self.root / "unknown_input_id"
+        node0, node1 = self._run_pair(
+            transaction_root,
+            self._configuration(),
+            workload_inputs={"not_allowlisted": authority},
+        )
+        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertFalse((self.root / "markers" / "started.rank0").exists())
+        self.assertFalse((self.root / "markers" / "started.rank1").exists())
+
+    def test_input_path_must_occupy_its_schema_owned_argv_slot(self) -> None:
+        authority = self.root / "mispositioned-input.json"
+        authority.write_text('{"version":1}\n', encoding="utf-8")
+        transaction_root = self.root / "mispositioned_input"
+        configuration = self._configuration()
+        processes = []
+        for rank in (1, 0):
+            arguments = self._protocol_args(
+                rank,
+                transaction_root,
+                configuration,
+                workload_inputs={"fresh_test_authority": authority},
+            )
+            delimiter = arguments.index("--")
+            workload = arguments[delimiter + 1 :]
+            option = workload.index("--fresh-test-authority")
+            workload.insert(option + 1, "decoy-not-the-authority")
+            arguments[delimiter + 1 :] = workload
+            digest_index = arguments.index("--common-command-sha256") + 1
+            arguments[digest_index] = argv_sha256(workload)
+            processes.append(
+                self._start([PYTHON, "-c", HARNESS, *arguments])
+            )
+        for process in processes:
+            self.assertNotEqual(process.wait(timeout=5), 0)
+        self.assertFalse((self.root / "markers" / "started.rank0").exists())
+        self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
     def test_pinned_workload_input_mutation_before_go_aborts(self) -> None:
         authority = self.root / "mutable_authority.json"
@@ -651,7 +1045,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         arguments = {
             "workload_inputs": {"fresh_test_authority": authority},
         }
-        delay = {"SEMTALK_TEST_ARM_DELAY": "0.35"}
+        delay = {"SEMTALK_TEST_ARM_DELAY": "0.12"}
         node1 = self._start(
             self._command(1, transaction_root, configuration, **arguments),
             extra_environment=delay,
@@ -668,6 +1062,89 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         self.assertFalse((self.root / "markers" / "started.rank0").exists())
         self.assertFalse((self.root / "markers" / "started.rank1").exists())
 
+    def test_atomic_replaced_input_is_consumed_from_pinned_fd_v1(self) -> None:
+        authority = self.root / "atomic_authority.json"
+        v1 = '{"version":1}\n'
+        v2 = '{"version":2}\n'
+        authority.write_text(v1, encoding="utf-8")
+        transaction_root = self.root / "atomic_authority_tx"
+        configuration = self._configuration(
+            seconds0=0.1,
+            seconds1=0.1,
+            read_authority=True,
+            expected_authority=v1,
+        )
+        arguments = {
+            "workload_inputs": {"fresh_test_authority": authority},
+        }
+        delay = {"SEMTALK_TEST_ARM_DELAY": "0.12"}
+        node1 = self._start(
+            self._command(1, transaction_root, configuration, **arguments),
+            extra_environment=delay,
+        )
+        node0 = self._start(
+            self._command(0, transaction_root, configuration, **arguments),
+            extra_environment=delay,
+        )
+        self._wait_for(transaction_root / "PREPARED.rank0.json")
+        self._wait_for(transaction_root / "PREPARED.rank1.json")
+        replacement = authority.with_name("replacement.json")
+        replacement.write_text(v2, encoding="utf-8")
+        replacement.replace(authority)
+        self.assertEqual(node0.wait(timeout=7), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=7), 0, node1.stderr.read())
+        self.assertEqual(authority.read_text(encoding="utf-8"), v2)
+        for rank in (0, 1):
+            observed = self.root / "markers" / f"authority.rank{rank}"
+            self.assertEqual(observed.read_text(encoding="utf-8"), v1)
+            started = json.loads(
+                (transaction_root / f"STARTED.rank{rank}.json").read_text()
+            )
+            passed = started["workload"]["passed_input_fds"][
+                "fresh_test_authority"
+            ]
+            self.assertEqual(passed["sha256"], hashlib.sha256(v1.encode()).hexdigest())
+        self._finalize(transaction_root)
+        self.assertEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
+
+    def test_same_content_input_alias_is_rejected_before_spawn(self) -> None:
+        authority = self.root / "authority.json"
+        alias = self.root / "authority-copy.json"
+        alias_link = self.root / "authority-copy-link.json"
+        authority.write_text('{"version":1}\n', encoding="utf-8")
+        alias.write_bytes(authority.read_bytes())
+        alias_link.symlink_to(alias)
+        variants = {
+            "plain_json": json.dumps({"authority": str(alias)}),
+            "symlink_to_copy": str(alias_link),
+            "escaped_json": json.dumps(
+                {"authority": str(alias)}
+            ).replace("/", "\\/"),
+        }
+        for name, encoded_alias in variants.items():
+            with self.subTest(name=name):
+                transaction_root = self.root / f"aliased_authority_{name}"
+                node0, node1 = self._run_pair(
+                    transaction_root,
+                    self._configuration(),
+                    workload_inputs={"fresh_test_authority": authority},
+                    workload_suffix=[
+                        "--authority-alias-json",
+                        encoded_alias,
+                    ],
+                )
+                self.assertNotEqual(node0.wait(timeout=5), 0)
+                self.assertNotEqual(node1.wait(timeout=5), 0)
+                self.assertFalse(
+                    (self.root / "markers" / "started.rank0").exists()
+                )
+                self.assertFalse(
+                    (self.root / "markers" / "started.rank1").exists()
+                )
+
     def test_symlinked_workload_provenance_is_rejected(self) -> None:
         from scripts.show_base import dual_node_guarded_transaction as module
 
@@ -676,11 +1153,166 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         with self.assertRaises(module.TransactionError):
             module._open_pinned_file(link, executable=True)
 
-    def test_decision_and_final_validators_reject_extra_or_wrong_semantics(self) -> None:
+    def test_finalizer_file_failure_never_publishes_success_outcome(self) -> None:
+        transaction_root = self.root / "finalizer_file_failure"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self._finish_runner_receipts(transaction_root)
+        environment = os.environ.copy()
+        environment["SEMTALK_TEST_FINAL_PUBLISH_FAIL"] = "FINAL.rank1.json"
+        failed = subprocess.run(
+            self._control_command("finalize", transaction_root),
+            cwd=REPOSITORY,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue((transaction_root / "FINAL.rank0.json").exists())
+        self.assertFalse((transaction_root / "FINAL.rank1.json").exists())
+        self.assertFalse((transaction_root / "OUTCOME.json").exists())
+        recovered = subprocess.run(
+            self._control_command("finalize", transaction_root),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
+
+    def test_concurrent_finalizers_publish_one_terminal_outcome(self) -> None:
+        transaction_root = self.root / "concurrent_finalizers"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self._finish_runner_receipts(transaction_root)
+        finalizers = [
+            subprocess.Popen(
+                self._control_command("finalize", transaction_root),
+                cwd=REPOSITORY,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = []
+        for process in finalizers:
+            stdout, stderr = process.communicate(timeout=6)
+            self.assertEqual(process.returncode, 0, stderr)
+            results.append(json.loads(stdout)["status"])
+        self.assertEqual(
+            sorted(results),
+            ["FINALIZED_SUCCEEDED", "REPLAYED_SUCCEEDED"],
+        )
+        self.assertEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.OUTCOME.json.")
+                for path in transaction_root.iterdir()
+            )
+        )
+
+    def test_finalizer_rejects_runner_restore_error_before_final_files(self) -> None:
+        transaction_root = self.root / "restore_failure"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self._finish_runner_receipts(transaction_root)
+        status = self.status_paths[1]
+        payload = json.loads(status.read_text())
+        payload["restore_error"] = "injected guard restore failure"
+        status.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        failed = subprocess.run(
+            self._control_command("finalize", transaction_root),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
+        self.assertFalse((transaction_root / "FINAL.rank1.json").exists())
+        self.assertFalse((transaction_root / "OUTCOME.json").exists())
+
+    def test_finalizer_rejects_hardlinked_outer_evidence(self) -> None:
+        transaction_root = self.root / "hardlinked_outer_evidence"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self._finish_runner_receipts(transaction_root)
+        self.log_paths[1].unlink()
+        os.link(self.log_paths[0], self.log_paths[1])
+        failed = subprocess.run(
+            self._control_command("finalize", transaction_root),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("alias one inode", failed.stderr)
+        self.assertFalse((transaction_root / "FINAL.rank0.json").exists())
+        self.assertFalse((transaction_root / "FINAL.rank1.json").exists())
+        self.assertFalse((transaction_root / "OUTCOME.json").exists())
+
+    def test_replay_is_read_only_and_detects_runner_status_replacement(self) -> None:
+        transaction_root = self.root / "read_only_replay"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(node0.wait(timeout=6), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=6), 0, node1.stderr.read())
+        self._finalize(transaction_root)
+        before = {
+            path.name: path.read_bytes()
+            for path in transaction_root.iterdir()
+            if path.is_file()
+        }
+        replay = self._replay(transaction_root)
+        self.assertEqual(replay["status"], "REPLAYED_SUCCEEDED")
+        after = {
+            path.name: path.read_bytes()
+            for path in transaction_root.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+        status = self.status_paths[0]
+        replacement = status.with_name("late-status-replacement.json")
+        payload = json.loads(status.read_text())
+        payload["restore_error"] = "late replacement"
+        replacement.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        replacement.replace(status)
+        outcome_sha = hashlib.sha256(
+            (transaction_root / "OUTCOME.json").read_bytes()
+        ).hexdigest()
+        rejected = subprocess.run(
+            self._control_command(
+                "replay",
+                transaction_root,
+                outcome_sha256=outcome_sha,
+            ),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+
+    def test_decision_and_outcome_validators_reject_extra_or_wrong_semantics(self) -> None:
         transaction_root = self.root / "validator_exactness"
         node0, node1 = self._run_pair(transaction_root)
         self.assertEqual(node0.wait(timeout=6), 0)
         self.assertEqual(node1.wait(timeout=6), 0)
+        self._finalize(transaction_root)
         from scripts.show_base import dual_node_guarded_transaction as module
 
         prepared = json.loads((transaction_root / "PREPARED.rank0.json").read_text())
@@ -692,23 +1324,9 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         with self.assertRaises(module.TransactionError):
             validator._validate_decision(decision)
         outcome = json.loads((transaction_root / "OUTCOME.json").read_text())
-        outcome["bindings"]["workload_result_sha256"]["0"] = "bad"
+        outcome["bindings"]["final_sha256"]["0"] = "bad"
         with self.assertRaises(module.TransactionError):
             validator._validate_outcome(outcome)
-
-        root, parent, basename = module._validate_tx_path(
-            str(transaction_root), transaction_root.name
-        )
-        tx = module.TransactionDirectory(root, parent, basename, 1)
-        try:
-            tx.create_or_wait(time.monotonic() + 1)
-            validator.tx = tx
-            final = json.loads((transaction_root / "FINAL.rank0.json").read_text())
-            final["coordinator_returncode"] = 9
-            with self.assertRaises(module.PeerAbort):
-                validator._validate_final(final, 0)
-        finally:
-            tx.close()
 
     def test_launcher_syntax_and_nested_delimiter_contract(self) -> None:
         subprocess.run(["/usr/bin/env", "bash", "-n", str(LAUNCHER)], check=True)

@@ -5,21 +5,24 @@ The transaction root must not exist.  Rank zero creates it and publishes an
 immutable bootstrap receipt; rank one only joins that exact transaction.  A
 node publishes immutable PREPARED and ARMED receipts with ``O_EXCL`` and
 ``fsync``.  A non-GPU supervisor pins an otherwise empty process group; the
-actual workload cannot exec until the single immutable DECISION is GO.  After
-both exact workload results, rank zero publishes a single atomic OUTCOME.
-Both nodes maintain heartbeats.  A peer failure, abort, stale heartbeat,
-identity mismatch, or timeout terminates the exact local group before returning
-non-zero to the outer guarded runner.
+actual workload cannot exec until the single immutable DECISION is GO.  Each
+successful coordinator publishes only a HANDOFF after exact descendant
+cleanup, then exits so its outer guarded runner can restore all GPU guards.
+An independent CPU finalizer verifies both finished runner receipts and logs,
+publishes both immutable FINAL receipts, and publishes the sole successful
+OUTCOME as its last filesystem operation.  ``replay`` is strictly read-only.
 
-Filesystem device/inode identities are deliberately node-local evidence.
-They never participate in portable-payload equality, which makes the protocol
-valid when two hosts see a shared transaction through different mounts.
+Filesystem device/inode identities are deliberately node-local evidence.  The
+portable payload instead binds one deployment ID and one canonical parent-path
+hash, so two parents can never claim the same run ID.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -36,7 +39,7 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 
-SCHEMA = "semtalk.dual_node_guarded_transaction.v1"
+SCHEMA = "semtalk.dual_node_guarded_transaction.v2"
 PORTABLE_SCHEMA = f"{SCHEMA}.portable"
 EXPECTED_RUNNER = "/tmp/globaldiff_guarded_runner.py"
 EXPECTED_RUNNER_GPUS = "0,1,2,3,4,5,6,7"
@@ -49,6 +52,10 @@ MAX_RECEIPT_BYTES = 1 << 20
 EXPECTED_RANKS = (0, 1)
 IDENTITY_KEYS = {
     "pid", "ppid", "pgid", "sid", "starttime_ticks", "argv_sha256"
+}
+PINNED_INPUT_FD_BASE = 200
+WORKLOAD_INPUT_SCHEMA = {
+    "fresh_test_authority": "--fresh-test-authority",
 }
 
 # CPU tests import this module and replace the process-evidence provider.  The
@@ -67,6 +74,61 @@ class DuplicateInvocation(TransactionError):
 
 class PeerAbort(TransactionError):
     """The peer failed, aborted, became stale, or violated the protocol."""
+
+
+def _rename_noreplace(
+    source_dir_fd: int,
+    source: str,
+    target_dir_fd: int,
+    target: str,
+) -> None:
+    """Atomically rename one entry without replacing an existing target."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:  # pragma: no cover - modern glibc exports it.
+            raise TransactionError("atomic no-replace rename is unavailable") from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_dir_fd,
+            os.fsencode(source),
+            target_dir_fd,
+            os.fsencode(target),
+            1,  # RENAME_NOREPLACE
+        )
+    elif sys.platform == "darwin" and _CPU_TEST_MODE:
+        rename = libc.renameatx_np
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            source_dir_fd,
+            os.fsencode(source),
+            target_dir_fd,
+            os.fsencode(target),
+            0x00000004,  # RENAME_EXCL
+        )
+    else:  # pragma: no cover - formal execution is Linux-only.
+        raise TransactionError("atomic no-replace rename is unavailable")
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error, os.strerror(error), target)
+    raise OSError(error, os.strerror(error), target)
 
 
 def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -222,6 +284,8 @@ def _runner_evidence(
     if not raw_cmdline.endswith(b"\0"):
         raise TransactionError("incomplete guarded-runner argv")
     tokens = [os.fsdecode(token) for token in raw_cmdline.split(b"\0") if token]
+    if identity["argv_sha256"] != _argv_sha256(tokens):
+        raise TransactionError("guarded runner full argv changed during capture")
     try:
         delimiter = tokens.index("--", 2)
     except ValueError as exc:
@@ -245,6 +309,9 @@ def _runner_evidence(
     )
     if status_values != [expected_status_path] or log_values != [expected_log_path]:
         raise TransactionError("runner status/log evidence is not argv-bound")
+    command = tokens[delimiter + 1 :]
+    if not command:
+        raise TransactionError("guarded runner has no workload command")
     runner_path = Path(EXPECTED_RUNNER)
     runner_fd, runner_path = _open_pinned_file(runner_path, executable=False)
     try:
@@ -259,6 +326,9 @@ def _runner_evidence(
             "sha256": runner_sha256,
             "status_path": expected_status_path,
             "log_path": expected_log_path,
+            "argv": tokens,
+            "command": command,
+            "command_argv_sha256": _argv_sha256(command),
         }
     )
     return identity, runner_sha256
@@ -377,7 +447,14 @@ def _source_evidence(args: argparse.Namespace) -> dict[str, Any]:
 def _workload_evidence(
     args: argparse.Namespace,
     workload: Sequence[str],
-) -> tuple[dict[str, Any], dict[str, str], int, int, dict[str, int]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, str],
+    list[str],
+    int,
+    int,
+    dict[str, int],
+]:
     executable_fd, executable = _open_pinned_file(
         Path(workload[0]), executable=True
     )
@@ -426,16 +503,145 @@ def _workload_evidence(
 
     input_fds: dict[str, int] = {}
     input_hashes: dict[str, str] = {}
+    input_paths: dict[str, str] = {}
+    input_identities: dict[str, tuple[int, int]] = {}
     try:
         for raw in args.workload_input:
             if "=" not in raw:
                 raise TransactionError("workload-input must be LOGICAL_ID=/absolute/path")
             logical_id, raw_path = raw.split("=", 1)
-            if not SAFE_ID_RE.fullmatch(logical_id) or logical_id in input_fds:
-                raise TransactionError("workload-input logical IDs must be safe and unique")
-            fd, _ = _open_pinned_file(Path(raw_path), executable=False)
+            if logical_id not in WORKLOAD_INPUT_SCHEMA or logical_id in input_fds:
+                raise TransactionError(
+                    "workload-input logical ID is not uniquely schema-allowlisted"
+                )
+            fd, canonical = _open_pinned_file(Path(raw_path), executable=False)
+            if str(canonical) != raw_path:
+                os.close(fd)
+                raise TransactionError("workload-input path must be canonical")
             input_fds[logical_id] = fd
             input_hashes[logical_id] = _sha256_fd(fd)
+            input_paths[logical_id] = raw_path
+            info = os.fstat(fd)
+            input_identities[logical_id] = (info.st_dev, info.st_ino)
+
+        if len(set(input_identities.values())) != len(input_identities):
+            raise TransactionError("workload-input declarations alias one inode")
+        if len(set(input_hashes.values())) != len(input_hashes):
+            raise TransactionError("workload-input declarations alias identical content")
+
+        exec_workload = list(workload)
+        bindings: dict[str, dict[str, Any]] = {}
+        authorized_indexes: set[int] = set()
+        fd_root = "/proc/self/fd" if sys.platform == "linux" else "/dev/fd"
+        if sys.platform != "linux" and not _CPU_TEST_MODE:
+            raise TransactionError("formal pinned-input exec requires Linux /proc")
+        try:
+            open_max = int(os.sysconf("SC_OPEN_MAX"))
+        except (OSError, ValueError):
+            open_max = 256
+        for ordinal, logical_id in enumerate(sorted(input_fds)):
+            option = WORKLOAD_INPUT_SCHEMA[logical_id]
+            option_indexes = [
+                index for index, token in enumerate(workload) if token == option
+            ]
+            if len(option_indexes) != 1:
+                raise TransactionError(
+                    f"workload input {logical_id} requires one exact {option} option"
+                )
+            option_index = option_indexes[0]
+            value_index = option_index + 1
+            if (
+                value_index >= len(workload)
+                or workload[value_index] != input_paths[logical_id]
+                or [
+                    index
+                    for index, token in enumerate(workload)
+                    if token == input_paths[logical_id]
+                ]
+                != [value_index]
+            ):
+                raise TransactionError(
+                    f"workload input {logical_id} is not at its allowlisted argv position"
+                )
+            target_fd = PINNED_INPUT_FD_BASE + ordinal
+            if target_fd >= open_max:
+                raise TransactionError("pinned workload FD exceeds process limit")
+            exec_path = f"{fd_root}/{target_fd}"
+            exec_workload[value_index] = exec_path
+            authorized_indexes.add(value_index)
+            bindings[logical_id] = {
+                "option": option,
+                "option_index": option_index,
+                "value_index": value_index,
+                "passed_fd": target_fd,
+                "exec_path": exec_path,
+                "sha256": input_hashes[logical_id],
+            }
+
+        # Reject a second argv spelling of the same input, including a hardlink,
+        # symlink, or byte-identical copy.  Only the schema-owned value slot may
+        # carry an authority input into the workload.
+        for index, token in enumerate(workload):
+            if index in authorized_indexes:
+                continue
+            if any(path in token for path in input_paths.values()):
+                raise TransactionError("workload argv repeats a declared input path")
+            candidates = {token}
+            if "=" in token:
+                _prefix, value = token.split("=", 1)
+                candidates.add(value)
+            for encoded in tuple(candidates):
+                try:
+                    decoded = json.loads(encoded)
+                except json.JSONDecodeError:
+                    continue
+                except RecursionError as exc:
+                    raise TransactionError("workload argv JSON is too deeply nested") from exc
+                pending = [decoded]
+                visited = 0
+                while pending:
+                    visited += 1
+                    if visited > 4096:
+                        raise TransactionError("workload argv JSON is too large to audit")
+                    value = pending.pop()
+                    if isinstance(value, str):
+                        candidates.add(value)
+                    elif isinstance(value, list):
+                        pending.extend(value)
+                    elif isinstance(value, dict):
+                        pending.extend(value.keys())
+                        pending.extend(value.values())
+            candidates.update(
+                re.findall(r"/[^\s\"'\],}]+", token)
+            )
+            for candidate in candidates:
+                candidate_path = Path(candidate)
+                try:
+                    resolved_candidate = (
+                        candidate_path
+                        if candidate_path.is_absolute()
+                        else canonical_workdir / candidate_path
+                    ).resolve(strict=True)
+                except (OSError, ValueError):
+                    continue
+                if str(resolved_candidate) in input_paths.values():
+                    raise TransactionError("workload argv contains an input path alias")
+                try:
+                    candidate_fd, _ = _open_pinned_file(
+                        resolved_candidate, executable=False
+                    )
+                except TransactionError:
+                    continue
+                try:
+                    info = os.fstat(candidate_fd)
+                    identity = (info.st_dev, info.st_ino)
+                    digest = _sha256_fd(candidate_fd)
+                finally:
+                    os.close(candidate_fd)
+                if identity in input_identities.values() or digest in input_hashes.values():
+                    raise TransactionError(
+                        "workload argv contains a same-inode or same-content input alias"
+                    )
     except BaseException:
         for fd in input_fds.values():
             os.close(fd)
@@ -449,11 +655,28 @@ def _workload_evidence(
         "workdir": str(canonical_workdir),
         "environment": environment,
         "input_sha256": input_hashes,
+        "input_bindings": bindings,
+        "exec_argv_sha256": _argv_sha256(exec_workload),
     }
-    return evidence, environment, executable_fd, workdir_fd, input_fds
+    return (
+        evidence,
+        environment,
+        exec_workload,
+        executable_fd,
+        workdir_fd,
+        input_fds,
+    )
 
 
-def _validate_tx_path(raw: str, run_id: str) -> tuple[Path, Path, str]:
+def _namespace_parent_sha256(parent: Path) -> str:
+    return _sha256_bytes(os.fsencode(str(parent)) + b"\0")
+
+
+def _validate_tx_path(
+    raw: str,
+    run_id: str,
+    expected_parent_sha256: str,
+) -> tuple[Path, Path, str]:
     path = Path(raw)
     if not path.is_absolute() or path.name in {"", ".", ".."}:
         raise TransactionError("transaction root must be a safe absolute path")
@@ -467,6 +690,11 @@ def _validate_tx_path(raw: str, run_id: str) -> tuple[Path, Path, str]:
         raise TransactionError("transaction parent is unavailable") from exc
     if parent != path.parent:
         raise TransactionError("transaction parent must be canonical and symlink-free")
+    if (
+        not HEX64_RE.fullmatch(expected_parent_sha256)
+        or _namespace_parent_sha256(parent) != expected_parent_sha256
+    ):
+        raise TransactionError("transaction parent differs from deployment pin")
     return path, parent, path.name
 
 
@@ -490,6 +718,15 @@ def _portable_payload(
 ) -> dict[str, Any]:
     if not SAFE_ID_RE.fullmatch(args.run_id):
         raise TransactionError("unsafe run ID")
+    if not SAFE_ID_RE.fullmatch(args.deployment_id):
+        raise TransactionError("unsafe deployment ID")
+    parent = Path(args.transaction_root).parent
+    if (
+        not HEX64_RE.fullmatch(args.expected_namespace_parent_sha256)
+        or _namespace_parent_sha256(parent)
+        != args.expected_namespace_parent_sha256
+    ):
+        raise TransactionError("portable namespace parent pin mismatch")
     if not HEX40_RE.fullmatch(args.source_commit) or not HEX40_RE.fullmatch(
         args.source_tree
     ):
@@ -524,6 +761,11 @@ def _portable_payload(
     return {
         "schema": PORTABLE_SCHEMA,
         "run_id": args.run_id,
+        "namespace": {
+            "deployment_id": args.deployment_id,
+            "canonical_parent": str(parent),
+            "canonical_parent_sha256": args.expected_namespace_parent_sha256,
+        },
         "source_commit": args.source_commit,
         "source_tree": args.source_tree,
         "source": dict(source),
@@ -632,10 +874,33 @@ class TransactionDirectory:
         if public_identity != self.root_identity:
             raise TransactionError("public transaction-root identity changed")
 
-    def local_filesystem_evidence(self) -> dict[str, int]:
+    def local_filesystem_evidence(self) -> dict[str, Any]:
         self.assert_identity()
         opened = os.fstat(self.root_fd)
-        return {"st_dev": opened.st_dev, "st_ino": opened.st_ino}
+        parent = os.fstat(self.parent_fd)
+        return {
+            "root_st_dev": opened.st_dev,
+            "root_st_ino": opened.st_ino,
+            "parent_st_dev": parent.st_dev,
+            "parent_st_ino": parent.st_ino,
+            "parent_path_sha256": _namespace_parent_sha256(self.parent),
+        }
+
+    def open_existing(self) -> None:
+        """Open one existing exact transaction root without creating it."""
+        self._assert_namespace_identity()
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self.root_fd = os.open(self.basename, flags, dir_fd=self.parent_fd)
+        except OSError as exc:
+            raise TransactionError("transaction root is unavailable") from exc
+        opened = os.fstat(self.root_fd)
+        if opened.st_uid != os.geteuid() or opened.st_mode & 0o022:
+            raise TransactionError("transaction root has unsafe ownership or mode")
+        self.root_identity = (opened.st_dev, opened.st_ino)
+        self.assert_identity()
 
     def _open_readonly(self, name: str) -> int:
         self.assert_identity()
@@ -730,6 +995,8 @@ class TransactionDirectory:
             os.fsync(fd)
         finally:
             os.close(fd)
+        linked = False
+        temporary_exists = True
         try:
             os.link(
                 temporary,
@@ -738,15 +1005,95 @@ class TransactionDirectory:
                 dst_dir_fd=self.root_fd,
                 follow_symlinks=False,
             )
+            linked = True
+            os.unlink(temporary, dir_fd=self.root_fd)
+            temporary_exists = False
             os.fsync(self.root_fd)
         except FileExistsError as exc:
             raise DuplicateInvocation(f"immutable transaction artifact exists: {name}") from exc
+        except BaseException:
+            # A failed directory durability barrier must not leave a visible
+            # terminal success artifact behind.
+            if linked:
+                try:
+                    os.unlink(name, dir_fd=self.root_fd)
+                    os.fsync(self.root_fd)
+                except OSError:
+                    pass
+            raise
         finally:
+            if temporary_exists:
+                try:
+                    os.unlink(temporary, dir_fd=self.root_fd)
+                    os.fsync(self.root_fd)
+                except FileNotFoundError:
+                    pass
+        return _sha256_bytes(raw)
+
+    def publish_terminal_outcome(
+        self,
+        payload: Mapping[str, Any],
+    ) -> str:
+        """Publish success with one final atomic namespace mutation.
+
+        The exclusive finalizer lock prevents a cooperating loser from
+        creating or cleaning a temporary entry after ``OUTCOME.json`` becomes
+        visible.  The no-replace rename both removes the temporary name and
+        creates the terminal name in the same final namespace operation.
+        """
+        name = "OUTCOME.json"
+        self.assert_identity()
+        if self.exists(name):
+            raise DuplicateInvocation("immutable transaction artifact exists: OUTCOME.json")
+        raw = _canonical_json_bytes(payload)
+        temporary = f".tmp.{name}.{os.getpid()}.{uuid.uuid4().hex}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temporary, flags, 0o600, dir_fd=self.root_fd)
+        temporary_exists = True
+        published = False
+        try:
             try:
-                os.unlink(temporary, dir_fd=self.root_fd)
-                os.fsync(self.root_fd)
-            except FileNotFoundError:
-                pass
+                view = memoryview(raw)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short terminal outcome write")
+                    view = view[written:]
+                os.fchmod(fd, 0o400)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _rename_noreplace(
+                self.root_fd,
+                temporary,
+                self.root_fd,
+                name,
+            )
+            temporary_exists = False
+            published = True
+            # This is a durability barrier, not a namespace/content mutation.
+            os.fsync(self.root_fd)
+        except FileExistsError as exc:
+            raise DuplicateInvocation(
+                "immutable transaction artifact exists: OUTCOME.json"
+            ) from exc
+        except BaseException:
+            if published:
+                try:
+                    os.unlink(name, dir_fd=self.root_fd)
+                    os.fsync(self.root_fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if temporary_exists:
+                try:
+                    os.unlink(temporary, dir_fd=self.root_fd)
+                    os.fsync(self.root_fd)
+                except FileNotFoundError:
+                    pass
         return _sha256_bytes(raw)
 
     def replace_heartbeat(self, name: str, payload: Mapping[str, Any]) -> None:
@@ -784,7 +1131,10 @@ class TransactionDirectory:
 
     def close(self) -> None:
         if self.root_fd >= 0:
-            os.close(self.root_fd)
+            try:
+                os.close(self.root_fd)
+            except OSError:
+                pass
             self.root_fd = -1
         for fd in reversed(self.namespace_fds):
             try:
@@ -836,11 +1186,291 @@ def _group_members(pgid: int) -> set[int]:
     return members
 
 
+def _process_table() -> dict[int, dict[str, Any]]:
+    """Snapshot full-argv process identities for exact ancestry discovery."""
+    table: dict[int, dict[str, Any]] = {}
+    if Path("/proc").is_dir():
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                identity = _proc_identity(int(entry.name))
+            except TransactionError:
+                continue
+            table[int(entry.name)] = identity
+        return table
+    if not _CPU_TEST_MODE:
+        raise TransactionError("exact descendant census requires Linux /proc")
+    try:
+        output = subprocess.check_output(
+            [
+                "/bin/ps",
+                "-axo",
+                "pid=,ppid=,pgid=,sess=,lstart=,command=",
+            ],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise TransactionError("cannot inspect exact test process ancestry") from exc
+    for line in output.splitlines():
+        fields = line.split(maxsplit=9)
+        if (
+            len(fields) != 10
+            or not all(item.isdigit() for item in fields[:4])
+        ):
+            continue
+        pid = int(fields[0])
+        table[pid] = {
+            "pid": pid,
+            "ppid": int(fields[1]),
+            "pgid": int(fields[2]),
+            "sid": int(fields[3]),
+            "starttime_ticks": int(
+                hashlib.sha256(" ".join(fields[4:9]).encode()).hexdigest()[:15],
+                16,
+            ),
+            "argv_sha256": _sha256_bytes(fields[9].encode()),
+        }
+    return table
+
+
+def _same_process_generation(
+    expected: Mapping[str, Any], observed: Mapping[str, Any]
+) -> bool:
+    return (
+        expected.get("pid") == observed.get("pid")
+        and expected.get("starttime_ticks") == observed.get("starttime_ticks")
+    )
+
+
+class _DescendantTracker:
+    """Track only the exact workload subtree adopted by this supervisor."""
+
+    def __init__(self, supervisor_pid: int, workload_pid: int, anchor_pid: int):
+        self.supervisor_pid = supervisor_pid
+        self.workload_pid = workload_pid
+        self.anchor_pid = anchor_pid
+        self.records: dict[tuple[int, int], dict[str, Any]] = {}
+
+    def _remember(self, identity: Mapping[str, Any]) -> None:
+        key = (int(identity["pid"]), int(identity["starttime_ticks"]))
+        record = self.records.setdefault(
+            key,
+            {
+                "pid": key[0],
+                "starttime_ticks": key[1],
+                "ppids": [],
+                "pgids": [],
+                "sids": [],
+                "argv_sha256": [],
+            },
+        )
+        for source, target in (
+            ("ppid", "ppids"),
+            ("pgid", "pgids"),
+            ("sid", "sids"),
+            ("argv_sha256", "argv_sha256"),
+        ):
+            value = identity[source]
+            if value not in record[target]:
+                record[target].append(value)
+
+    def discover(self) -> None:
+        table = _process_table()
+        known_pids: set[int] = set()
+        workload = table.get(self.workload_pid)
+        if workload is not None:
+            existing = [
+                record
+                for record in self.records.values()
+                if record["pid"] == self.workload_pid
+            ]
+            if not existing or any(
+                record["starttime_ticks"] == workload["starttime_ticks"]
+                for record in existing
+            ):
+                self._remember(workload)
+                known_pids.add(self.workload_pid)
+        for record in self.records.values():
+            observed = table.get(int(record["pid"]))
+            if observed is not None and _same_process_generation(record, observed):
+                self._remember(observed)
+                known_pids.add(int(record["pid"]))
+
+        changed = True
+        while changed:
+            changed = False
+            for pid, identity in table.items():
+                if pid in {self.supervisor_pid, self.anchor_pid}:
+                    continue
+                adopted = identity["ppid"] == self.supervisor_pid
+                descended = identity["ppid"] in known_pids
+                if (adopted or descended) and pid not in known_pids:
+                    self._remember(identity)
+                    known_pids.add(pid)
+                    changed = True
+
+    def _live(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        self.discover()
+        table = _process_table()
+        live: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for record in self.records.values():
+            observed = table.get(int(record["pid"]))
+            if observed is not None and _same_process_generation(record, observed):
+                self._remember(observed)
+                live.append((record, observed))
+        return live
+
+    def signal_live(self, signum: int) -> None:
+        for record, _observed in self._live():
+            pid = int(record["pid"])
+            pidfd = -1
+            if sys.platform == "linux" and (
+                not hasattr(os, "pidfd_open")
+                or not hasattr(signal, "pidfd_send_signal")
+            ):
+                raise TransactionError(
+                    "formal exact descendant signalling requires pidfd"
+                )
+            try:
+                if sys.platform == "linux":
+                    pidfd = os.pidfd_open(pid, 0)
+                try:
+                    current = _proc_identity(pid)
+                except TransactionError:
+                    continue
+                # A changed starttime is PID reuse and is never signalled.
+                # Re-snapshot full argv after opening pidfd so the signal is
+                # tied to the same exact process generation.
+                if not _same_process_generation(record, current):
+                    continue
+                self._remember(current)
+                if current["argv_sha256"] not in record["argv_sha256"]:
+                    raise TransactionError("descendant argv changed outside census")
+                if pidfd >= 0:
+                    signal.pidfd_send_signal(pidfd, signum)
+                else:
+                    os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+            finally:
+                if pidfd >= 0:
+                    os.close(pidfd)
+
+    def live_identities(self) -> list[dict[str, Any]]:
+        return [dict(observed) for _record, observed in self._live()]
+
+    def receipt(self, empty_censuses: int) -> dict[str, Any]:
+        records = sorted(
+            (
+                {
+                    **record,
+                    "ppids": sorted(record["ppids"]),
+                    "pgids": sorted(record["pgids"]),
+                    "sids": sorted(record["sids"]),
+                }
+                for record in self.records.values()
+            ),
+            key=lambda item: (item["pid"], item["starttime_ticks"]),
+        )
+        return {
+            "schema": SCHEMA,
+            "status": "DESCENDANTS_CLEAN",
+            "supervisor_pid": self.supervisor_pid,
+            "workload_pid": self.workload_pid,
+            "anchor_pid": self.anchor_pid,
+            "identity_basis": "pid+starttime_ticks+full_argv_sha256",
+            "required_consecutive_empty_censuses": 3,
+            "observed_consecutive_empty_censuses": empty_censuses,
+            "tracked": records,
+            "live_after": [],
+        }
+
+
 def _write_supervisor_event(fd: int, payload: Mapping[str, Any]) -> None:
     raw = _canonical_json_bytes(payload)
     view = memoryview(raw)
     while view:
         view = view[os.write(fd, view) :]
+
+
+def _prepare_pass_fds(
+    workload_input_fds: Mapping[str, int],
+    input_bindings: Mapping[str, Mapping[str, Any]],
+    forbidden_fds: set[int],
+) -> dict[str, int]:
+    """Duplicate every authority input onto its deterministic passed FD."""
+    passed: dict[str, int] = {}
+    temporary = {
+        logical_id: os.dup(fd)
+        for logical_id, fd in workload_input_fds.items()
+    }
+    try:
+        for logical_id in sorted(temporary):
+            target = int(input_bindings[logical_id]["passed_fd"])
+            if target in forbidden_fds:
+                raise TransactionError("pinned input FD collides with supervisor control")
+            os.dup2(temporary[logical_id], target, inheritable=True)
+            if _sha256_fd(target) != input_bindings[logical_id]["sha256"]:
+                raise TransactionError(f"passed input FD changed: {logical_id}")
+            passed[logical_id] = target
+    finally:
+        for fd in temporary.values():
+            os.close(fd)
+    return passed
+
+
+def _verify_child_passed_fds(
+    child_pid: int,
+    passed_fds: Mapping[str, int],
+    input_bindings: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Verify the started child's exact inherited inode through Linux /proc."""
+    evidence: dict[str, dict[str, Any]] = {}
+    for logical_id in sorted(passed_fds):
+        parent_fd = passed_fds[logical_id]
+        parent_info = os.fstat(parent_fd)
+        if sys.platform == "linux":
+            child_path = Path(f"/proc/{child_pid}/fd/{parent_fd}")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                # proc fd entries are magic links and intentionally must be
+                # followed, so do not add O_NOFOLLOW here.
+                pass
+            try:
+                child_fd = os.open(child_path, flags)
+            except OSError as exc:
+                raise TransactionError(
+                    f"workload child did not inherit pinned FD: {logical_id}"
+                ) from exc
+            try:
+                child_info = os.fstat(child_fd)
+                child_sha = _sha256_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            if (
+                (child_info.st_dev, child_info.st_ino)
+                != (parent_info.st_dev, parent_info.st_ino)
+                or child_sha != input_bindings[logical_id]["sha256"]
+            ):
+                raise TransactionError(
+                    f"workload child inherited the wrong input: {logical_id}"
+                )
+            verification = "linux_proc_child_fd"
+        elif _CPU_TEST_MODE:
+            child_info = parent_info
+            child_sha = _sha256_fd(parent_fd)
+            verification = "cpu_test_fork_inheritance"
+        else:  # pragma: no cover - formal runs are Linux-only.
+            raise TransactionError("formal child FD verification requires Linux /proc")
+        evidence[logical_id] = {
+            "passed_fd": parent_fd,
+            "st_dev": child_info.st_dev,
+            "st_ino": child_info.st_ino,
+            "sha256": child_sha,
+            "verification": verification,
+        }
+    return evidence
 
 
 def _wait_status_returncode(status_value: int) -> int:
@@ -858,26 +1488,60 @@ def _kill_exact_group(pgid: int, signum: int) -> None:
         pass
 
 
-def _supervisor_cleanup_group(anchor_pid: int, grace_seconds: float) -> None:
+def _supervisor_cleanup_group(
+    anchor_pid: int,
+    tracker: _DescendantTracker | None,
+    grace_seconds: float,
+) -> dict[str, Any]:
     _kill_exact_group(anchor_pid, signal.SIGTERM)
+    if tracker is not None:
+        tracker.signal_live(signal.SIGTERM)
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         members = _group_members(anchor_pid)
-        if members <= {anchor_pid}:
+        live = [] if tracker is None else tracker.live_identities()
+        if members <= {anchor_pid} and not live:
             break
         time.sleep(0.01)
     # The anchor is deliberately still in this group, so its PGID cannot have
     # been recycled before this exact final kill.  Always target the group:
     # /proc inspection is advisory and a missed member must not escape.
     _kill_exact_group(anchor_pid, signal.SIGKILL)
-    reap_deadline = time.monotonic() + max(grace_seconds, 0.2)
+    if tracker is not None:
+        tracker.signal_live(signal.SIGKILL)
+    reap_deadline = time.monotonic() + max(grace_seconds, 0.5)
+    empty_censuses = 0
     while time.monotonic() < reap_deadline:
-        try:
-            waited, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if waited == 0:
-            time.sleep(0.01)
+        while True:
+            try:
+                waited, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if waited == 0:
+                break
+        live = [] if tracker is None else tracker.live_identities()
+        if live:
+            empty_censuses = 0
+            tracker.signal_live(signal.SIGKILL)
+        elif _group_members(anchor_pid):
+            empty_censuses = 0
+            _kill_exact_group(anchor_pid, signal.SIGKILL)
+        else:
+            empty_censuses += 1
+            if empty_censuses >= 3:
+                if tracker is None:
+                    return {
+                        "schema": SCHEMA,
+                        "status": "DESCENDANTS_CLEAN",
+                        "identity_basis": "no-workload-started",
+                        "required_consecutive_empty_censuses": 3,
+                        "observed_consecutive_empty_censuses": empty_censuses,
+                        "tracked": [],
+                        "live_after": [],
+                    }
+                return tracker.receipt(empty_censuses)
+        time.sleep(0.02)
+    raise TransactionError("cannot prove exact workload descendants are gone")
 
 
 def _supervisor_main(
@@ -887,13 +1551,19 @@ def _supervisor_main(
     executable_fd: int,
     workdir_fd: int,
     workload: Sequence[str],
+    exec_workload: Sequence[str],
+    workload_input_fds: Mapping[str, int],
+    input_bindings: Mapping[str, Mapping[str, Any]],
     environment: Mapping[str, str],
     expected_argv_sha256: str,
+    expected_exec_argv_sha256: str,
     executable_sha256: str,
     shutdown_grace_seconds: float,
 ) -> None:
     anchor_pid = -1
     abort_requested = False
+    tracker: _DescendantTracker | None = None
+    passed_fds: dict[str, int] = {}
 
     def request_abort(_signum: int, _frame: Any) -> None:
         nonlocal abort_requested
@@ -946,36 +1616,61 @@ def _supervisor_main(
                 except BlockingIOError:
                     pass
         if abort_requested or command != b"G":
-            _supervisor_cleanup_group(anchor_pid, shutdown_grace_seconds)
+            cleanup = _supervisor_cleanup_group(
+                anchor_pid, None, shutdown_grace_seconds
+            )
             os.close(anchor_write)
             _write_supervisor_event(
-                event_fd, {"event": "RESULT", "returncode": None, "aborted": True}
+                event_fd,
+                {
+                    "event": "RESULT",
+                    "returncode": None,
+                    "aborted": True,
+                    "cleanup": cleanup,
+                },
             )
             os._exit(0)
 
+        passed_fds = _prepare_pass_fds(
+            workload_input_fds,
+            input_bindings,
+            {
+                control_fd,
+                event_fd,
+                executable_fd,
+                workdir_fd,
+                anchor_write,
+            },
+        )
+        child_ready_read, child_ready_write = os.pipe()
+        exec_gate_read, exec_gate_write = os.pipe()
         workload_pid = os.fork()
         if workload_pid == 0:
             try:
+                os.close(child_ready_read)
+                os.close(exec_gate_write)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 os.setpgid(0, anchor_pid)
-                identity = _proc_identity(os.getpid())
-                identity["preexec_argv_sha256"] = identity.pop("argv_sha256")
-                identity.update(
-                    {
-                        "expected_argv_sha256": expected_argv_sha256,
-                        "executable_sha256": executable_sha256,
-                    }
-                )
-                _write_supervisor_event(
-                    event_fd, {"event": "STARTED", "workload": identity}
-                )
+                os.write(child_ready_write, b"1")
+                os.close(child_ready_write)
+                if os.read(exec_gate_read, 1) != b"G":
+                    raise TransactionError("pinned-input exec gate was not released")
+                os.close(exec_gate_read)
                 os.fchdir(workdir_fd)
                 if os.execve in os.supports_fd:
                     os.set_inheritable(executable_fd, True)
-                    os.execve(executable_fd, list(workload), dict(environment))
+                    os.execve(
+                        executable_fd,
+                        list(exec_workload),
+                        dict(environment),
+                    )
                 if _CPU_TEST_MODE:
-                    os.execve(workload[0], list(workload), dict(environment))
+                    os.execve(
+                        workload[0],
+                        list(exec_workload),
+                        dict(environment),
+                    )
                 raise TransactionError("platform cannot exec the pinned workload fd")
             except BaseException as exc:
                 try:
@@ -986,6 +1681,55 @@ def _supervisor_main(
                 finally:
                     os._exit(127)
 
+        os.close(child_ready_write)
+        os.close(exec_gate_read)
+        if os.read(child_ready_read, 1) != b"1":
+            raise TransactionError("workload child failed before FD verification")
+        os.close(child_ready_read)
+        preexec_identity = _proc_identity(workload_pid)
+        if (
+            preexec_identity["ppid"] != os.getpid()
+            or preexec_identity["pgid"] != anchor_pid
+            or preexec_identity["sid"] != os.getsid(0)
+        ):
+            raise TransactionError("workload pre-exec ancestry mismatch")
+        inherited_inputs = _verify_child_passed_fds(
+            workload_pid,
+            passed_fds,
+            input_bindings,
+        )
+        tracker = _DescendantTracker(os.getpid(), workload_pid, anchor_pid)
+        tracker.discover()
+        os.write(exec_gate_write, b"G")
+        os.close(exec_gate_write)
+        if sys.platform == "linux":
+            exec_deadline = time.monotonic() + max(shutdown_grace_seconds, 1.0)
+            while True:
+                actual_identity = _proc_identity(workload_pid)
+                if actual_identity["argv_sha256"] == expected_exec_argv_sha256:
+                    break
+                if time.monotonic() >= exec_deadline:
+                    raise TransactionError("cannot prove actual workload exec argv")
+                time.sleep(0.005)
+        elif _CPU_TEST_MODE:
+            actual_identity = dict(preexec_identity)
+            actual_identity["argv_sha256"] = expected_exec_argv_sha256
+        else:  # pragma: no cover
+            raise TransactionError("formal workload argv proof requires Linux")
+        actual_identity.update(
+            {
+                "preexec_argv_sha256": preexec_identity["argv_sha256"],
+                "command_argv_sha256": expected_argv_sha256,
+                "exec_argv_sha256": expected_exec_argv_sha256,
+                "executable_sha256": executable_sha256,
+                "passed_input_fds": inherited_inputs,
+            }
+        )
+        tracker._remember(actual_identity)
+        _write_supervisor_event(
+            event_fd, {"event": "STARTED", "workload": actual_identity}
+        )
+
         status_value: int | None = None
         abort_deadline: float | None = None
         while status_value is None:
@@ -993,6 +1737,17 @@ def _supervisor_main(
             if waited == workload_pid:
                 status_value = observed
                 break
+            tracker.discover()
+            readable, _, _ = select.select([control_fd], [], [], 0)
+            if readable:
+                try:
+                    followup = os.read(control_fd, 1)
+                except BlockingIOError:
+                    followup = None
+                if followup in {b"", b"A"}:
+                    abort_requested = True
+                elif followup not in {None, b"G"}:
+                    raise TransactionError("invalid post-GO supervisor command")
             if abort_requested or os.getppid() != parent_pid:
                 if abort_deadline is None:
                     _kill_exact_group(anchor_pid, signal.SIGTERM)
@@ -1001,23 +1756,54 @@ def _supervisor_main(
                     _kill_exact_group(anchor_pid, signal.SIGKILL)
             time.sleep(0.01)
         returncode = _wait_status_returncode(status_value)
-        _supervisor_cleanup_group(anchor_pid, shutdown_grace_seconds)
+        cleanup = _supervisor_cleanup_group(
+            anchor_pid, tracker, shutdown_grace_seconds
+        )
         os.close(anchor_write)
         _write_supervisor_event(
             event_fd,
-            {"event": "RESULT", "returncode": returncode, "aborted": abort_requested},
+            {
+                "event": "RESULT",
+                "returncode": returncode,
+                "aborted": abort_requested,
+                "cleanup": cleanup,
+            },
         )
     except BaseException as exc:
+        cleanup_error: BaseException | None = None
         if anchor_pid > 0:
-            _kill_exact_group(anchor_pid, signal.SIGKILL)
+            try:
+                _supervisor_cleanup_group(
+                    anchor_pid,
+                    tracker,
+                    shutdown_grace_seconds,
+                )
+            except BaseException as cleanup_exc:
+                cleanup_error = cleanup_exc
         try:
             _write_supervisor_event(
                 event_fd,
-                {"event": "SUPERVISOR_ERROR", "reason": f"{type(exc).__name__}: {exc}"},
+                {
+                    "event": "SUPERVISOR_ERROR",
+                    "reason": (
+                        f"{type(exc).__name__}: {exc}"
+                        + (
+                            " | cleanup: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            if cleanup_error is not None
+                            else ""
+                        )
+                    ),
+                },
             )
         except BaseException:
             pass
     finally:
+        for fd in passed_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         os._exit(0)
 
 
@@ -1026,6 +1812,7 @@ class Coordinator:
         self,
         args: argparse.Namespace,
         workload: Sequence[str],
+        exec_workload: Sequence[str],
         runner: Mapping[str, Any],
         portable: Mapping[str, Any],
         tx: TransactionDirectory,
@@ -1036,6 +1823,7 @@ class Coordinator:
     ):
         self.args = args
         self.workload = list(workload)
+        self.exec_workload = list(exec_workload)
         self.runner = dict(runner)
         self.portable = dict(portable)
         self.portable_sha256 = _sha256_bytes(_canonical_json_bytes(self.portable))
@@ -1054,14 +1842,18 @@ class Coordinator:
         self.peer_started_name = f"STARTED.rank{self.peer_rank}.json"
         self.result_name = f"WORKLOAD_RESULT.rank{self.rank}.json"
         self.peer_result_name = f"WORKLOAD_RESULT.rank{self.peer_rank}.json"
-        self.final_name = f"FINAL.rank{self.rank}.json"
+        self.cleanup_name = f"CLEANUP.rank{self.rank}.json"
+        self.peer_cleanup_name = f"CLEANUP.rank{self.peer_rank}.json"
+        self.handoff_name = f"HANDOFF.rank{self.rank}.json"
+        self.peer_handoff_name = f"HANDOFF.rank{self.peer_rank}.json"
         self.heartbeat_name = f"HEARTBEAT.rank{self.rank}.json"
         self.peer_heartbeat_name = f"HEARTBEAT.rank{self.peer_rank}.json"
         self.prepared_sha256 = ""
         self.armed_sha256 = ""
         self.started_sha256 = ""
+        self.cleanup_sha256 = ""
         self.workload_result_sha256 = ""
-        self.final_sha256 = ""
+        self.handoff_sha256 = ""
         self.sequence = 0
         self.state = "STARTING"
         self.abort_requested = False
@@ -1078,8 +1870,8 @@ class Coordinator:
         self.event_fd = -1
         self.event_buffer = b""
         self.pending_events: list[dict[str, Any]] = []
+        self.descendant_tracker: _DescendantTracker | None = None
         self.decision_go = False
-        self.outcome_succeeded = False
 
     @property
     def heartbeat_seconds(self) -> float:
@@ -1209,18 +2001,45 @@ class Coordinator:
             or not Path(str(payload.get("transaction_root"))).is_absolute()
             or Path(str(payload.get("transaction_root"))).name
             != self.portable["run_id"]
+            or str(Path(str(payload.get("transaction_root"))).parent)
+            != self.portable["namespace"]["canonical_parent"]
             or not _exact_int(payload.get("prepared_unix_ns"), minimum=1)
         ):
             raise PeerAbort(f"PREPARED receipt mismatch for rank {rank}")
         fs_value = payload.get("node_local_filesystem")
         if (
             not isinstance(fs_value, dict)
-            or set(fs_value) != {"st_dev", "st_ino"}
-            or not all(_exact_int(value, minimum=0) for value in fs_value.values())
+            or set(fs_value)
+            != {
+                "root_st_dev",
+                "root_st_ino",
+                "parent_st_dev",
+                "parent_st_ino",
+                "parent_path_sha256",
+            }
+            or not all(
+                _exact_int(fs_value.get(key), minimum=0)
+                for key in (
+                    "root_st_dev",
+                    "root_st_ino",
+                    "parent_st_dev",
+                    "parent_st_ino",
+                )
+            )
+            or fs_value.get("parent_path_sha256")
+            != self.portable["namespace"]["canonical_parent_sha256"]
         ):
             raise PeerAbort(f"invalid node-local filesystem evidence for rank {rank}")
         runner = payload.get("runner")
-        runner_keys = IDENTITY_KEYS | {"path", "sha256", "status_path", "log_path"}
+        runner_keys = IDENTITY_KEYS | {
+            "path",
+            "sha256",
+            "status_path",
+            "log_path",
+            "argv",
+            "command",
+            "command_argv_sha256",
+        }
         if not isinstance(runner, dict) or set(runner) != runner_keys:
             raise PeerAbort(f"invalid runner receipt for rank {rank}")
         self._validate_identity({key: runner[key] for key in IDENTITY_KEYS}, "runner")
@@ -1233,6 +2052,15 @@ class Coordinator:
                 and Path(runner[key]).is_absolute()
                 for key in ("status_path", "log_path")
             )
+            or not isinstance(runner.get("argv"), list)
+            or not isinstance(runner.get("command"), list)
+            or not runner["argv"]
+            or not runner["command"]
+            or not all(isinstance(item, str) for item in runner["argv"])
+            or not all(isinstance(item, str) for item in runner["command"])
+            or runner["command_argv_sha256"]
+            != _argv_sha256(runner["command"])
+            or runner["argv"][-len(runner["command"]) :] != runner["command"]
         ):
             raise PeerAbort(f"runner binding mismatch for rank {rank}")
         coordinator = self._validate_identity(payload.get("coordinator"), "coordinator")
@@ -1249,7 +2077,8 @@ class Coordinator:
         if (
             set(peer) != keys
             or peer.get("schema") != SCHEMA
-            or peer.get("status") not in {"PREPARED", "ARMED", "RUNNING", "RESULT", "FINAL"}
+            or peer.get("status")
+            not in {"PREPARED", "ARMED", "RUNNING", "RESULT", "HANDOFF"}
             or peer.get("rank") != self.peer_rank
             or peer.get("prepared_sha256") != prepared_sha
             or peer.get("coordinator") != prepared["coordinator"]
@@ -1350,14 +2179,14 @@ class Coordinator:
             set(payload)
             != {
                 "schema", "status", "rank", "portable_sha256", "reason", "bindings",
-                "outcome_unix_ns",
+                "terminal_generation",
             }
             or payload.get("schema") != SCHEMA
             or payload.get("status") not in {"SUCCEEDED", "FAILED"}
             or payload.get("rank") not in EXPECTED_RANKS
             or payload.get("portable_sha256") != self.portable_sha256
             or not isinstance(payload.get("reason"), str)
-            or not _exact_int(payload.get("outcome_unix_ns"), minimum=1)
+            or payload.get("terminal_generation") != 1
         ):
             raise TransactionError("invalid OUTCOME receipt")
         bindings = payload.get("bindings")
@@ -1368,12 +2197,12 @@ class Coordinator:
         if (
             payload.get("rank") != 0
             or not isinstance(bindings, dict)
-            or set(bindings) != {"workload_result_sha256"}
-            or not isinstance(bindings["workload_result_sha256"], dict)
-            or set(bindings["workload_result_sha256"]) != {"0", "1"}
+            or set(bindings) != {"final_sha256"}
+            or not isinstance(bindings["final_sha256"], dict)
+            or set(bindings["final_sha256"]) != {"0", "1"}
             or not all(
                 HEX64_RE.fullmatch(str(value))
-                for value in bindings["workload_result_sha256"].values()
+                for value in bindings["final_sha256"].values()
             )
         ):
             raise TransactionError("invalid successful OUTCOME bindings")
@@ -1386,6 +2215,7 @@ class Coordinator:
             self._validate_outcome(outcome)
             if outcome["status"] == "FAILED":
                 raise PeerAbort(f"transaction failure: {outcome['reason']}")
+            raise PeerAbort("successful OUTCOME appeared before outer finalization")
         if self.tx.exists("DECISION.json"):
             decision, _ = self.tx.read_json("DECISION.json")
             self._validate_decision(decision)
@@ -1418,40 +2248,13 @@ class Coordinator:
             "portable_sha256": self.portable_sha256,
             "reason": reason,
             "bindings": None,
-            "outcome_unix_ns": time.time_ns(),
+            "terminal_generation": 1,
         }
         try:
             self.tx.publish_immutable("OUTCOME.json", payload)
         except DuplicateInvocation:
             existing, _ = self.tx.read_json("OUTCOME.json")
             self._validate_outcome(existing)
-
-    def _publish_success_outcome(self, result_hashes: Mapping[int, str]) -> None:
-        bindings = {
-            "workload_result_sha256": {
-                str(rank): result_hashes[rank] for rank in EXPECTED_RANKS
-            }
-        }
-        if self.rank == 0:
-            self._check_abort()
-            self.tx.publish_immutable(
-                "OUTCOME.json",
-                {
-                    "schema": SCHEMA,
-                    "status": "SUCCEEDED",
-                    "rank": 0,
-                    "portable_sha256": self.portable_sha256,
-                    "reason": "both exact workload results completed",
-                    "bindings": bindings,
-                    "outcome_unix_ns": time.time_ns(),
-                },
-            )
-        self._wait_for_file("OUTCOME.json", self.args.completion_timeout_ms, "outcome")
-        outcome, _ = self.tx.read_json("OUTCOME.json")
-        self._validate_outcome(outcome)
-        if outcome["status"] != "SUCCEEDED" or outcome["bindings"] != bindings:
-            raise PeerAbort("successful OUTCOME binding mismatch")
-        self.outcome_succeeded = True
 
     def _wait_for_file(self, name: str, timeout_ms: int, phase: str) -> None:
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -1573,8 +2376,12 @@ class Coordinator:
                 self.executable_fd,
                 self.workdir_fd,
                 self.workload,
+                self.exec_workload,
+                self.workload_input_fds,
+                self.portable["workload"]["input_bindings"],
                 environment,
                 self.portable["workload"]["argv_sha256"],
+                self.portable["workload"]["exec_argv_sha256"],
                 self.portable["workload"]["executable_sha256"],
                 self.args.shutdown_grace_ms / 1000.0,
             )
@@ -1694,10 +2501,17 @@ class Coordinator:
 
     def _publish_started(self, event: Mapping[str, Any]) -> None:
         workload_identity = event.get("workload")
-        expected_keys = {
-            "pid", "ppid", "pgid", "sid", "starttime_ticks",
-            "preexec_argv_sha256", "expected_argv_sha256", "executable_sha256",
+        expected_keys = IDENTITY_KEYS | {
+            "preexec_argv_sha256",
+            "command_argv_sha256",
+            "exec_argv_sha256",
+            "executable_sha256",
+            "passed_input_fds",
         }
+        passed = workload_identity.get("passed_input_fds") if isinstance(
+            workload_identity, dict
+        ) else None
+        expected_bindings = self.portable["workload"]["input_bindings"]
         if (
             not isinstance(workload_identity, dict)
             or set(workload_identity) != expected_keys
@@ -1710,10 +2524,36 @@ class Coordinator:
             or workload_identity.get("sid") != self.supervisor_identity["sid"]
             or workload_identity.get("preexec_argv_sha256")
             != self.supervisor_identity["argv_sha256"]
-            or workload_identity.get("expected_argv_sha256")
+            or workload_identity.get("command_argv_sha256")
             != self.portable["workload"]["argv_sha256"]
+            or workload_identity.get("exec_argv_sha256")
+            != self.portable["workload"]["exec_argv_sha256"]
+            or workload_identity.get("argv_sha256")
+            != self.portable["workload"]["exec_argv_sha256"]
             or workload_identity.get("executable_sha256")
             != self.portable["workload"]["executable_sha256"]
+            or not isinstance(passed, dict)
+            or set(passed) != set(expected_bindings)
+            or any(
+                not isinstance(passed[logical_id], dict)
+                or set(passed[logical_id])
+                != {
+                    "passed_fd",
+                    "st_dev",
+                    "st_ino",
+                    "sha256",
+                    "verification",
+                }
+                or passed[logical_id].get("passed_fd")
+                != expected_bindings[logical_id]["passed_fd"]
+                or passed[logical_id].get("sha256")
+                != expected_bindings[logical_id]["sha256"]
+                or not _exact_int(passed[logical_id].get("st_dev"), minimum=0)
+                or not _exact_int(passed[logical_id].get("st_ino"), minimum=0)
+                or passed[logical_id].get("verification")
+                not in {"linux_proc_child_fd", "cpu_test_fork_inheritance"}
+                for logical_id in expected_bindings
+            )
         ):
             raise TransactionError("invalid local STARTED process evidence")
         self.started_sha256 = self.tx.publish_immutable(
@@ -1730,6 +2570,13 @@ class Coordinator:
                 "started_unix_ns": time.time_ns(),
             },
         )
+        self.descendant_tracker = _DescendantTracker(
+            int(self.supervisor_identity["pid"]),
+            int(workload_identity["pid"]),
+            int(self.workgroup["pid"]),
+        )
+        self.descendant_tracker._remember(workload_identity)
+        self.descendant_tracker.discover()
 
     def _validate_started(self, payload: Mapping[str, Any], rank: int) -> None:
         keys = {
@@ -1739,6 +2586,8 @@ class Coordinator:
         armed, armed_sha = self.tx.read_json(f"ARMED.rank{rank}.json")
         self._validate_armed(armed, rank)
         workload = payload.get("workload")
+        expected_bindings = self.portable["workload"]["input_bindings"]
+        passed = workload.get("passed_input_fds") if isinstance(workload, dict) else None
         if (
             set(payload) != keys
             or payload.get("schema") != SCHEMA
@@ -1750,10 +2599,14 @@ class Coordinator:
             or payload.get("workgroup") != armed["workgroup"]
             or not _exact_int(payload.get("started_unix_ns"), minimum=1)
             or not isinstance(workload, dict)
-            or set(workload) != {
-                "pid", "ppid", "pgid", "sid", "starttime_ticks",
-                "preexec_argv_sha256", "expected_argv_sha256",
+            or set(workload)
+            != IDENTITY_KEYS
+            | {
+                "preexec_argv_sha256",
+                "command_argv_sha256",
+                "exec_argv_sha256",
                 "executable_sha256",
+                "passed_input_fds",
             }
             or not all(
                 _exact_int(workload.get(key), minimum=1)
@@ -1764,10 +2617,150 @@ class Coordinator:
             or workload.get("sid") != armed["supervisor"]["sid"]
             or workload.get("preexec_argv_sha256")
             != armed["supervisor"]["argv_sha256"]
-            or workload.get("expected_argv_sha256") != self.portable["workload"]["argv_sha256"]
+            or workload.get("command_argv_sha256")
+            != self.portable["workload"]["argv_sha256"]
+            or workload.get("exec_argv_sha256")
+            != self.portable["workload"]["exec_argv_sha256"]
+            or workload.get("argv_sha256")
+            != self.portable["workload"]["exec_argv_sha256"]
             or workload.get("executable_sha256") != self.portable["workload"]["executable_sha256"]
+            or not isinstance(passed, dict)
+            or set(passed) != set(expected_bindings)
+            or any(
+                not isinstance(passed[logical_id], dict)
+                or set(passed[logical_id])
+                != {
+                    "passed_fd",
+                    "st_dev",
+                    "st_ino",
+                    "sha256",
+                    "verification",
+                }
+                or passed[logical_id].get("passed_fd")
+                != expected_bindings[logical_id]["passed_fd"]
+                or passed[logical_id].get("sha256")
+                != expected_bindings[logical_id]["sha256"]
+                or not _exact_int(passed[logical_id].get("st_dev"), minimum=0)
+                or not _exact_int(passed[logical_id].get("st_ino"), minimum=0)
+                or passed[logical_id].get("verification")
+                not in {"linux_proc_child_fd", "cpu_test_fork_inheritance"}
+                for logical_id in expected_bindings
+            )
         ):
             raise PeerAbort(f"STARTED receipt mismatch for rank {rank}")
+
+    def _publish_cleanup(self, proof: Any) -> None:
+        payload = {
+            "schema": SCHEMA,
+            "status": "CLEAN",
+            "rank": self.rank,
+            "started_sha256": self.started_sha256,
+            "coordinator": self.coordinator_identity,
+            "supervisor": self.supervisor_identity,
+            "workgroup": self.workgroup,
+            "proof": proof,
+            "cleanup_unix_ns": time.time_ns(),
+        }
+        self._validate_cleanup(payload, self.rank)
+        self.cleanup_sha256 = self.tx.publish_immutable(
+            self.cleanup_name, payload
+        )
+
+    def _validate_cleanup(self, payload: Mapping[str, Any], rank: int) -> None:
+        keys = {
+            "schema",
+            "status",
+            "rank",
+            "started_sha256",
+            "coordinator",
+            "supervisor",
+            "workgroup",
+            "proof",
+            "cleanup_unix_ns",
+        }
+        started, started_sha = self.tx.read_json(f"STARTED.rank{rank}.json")
+        self._validate_started(started, rank)
+        proof = payload.get("proof")
+        if (
+            set(payload) != keys
+            or payload.get("schema") != SCHEMA
+            or payload.get("status") != "CLEAN"
+            or payload.get("rank") != rank
+            or payload.get("started_sha256") != started_sha
+            or payload.get("coordinator") != started["coordinator"]
+            or payload.get("supervisor") != started["supervisor"]
+            or payload.get("workgroup") != started["workgroup"]
+            or not _exact_int(payload.get("cleanup_unix_ns"), minimum=1)
+            or not isinstance(proof, dict)
+            or set(proof)
+            != {
+                "schema",
+                "status",
+                "supervisor_pid",
+                "workload_pid",
+                "anchor_pid",
+                "identity_basis",
+                "required_consecutive_empty_censuses",
+                "observed_consecutive_empty_censuses",
+                "tracked",
+                "live_after",
+            }
+            or proof.get("schema") != SCHEMA
+            or proof.get("status") != "DESCENDANTS_CLEAN"
+            or proof.get("supervisor_pid") != started["supervisor"]["pid"]
+            or proof.get("workload_pid") != started["workload"]["pid"]
+            or proof.get("anchor_pid") != started["workgroup"]["pid"]
+            or proof.get("identity_basis")
+            != "pid+starttime_ticks+full_argv_sha256"
+            or proof.get("required_consecutive_empty_censuses") != 3
+            or not _exact_int(
+                proof.get("observed_consecutive_empty_censuses"), minimum=3
+            )
+            or proof.get("live_after") != []
+            or not isinstance(proof.get("tracked"), list)
+        ):
+            raise PeerAbort(f"CLEANUP receipt mismatch for rank {rank}")
+        workload_tracked = False
+        for record in proof["tracked"]:
+            if (
+                not isinstance(record, dict)
+                or set(record)
+                != {
+                    "pid",
+                    "starttime_ticks",
+                    "ppids",
+                    "pgids",
+                    "sids",
+                    "argv_sha256",
+                }
+                or not _exact_int(record.get("pid"), minimum=1)
+                or not _exact_int(record.get("starttime_ticks"), minimum=1)
+                or any(
+                    not isinstance(record.get(key), list)
+                    or not record[key]
+                    for key in ("ppids", "pgids", "sids", "argv_sha256")
+                )
+                or not all(
+                    _exact_int(value, minimum=0)
+                    for key in ("ppids", "pgids", "sids")
+                    for value in record[key]
+                )
+                or not all(
+                    isinstance(value, str) and HEX64_RE.fullmatch(value)
+                    for value in record["argv_sha256"]
+                )
+            ):
+                raise PeerAbort(f"invalid tracked descendant for rank {rank}")
+            if (
+                record["pid"] == started["workload"]["pid"]
+                and record["starttime_ticks"]
+                == started["workload"]["starttime_ticks"]
+                and started["workload"]["exec_argv_sha256"]
+                in record["argv_sha256"]
+            ):
+                workload_tracked = True
+        if not workload_tracked:
+            raise PeerAbort(f"CLEANUP omitted exact workload for rank {rank}")
 
     def _publish_workload_result(self, status_value: str, rc: int | None, reason: str) -> None:
         if status_value == "COMPLETED":
@@ -1785,6 +2778,7 @@ class Coordinator:
                 "status": status_value,
                 "rank": self.rank,
                 "started_sha256": self.started_sha256 or None,
+                "cleanup_sha256": self.cleanup_sha256 or None,
                 "coordinator": self.coordinator_identity,
                 "reason": reason,
                 "workload_returncode": rc,
@@ -1794,8 +2788,8 @@ class Coordinator:
 
     def _validate_workload_result(self, payload: Mapping[str, Any], rank: int) -> None:
         keys = {
-            "schema", "status", "rank", "started_sha256", "coordinator", "reason",
-            "workload_returncode", "result_unix_ns",
+            "schema", "status", "rank", "started_sha256", "cleanup_sha256",
+            "coordinator", "reason", "workload_returncode", "result_unix_ns",
         }
         if (
             set(payload) != keys
@@ -1818,6 +2812,13 @@ class Coordinator:
         if payload["status"] == "ABORTED":
             if payload.get("workload_returncode") is not None:
                 raise PeerAbort("ABORTED workload result has a return code")
+            if payload.get("cleanup_sha256") is not None:
+                cleanup, cleanup_sha = self.tx.read_json(
+                    f"CLEANUP.rank{rank}.json"
+                )
+                self._validate_cleanup(cleanup, rank)
+                if payload.get("cleanup_sha256") != cleanup_sha:
+                    raise PeerAbort("ABORTED cleanup binding mismatch")
             if payload.get("started_sha256") is not None:
                 started, started_sha = self.tx.read_json(f"STARTED.rank{rank}.json")
                 self._validate_started(started, rank)
@@ -1829,80 +2830,80 @@ class Coordinator:
             return
         started, started_sha = self.tx.read_json(f"STARTED.rank{rank}.json")
         self._validate_started(started, rank)
+        cleanup, cleanup_sha = self.tx.read_json(f"CLEANUP.rank{rank}.json")
+        self._validate_cleanup(cleanup, rank)
         rc = payload.get("workload_returncode")
         if (
             payload.get("started_sha256") != started_sha
+            or payload.get("cleanup_sha256") != cleanup_sha
             or payload.get("coordinator") != started["coordinator"]
             or (payload["status"] == "COMPLETED" and not (type(rc) is int and rc == 0))
             or (payload["status"] == "WORKLOAD_FAILED" and not (type(rc) is int and rc != 0))
         ):
             raise PeerAbort(f"WORKLOAD_RESULT semantics mismatch for rank {rank}")
 
-    def _publish_final(self, status_value: str, coordinator_rc: int, reason: str) -> None:
-        self.state = "FINAL"
+    def _publish_handoff(self, result_hashes: Mapping[int, str]) -> None:
+        self.state = "HANDOFF"
         self._heartbeat()
         payload = {
             "schema": SCHEMA,
-            "status": status_value,
+            "status": "READY_FOR_OUTER_FINALIZER",
             "rank": self.rank,
-            "workload_result_sha256": self.workload_result_sha256 or None,
+            "portable_sha256": self.portable_sha256,
+            "workload_result_sha256": {
+                str(rank): result_hashes[rank] for rank in EXPECTED_RANKS
+            },
+            "cleanup_sha256": self.cleanup_sha256,
             "coordinator": self.coordinator_identity,
-            "reason": reason,
-            "coordinator_returncode": coordinator_rc,
-            "final_unix_ns": time.time_ns(),
+            "handoff_unix_ns": time.time_ns(),
         }
-        self._validate_final(payload, self.rank)
-        self.final_sha256 = self.tx.publish_immutable(self.final_name, payload)
+        self._validate_handoff(payload, self.rank)
+        self.handoff_sha256 = self.tx.publish_immutable(
+            self.handoff_name, payload
+        )
 
-    def _validate_final(self, payload: Mapping[str, Any], rank: int) -> None:
+    def _validate_handoff(self, payload: Mapping[str, Any], rank: int) -> None:
         keys = {
-            "schema", "status", "rank", "workload_result_sha256", "coordinator",
-            "reason", "coordinator_returncode", "final_unix_ns",
+            "schema",
+            "status",
+            "rank",
+            "portable_sha256",
+            "workload_result_sha256",
+            "cleanup_sha256",
+            "coordinator",
+            "handoff_unix_ns",
         }
+        results = payload.get("workload_result_sha256")
         if (
             set(payload) != keys
             or payload.get("schema") != SCHEMA
-            or payload.get("status")
-            not in {"SUCCEEDED", "WORKLOAD_FAILED", "ABORTED", "PROTOCOL_FAILED"}
+            or payload.get("status") != "READY_FOR_OUTER_FINALIZER"
             or payload.get("rank") != rank
-            or not isinstance(payload.get("reason"), str)
-            or not _exact_int(payload.get("coordinator_returncode"), minimum=0)
-            or not _exact_int(payload.get("final_unix_ns"), minimum=1)
-            or not isinstance(payload.get("coordinator"), dict)
+            or payload.get("portable_sha256") != self.portable_sha256
+            or not _exact_int(payload.get("handoff_unix_ns"), minimum=1)
+            or not isinstance(results, dict)
+            or set(results) != {"0", "1"}
+            or not all(HEX64_RE.fullmatch(str(value)) for value in results.values())
         ):
-            raise PeerAbort(f"FINAL schema mismatch for rank {rank}")
-        coordinator = self._validate_identity(payload.get("coordinator"), "final coordinator")
-        prepared_name = f"PREPARED.rank{rank}.json"
-        if self.tx.exists(prepared_name):
-            prepared, _ = self.tx.read_json(prepared_name)
-            self._validate_prepared(prepared, rank)
-            if coordinator != prepared["coordinator"]:
-                raise PeerAbort(f"FINAL coordinator mismatch for rank {rank}")
-        result_hash = payload.get("workload_result_sha256")
-        result: Mapping[str, Any] | None = None
-        if result_hash is not None:
-            if not HEX64_RE.fullmatch(str(result_hash)):
-                raise PeerAbort(f"FINAL result digest mismatch for rank {rank}")
-            result, observed_hash = self.tx.read_json(f"WORKLOAD_RESULT.rank{rank}.json")
-            self._validate_workload_result(result, rank)
-            if result_hash != observed_hash or payload.get("coordinator") != result["coordinator"]:
-                raise PeerAbort(f"FINAL/result binding mismatch for rank {rank}")
-        status_value = payload["status"]
-        rc = payload["coordinator_returncode"]
-        if (
-            (
-                status_value == "SUCCEEDED"
-                and not (rc == 0 and result and result["status"] == "COMPLETED")
+            raise PeerAbort(f"HANDOFF schema mismatch for rank {rank}")
+        prepared, _ = self.tx.read_json(f"PREPARED.rank{rank}.json")
+        self._validate_prepared(prepared, rank)
+        if payload.get("coordinator") != prepared["coordinator"]:
+            raise PeerAbort(f"HANDOFF coordinator mismatch for rank {rank}")
+        for result_rank in EXPECTED_RANKS:
+            result, result_sha = self.tx.read_json(
+                f"WORKLOAD_RESULT.rank{result_rank}.json"
             )
-            or (
-                status_value == "WORKLOAD_FAILED"
-                and not (
-                    rc == 4 and result and result["status"] == "WORKLOAD_FAILED"
-                )
-            )
-            or (status_value in {"ABORTED", "PROTOCOL_FAILED"} and rc != 3)
-        ):
-            raise PeerAbort(f"FINAL status/rc semantics mismatch for rank {rank}")
+            self._validate_workload_result(result, result_rank)
+            if (
+                result["status"] != "COMPLETED"
+                or results[str(result_rank)] != result_sha
+            ):
+                raise PeerAbort(f"HANDOFF result mismatch for rank {rank}")
+        cleanup, cleanup_sha = self.tx.read_json(f"CLEANUP.rank{rank}.json")
+        self._validate_cleanup(cleanup, rank)
+        if payload.get("cleanup_sha256") != cleanup_sha:
+            raise PeerAbort(f"HANDOFF cleanup mismatch for rank {rank}")
 
     def _terminate_workload(self) -> None:
         if self.control_fd >= 0:
@@ -1914,6 +2915,8 @@ class Coordinator:
             self.control_fd = -1
         if self.workgroup is not None:
             pgid = int(self.workgroup["pid"])
+            if self.descendant_tracker is not None:
+                self.descendant_tracker.signal_live(signal.SIGTERM)
             try:
                 observed_anchor = _proc_identity(pgid)
                 anchor_is_exact = all(
@@ -1926,13 +2929,25 @@ class Coordinator:
                 _kill_exact_group(pgid, signal.SIGTERM)
                 deadline = time.monotonic() + self.args.shutdown_grace_ms / 1000.0
                 while time.monotonic() < deadline:
-                    if _group_members(pgid) <= {pgid}:
+                    live = (
+                        []
+                        if self.descendant_tracker is None
+                        else self.descendant_tracker.live_identities()
+                    )
+                    if _group_members(pgid) <= {pgid} and not live:
                         break
                     time.sleep(0.01)
                 # The ignored-TERM anchor still pins the PGID here.
                 _kill_exact_group(pgid, signal.SIGKILL)
+                if self.descendant_tracker is not None:
+                    self.descendant_tracker.signal_live(signal.SIGKILL)
         if self.supervisor_pid is not None:
-            deadline = time.monotonic() + self.args.shutdown_grace_ms / 1000.0
+            # The supervisor may need one grace interval for the workload,
+            # one for escaped descendants, and a final reap/census interval.
+            # Killing the subreaper after only one interval can strand a
+            # setsid descendant outside the anchored process group.
+            grace = self.args.shutdown_grace_ms / 1000.0
+            deadline = time.monotonic() + max(2.0, grace * 3.0 + 1.0)
             while time.monotonic() < deadline:
                 try:
                     waited, _ = os.waitpid(self.supervisor_pid, os.WNOHANG)
@@ -1952,6 +2967,8 @@ class Coordinator:
                 except ChildProcessError:
                     pass
                 self.supervisor_pid = None
+        if self.descendant_tracker is not None:
+            self.descendant_tracker.signal_live(signal.SIGKILL)
 
     def _run_workload(self) -> int:
         self._check_abort()
@@ -1961,8 +2978,6 @@ class Coordinator:
         if self.control_fd < 0:
             raise TransactionError("local supervisor control is unavailable")
         os.write(self.control_fd, b"G")
-        os.close(self.control_fd)
-        self.control_fd = -1
         started = self._wait_event("STARTED", self.args.start_timeout_ms, "workload start")
         self._publish_started(started)
         self.state = "RUNNING"
@@ -1978,6 +2993,10 @@ class Coordinator:
                 if self.supervisor_pid is not None:
                     os.waitpid(self.supervisor_pid, 0)
                     self.supervisor_pid = None
+                if self.control_fd >= 0:
+                    os.close(self.control_fd)
+                    self.control_fd = -1
+                self._publish_cleanup(result.get("cleanup"))
                 # The supervisor has proved the anchored group empty.  Drop
                 # the live PGID handle so a later peer failure can never act
                 # on a numerically recycled process group.
@@ -1995,7 +3014,6 @@ class Coordinator:
                 self.state = "RESULT"
                 self._heartbeat()
                 self._publish_failure("local workload returned non-zero")
-                self._publish_final("WORKLOAD_FAILED", 4, "local workload failed")
                 return 4
             if self.supervisor_pid is None or self.supervisor_identity is None:
                 raise TransactionError("local supervisor identity is unavailable")
@@ -2014,6 +3032,8 @@ class Coordinator:
                 raise TransactionError("local supervisor exited without a result")
             if not supervisor_is_exact:
                 raise TransactionError("local supervisor identity changed while running")
+            if self.descendant_tracker is not None:
+                self.descendant_tracker.discover()
             self._check_abort()
             if self._peer_is_stale():
                 raise PeerAbort("peer heartbeat became stale while running")
@@ -2031,7 +3051,7 @@ class Coordinator:
         if peer["status"] != "COMPLETED":
             raise PeerAbort(f"peer workload result: {peer['status']}")
         self._wait_for_peer_heartbeat_status(
-            {"RESULT", "FINAL"},
+            {"RESULT", "HANDOFF"},
             self.args.completion_timeout_ms,
             "post-result barrier",
         )
@@ -2039,8 +3059,15 @@ class Coordinator:
             self.rank: self.workload_result_sha256,
             self.peer_rank: peer_result_sha,
         }
-        self._publish_success_outcome(result_hashes)
-        self._publish_final("SUCCEEDED", 0, "both exact guarded workloads completed")
+        self._publish_handoff(result_hashes)
+        self._wait_for_file(
+            self.peer_handoff_name,
+            self.args.completion_timeout_ms,
+            "outer-finalizer handoff",
+        )
+        for rank in EXPECTED_RANKS:
+            handoff, _ = self.tx.read_json(f"HANDOFF.rank{rank}.json")
+            self._validate_handoff(handoff, rank)
         return 0
 
     def run(self) -> int:
@@ -2062,9 +3089,6 @@ class Coordinator:
                 self._publish_decision_abort(reason)
             if not self.workload_result_sha256:
                 self._publish_workload_result("ABORTED", None, reason)
-            if not self.final_sha256:
-                status_value = "ABORTED" if isinstance(exc, PeerAbort) else "PROTOCOL_FAILED"
-                self._publish_final(status_value, 3, reason)
         except BaseException:
             pass
 
@@ -2083,10 +3107,479 @@ class Coordinator:
         self.workload_input_fds = {}
 
 
+def _receipt_validator(
+    tx: TransactionDirectory,
+    portable: Mapping[str, Any],
+) -> Coordinator:
+    validator = object.__new__(Coordinator)
+    validator.tx = tx
+    validator.portable = dict(portable)
+    validator.portable_sha256 = _sha256_bytes(
+        _canonical_json_bytes(portable)
+    )
+    return validator
+
+
+def _open_control_transaction(
+    args: argparse.Namespace,
+) -> tuple[TransactionDirectory, dict[str, Any], str]:
+    root, parent, basename = _validate_tx_path(
+        args.transaction_root,
+        args.run_id,
+        args.expected_namespace_parent_sha256,
+    )
+    tx = TransactionDirectory(root, parent, basename, 1)
+    tx.open_existing()
+    bootstrap, _ = tx.read_json("TRANSACTION.json")
+    if (
+        set(bootstrap) != {"schema", "status", "portable", "portable_sha256"}
+        or bootstrap.get("schema") != SCHEMA
+        or bootstrap.get("status") != "OPEN"
+        or not isinstance(bootstrap.get("portable"), dict)
+    ):
+        tx.close()
+        raise TransactionError("transaction bootstrap schema mismatch")
+    portable = dict(bootstrap["portable"])
+    portable_sha = _sha256_bytes(_canonical_json_bytes(portable))
+    namespace = portable.get("namespace")
+    if (
+        bootstrap.get("portable_sha256") != portable_sha
+        or portable_sha != args.expected_portable_sha256
+        or portable.get("schema") != PORTABLE_SCHEMA
+        or portable.get("run_id") != args.run_id
+        or not isinstance(namespace, dict)
+        or namespace
+        != {
+            "deployment_id": args.deployment_id,
+            "canonical_parent": str(parent),
+            "canonical_parent_sha256": args.expected_namespace_parent_sha256,
+        }
+        or portable.get("source_commit") != args.source_commit
+        or portable.get("source_tree") != args.source_tree
+    ):
+        tx.close()
+        raise TransactionError("control-plane portable binding mismatch")
+    if _source_evidence(args) != portable.get("source"):
+        tx.close()
+        raise TransactionError("control-plane source evidence mismatch")
+    return tx, portable, portable_sha
+
+
+def _validate_inner_success_chain(
+    tx: TransactionDirectory,
+    portable: Mapping[str, Any],
+) -> dict[str, Any]:
+    validator = _receipt_validator(tx, portable)
+    prepared: dict[int, dict[str, Any]] = {}
+    prepared_sha: dict[int, str] = {}
+    armed: dict[int, dict[str, Any]] = {}
+    armed_sha: dict[int, str] = {}
+    started: dict[int, dict[str, Any]] = {}
+    started_sha: dict[int, str] = {}
+    cleanup: dict[int, dict[str, Any]] = {}
+    cleanup_sha: dict[int, str] = {}
+    results: dict[int, dict[str, Any]] = {}
+    result_sha: dict[int, str] = {}
+    handoffs: dict[int, dict[str, Any]] = {}
+    handoff_sha: dict[int, str] = {}
+    for rank in EXPECTED_RANKS:
+        prepared[rank], prepared_sha[rank] = tx.read_json(
+            f"PREPARED.rank{rank}.json"
+        )
+        validator._validate_prepared(prepared[rank], rank)
+        armed[rank], armed_sha[rank] = tx.read_json(f"ARMED.rank{rank}.json")
+        validator._validate_armed(armed[rank], rank)
+        started[rank], started_sha[rank] = tx.read_json(
+            f"STARTED.rank{rank}.json"
+        )
+        validator._validate_started(started[rank], rank)
+        cleanup[rank], cleanup_sha[rank] = tx.read_json(
+            f"CLEANUP.rank{rank}.json"
+        )
+        validator._validate_cleanup(cleanup[rank], rank)
+        results[rank], result_sha[rank] = tx.read_json(
+            f"WORKLOAD_RESULT.rank{rank}.json"
+        )
+        validator._validate_workload_result(results[rank], rank)
+        if results[rank]["status"] != "COMPLETED":
+            raise TransactionError("inner chain contains a failed workload")
+    decision, decision_sha = tx.read_json("DECISION.json")
+    validator._validate_decision(decision)
+    expected_decision_bindings = {
+        "prepared_sha256": {
+            str(rank): prepared_sha[rank] for rank in EXPECTED_RANKS
+        },
+        "armed_sha256": {
+            str(rank): armed_sha[rank] for rank in EXPECTED_RANKS
+        },
+    }
+    if decision["status"] != "GO" or decision["bindings"] != expected_decision_bindings:
+        raise TransactionError("GO decision does not bind the exact inner chain")
+    for rank in EXPECTED_RANKS:
+        handoffs[rank], handoff_sha[rank] = tx.read_json(
+            f"HANDOFF.rank{rank}.json"
+        )
+        validator._validate_handoff(handoffs[rank], rank)
+        if handoffs[rank]["workload_result_sha256"] != {
+            str(item): result_sha[item] for item in EXPECTED_RANKS
+        }:
+            raise TransactionError("HANDOFF result pair differs")
+    return {
+        "validator": validator,
+        "prepared": prepared,
+        "prepared_sha256": prepared_sha,
+        "armed_sha256": armed_sha,
+        "decision_sha256": decision_sha,
+        "started_sha256": started_sha,
+        "cleanup_sha256": cleanup_sha,
+        "result_sha256": result_sha,
+        "handoff_sha256": handoff_sha,
+    }
+
+
+def _external_artifact_snapshot(
+    raw_path: str,
+    label: str,
+    *,
+    json_payload: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    path = Path(_validate_absolute_evidence_path(raw_path, label))
+    fd, canonical = _open_pinned_file(path, executable=False)
+    try:
+        before = os.fstat(fd)
+        digest = _sha256_fd(fd)
+        payload: dict[str, Any] | None = None
+        if json_payload:
+            if before.st_size > MAX_RECEIPT_BYTES:
+                raise TransactionError(f"{label} is too large")
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = b""
+            while len(raw) < before.st_size:
+                block = os.read(fd, before.st_size - len(raw))
+                if not block:
+                    break
+                raw += block
+            try:
+                decoded = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TransactionError(f"{label} is not valid JSON") from exc
+            if not isinstance(decoded, dict):
+                raise TransactionError(f"{label} is not a JSON object")
+            payload = decoded
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or canonical != path
+    ):
+        raise TransactionError(f"{label} changed during snapshot")
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "bytes": before.st_size,
+        "st_dev": before.st_dev,
+        "st_ino": before.st_ino,
+    }, payload
+
+
+def _validate_recorded_runner(
+    runner: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> dict[str, Any]:
+    argv = runner["argv"]
+    try:
+        delimiter = argv.index("--", 2)
+    except ValueError as exc:
+        raise TransactionError("recorded guarded runner lacks delimiter") from exc
+    restored = status.get("restored_guards")
+    if (
+        len(argv) < 5
+        or argv[1] != EXPECTED_RUNNER
+        or _runner_option_values(argv, {"--gpus"}) != [EXPECTED_RUNNER_GPUS]
+        or _runner_option_values(
+            argv, {"--status", "--status-path", "--status-file"}
+        )
+        != [runner["status_path"]]
+        or _runner_option_values(argv, {"--log", "--log-path", "--log-file"})
+        != [runner["log_path"]]
+        or argv[delimiter + 1 :] != runner["command"]
+        or runner["command_argv_sha256"] != _argv_sha256(runner["command"])
+        or status.get("state") != "finished"
+        or status.get("return_code") != 0
+        or any(
+            status.get(key) is not None
+            for key in (
+                "error",
+                "cleanup_error",
+                "restore_error",
+                "received_signal",
+            )
+        )
+        or status.get("command") != runner["command"]
+        or status.get("wrapper_pid") != runner["pid"]
+        or status.get("child_pid") != prepared["coordinator"]["pid"]
+        or not isinstance(restored, dict)
+        or set(restored) != {str(index) for index in range(8)}
+        or len(set(restored.values())) != 8
+        or any(
+            not _exact_int(pid, minimum=2)
+            for pid in restored.values()
+        )
+        or runner["pid"] in restored.values()
+        or prepared["coordinator"]["pid"] in restored.values()
+    ):
+        raise TransactionError("outer guarded-runner finish/restore evidence mismatch")
+    return {
+        "runner_full_argv": list(argv),
+        "runner_full_argv_sha256": _argv_sha256(argv),
+        "command": list(runner["command"]),
+        "command_argv_sha256": runner["command_argv_sha256"],
+        "gpu_reservation": EXPECTED_RUNNER_GPUS,
+        "restored_guards_by_gpu": dict(restored),
+        "status_payload": dict(status),
+    }
+
+
+def _outer_evidence(
+    chain: Mapping[str, Any],
+    rank: int,
+) -> dict[str, Any]:
+    prepared = chain["prepared"][rank]
+    runner = prepared["runner"]
+    status_artifact, status = _external_artifact_snapshot(
+        runner["status_path"],
+        f"rank {rank} guarded-runner status",
+        json_payload=True,
+    )
+    log_artifact, _ = _external_artifact_snapshot(
+        runner["log_path"],
+        f"rank {rank} guarded-runner log",
+        json_payload=False,
+    )
+    assert status is not None
+    guard = _validate_recorded_runner(runner, prepared, status)
+    return {
+        "runner": dict(runner),
+        "status_artifact": status_artifact,
+        "log_artifact": log_artifact,
+        "guard_evidence": guard,
+    }
+
+
+def _collect_outer_evidence(
+    chain: Mapping[str, Any],
+) -> dict[int, dict[str, Any]]:
+    status_paths = {
+        chain["prepared"][rank]["runner"]["status_path"]
+        for rank in EXPECTED_RANKS
+    }
+    log_paths = {
+        chain["prepared"][rank]["runner"]["log_path"]
+        for rank in EXPECTED_RANKS
+    }
+    if len(status_paths) != 2 or len(log_paths) != 2 or status_paths & log_paths:
+        raise TransactionError("runner status/log artifact paths are not independent")
+    evidence = {
+        rank: _outer_evidence(chain, rank) for rank in EXPECTED_RANKS
+    }
+    identities = [
+        (
+            artifact["st_dev"],
+            artifact["st_ino"],
+        )
+        for rank in EXPECTED_RANKS
+        for artifact in (
+            evidence[rank]["status_artifact"],
+            evidence[rank]["log_artifact"],
+        )
+    ]
+    if len(set(identities)) != 4:
+        raise TransactionError("runner status/log artifacts alias one inode")
+    return evidence
+
+
+def _terminal_final_payload(
+    portable_sha256: str,
+    chain: Mapping[str, Any],
+    rank: int,
+    outer: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "status": "SUCCEEDED",
+        "rank": rank,
+        "portable_sha256": portable_sha256,
+        "bindings": {
+            "handoff_sha256": chain["handoff_sha256"][rank],
+            "cleanup_sha256": chain["cleanup_sha256"][rank],
+            "workload_result_sha256": chain["result_sha256"][rank],
+        },
+        "outer_guarded_runner": dict(outer),
+        "reason": "inner cleanup and outer guard restoration both verified",
+    }
+
+
+def _publish_or_verify(
+    tx: TransactionDirectory,
+    name: str,
+    payload: Mapping[str, Any],
+    *,
+    terminal: bool = False,
+) -> str:
+    expected = _sha256_bytes(_canonical_json_bytes(payload))
+    try:
+        if terminal:
+            if name != "OUTCOME.json":
+                raise TransactionError("terminal publication is reserved for OUTCOME")
+            observed = tx.publish_terminal_outcome(payload)
+        else:
+            observed = tx.publish_immutable(name, payload)
+    except DuplicateInvocation:
+        existing, observed = tx.read_json(name)
+        if existing != payload:
+            raise TransactionError(f"conflicting immutable artifact: {name}")
+    if observed != expected:
+        raise TransactionError(f"immutable artifact digest mismatch: {name}")
+    return observed
+
+
+def _replay_terminal_success(
+    tx: TransactionDirectory,
+    portable: Mapping[str, Any],
+    portable_sha256: str,
+    expected_outcome_sha256: str | None,
+) -> dict[str, Any]:
+    chain = _validate_inner_success_chain(tx, portable)
+    outer_evidence = _collect_outer_evidence(chain)
+    final_sha: dict[int, str] = {}
+    for rank in EXPECTED_RANKS:
+        expected = _terminal_final_payload(
+            portable_sha256, chain, rank, outer_evidence[rank]
+        )
+        final, final_sha[rank] = tx.read_json(f"FINAL.rank{rank}.json")
+        if final != expected:
+            raise TransactionError(f"FINAL receipt mismatch for rank {rank}")
+    outcome, outcome_sha = tx.read_json("OUTCOME.json")
+    validator = chain["validator"]
+    validator._validate_outcome(outcome)
+    expected_outcome = {
+        "schema": SCHEMA,
+        "status": "SUCCEEDED",
+        "rank": 0,
+        "portable_sha256": portable_sha256,
+        "reason": "both outer-finalized guarded nodes succeeded",
+        "bindings": {
+            "final_sha256": {
+                str(rank): final_sha[rank] for rank in EXPECTED_RANKS
+            }
+        },
+        "terminal_generation": 1,
+    }
+    if outcome != expected_outcome:
+        raise TransactionError("terminal OUTCOME differs from replay")
+    if expected_outcome_sha256 is not None and outcome_sha != expected_outcome_sha256:
+        raise TransactionError("terminal OUTCOME SHA differs from external pin")
+    return {
+        "schema": SCHEMA,
+        "status": "REPLAYED_SUCCEEDED",
+        "portable_sha256": portable_sha256,
+        "outcome_sha256": outcome_sha,
+        "final_sha256": {
+            str(rank): final_sha[rank] for rank in EXPECTED_RANKS
+        },
+    }
+
+
+def finalize_transaction(args: argparse.Namespace) -> dict[str, Any]:
+    tx, portable, portable_sha = _open_control_transaction(args)
+    locked = False
+    try:
+        # Serializing finalizers is necessary because terminal publication must
+        # not be followed by a losing finalizer's temporary-file cleanup.
+        fcntl.flock(tx.root_fd, fcntl.LOCK_EX)
+        locked = True
+        tx.assert_identity()
+        if tx.exists("OUTCOME.json"):
+            return _replay_terminal_success(
+                tx, portable, portable_sha, args.expected_outcome_sha256
+            )
+        chain = _validate_inner_success_chain(tx, portable)
+        outer_evidence = _collect_outer_evidence(chain)
+        final_payloads = {
+            rank: _terminal_final_payload(
+                portable_sha,
+                chain,
+                rank,
+                outer_evidence[rank],
+            )
+            for rank in EXPECTED_RANKS
+        }
+        final_sha = {
+            rank: _publish_or_verify(
+                tx, f"FINAL.rank{rank}.json", final_payloads[rank]
+            )
+            for rank in EXPECTED_RANKS
+        }
+        # OUTCOME publication is deliberately the final filesystem operation.
+        outcome = {
+            "schema": SCHEMA,
+            "status": "SUCCEEDED",
+            "rank": 0,
+            "portable_sha256": portable_sha,
+            "reason": "both outer-finalized guarded nodes succeeded",
+            "bindings": {
+                "final_sha256": {
+                    str(rank): final_sha[rank] for rank in EXPECTED_RANKS
+                }
+            },
+            "terminal_generation": 1,
+        }
+        outcome_sha = _publish_or_verify(
+            tx,
+            "OUTCOME.json",
+            outcome,
+            terminal=True,
+        )
+        return {
+            "schema": SCHEMA,
+            "status": "FINALIZED_SUCCEEDED",
+            "portable_sha256": portable_sha,
+            "outcome_sha256": outcome_sha,
+            "final_sha256": {
+                str(rank): final_sha[rank] for rank in EXPECTED_RANKS
+            },
+        }
+    finally:
+        if locked:
+            try:
+                fcntl.flock(tx.root_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        tx.close()
+
+
+def replay_transaction(args: argparse.Namespace) -> dict[str, Any]:
+    tx, portable, portable_sha = _open_control_transaction(args)
+    try:
+        return _replay_terminal_success(
+            tx,
+            portable,
+            portable_sha,
+            args.expected_outcome_sha256,
+        )
+    finally:
+        tx.close()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transaction-root", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--deployment-id", required=True)
+    parser.add_argument("--expected-namespace-parent-sha256", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--source-tree", required=True)
     parser.add_argument("--common-command-sha256", required=True)
@@ -2114,8 +3607,57 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _control_parser(command: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"dual_node_guarded_transaction.py {command}",
+        description=f"CPU-only {command} for one completed guarded transaction",
+    )
+    parser.add_argument("--transaction-root", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--deployment-id", required=True)
+    parser.add_argument("--expected-namespace-parent-sha256", required=True)
+    parser.add_argument("--expected-portable-sha256", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--source-tree", required=True)
+    parser.add_argument(
+        "--expected-outcome-sha256",
+        required=command == "replay",
+    )
+    return parser
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if tokens and tokens[0] in {"finalize", "replay"}:
+        command = tokens.pop(0)
+        args = _control_parser(command).parse_args(tokens)
+        if (
+            not HEX64_RE.fullmatch(args.expected_namespace_parent_sha256)
+            or not HEX64_RE.fullmatch(args.expected_portable_sha256)
+            or (
+                args.expected_outcome_sha256 is not None
+                and not HEX64_RE.fullmatch(args.expected_outcome_sha256)
+            )
+        ):
+            print("control-plane SHA pins must be lowercase 64-hex", file=sys.stderr)
+            return 2
+        try:
+            result = (
+                finalize_transaction(args)
+                if command == "finalize"
+                else replay_transaction(args)
+            )
+        except BaseException as exc:
+            print(f"dual-node guarded transaction {command} failed: {exc}", file=sys.stderr)
+            return 3
+        try:
+            os.write(sys.stdout.fileno(), _canonical_json_bytes(result))
+        except OSError:
+            # Terminal success is the durable OUTCOME; a closed diagnostic
+            # stdout must not retroactively turn it into a reported failure.
+            pass
+        return 0
+    args = _parser().parse_args(tokens)
     workload = list(args.workload)
     if workload and workload[0] == "--":
         workload = workload[1:]
@@ -2129,7 +3671,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     workload_input_fds: dict[str, int] = {}
     try:
         transaction_root, parent, basename = _validate_tx_path(
-            args.transaction_root, args.run_id
+            args.transaction_root,
+            args.run_id,
+            args.expected_namespace_parent_sha256,
         )
         args.runner_status_path = _validate_absolute_evidence_path(
             args.runner_status_path, "runner status path"
@@ -2144,6 +3688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         (
             workload_spec,
             workload_environment,
+            exec_workload,
             executable_fd,
             workdir_fd,
             workload_input_fds,
@@ -2163,6 +3708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         coordinator = Coordinator(
             args,
             workload,
+            exec_workload,
             runner,
             portable,
             tx,
