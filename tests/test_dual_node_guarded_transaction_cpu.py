@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ LAUNCHER = REPOSITORY / "scripts" / "show_base" / "run_dual_node_guarded_transac
 PYTHON = str(Path(sys.executable).resolve())
 
 HARNESS = r"""
+import json
 import os
 import sys
 from scripts.show_base import dual_node_guarded_transaction as module
@@ -27,7 +29,12 @@ module._CPU_TEST_MODE = True
 
 def fake_runner(status_path, log_path):
     identity = module._proc_identity(os.getppid())
-    command = ["/test/fake-transaction-coordinator"]
+    formal_command = os.environ.get("SEMTALK_TEST_FORMAL_RUNNER_COMMAND")
+    command = (
+        json.loads(formal_command)
+        if formal_command
+        else ["/test/fake-transaction-coordinator"]
+    )
     argv = [
         sys.executable,
         module.EXPECTED_RUNNER,
@@ -111,6 +118,30 @@ entry = configuration[rank]
 marker_root = Path(configuration["marker_root"])
 marker_root.mkdir(parents=True, exist_ok=True)
 (marker_root / f"started.rank{rank}").write_text(str(os.getpid()))
+if entry.get("record_runtime"):
+    python_target_fd_leaks = []
+    proc_fd = Path("/proc/self/fd")
+    if proc_fd.is_dir():
+        target_stat = os.stat(Path(sys.executable).resolve())
+        for fd_path in proc_fd.iterdir():
+            try:
+                fd = int(fd_path.name)
+                if fd <= 2:
+                    continue
+                observed = os.fstat(fd)
+            except (OSError, ValueError):
+                continue
+            if (
+                observed.st_dev == target_stat.st_dev
+                and observed.st_ino == target_stat.st_ino
+            ):
+                python_target_fd_leaks.append(fd)
+    (marker_root / f"runtime.rank{rank}.json").write_text(json.dumps({
+        "sys_executable": sys.executable,
+        "sys_prefix": sys.prefix,
+        "sys_base_prefix": sys.base_prefix,
+        "python_target_fd_leaks": python_target_fd_leaks,
+    }, sort_keys=True))
 if entry.get("spawn_descendant"):
     descendant = r'''import os,signal,sys,time
 from pathlib import Path
@@ -197,6 +228,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         setsid: bool = False,
         read_authority: bool = False,
         expected_authority: str = "",
+        record_runtime: bool = False,
     ) -> dict[str, object]:
         return {
             "marker_root": str(self.root / "markers"),
@@ -208,6 +240,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "setsid": setsid,
                 "read_authority": read_authority,
                 "expected_authority": expected_authority,
+                "record_runtime": record_runtime,
             },
             "1": {
                 "seconds": seconds1,
@@ -217,6 +250,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "setsid": setsid,
                 "read_authority": read_authority,
                 "expected_authority": expected_authority,
+                "record_runtime": record_runtime,
             },
         }
 
@@ -232,10 +266,11 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         workload_inputs: dict[str, Path] | None = None,
         allow_env: list[str] | None = None,
         expected_parent_sha256: str | None = None,
+        workload_python: str = PYTHON,
     ) -> list[str]:
         peer = 1 - rank
         config_text = json.dumps(configuration, sort_keys=True, separators=(",", ":"))
-        workload = [PYTHON, "-c", WORKLOAD, config_text]
+        workload = [workload_python, "-c", WORKLOAD, config_text]
         for logical_id, path in sorted((workload_inputs or {}).items()):
             workload.extend(
                 [
@@ -337,6 +372,56 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         configuration = configuration or self._configuration()
         node1 = self._start(self._command(1, transaction_root, configuration, **kwargs))
         node0 = self._start(self._command(0, transaction_root, configuration, **kwargs))
+        return node0, node1
+
+    def _formal_venv(self) -> tuple[Path, Path]:
+        venv_root = self.root / "formal-venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_root)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        leaf = venv_root / "bin" / "python"
+        self.assertTrue(leaf.is_symlink())
+        return venv_root, leaf
+
+    def _run_formal_pair(
+        self,
+        transaction_root: Path,
+        venv_python: Path,
+        configuration: dict[str, object],
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> tuple[subprocess.Popen[str], subprocess.Popen[str]]:
+        commands: list[list[str]] = []
+        environments: list[dict[str, str]] = []
+        for rank in (1, 0):
+            arguments = self._protocol_args(
+                rank,
+                transaction_root,
+                configuration,
+                workload_python=str(venv_python),
+            )
+            workload = arguments[arguments.index("--") + 1 :]
+            runner_command = [
+                "/bin/bash",
+                str(LAUNCHER),
+                str(venv_python),
+                "--transaction-root",
+                str(transaction_root),
+                "--",
+                *workload,
+            ]
+            commands.append([str(venv_python), "-c", HARNESS, *arguments])
+            environment = {
+                "SEMTALK_TEST_FORMAL_RUNNER_COMMAND": json.dumps(runner_command),
+                **(extra_environment or {}),
+            }
+            environments.append(environment)
+        node1 = self._start(commands[0], extra_environment=environments[0])
+        node0 = self._start(commands[1], extra_environment=environments[1])
         return node0, node1
 
     def _wait_for(self, path: Path, timeout: float = 4.0) -> None:
@@ -1152,6 +1237,110 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         link.symlink_to(PYTHON)
         with self.assertRaises(module.TransactionError):
             module._open_pinned_file(link, executable=True)
+
+    def test_two_hop_formal_venv_python_preserves_exact_runtime(self) -> None:
+        venv_root, venv_python = self._formal_venv()
+        transaction_root = self.root / "formal_venv_success"
+        node0, node1 = self._run_formal_pair(
+            transaction_root,
+            venv_python,
+            self._configuration(record_runtime=True),
+        )
+        self.assertEqual(node0.wait(timeout=8), 0, node0.stderr.read())
+        self.assertEqual(node1.wait(timeout=8), 0, node1.stderr.read())
+        portable = json.loads(
+            (transaction_root / "PREPARED.rank0.json").read_text()
+        )["portable"]
+        binding = portable["workload"]["formal_python_binding"]
+        self.assertEqual(portable["workload"]["executable_path"], str(venv_python))
+        self.assertEqual(binding["argv0"], str(venv_python))
+        self.assertGreaterEqual(len(binding["symlink_chain"]), 1)
+        self.assertEqual(
+            binding["resolved_target"]["sha256"],
+            portable["workload"]["executable_sha256"],
+        )
+        for rank in (0, 1):
+            runtime = json.loads(
+                (self.root / "markers" / f"runtime.rank{rank}.json").read_text()
+            )
+            self.assertEqual(runtime["sys_executable"], str(venv_python))
+            self.assertEqual(runtime["sys_prefix"], str(venv_root))
+            self.assertNotEqual(runtime["sys_base_prefix"], str(venv_root))
+            self.assertEqual(runtime["python_target_fd_leaks"], [])
+
+    def test_formal_pyvenv_replacement_aborts_before_go(self) -> None:
+        venv_root, venv_python = self._formal_venv()
+        transaction_root = self.root / "formal_cfg_replaced"
+        node0, node1 = self._run_formal_pair(
+            transaction_root,
+            venv_python,
+            self._configuration(record_runtime=True),
+            extra_environment={"SEMTALK_TEST_ARM_DELAY": "0.5"},
+        )
+        self._wait_for(transaction_root / "PREPARED.rank0.json")
+        self._wait_for(transaction_root / "PREPARED.rank1.json")
+        cfg = venv_root / "pyvenv.cfg"
+        replacement = venv_root / "pyvenv.cfg.replacement"
+        replacement.write_bytes(cfg.read_bytes())
+        replacement.replace(cfg)
+        self.assertNotEqual(node0.wait(timeout=8), 0)
+        self.assertNotEqual(node1.wait(timeout=8), 0)
+        self.assertFalse((self.root / "markers" / "started.rank0").exists())
+        self.assertFalse((self.root / "markers" / "started.rank1").exists())
+        decision = transaction_root / "DECISION.json"
+        if decision.exists():
+            self.assertNotEqual(json.loads(decision.read_text()).get("status"), "GO")
+
+    def test_formal_leaf_redirect_aborts_before_go(self) -> None:
+        _venv_root, venv_python = self._formal_venv()
+        transaction_root = self.root / "formal_leaf_redirected"
+        node0, node1 = self._run_formal_pair(
+            transaction_root,
+            venv_python,
+            self._configuration(record_runtime=True),
+            extra_environment={"SEMTALK_TEST_ARM_DELAY": "0.5"},
+        )
+        self._wait_for(transaction_root / "PREPARED.rank0.json")
+        self._wait_for(transaction_root / "PREPARED.rank1.json")
+        replacement = venv_python.with_name("python.replacement")
+        replacement.symlink_to("/bin/sh")
+        replacement.replace(venv_python)
+        self.assertNotEqual(node0.wait(timeout=8), 0)
+        self.assertNotEqual(node1.wait(timeout=8), 0)
+        self.assertFalse((self.root / "markers" / "started.rank0").exists())
+        self.assertFalse((self.root / "markers" / "started.rank1").exists())
+
+    def test_declared_workload_input_symlink_is_rejected_before_spawn(self) -> None:
+        authority = self.root / "authority.json"
+        authority.write_text('{"version":1}\n', encoding="utf-8")
+        alias = self.root / "authority-link.json"
+        alias.symlink_to(authority)
+        transaction_root = self.root / "symlinked_authority"
+        node0, node1 = self._run_pair(
+            transaction_root,
+            self._configuration(),
+            workload_inputs={"fresh_test_authority": alias},
+        )
+        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertFalse((self.root / "markers" / "started.rank0").exists())
+        self.assertFalse((self.root / "markers" / "started.rank1").exists())
+
+    def test_formal_leaf_replaced_by_regular_file_is_rejected_before_prepared(self) -> None:
+        _venv_root, venv_python = self._formal_venv()
+        target = venv_python.resolve(strict=True)
+        venv_python.unlink()
+        shutil.copy2(target, venv_python)
+        transaction_root = self.root / "formal_leaf_regular"
+        node0, node1 = self._run_formal_pair(
+            transaction_root,
+            venv_python,
+            self._configuration(record_runtime=True),
+        )
+        self.assertNotEqual(node0.wait(timeout=5), 0)
+        self.assertNotEqual(node1.wait(timeout=5), 0)
+        self.assertFalse((transaction_root / "PREPARED.rank0.json").exists())
+        self.assertFalse((transaction_root / "PREPARED.rank1.json").exists())
 
     def test_finalizer_file_failure_never_publishes_success_outcome(self) -> None:
         transaction_root = self.root / "finalizer_file_failure"

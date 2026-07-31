@@ -28,10 +28,12 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import select
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -39,7 +41,7 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 
-SCHEMA = "semtalk.dual_node_guarded_transaction.v2"
+SCHEMA = "semtalk.dual_node_guarded_transaction.v3"
 PORTABLE_SCHEMA = f"{SCHEMA}.portable"
 EXPECTED_RUNNER = "/tmp/globaldiff_guarded_runner.py"
 EXPECTED_RUNNER_GPUS = "0,1,2,3,4,5,6,7"
@@ -359,6 +361,466 @@ def _open_pinned_file(path: Path, *, executable: bool) -> tuple[int, Path]:
     return fd, canonical
 
 
+def _stat_binding(value: os.stat_result) -> dict[str, int]:
+    return {
+        "st_dev": value.st_dev,
+        "st_ino": value.st_ino,
+        "st_mode": value.st_mode,
+        "st_size": value.st_size,
+        "st_mtime_ns": value.st_mtime_ns,
+    }
+
+
+def _read_pyvenv_configuration(fd: int) -> dict[str, str]:
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = b""
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        raw += block
+        if len(raw) > 65536:
+            raise TransactionError("formal Python pyvenv.cfg is too large")
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise TransactionError("formal Python pyvenv.cfg is not UTF-8") from exc
+    configuration: dict[str, str] = {}
+    for raw_line in lines:
+        if not raw_line.strip():
+            continue
+        if "=" not in raw_line:
+            raise TransactionError("formal Python pyvenv.cfg record is invalid")
+        key, value = raw_line.split("=", 1)
+        key = key.strip().casefold()
+        if not key or key in configuration:
+            raise TransactionError("formal Python pyvenv.cfg key is invalid")
+        configuration[key] = value.strip()
+    if not {"home", "include-system-site-packages", "version"}.issubset(
+        configuration
+    ):
+        raise TransactionError("formal Python pyvenv.cfg is incomplete")
+    if configuration["include-system-site-packages"].casefold() not in {
+        "true",
+        "false",
+    }:
+        raise TransactionError("formal Python pyvenv.cfg site policy is invalid")
+    if configuration["version"] != platform.python_version():
+        raise TransactionError("formal Python pyvenv.cfg version changed")
+    return configuration
+
+
+def _capture_formal_venv_python(
+    path: Path,
+) -> tuple[int, int, dict[str, Any], dict[str, Any]]:
+    """Pin one already-validated venv Python without erasing its argv[0].
+
+    This is deliberately separate from ``_open_pinned_file``: every generic
+    workload and authority input remains canonical and symlink-free.  The only
+    accepted symlink is the exact Python used to run this coordinator, under
+    its canonical ``venv/bin`` parent.  Every symlink hop is recorded while
+    the final ELF and pyvenv.cfg remain held open.
+    """
+
+    if (
+        not path.is_absolute()
+        or os.fsencode(str(path)) != os.fsencode(sys.executable)
+        or not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", path.name)
+    ):
+        raise TransactionError("formal workload Python is not sys.executable")
+    try:
+        parent = path.parent.resolve(strict=True)
+        venv_root = parent.parent.resolve(strict=True)
+    except OSError as exc:
+        raise TransactionError("formal workload Python venv is unavailable") from exc
+    if (
+        parent != path.parent
+        or parent.name != "bin"
+        or parent.is_symlink()
+        or venv_root != parent.parent
+        or venv_root.is_symlink()
+        or Path(sys.prefix) != venv_root
+        or Path(sys.exec_prefix) != venv_root
+        or sys.prefix == sys.base_prefix
+        or sys.exec_prefix == sys.base_exec_prefix
+    ):
+        raise TransactionError("formal workload Python venv identity changed")
+
+    portable_chain: list[dict[str, str]] = []
+    local_chain: list[dict[str, Any]] = []
+    current = path
+    visited: set[str] = set()
+    for _ordinal in range(16):
+        current_key = str(current)
+        if current_key in visited:
+            raise TransactionError("formal workload Python symlink loop")
+        visited.add(current_key)
+        try:
+            if current.parent.resolve(strict=True) != current.parent:
+                raise TransactionError(
+                    "formal workload Python chain parent is noncanonical"
+                )
+            before = current.lstat()
+        except OSError as exc:
+            raise TransactionError("formal workload Python chain disappeared") from exc
+        if not stat.S_ISLNK(before.st_mode):
+            break
+        try:
+            target_text = os.readlink(current)
+            after = current.lstat()
+        except OSError as exc:
+            raise TransactionError("formal workload Python link changed") from exc
+        if _stat_binding(before) != _stat_binding(after):
+            raise TransactionError("formal workload Python link changed while pinning")
+        next_path = Path(target_text)
+        if not next_path.is_absolute():
+            next_path = current.parent / next_path
+        next_path = Path(os.path.normpath(str(next_path)))
+        if not next_path.is_absolute() or next_path.name in {"", ".", ".."}:
+            raise TransactionError("formal workload Python link target is unsafe")
+        portable_chain.append({"path": str(current), "target": target_text})
+        local_chain.append(
+            {
+                "path": str(current),
+                "target": target_text,
+                "identity": _stat_binding(before),
+            }
+        )
+        current = next_path
+    else:
+        raise TransactionError("formal workload Python symlink chain is too deep")
+    if not portable_chain:
+        raise TransactionError("formal workload Python is not a venv leaf symlink")
+    try:
+        resolved_target = path.resolve(strict=True)
+    except OSError as exc:
+        raise TransactionError("formal workload Python target is unavailable") from exc
+    if resolved_target != current or current.is_symlink():
+        raise TransactionError("formal workload Python chain resolution changed")
+    executable_fd, canonical_target = _open_pinned_file(
+        resolved_target, executable=True
+    )
+    target_info = os.fstat(executable_fd)
+
+    pyvenv_cfg = venv_root / "pyvenv.cfg"
+    try:
+        pyvenv_fd, canonical_cfg = _open_pinned_file(
+            pyvenv_cfg, executable=False
+        )
+    except BaseException:
+        os.close(executable_fd)
+        raise
+    if canonical_cfg != pyvenv_cfg:
+        os.close(pyvenv_fd)
+        os.close(executable_fd)
+        raise TransactionError("formal Python pyvenv.cfg is noncanonical")
+    try:
+        configuration = _read_pyvenv_configuration(pyvenv_fd)
+        configured_home = Path(configuration["home"]).resolve(strict=True)
+        home_executable = (configured_home / resolved_target.name).resolve(strict=True)
+        if home_executable != resolved_target:
+            raise TransactionError("formal Python pyvenv.cfg home changed")
+        configured_executable = configuration.get("executable")
+        if (
+            configured_executable is not None
+            and Path(configured_executable).resolve(strict=True) != resolved_target
+        ):
+            raise TransactionError("formal Python pyvenv.cfg executable changed")
+        target_sha256 = _sha256_fd(executable_fd)
+        cfg_sha256 = _sha256_fd(pyvenv_fd)
+        cfg_info = os.fstat(pyvenv_fd)
+    except BaseException:
+        os.close(pyvenv_fd)
+        os.close(executable_fd)
+        raise
+    portable = {
+        "format": "semtalk.formal_venv_python_binding.v1",
+        "argv0": str(path),
+        "venv_root": str(venv_root),
+        "symlink_chain": portable_chain,
+        "resolved_target": {
+            "path": str(canonical_target),
+            "sha256": target_sha256,
+            "bytes": target_info.st_size,
+        },
+        "pyvenv_cfg": {
+            "path": str(canonical_cfg),
+            "sha256": cfg_sha256,
+            "bytes": cfg_info.st_size,
+        },
+    }
+    node_local = {
+        "format": "semtalk.formal_venv_python_node_binding.v1",
+        "symlink_chain": local_chain,
+        "resolved_target_identity": _stat_binding(target_info),
+        "pyvenv_cfg_identity": _stat_binding(cfg_info),
+    }
+    return executable_fd, pyvenv_fd, portable, node_local
+
+
+def _runner_proves_formal_python_contract(
+    runner: Mapping[str, Any],
+    workload: Sequence[str],
+) -> bool:
+    repository = Path(__file__).resolve().parents[2]
+    launcher = repository / "scripts/show_base/run_dual_node_guarded_transaction.sh"
+    command = runner.get("command")
+    if not isinstance(command, list):
+        return False
+    return (
+        os.fsencode(workload[0]) == os.fsencode(sys.executable)
+        and len(command) > len(workload) + 3
+        and command[:3] == ["/bin/bash", str(launcher), workload[0]]
+        and command[-len(workload) - 1] == "--"
+        and command[-len(workload) :] == list(workload)
+    )
+
+
+def _assert_formal_venv_python_binding(
+    portable: Mapping[str, Any],
+    node_local: Mapping[str, Any],
+    executable_fd: int,
+    pyvenv_fd: int,
+    monitor: "_FormalRuntimeMonitor | None" = None,
+) -> None:
+    new_executable_fd = -1
+    new_pyvenv_fd = -1
+    try:
+        if monitor is not None:
+            monitor.assert_quiet("formal Python binding precheck")
+        (
+            new_executable_fd,
+            new_pyvenv_fd,
+            observed_portable,
+            observed_local,
+        ) = _capture_formal_venv_python(Path(str(portable.get("argv0", ""))))
+        if observed_portable != portable or observed_local != node_local:
+            raise TransactionError("formal workload Python public binding changed")
+        if (
+            _stat_binding(os.fstat(executable_fd))
+            != node_local.get("resolved_target_identity")
+            or _sha256_fd(executable_fd)
+            != portable.get("resolved_target", {}).get("sha256")
+            or _stat_binding(os.fstat(pyvenv_fd))
+            != node_local.get("pyvenv_cfg_identity")
+            or _sha256_fd(pyvenv_fd)
+            != portable.get("pyvenv_cfg", {}).get("sha256")
+        ):
+            raise TransactionError("formal workload Python pinned binding changed")
+        if monitor is not None:
+            monitor.assert_quiet("formal Python binding postcheck")
+    finally:
+        if new_pyvenv_fd >= 0:
+            os.close(new_pyvenv_fd)
+        if new_executable_fd >= 0:
+            os.close(new_executable_fd)
+
+
+def _validate_node_local_executable_binding(
+    value: Any,
+    portable: Mapping[str, Any],
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "format",
+        "symlink_chain",
+        "resolved_target_identity",
+        "pyvenv_cfg_identity",
+    }:
+        raise PeerAbort("formal Python node-local binding schema mismatch")
+    chain = value.get("symlink_chain")
+    portable_chain = portable.get("symlink_chain")
+    if (
+        value.get("format") != "semtalk.formal_venv_python_node_binding.v1"
+        or not isinstance(chain, list)
+        or not isinstance(portable_chain, list)
+        or len(chain) != len(portable_chain)
+        or not chain
+    ):
+        raise PeerAbort("formal Python node-local chain mismatch")
+    for local_hop, portable_hop in zip(chain, portable_chain):
+        if (
+            not isinstance(local_hop, dict)
+            or set(local_hop) != {"path", "target", "identity"}
+            or not isinstance(portable_hop, dict)
+            or local_hop.get("path") != portable_hop.get("path")
+            or local_hop.get("target") != portable_hop.get("target")
+        ):
+            raise PeerAbort("formal Python node-local hop mismatch")
+        _validate_stat_binding(local_hop.get("identity"))
+    _validate_stat_binding(value.get("resolved_target_identity"))
+    _validate_stat_binding(value.get("pyvenv_cfg_identity"))
+
+
+def _validate_stat_binding(value: Any) -> None:
+    keys = {"st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != keys
+        or not all(_exact_int(value.get(key), minimum=0) for key in keys)
+    ):
+        raise PeerAbort("formal Python node-local stat binding is invalid")
+
+
+class _FormalRuntimeMonitor:
+    """Fail-closed Linux inotify fence for the public venv binding."""
+
+    _EVENT = struct.Struct("iIII")
+    _IN_ATTRIB = 0x00000004
+    _IN_CLOSE_WRITE = 0x00000008
+    _IN_MODIFY = 0x00000002
+    _IN_MOVED_FROM = 0x00000040
+    _IN_MOVED_TO = 0x00000080
+    _IN_CREATE = 0x00000100
+    _IN_DELETE = 0x00000200
+    _IN_DELETE_SELF = 0x00000400
+    _IN_MOVE_SELF = 0x00000800
+    _IN_UNMOUNT = 0x00002000
+    _IN_Q_OVERFLOW = 0x00004000
+    _IN_IGNORED = 0x00008000
+    _IN_DONT_FOLLOW = 0x02000000
+    _IN_MASK_ADD = 0x20000000
+    _SELF_MASK = (
+        _IN_ATTRIB
+        | _IN_CLOSE_WRITE
+        | _IN_MODIFY
+        | _IN_DELETE_SELF
+        | _IN_MOVE_SELF
+        | _IN_UNMOUNT
+        | _IN_IGNORED
+    )
+    _PARENT_MASK = (
+        _IN_ATTRIB
+        | _IN_CREATE
+        | _IN_DELETE
+        | _IN_MOVED_FROM
+        | _IN_MOVED_TO
+        | _IN_DELETE_SELF
+        | _IN_MOVE_SELF
+        | _IN_UNMOUNT
+        | _IN_IGNORED
+    )
+
+    def __init__(self, binding: Mapping[str, Any]):
+        self.fd = -1
+        self._watch: dict[int, dict[str, Any]] = {}
+        if sys.platform != "linux":
+            if _CPU_TEST_MODE:
+                return
+            raise TransactionError("formal Python runtime fence requires Linux")
+        libc = ctypes.CDLL(None, use_errno=True)
+        self._libc = libc
+        try:
+            init = libc.inotify_init1
+            add = libc.inotify_add_watch
+        except AttributeError as exc:  # pragma: no cover - supported Linux.
+            raise TransactionError("formal Python inotify fence is unavailable") from exc
+        init.argtypes = [ctypes.c_int]
+        init.restype = ctypes.c_int
+        add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add.restype = ctypes.c_int
+        fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+        if fd < 0:
+            error = ctypes.get_errno()
+            raise TransactionError(
+                f"formal Python inotify initialization failed: {os.strerror(error)}"
+            )
+        self.fd = fd
+        self._add = add
+        paths = [
+            Path(str(hop["path"]))
+            for hop in binding.get("symlink_chain", [])
+        ]
+        paths.extend(
+            [
+                Path(str(binding["resolved_target"]["path"])),
+                Path(str(binding["pyvenv_cfg"]["path"])),
+                Path(str(binding["venv_root"])),
+                Path(str(binding["venv_root"])) / "bin",
+            ]
+        )
+        try:
+            for path in paths:
+                self._add_path(path, all_events=True)
+                self._add_path(path.parent, all_events=False, name=path.name)
+            self.assert_quiet("runtime-fence initialization")
+        except BaseException:
+            self.close()
+            raise
+
+    def _add_path(
+        self,
+        path: Path,
+        *,
+        all_events: bool,
+        name: str | None = None,
+    ) -> None:
+        mask = (
+            self._SELF_MASK | self._IN_DONT_FOLLOW
+            if all_events
+            else self._PARENT_MASK
+        )
+        wd = self._add(
+            self.fd,
+            os.fsencode(str(path)),
+            mask | self._IN_MASK_ADD,
+        )
+        if wd < 0:
+            error = ctypes.get_errno()
+            raise TransactionError(
+                f"formal Python inotify watch failed: {os.strerror(error)}"
+            )
+        record = self._watch.setdefault(wd, {"all": False, "names": set()})
+        record["all"] = bool(record["all"] or all_events)
+        if name is not None:
+            record["names"].add(name)
+
+    def assert_quiet(self, phase: str) -> None:
+        if self.fd < 0:
+            return
+        while True:
+            try:
+                raw = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                raise TransactionError(
+                    f"formal Python runtime fence failed during {phase}"
+                ) from exc
+            if not raw:
+                raise TransactionError(
+                    f"formal Python runtime fence closed during {phase}"
+                )
+            offset = 0
+            while offset < len(raw):
+                if len(raw) - offset < self._EVENT.size:
+                    raise TransactionError("formal Python inotify event is truncated")
+                wd, mask, _cookie, name_length = self._EVENT.unpack_from(raw, offset)
+                offset += self._EVENT.size
+                if name_length > len(raw) - offset:
+                    raise TransactionError("formal Python inotify name is truncated")
+                name_raw = raw[offset : offset + name_length].split(b"\0", 1)[0]
+                offset += name_length
+                if mask & self._IN_Q_OVERFLOW:
+                    raise TransactionError("formal Python inotify queue overflowed")
+                record = self._watch.get(wd)
+                if record is None:
+                    raise TransactionError("formal Python inotify watch changed")
+                try:
+                    name = os.fsdecode(name_raw)
+                except UnicodeDecodeError as exc:
+                    raise TransactionError("formal Python inotify name is invalid") from exc
+                if record["all"] or name in record["names"]:
+                    raise TransactionError(
+                        f"formal Python runtime binding changed during {phase}"
+                    )
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
 def _validate_absolute_evidence_path(raw: str, label: str) -> str:
     path = Path(raw)
     if not path.is_absolute():
@@ -418,6 +880,7 @@ def _source_evidence(args: argparse.Namespace) -> dict[str, Any]:
         "scripts/show_base/dual_node_guarded_transaction.py",
         "scripts/show_base/run_dual_node_guarded_transaction.sh",
         "scripts/show_base/guarded_runner_contract.sh",
+        "scripts/show_base/formal_python_runtime_contract.sh",
     ):
         fd, canonical = _open_pinned_file(repository / relative, executable=False)
         try:
@@ -447,6 +910,7 @@ def _source_evidence(args: argparse.Namespace) -> dict[str, Any]:
 def _workload_evidence(
     args: argparse.Namespace,
     workload: Sequence[str],
+    runner: Mapping[str, Any],
 ) -> tuple[
     dict[str, Any],
     dict[str, str],
@@ -454,21 +918,63 @@ def _workload_evidence(
     int,
     int,
     dict[str, int],
+    dict[str, int],
+    dict[str, Any] | None,
+    _FormalRuntimeMonitor | None,
 ]:
-    executable_fd, executable = _open_pinned_file(
-        Path(workload[0]), executable=True
-    )
+    executable_path = Path(workload[0])
+    runtime_fds: dict[str, int] = {}
+    executable_binding: dict[str, Any] | None = None
+    node_local_executable: dict[str, Any] | None = None
+    runtime_monitor: _FormalRuntimeMonitor | None = None
+    if _runner_proves_formal_python_contract(runner, workload):
+        (
+            executable_fd,
+            pyvenv_fd,
+            executable_binding,
+            node_local_executable,
+        ) = _capture_formal_venv_python(executable_path)
+        runtime_fds["pyvenv_cfg"] = pyvenv_fd
+        executable = executable_path
+        try:
+            runtime_monitor = _FormalRuntimeMonitor(executable_binding)
+            _assert_formal_venv_python_binding(
+                executable_binding,
+                node_local_executable,
+                executable_fd,
+                pyvenv_fd,
+                runtime_monitor,
+            )
+        except BaseException:
+            if runtime_monitor is not None:
+                runtime_monitor.close()
+            os.close(pyvenv_fd)
+            os.close(executable_fd)
+            raise
+    else:
+        executable_fd, executable = _open_pinned_file(
+            executable_path, executable=True
+        )
+
+    def close_executable_binding() -> None:
+        if runtime_monitor is not None:
+            runtime_monitor.close()
+        for runtime_fd in runtime_fds.values():
+            os.close(runtime_fd)
+        runtime_fds.clear()
+        os.close(executable_fd)
+
     workdir = Path(args.workdir)
     if not workdir.is_absolute():
-        os.close(executable_fd)
+        close_executable_binding()
         raise TransactionError("workdir must be absolute")
     try:
         canonical_workdir = workdir.resolve(strict=True)
     except OSError as exc:
-        os.close(executable_fd)
+        close_executable_binding()
         raise TransactionError("workdir is unavailable") from exc
     if canonical_workdir != workdir or not workdir.is_dir():
-        os.close(executable_fd)
+        close_executable_binding()
         raise TransactionError("workdir must be a canonical real directory")
     workdir_flags = os.O_RDONLY | os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
@@ -481,12 +987,12 @@ def _workload_evidence(
         public_workdir.st_ino,
     ):
         os.close(workdir_fd)
-        os.close(executable_fd)
+        close_executable_binding()
         raise TransactionError("workdir identity changed while pinning")
 
     allow_names = list(args.allow_env)
     if len(allow_names) != len(set(allow_names)):
-        os.close(executable_fd)
+        close_executable_binding()
         os.close(workdir_fd)
         raise TransactionError("allow-env names must be unique")
     environment = {"PYTHONDONTWRITEBYTECODE": "1"}
@@ -496,7 +1002,7 @@ def _workload_evidence(
             or name.startswith("SEMTALK_W16_")
             or name not in os.environ
         ):
-            os.close(executable_fd)
+            close_executable_binding()
             os.close(workdir_fd)
             raise TransactionError(f"invalid or unavailable allow-env name: {name}")
         environment[name] = os.environ[name]
@@ -645,6 +1151,10 @@ def _workload_evidence(
     except BaseException:
         for fd in input_fds.values():
             os.close(fd)
+        for fd in runtime_fds.values():
+            os.close(fd)
+        if runtime_monitor is not None:
+            runtime_monitor.close()
         os.close(workdir_fd)
         os.close(executable_fd)
         raise
@@ -658,6 +1168,8 @@ def _workload_evidence(
         "input_bindings": bindings,
         "exec_argv_sha256": _argv_sha256(exec_workload),
     }
+    if executable_binding is not None:
+        evidence["formal_python_binding"] = executable_binding
     return (
         evidence,
         environment,
@@ -665,6 +1177,9 @@ def _workload_evidence(
         executable_fd,
         workdir_fd,
         input_fds,
+        runtime_fds,
+        node_local_executable,
+        runtime_monitor,
     )
 
 
@@ -1553,12 +2068,14 @@ def _supervisor_main(
     workload: Sequence[str],
     exec_workload: Sequence[str],
     workload_input_fds: Mapping[str, int],
+    runtime_fds: Mapping[str, int],
     input_bindings: Mapping[str, Mapping[str, Any]],
     environment: Mapping[str, str],
     expected_argv_sha256: str,
     expected_exec_argv_sha256: str,
     executable_sha256: str,
     shutdown_grace_seconds: float,
+    runtime_monitor: _FormalRuntimeMonitor | None,
 ) -> None:
     anchor_pid = -1
     abort_requested = False
@@ -1631,6 +2148,9 @@ def _supervisor_main(
             )
             os._exit(0)
 
+        if runtime_monitor is not None:
+            runtime_monitor.assert_quiet("supervisor before workload fork")
+
         passed_fds = _prepare_pass_fds(
             workload_input_fds,
             input_bindings,
@@ -1640,6 +2160,12 @@ def _supervisor_main(
                 executable_fd,
                 workdir_fd,
                 anchor_write,
+                *runtime_fds.values(),
+                *(
+                    [runtime_monitor.fd]
+                    if runtime_monitor is not None and runtime_monitor.fd >= 0
+                    else []
+                ),
             },
         )
         child_ready_read, child_ready_write = os.pipe()
@@ -1659,7 +2185,6 @@ def _supervisor_main(
                 os.close(exec_gate_read)
                 os.fchdir(workdir_fd)
                 if os.execve in os.supports_fd:
-                    os.set_inheritable(executable_fd, True)
                     os.execve(
                         executable_fd,
                         list(exec_workload),
@@ -1700,6 +2225,8 @@ def _supervisor_main(
         )
         tracker = _DescendantTracker(os.getpid(), workload_pid, anchor_pid)
         tracker.discover()
+        if runtime_monitor is not None:
+            runtime_monitor.assert_quiet("supervisor before workload exec")
         os.write(exec_gate_write, b"G")
         os.close(exec_gate_write)
         if sys.platform == "linux":
@@ -1733,6 +2260,8 @@ def _supervisor_main(
         status_value: int | None = None
         abort_deadline: float | None = None
         while status_value is None:
+            if runtime_monitor is not None:
+                runtime_monitor.assert_quiet("formal workload runtime")
             waited, observed = os.waitpid(workload_pid, os.WNOHANG)
             if waited == workload_pid:
                 status_value = observed
@@ -1820,6 +2349,9 @@ class Coordinator:
         executable_fd: int,
         workdir_fd: int,
         workload_input_fds: Mapping[str, int],
+        runtime_fds: Mapping[str, int],
+        node_local_executable: Mapping[str, Any] | None,
+        runtime_monitor: _FormalRuntimeMonitor | None,
     ):
         self.args = args
         self.workload = list(workload)
@@ -1832,6 +2364,11 @@ class Coordinator:
         self.executable_fd = executable_fd
         self.workdir_fd = workdir_fd
         self.workload_input_fds = dict(workload_input_fds)
+        self.runtime_fds = dict(runtime_fds)
+        self.node_local_executable = (
+            None if node_local_executable is None else dict(node_local_executable)
+        )
+        self.runtime_monitor = runtime_monitor
         self.rank = args.node_rank
         self.peer_rank = args.peer_node_rank
         self.prepared_name = f"PREPARED.rank{self.rank}.json"
@@ -1921,7 +2458,7 @@ class Coordinator:
         self._assert_runner_identity()
         if self.coordinator_identity["ppid"] != self.runner["pid"]:
             raise TransactionError("coordinator is not the recorded runner child")
-        return {
+        prepared = {
             "schema": SCHEMA,
             "status": "PREPARED",
             "portable": self.portable,
@@ -1933,6 +2470,9 @@ class Coordinator:
             "node_local_filesystem": self.tx.local_filesystem_evidence(),
             "prepared_unix_ns": time.time_ns(),
         }
+        if self.node_local_executable is not None:
+            prepared["node_local_executable"] = self.node_local_executable
+        return prepared
 
     def _bootstrap(self, deadline: float) -> None:
         bootstrap = {
@@ -1990,6 +2530,11 @@ class Coordinator:
             "schema", "status", "portable", "portable_sha256", "node", "runner",
             "coordinator", "transaction_root", "node_local_filesystem", "prepared_unix_ns",
         }
+        formal_binding = self.portable.get("workload", {}).get(
+            "formal_python_binding"
+        )
+        if formal_binding is not None:
+            keys.add("node_local_executable")
         if (
             set(payload) != keys
             or payload.get("schema") != SCHEMA
@@ -2030,6 +2575,10 @@ class Coordinator:
             != self.portable["namespace"]["canonical_parent_sha256"]
         ):
             raise PeerAbort(f"invalid node-local filesystem evidence for rank {rank}")
+        if formal_binding is not None:
+            _validate_node_local_executable_binding(
+                payload.get("node_local_executable"), formal_binding
+            )
         runner = payload.get("runner")
         runner_keys = IDENTITY_KEYS | {
             "path",
@@ -2378,12 +2927,14 @@ class Coordinator:
                 self.workload,
                 self.exec_workload,
                 self.workload_input_fds,
+                self.runtime_fds,
                 self.portable["workload"]["input_bindings"],
                 environment,
                 self.portable["workload"]["argv_sha256"],
                 self.portable["workload"]["exec_argv_sha256"],
                 self.portable["workload"]["executable_sha256"],
                 self.args.shutdown_grace_ms / 1000.0,
+                self.runtime_monitor,
             )
         os.close(control_read)
         os.close(event_write)
@@ -2469,6 +3020,17 @@ class Coordinator:
             raise TransactionError("source evidence changed before GO")
         if _sha256_fd(self.executable_fd) != self.portable["workload"]["executable_sha256"]:
             raise TransactionError("pinned workload executable changed before GO")
+        formal_binding = self.portable["workload"].get("formal_python_binding")
+        if formal_binding is not None:
+            if self.node_local_executable is None or "pyvenv_cfg" not in self.runtime_fds:
+                raise TransactionError("formal workload Python binding was not retained")
+            _assert_formal_venv_python_binding(
+                formal_binding,
+                self.node_local_executable,
+                self.executable_fd,
+                self.runtime_fds["pyvenv_cfg"],
+                self.runtime_monitor,
+            )
         for logical_id, fd in self.workload_input_fds.items():
             if _sha256_fd(fd) != self.portable["workload"]["input_sha256"][logical_id]:
                 raise TransactionError(f"pinned workload input changed: {logical_id}")
@@ -3105,6 +3667,12 @@ class Coordinator:
         for fd in self.workload_input_fds.values():
             os.close(fd)
         self.workload_input_fds = {}
+        for fd in self.runtime_fds.values():
+            os.close(fd)
+        self.runtime_fds = {}
+        if self.runtime_monitor is not None:
+            self.runtime_monitor.close()
+            self.runtime_monitor = None
 
 
 def _receipt_validator(
@@ -3669,6 +4237,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     executable_fd = -1
     workdir_fd = -1
     workload_input_fds: dict[str, int] = {}
+    runtime_fds: dict[str, int] = {}
+    runtime_monitor: _FormalRuntimeMonitor | None = None
     try:
         transaction_root, parent, basename = _validate_tx_path(
             args.transaction_root,
@@ -3692,7 +4262,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             executable_fd,
             workdir_fd,
             workload_input_fds,
-        ) = _workload_evidence(args, workload)
+            runtime_fds,
+            node_local_executable,
+            runtime_monitor,
+        ) = _workload_evidence(args, workload, runner)
         portable = _portable_payload(
             args, runner_sha256, source, workload_spec
         )
@@ -3716,10 +4289,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             executable_fd,
             workdir_fd,
             workload_input_fds,
+            runtime_fds,
+            node_local_executable,
+            runtime_monitor,
         )
         executable_fd = -1
         workdir_fd = -1
         workload_input_fds = {}
+        runtime_fds = {}
+        runtime_monitor = None
         signal.signal(signal.SIGTERM, coordinator.request_abort)
         signal.signal(signal.SIGINT, coordinator.request_abort)
         return coordinator.run()
@@ -3737,6 +4315,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             os.close(workdir_fd)
         for fd in workload_input_fds.values():
             os.close(fd)
+        for fd in runtime_fds.values():
+            os.close(fd)
+        if runtime_monitor is not None:
+            runtime_monitor.close()
         if tx is not None:
             tx.close()
 

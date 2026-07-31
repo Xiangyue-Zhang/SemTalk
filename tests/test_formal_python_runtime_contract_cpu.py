@@ -72,6 +72,31 @@ class FormalPythonRuntimeContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [str(python), str(python)])
 
+    def test_two_hop_venv_python_chain_preserves_exact_leaf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="semtalk-python-contract-") as raw:
+            root = Path(raw).resolve()
+            python = self._new_venv(root)
+            resolved = python.resolve(strict=True)
+            intermediate = python.with_name("python-formal-target")
+            python.unlink()
+            intermediate.symlink_to(resolved)
+            python.symlink_to(intermediate.name)
+            result = self._contract(python)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [str(python), str(python)])
+
+    def test_two_hop_intermediate_redirect_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="semtalk-python-contract-") as raw:
+            root = Path(raw).resolve()
+            python = self._new_venv(root)
+            intermediate = python.with_name("python-formal-target")
+            python.unlink()
+            intermediate.symlink_to("/bin/sh")
+            python.symlink_to(intermediate.name)
+            result = self._contract(python)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(result.stderr)
+
     def test_resolved_base_interpreter_is_rejected(self) -> None:
         base = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
         result = self._contract(base)

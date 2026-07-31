@@ -29,7 +29,7 @@ from types import ModuleType
 from typing import Any, Mapping, Sequence
 
 
-TRANSACTION_SCHEMA = "semtalk.dual_node_guarded_transaction.v2"
+TRANSACTION_SCHEMA = "semtalk.dual_node_guarded_transaction.v3"
 PORTABLE_SCHEMA = f"{TRANSACTION_SCHEMA}.portable"
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 EXPECTED_RUNNER = "/tmp/globaldiff_guarded_runner.py"
@@ -181,6 +181,87 @@ def _snapshot_file(path: Path, label: str) -> dict[str, Any]:
     }
 
 
+def _validate_formal_python_binding(
+    binding: Any,
+    *,
+    expected_leaf: Path,
+) -> dict[str, Any]:
+    if (
+        not isinstance(binding, dict)
+        or set(binding)
+        != {
+            "format",
+            "argv0",
+            "venv_root",
+            "symlink_chain",
+            "resolved_target",
+            "pyvenv_cfg",
+        }
+        or binding.get("format") != "semtalk.formal_venv_python_binding.v1"
+        or binding.get("argv0") != str(expected_leaf)
+        or os.fsencode(sys.executable) != os.fsencode(str(expected_leaf))
+    ):
+        raise W16ShimError("formal Python portable binding is invalid")
+    venv_root = Path(str(binding.get("venv_root", "")))
+    if (
+        not expected_leaf.is_absolute()
+        or expected_leaf.parent.name != "bin"
+        or expected_leaf.parent.resolve(strict=True) != expected_leaf.parent
+        or expected_leaf.parent.parent.resolve(strict=True) != venv_root
+        or Path(sys.prefix) != venv_root
+        or Path(sys.exec_prefix) != venv_root
+        or sys.prefix == sys.base_prefix
+        or sys.exec_prefix == sys.base_exec_prefix
+    ):
+        raise W16ShimError("formal Python venv identity changed after exec")
+    chain = binding.get("symlink_chain")
+    if not isinstance(chain, list) or not chain:
+        raise W16ShimError("formal Python symlink chain is empty")
+    current = expected_leaf
+    for hop in chain:
+        if (
+            not isinstance(hop, dict)
+            or set(hop) != {"path", "target"}
+            or hop.get("path") != str(current)
+        ):
+            raise W16ShimError("formal Python symlink chain schema changed")
+        try:
+            public = current.lstat()
+            target_text = os.readlink(current)
+        except OSError as exc:
+            raise W16ShimError("formal Python symlink chain disappeared") from exc
+        if not stat.S_ISLNK(public.st_mode) or target_text != hop.get("target"):
+            raise W16ShimError("formal Python symlink chain was redirected")
+        next_path = Path(target_text)
+        if not next_path.is_absolute():
+            next_path = current.parent / next_path
+        current = Path(os.path.normpath(str(next_path)))
+    target = binding.get("resolved_target")
+    cfg = binding.get("pyvenv_cfg")
+    if (
+        not isinstance(target, dict)
+        or set(target) != {"path", "sha256", "bytes"}
+        or not isinstance(cfg, dict)
+        or set(cfg) != {"path", "sha256", "bytes"}
+        or str(current) != target.get("path")
+        or expected_leaf.resolve(strict=True) != current
+    ):
+        raise W16ShimError("formal Python resolved target changed")
+    target_snapshot = _snapshot_file(current, "formal Python resolved target")
+    cfg_snapshot = _snapshot_file(
+        Path(str(cfg.get("path", ""))), "formal Python pyvenv.cfg"
+    )
+    if target_snapshot != target or cfg_snapshot != cfg:
+        raise W16ShimError("formal Python target or pyvenv.cfg changed")
+    return {
+        "path": str(expected_leaf),
+        "sha256": target_snapshot["sha256"],
+        "bytes": target_snapshot["bytes"],
+        "resolved_target_path": target_snapshot["path"],
+        "pyvenv_cfg": cfg_snapshot,
+    }
+
+
 def _read_canonical_json(path: Path, label: str) -> tuple[dict[str, Any], str]:
     fd, before = _open_regular(path, label)
     try:
@@ -262,6 +343,7 @@ def audit_source(
         "scripts/show_base/dual_node_guarded_transaction.py",
         "scripts/show_base/run_dual_node_guarded_transaction.sh",
         "scripts/show_base/guarded_runner_contract.sh",
+        "scripts/show_base/formal_python_runtime_contract.sh",
         "scripts/show_base/base_w16_transaction_workload.py",
         "scripts/show_base/train_base_official_adapt_long.py",
     ):
@@ -368,6 +450,7 @@ def validate_transaction_context(
             "scripts/show_base/dual_node_guarded_transaction.py",
             "scripts/show_base/run_dual_node_guarded_transaction.sh",
             "scripts/show_base/guarded_runner_contract.sh",
+            "scripts/show_base/formal_python_runtime_contract.sh",
         )
     }
     if (
@@ -435,9 +518,9 @@ def validate_transaction_context(
         or workload.get("workdir") != str(repository)
     ):
         raise W16ShimError("two-node immutable workload argv/input binding changed")
-    executable = _snapshot_file(
-        Path(str(workload.get("executable_path", ""))),
-        "transaction workload Python",
+    executable = _validate_formal_python_binding(
+        workload.get("formal_python_binding"),
+        expected_leaf=Path(str(workload.get("executable_path", ""))),
     )
     if executable["sha256"] != workload.get("executable_sha256"):
         raise W16ShimError("transaction workload Python changed")
@@ -541,6 +624,7 @@ def validate_transaction_context(
     return {
         "portable_sha256": portable_sha,
         "python": executable,
+        "python_binding": workload["formal_python_binding"],
         "participant": participants[node_rank],
     }
 
@@ -844,7 +928,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         or os.environ.get("CUDA_VISIBLE_DEVICES") != EXPECTED_GPUS
     ):
         raise W16ShimError("transaction run/restart/GPU environment changed")
-    executable = Path(sys.executable).resolve(strict=True)
+    executable = Path(sys.executable)
     shim = Path(__file__).resolve(strict=True)
     original_argv = [str(executable), str(shim), *sys.argv[1:]]
     context = validate_transaction_context(
@@ -892,7 +976,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment = dict(os.environ)
     environment["PYTHONHASHSEED"] = "43"
     environment["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    os.execve(str(executable), command, environment)
+    # Re-open and re-hash the terminal ELF immediately before the second exec.
+    # argv[0] remains the exact venv leaf so CPython retains sys.executable and
+    # discovers the pinned pyvenv.cfg; path execution of the resolved system
+    # interpreter would silently discard the formal venv identity.
+    _validate_formal_python_binding(
+        context["python_binding"], expected_leaf=executable
+    )
+    target_fd, target_info = _open_regular(
+        Path(str(context["python"]["resolved_target_path"])),
+        "formal Python resolved target for torchrun",
+    )
+    if (
+        target_info.st_size != context["python"]["bytes"]
+        or _sha256_fd(target_fd) != context["python"]["sha256"]
+    ):
+        os.close(target_fd)
+        raise W16ShimError("formal Python target changed before torchrun exec")
+    if os.execve not in os.supports_fd:
+        os.close(target_fd)
+        raise W16ShimError("formal Python target FD exec is unavailable")
+    os.execve(target_fd, command, environment)
     raise AssertionError("os.execve returned")
 
 

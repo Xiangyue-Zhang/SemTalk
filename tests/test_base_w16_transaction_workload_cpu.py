@@ -43,6 +43,19 @@ def _identity(pid: int) -> dict[str, object]:
 
 
 class BaseW16TransactionWorkloadTests(unittest.TestCase):
+    def _validate_transaction_context(self, **kwargs: object) -> dict[str, object]:
+        python = Path(str(kwargs["original_argv"][0]))  # type: ignore[index]
+        snapshot = SHIM._snapshot_file(python, "mock formal Python")
+        result = {
+            **snapshot,
+            "resolved_target_path": snapshot["path"],
+            "pyvenv_cfg": snapshot,
+        }
+        with mock.patch.object(
+            SHIM, "_validate_formal_python_binding", return_value=result
+        ):
+            return SHIM.validate_transaction_context(**kwargs)
+
     def _transaction_fixture(
         self,
         root: Path,
@@ -77,6 +90,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                         "scripts/show_base/dual_node_guarded_transaction.py",
                         "scripts/show_base/run_dual_node_guarded_transaction.sh",
                         "scripts/show_base/guarded_runner_contract.sh",
+                        "scripts/show_base/formal_python_runtime_contract.sh",
                     )
                 },
             },
@@ -91,6 +105,16 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                 "input_sha256": {},
                 "input_bindings": {},
                 "exec_argv_sha256": SHIM._argv_sha256(argv),
+                "formal_python_binding": {
+                    "format": "semtalk.formal_venv_python_binding.v1",
+                    "argv0": str(python),
+                    "venv_root": str(python.parent.parent),
+                    "symlink_chain": [
+                        {"path": str(python), "target": python.name}
+                    ],
+                    "resolved_target": executable,
+                    "pyvenv_cfg": executable,
+                },
             },
             "participants": participants,
             "max_restarts": 0,
@@ -192,6 +216,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                     "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
                     "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
                     "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/formal_python_runtime_contract.sh": "6" * 64,
                     "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
                     "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
                 },
@@ -199,7 +224,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
             transaction_root, _ = self._transaction_fixture(
                 root, argv=argv, source=source
             )
-            result = SHIM.validate_transaction_context(
+            result = self._validate_transaction_context(
                 transaction_root=transaction_root,
                 run_id=transaction_root.name,
                 node_id=SHIM.EXPECTED_HOST_BY_RANK[0],
@@ -227,6 +252,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                     "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
                     "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
                     "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/formal_python_runtime_contract.sh": "6" * 64,
                     "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
                     "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
                 },
@@ -238,7 +264,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                 completion_timeout_ms=120_000,
             )
             with self.assertRaisesRegex(SHIM.W16ShimError, "at least 24 hours"):
-                SHIM.validate_transaction_context(
+                self._validate_transaction_context(
                     transaction_root=transaction_root,
                     run_id=transaction_root.name,
                     node_id=SHIM.EXPECTED_HOST_BY_RANK[0],
@@ -265,6 +291,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                     "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
                     "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
                     "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/formal_python_runtime_contract.sh": "6" * 64,
                     "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
                     "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
                 },
@@ -278,7 +305,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 SHIM.W16ShimError, "launcher chain changed"
             ):
-                SHIM.validate_transaction_context(
+                self._validate_transaction_context(
                     transaction_root=transaction_root,
                     run_id=transaction_root.name,
                     node_id=SHIM.EXPECTED_HOST_BY_RANK[0],
@@ -305,6 +332,7 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                     "scripts/show_base/dual_node_guarded_transaction.py": "1" * 64,
                     "scripts/show_base/run_dual_node_guarded_transaction.sh": "2" * 64,
                     "scripts/show_base/guarded_runner_contract.sh": "3" * 64,
+                    "scripts/show_base/formal_python_runtime_contract.sh": "6" * 64,
                     "scripts/show_base/base_w16_transaction_workload.py": "4" * 64,
                     "scripts/show_base/train_base_official_adapt_long.py": "5" * 64,
                 },
@@ -323,13 +351,13 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
                 hostname=SHIM.EXPECTED_HOST_BY_RANK[1],
             )
             with self.assertRaisesRegex(SHIM.W16ShimError, "argv/input"):
-                SHIM.validate_transaction_context(
+                self._validate_transaction_context(
                     **common,
                     original_argv=[*argv, "--tampered"],
                     parent_identity={**_identity(1001), "ppid": 901},
                 )
             with self.assertRaisesRegex(SHIM.W16ShimError, "supervisor child"):
-                SHIM.validate_transaction_context(
+                self._validate_transaction_context(
                     **common,
                     original_argv=argv,
                     parent_identity=_identity(9999),
@@ -543,8 +571,100 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
         self.assertIn('"--nnodes=2"', source)
         self.assertIn('"--nproc_per_node=8"', source)
         self.assertIn("os.execve", source)
+        self.assertNotIn("Path(sys.executable).resolve", source)
+        self.assertIn("os.execve(target_fd, command, environment)", source)
         self.assertIn('"scripts/show_base/train_base_official_adapt_long.py"', source)
         self.assertIn("derive-input-set-sha256", source)
+
+    def test_main_preserves_exact_venv_leaf_for_context_and_torchrun(self) -> None:
+        class ExecCalled(Exception):
+            pass
+
+        leaf = "/canonical/formal-venv/bin/python"
+        target = "/usr/bin/python3.12"
+        target_sha = "9" * 64
+        captured: dict[str, object] = {}
+
+        def fake_context(**kwargs: object) -> dict[str, object]:
+            captured["original_argv"] = kwargs["original_argv"]
+            return {
+                "python": {
+                    "path": leaf,
+                    "resolved_target_path": target,
+                    "bytes": 123,
+                    "sha256": target_sha,
+                },
+                "python_binding": {"format": "test"},
+            }
+
+        def fake_execve(
+            executable: object,
+            command: list[str],
+            environment: dict[str, str],
+        ) -> None:
+            captured["exec"] = (executable, command, environment)
+            raise ExecCalled
+
+        environment = {
+            "SEMTALK_W16_TRANSACTION_ROOT": "/efs/tx/run",
+            "SEMTALK_W16_RUN_ID": "formal-w16-run-001",
+            "SEMTALK_W16_NODE_ID": SHIM.EXPECTED_HOST_BY_RANK[0],
+            "SEMTALK_W16_NODE_RANK": "0",
+            "SEMTALK_W16_MAX_RESTARTS": "0",
+            "CUDA_VISIBLE_DEVICES": SHIM.EXPECTED_GPUS,
+        }
+        trainer_args = argparse.Namespace()
+        argv = [
+            "--source-commit", "c" * 40,
+            "--source-tree", "d" * 40,
+            "--master-addr", SHIM.EXPECTED_HOST_BY_RANK[0],
+            "--master-port", "29601",
+            "--formal-run-id", "formal-w16-run-001",
+            "--topology-mode", "official_objective_w16_l4_g64_ddp_adaptation",
+            "--expected-input-set-sha256", "e" * 64,
+            "--", "--mode", "train",
+        ]
+        fake_stat = types.SimpleNamespace(st_size=123)
+        with (
+            mock.patch.object(SHIM.sys, "executable", leaf),
+            mock.patch.dict(SHIM.os.environ, environment, clear=True),
+            mock.patch.object(SHIM, "audit_source", return_value={}),
+            mock.patch.object(
+                SHIM, "validate_transaction_context", side_effect=fake_context
+            ),
+            mock.patch.object(SHIM, "_proc_identity", return_value=_identity(1000)),
+            mock.patch.object(
+                SHIM.socket,
+                "gethostname",
+                return_value=SHIM.EXPECTED_HOST_BY_RANK[0],
+            ),
+            mock.patch.object(
+                SHIM, "_load_trainer", return_value=types.SimpleNamespace()
+            ),
+            mock.patch.object(
+                SHIM,
+                "prepare_trainer_launch",
+                return_value=(trainer_args, ["--mode", "train"]),
+            ),
+            mock.patch.object(SHIM, "audit_inputs", return_value={}),
+            mock.patch.object(
+                SHIM, "_validate_formal_python_binding", return_value={}
+            ),
+            mock.patch.object(
+                SHIM, "_open_regular", return_value=(99, fake_stat)
+            ),
+            mock.patch.object(SHIM, "_sha256_fd", return_value=target_sha),
+            mock.patch.object(SHIM.os, "execve", side_effect=fake_execve) as exec_mock,
+            mock.patch.object(SHIM.os, "supports_fd", {exec_mock}),
+        ):
+            with self.assertRaises(ExecCalled):
+                SHIM.main(argv)
+        original_argv = captured["original_argv"]
+        self.assertEqual(original_argv[0], leaf)  # type: ignore[index]
+        executable, command, _environment = captured["exec"]  # type: ignore[misc]
+        self.assertEqual(executable, 99)
+        self.assertEqual(command[0], leaf)
+        self.assertNotEqual(command[0], target)
 
 
 if __name__ == "__main__":
