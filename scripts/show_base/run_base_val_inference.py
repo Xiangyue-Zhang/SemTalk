@@ -7,7 +7,7 @@ explicit ``--split val`` and never exposes a test input.
 
 The transaction has three small, explicit phases:
 
-* ``prepare`` validates the complete seven-candidate bundle, the exact 1,715
+* ``prepare`` validates the complete 22-candidate bundle, the exact 1,715
   clip validation cache, and the frozen downstream pipeline once.
 * ``shard`` runs one deterministic modulo shard.  ``--num-shards`` is
   configurable (including 16 shards across two eight-GPU workers).
@@ -16,8 +16,9 @@ The transaction has three small, explicit phases:
   writes the selector-compatible lineage, and publishes the whole generation
   with one directory rename.
 
-Only Base epochs 1/2/4/8/16/32/40 are accepted.  Withdrawn e30/epoch-30 and
-Speaker2 labels, as well as every test-labelled path, fail before model load.
+Only the registered 22 epochs from e1 through e400 are accepted.  Withdrawn
+e30/epoch-30 and Speaker2 labels, as well as every test-labelled path, fail
+before model load.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.show_base import select_base_official_adapt as selector  # noqa: E402
+from scripts.show_base import base_long_val_contract as selector  # noqa: E402
 
 
 PREFLIGHT_FORMAT = (
@@ -363,7 +364,12 @@ def _epoch(value: str) -> int:
         raise argparse.ArgumentTypeError("epoch must be an integer") from error
     if epoch not in selector.EXPECTED_CANDIDATE_EPOCHS:
         raise argparse.ArgumentTypeError(
-            "epoch must be one of 1,2,4,8,16,32,40; e30 is withdrawn"
+            "epoch must be one of "
+            + ",".join(
+                str(value)
+                for value in selector.EXPECTED_CANDIDATE_EPOCHS
+            )
+            + "; e30 is withdrawn"
         )
     return epoch
 

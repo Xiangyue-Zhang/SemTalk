@@ -763,7 +763,12 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 payload = json.loads(output.read_text())
                 self.assertEqual(
                     set(payload["candidate_bundle"]["candidates"]),
-                    {"1", "2", "4", "8", "16", "32", "40"},
+                    {
+                        str(epoch)
+                        for epoch in (
+                            PRODUCER.selector.EXPECTED_CANDIDATE_EPOCHS
+                        )
+                    },
                 )
                 self.assertEqual(artifact["path"], str(output.resolve()))
                 with self.assertRaises(FileExistsError):

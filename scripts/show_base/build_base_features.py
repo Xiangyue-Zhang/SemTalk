@@ -40,8 +40,13 @@ import zipfile
 
 # Formal source receipts require the checkout to stay byte-for-byte clean.
 sys.dont_write_bytecode = True
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+
+from scripts.show_base import selected_prerequisites as selected_contract
 
 
 AUDIO_FIELDS = ("beat", "hubert")
@@ -66,11 +71,13 @@ CANONICAL_FIELDS = (
 )
 RVQ_NAMES = ("face", "upper", "hands", "lower")
 SHOW_TRAINED_PREREQUISITE_SOURCE = "show_trained_v1"
+SHOW_VAL_SELECTED_PREREQUISITE_SOURCE = "show_val_selected_v1"
 RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE = (
     "released_all_speakers_v1"
 )
 PREREQUISITE_SOURCES = (
     SHOW_TRAINED_PREREQUISITE_SOURCE,
+    SHOW_VAL_SELECTED_PREREQUISITE_SOURCE,
     RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE,
 )
 VAL_CANONICAL_SUMMARY_FORMAT = (
@@ -2881,6 +2888,147 @@ def load_released_all_speakers_models(
     return models, records, receipt
 
 
+def load_val_selected_models(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load exactly the five independently validation-selected SHOW models."""
+
+    import torch
+    from models.rvq import RVQVAE
+
+    bridge = selected_contract.load_selected_prerequisites(
+        args.prerequisite_selection_json,
+        args.expected_prerequisite_selection_sha256,
+    )
+    dimensions = {
+        "face": 106,
+        "hands": 180,
+        "upper": 78,
+        "lower": 61,
+    }
+    layers = {"face": 2, "hands": 2, "upper": 2, "lower": 4}
+    models: dict[str, Any] = {}
+    records: dict[str, Any] = {}
+    for stage in (*RVQ_NAMES, "global"):
+        selected = bridge["selected"][stage]
+        checkpoint = selected["candidate_checkpoint"]
+        resolved = Path(checkpoint["path"])
+        checkpoint_bytes = resolved.read_bytes()
+        if (
+            len(checkpoint_bytes) != checkpoint["bytes"]
+            or hashlib.sha256(checkpoint_bytes).hexdigest()
+            != checkpoint["sha256"]
+        ):
+            raise RuntimeError(
+                f"{stage} validation-selected checkpoint changed"
+            )
+        payload = _torch_load(checkpoint_bytes, resolved)
+        if not isinstance(payload, dict) or set(payload) != {
+            "model_state",
+            "audit",
+        }:
+            raise RuntimeError(
+                f"{stage} selected checkpoint container schema mismatch"
+            )
+        audit = payload["audit"]
+        if (
+            not isinstance(audit, dict)
+            or audit.get("format")
+            != "semtalk_show_representation_candidate_v1"
+            or audit.get("formal_stage") != stage
+            or audit.get("completed_epochs") != selected["epoch"]
+            or audit.get("optimizer_updates")
+            != selected["optimizer_updates"]
+            or audit.get("selection_status")
+            != "offline_validation_pending"
+            or audit.get("source_receipt")
+            != bridge["training_sources"][stage]["training_audit"]
+            or audit.get("config_sha256")
+            != bridge["config_sha256"][stage]
+            or selected_contract.canonical_json_sha256(audit)
+            != selected["candidate_audit_sha256"]
+        ):
+            raise RuntimeError(
+                f"{stage} selected checkpoint audit binding mismatch"
+            )
+        raw_state = payload["model_state"]
+        if not isinstance(raw_state, Mapping) or not raw_state:
+            raise RuntimeError(f"{stage} selected model_state is empty")
+        state: dict[str, Any] = {}
+        for raw_key, value in raw_state.items():
+            if not isinstance(raw_key, str) or not torch.is_tensor(value):
+                raise RuntimeError(
+                    f"{stage} selected model_state entry is invalid"
+                )
+            key = raw_key[7:] if raw_key.startswith("module.") else raw_key
+            if key in state:
+                raise RuntimeError(
+                    f"{stage} selected model_state key collision"
+                )
+            if (
+                (value.is_floating_point() or value.is_complex())
+                and not bool(torch.isfinite(value).all().item())
+            ):
+                raise RuntimeError(
+                    f"{stage} selected model_state tensor is non-finite"
+                )
+            state[key] = value
+        record = {
+            "path": str(resolved),
+            "sha256": checkpoint["sha256"],
+            "bytes": checkpoint["bytes"],
+            "formal_stage": stage,
+            "prerequisite_source": SHOW_VAL_SELECTED_PREREQUISITE_SOURCE,
+            "training_dataset": "SHOW",
+            "speaker_scope": "All",
+            "show_trained": True,
+            "selection_split": "val",
+            "test_visible": False,
+            "selected_epoch": selected["epoch"],
+            "selected_optimizer_updates": selected["optimizer_updates"],
+            "selection_metric": selected["selection_metric"],
+            "selection_score": selected["selection_score"],
+            "candidate_audit_sha256": selected[
+                "candidate_audit_sha256"
+            ],
+            "measurement_receipt": selected["measurement_receipt"],
+            "selection_receipt": dict(bridge["selection"]),
+            "checkpoint_container_schema": ["audit", "model_state"],
+            "model_state_tensors": len(state),
+            "model_state_schema_sha256": _state_dict_schema_sha256(state),
+            "all_model_state_tensors_finite": True,
+            "strict_state_dict_load": True,
+            "frozen_eval": True,
+        }
+        if stage == "global":
+            # Global is required and fully audited but is not in the Base
+            # feature graph.
+            records[stage] = record
+            del state, payload
+            continue
+        model = RVQVAE(
+            SimpleNamespace(
+                vae_test_dim=dimensions[stage],
+                vae_layer=layers[stage],
+                vae_length=256,
+            )
+        ).to(args.device)
+        _strict_load_freeze_eval(model, state, path=resolved)
+        models[stage] = model
+        records[stage] = record
+        del state, payload
+    if set(models) != set(RVQ_NAMES) or set(records) != {
+        *RVQ_NAMES,
+        "global",
+    }:
+        raise RuntimeError(
+            "show_val_selected_v1 did not load four RVQs and audit Global"
+        )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return models, records, bridge
+
+
 def load_prerequisite_models(
     args: argparse.Namespace,
     expected_lineage_sha256: str,
@@ -2914,6 +3062,16 @@ def load_prerequisite_models(
                 f"for {', '.join(unexpected)}"
             )
         return load_released_all_speakers_models(args)
+    if source == SHOW_VAL_SELECTED_PREREQUISITE_SOURCE:
+        unexpected = sorted(
+            name for name, path in statuses.items() if path is not None
+        )
+        if unexpected:
+            raise RuntimeError(
+                "show_val_selected_v1 forbids legacy training status JSON "
+                f"for {', '.join(unexpected)}"
+            )
+        return load_val_selected_models(args)
     raise RuntimeError(f"unsupported prerequisite source: {source!r}")
 
 
@@ -2955,6 +3113,38 @@ def revalidate_checkpoint_records(
             ):
                 raise RuntimeError(
                     f"{name} released checkpoint receipt changed during "
+                    "Base cache build"
+                )
+            continue
+        if (
+            record.get("prerequisite_source")
+            == SHOW_VAL_SELECTED_PREREQUISITE_SOURCE
+        ):
+            try:
+                mode = os.lstat(checkpoint).st_mode
+            except FileNotFoundError:
+                raise RuntimeError(
+                    f"{name} selected checkpoint disappeared: {checkpoint}"
+                ) from None
+            if (
+                checkpoint.is_symlink()
+                or not stat.S_ISREG(mode)
+                or checkpoint.stat().st_size != record.get("bytes")
+                or sha256(checkpoint) != record.get("sha256")
+                or record.get("formal_stage") != name
+                or record.get("training_dataset") != "SHOW"
+                or record.get("speaker_scope") != "All"
+                or record.get("show_trained") is not True
+                or record.get("selection_split") != "val"
+                or record.get("test_visible") is not False
+                or record.get("checkpoint_container_schema")
+                != ["audit", "model_state"]
+                or record.get("strict_state_dict_load") is not True
+                or record.get("all_model_state_tensors_finite") is not True
+                or record.get("frozen_eval") is not True
+            ):
+                raise RuntimeError(
+                    f"{name} selected checkpoint receipt changed during "
                     "Base cache build"
                 )
             continue
@@ -3676,6 +3866,13 @@ def base_mode(args: argparse.Namespace) -> None:
                 "Base cache construction"
             )
         revalidate_checkpoint_records(checkpoint_records)
+        if (
+            args.prerequisite_source
+            == SHOW_VAL_SELECTED_PREREQUISITE_SOURCE
+        ):
+            selected_contract.revalidate_selected_prerequisites(
+                prerequisite_source_receipt
+            )
     except BaseException:
         shutil.rmtree(temp, ignore_errors=True)
         raise
@@ -3754,7 +3951,7 @@ def base_mode(args: argparse.Namespace) -> None:
             prerequisite_source_receipt
         )
         lineage["protocol"]["prerequisite_source"] = (
-            RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
+            args.prerequisite_source
         )
     atomic_json(lineage_path, lineage)
     lineage_sha = sha256(lineage_path)
@@ -3859,8 +4056,10 @@ def parse_args() -> argparse.Namespace:
         default=SHOW_TRAINED_PREREQUISITE_SOURCE,
     )
     for name in (*RVQ_NAMES, "global"):
-        base.add_argument(f"--{name}-checkpoint", required=True)
+        base.add_argument(f"--{name}-checkpoint")
         base.add_argument(f"--{name}-status-json")
+    base.add_argument("--prerequisite-selection-json")
+    base.add_argument("--expected-prerequisite-selection-sha256")
     base.add_argument("--output-lmdb", required=True)
     base.add_argument("--summary-json", required=True)
     base.add_argument("--lineage-json", required=True)
@@ -3897,26 +4096,78 @@ def parse_args() -> argparse.Namespace:
             name: getattr(args, f"{name}_status_json")
             for name in (*RVQ_NAMES, "global")
         }
+        checkpoints = {
+            name: getattr(args, f"{name}_checkpoint")
+            for name in (*RVQ_NAMES, "global")
+        }
         if args.prerequisite_source == SHOW_TRAINED_PREREQUISITE_SOURCE:
+            missing_checkpoints = sorted(
+                name for name, path in checkpoints.items() if path is None
+            )
             missing = sorted(
                 name for name, path in statuses.items() if path is None
             )
-            if missing:
+            if missing or missing_checkpoints:
                 parser.error(
-                    "show_trained_v1 requires status JSON for "
-                    f"{', '.join(missing)}"
+                    "show_trained_v1 requires checkpoints and status JSON "
+                    f"(checkpoint missing={missing_checkpoints}, "
+                    f"status missing={missing})"
                 )
         elif (
             args.prerequisite_source
             == RELEASED_ALL_SPEAKERS_PREREQUISITE_SOURCE
         ):
+            missing_checkpoints = sorted(
+                name for name, path in checkpoints.items() if path is None
+            )
             unexpected = sorted(
                 name for name, path in statuses.items() if path is not None
             )
+            if unexpected or missing_checkpoints:
+                parser.error(
+                    "released_all_speakers_v1 requires checkpoints and "
+                    "forbids SHOW status JSON "
+                    f"(checkpoint missing={missing_checkpoints}, "
+                    f"status present={unexpected})"
+                )
+        elif (
+            args.prerequisite_source
+            == SHOW_VAL_SELECTED_PREREQUISITE_SOURCE
+        ):
+            if (
+                args.prerequisite_selection_json is None
+                or args.expected_prerequisite_selection_sha256 is None
+            ):
+                parser.error(
+                    "show_val_selected_v1 requires the selection JSON and "
+                    "its external SHA-256"
+                )
+            unexpected = sorted(
+                [
+                    f"{name}-checkpoint"
+                    for name, value in checkpoints.items()
+                    if value is not None
+                ]
+                + [
+                    f"{name}-status-json"
+                    for name, value in statuses.items()
+                    if value is not None
+                ]
+            )
             if unexpected:
                 parser.error(
-                    "released_all_speakers_v1 forbids SHOW training status "
-                    f"JSON for {', '.join(unexpected)}"
+                    "show_val_selected_v1 derives checkpoint paths from the "
+                    "selection receipt and forbids legacy checkpoint/status "
+                    f"arguments: {unexpected}"
+                )
+        if args.prerequisite_source != SHOW_VAL_SELECTED_PREREQUISITE_SOURCE:
+            if (
+                args.prerequisite_selection_json is not None
+                or args.expected_prerequisite_selection_sha256 is not None
+            ):
+                parser.error(
+                    "prerequisite selection arguments are restricted to "
+                    "show_val_selected_v1"
                 )
     return args
 

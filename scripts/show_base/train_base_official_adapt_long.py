@@ -37,9 +37,15 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 sys.dont_write_bytecode = True
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.show_base import selected_prerequisites as selected_contract
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 OFFICIAL_BASE_SOURCE = "released_all_speakers_v1"
+SHOW_VAL_SELECTED_SOURCE = "show_val_selected_v1"
 OFFICIAL_BASE_CLASSIFICATION = (
     "official_BEAT2_All-Speakers_released_weights_not_SHOW-trained"
 )
@@ -533,7 +539,7 @@ def _load_json_receipt(
 
 
 def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
-    """Bind the train LMDB to official All-Speakers frozen RVQ targets."""
+    """Bind the train LMDB to one immutable five-prerequisite transaction."""
 
     summary, summary_path, summary_sha = _load_json_receipt(
         Path(args.dataset_summary),
@@ -587,7 +593,6 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         != "int64_all_zero_unused_placeholder"
         or set(protocol.get("forbidden_components", []))
         != expected_forbidden
-        or protocol.get("prerequisite_source") != OFFICIAL_BASE_SOURCE
         or not isinstance(records, dict)
         or set(records) != set(OFFICIAL_PREREQUISITE_SPECS)
     ):
@@ -595,32 +600,112 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
             "Base summary/lineage does not match the frozen All-Speakers "
             "SHOW Base-only feature contract"
         )
-    for stage, specification in OFFICIAL_PREREQUISITE_SPECS.items():
-        record = records[stage]
-        if not isinstance(record, dict):
-            raise AdaptationContractError(
-                f"Base feature lineage {stage} record is not an object"
+    selected_mode = (
+        getattr(args, "prerequisite_selection_json", None) is not None
+    )
+    selected_bridge: dict[str, Any] | None = None
+    if selected_mode:
+        try:
+            selected_bridge = selected_contract.load_selected_prerequisites(
+                args.prerequisite_selection_json,
+                getattr(
+                    args,
+                    "expected_prerequisite_selection_sha256",
+                    None,
+                ),
             )
-        reject_forbidden_source_labels(record.get("path", ""), record)
+        except selected_contract.SelectedPrerequisiteError as error:
+            raise AdaptationContractError(str(error)) from error
         if (
-            record.get("formal_stage") != stage
-            or record.get("filename") != specification["filename"]
-            or record.get("sha256") != specification["sha256"]
-            or record.get("prerequisite_source") != OFFICIAL_BASE_SOURCE
-            or record.get("classification") != OFFICIAL_BASE_CLASSIFICATION
-            or record.get("training_dataset") != "BEAT2"
-            or record.get("speaker_scope") != "All-Speakers"
-            or record.get("show_trained") is not False
-            or record.get("checkpoint_container_schema") != ["model_state"]
-            or record.get("strict_state_dict_load") is not True
-            or record.get("all_model_state_tensors_finite") is not True
-            or record.get("frozen_eval") is not True
+            protocol.get("prerequisite_source") != SHOW_VAL_SELECTED_SOURCE
+            or lineage.get("prerequisite_source_receipt")
+            != selected_bridge
+            or selected_bridge.get("global_verified_not_consumed") is not True
         ):
             raise AdaptationContractError(
-                f"Base feature lineage does not use exact official {stage} weight"
+                "Base feature lineage is not bound to the externally "
+                "hash-pinned five-stage validation selection"
             )
-    return {
-        "format": "semtalk_show_base_official_feature_dataset_receipt_v1",
+        for stage in selected_contract.STAGES:
+            record = records[stage]
+            selected = selected_bridge["selected"][stage]
+            checkpoint = selected["candidate_checkpoint"]
+            if not isinstance(record, dict):
+                raise AdaptationContractError(
+                    f"Base feature lineage {stage} record is not an object"
+                )
+            reject_forbidden_source_labels(record.get("path", ""), record)
+            if (
+                record.get("formal_stage") != stage
+                or record.get("path") != checkpoint["path"]
+                or record.get("sha256") != checkpoint["sha256"]
+                or record.get("bytes") != checkpoint["bytes"]
+                or record.get("prerequisite_source")
+                != SHOW_VAL_SELECTED_SOURCE
+                or record.get("training_dataset") != "SHOW"
+                or record.get("speaker_scope") != "All"
+                or record.get("show_trained") is not True
+                or record.get("selection_split") != "val"
+                or record.get("test_visible") is not False
+                or record.get("selected_epoch") != selected["epoch"]
+                or record.get("selected_optimizer_updates")
+                != selected["optimizer_updates"]
+                or record.get("selection_metric")
+                != selected["selection_metric"]
+                or record.get("selection_score")
+                != selected["selection_score"]
+                or record.get("candidate_audit_sha256")
+                != selected["candidate_audit_sha256"]
+                or record.get("measurement_receipt")
+                != selected["measurement_receipt"]
+                or record.get("checkpoint_container_schema")
+                != ["audit", "model_state"]
+                or record.get("strict_state_dict_load") is not True
+                or record.get("all_model_state_tensors_finite") is not True
+                or record.get("frozen_eval") is not True
+            ):
+                raise AdaptationContractError(
+                    f"Base feature lineage does not bind selected {stage}"
+                )
+    else:
+        if protocol.get("prerequisite_source") != OFFICIAL_BASE_SOURCE:
+            raise AdaptationContractError(
+                "legacy Base feature lineage does not use official "
+                "All-Speakers prerequisites"
+            )
+        for stage, specification in OFFICIAL_PREREQUISITE_SPECS.items():
+            record = records[stage]
+            if not isinstance(record, dict):
+                raise AdaptationContractError(
+                    f"Base feature lineage {stage} record is not an object"
+                )
+            reject_forbidden_source_labels(record.get("path", ""), record)
+            if (
+                record.get("formal_stage") != stage
+                or record.get("filename") != specification["filename"]
+                or record.get("sha256") != specification["sha256"]
+                or record.get("prerequisite_source") != OFFICIAL_BASE_SOURCE
+                or record.get("classification")
+                != OFFICIAL_BASE_CLASSIFICATION
+                or record.get("training_dataset") != "BEAT2"
+                or record.get("speaker_scope") != "All-Speakers"
+                or record.get("show_trained") is not False
+                or record.get("checkpoint_container_schema")
+                != ["model_state"]
+                or record.get("strict_state_dict_load") is not True
+                or record.get("all_model_state_tensors_finite") is not True
+                or record.get("frozen_eval") is not True
+            ):
+                raise AdaptationContractError(
+                    "Base feature lineage does not use exact official "
+                    f"{stage} weight"
+                )
+    receipt = {
+        "format": (
+            "semtalk_show_base_selected_feature_dataset_receipt_v1"
+            if selected_mode
+            else "semtalk_show_base_official_feature_dataset_receipt_v1"
+        ),
         "lmdb": str(lmdb_path),
         "entries": EXPECTED_TRAIN_SAMPLES,
         "train_clips": EXPECTED_TRAIN_CLIPS,
@@ -630,10 +715,11 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         "summary_sha256": summary_sha,
         "lineage": str(lineage_path),
         "lineage_sha256": lineage_sha,
-        "prerequisite_source": OFFICIAL_BASE_SOURCE,
+        "prerequisite_source": (
+            SHOW_VAL_SELECTED_SOURCE if selected_mode else OFFICIAL_BASE_SOURCE
+        ),
         "formal_checkpoints": {
             stage: {
-                "filename": records[stage]["filename"],
                 "sha256": records[stage]["sha256"],
                 "formal_stage": stage,
                 "frozen_eval": True,
@@ -643,6 +729,21 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         "vq_models_in_training_graph": False,
         "vq_targets": "precomputed_frozen_lmdb_tensors",
     }
+    if selected_bridge is not None:
+        receipt["prerequisite_selection"] = selected_bridge["selection"]
+        receipt["selected_prerequisite_sha256"] = {
+            stage: selected_bridge["selected"][stage][
+                "candidate_checkpoint"
+            ]["sha256"]
+            for stage in selected_contract.STAGES
+        }
+        receipt["global_verified_not_consumed"] = True
+    else:
+        for stage in OFFICIAL_PREREQUISITE_SPECS:
+            receipt["formal_checkpoints"][stage]["filename"] = records[stage][
+                "filename"
+            ]
+    return receipt
 
 
 def validate_long_contract_receipts(
@@ -1489,6 +1590,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-dataset-summary-sha256", required=True)
     parser.add_argument("--lineage-manifest", required=True)
     parser.add_argument("--expected-lineage-sha256", required=True)
+    parser.add_argument("--prerequisite-selection-json")
+    parser.add_argument("--expected-prerequisite-selection-sha256")
     parser.add_argument("--schedule-json", required=True)
     parser.add_argument("--expected-schedule-sha256", required=True)
     parser.add_argument("--trajectory-anchor-json", required=True)
@@ -1517,6 +1620,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.train_lmdb,
         args.dataset_summary,
         args.lineage_manifest,
+        args.prerequisite_selection_json or "",
         args.schedule_json,
         args.trajectory_anchor_json,
         args.throughput_gate_report or "",
@@ -1527,6 +1631,18 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.run_name in {".", ".."}
     ):
         raise AdaptationContractError("--run-name must be one path component")
+    if (args.prerequisite_selection_json is None) != (
+        args.expected_prerequisite_selection_sha256 is None
+    ):
+        raise AdaptationContractError(
+            "prerequisite selection JSON and external SHA-256 must be "
+            "supplied together"
+        )
+    if args.expected_prerequisite_selection_sha256 is not None:
+        selected_contract.require_sha256(
+            args.expected_prerequisite_selection_sha256,
+            "prerequisite selection expected SHA-256",
+        )
     if args.local_batch_size != LOCAL_BATCH_SIZE:
         raise AdaptationContractError("local batch size must be exactly 64")
     if args.epochs != TOTAL_EPOCHS:
