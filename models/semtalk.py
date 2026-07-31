@@ -167,8 +167,16 @@ class RhythmicIdentificationLoss(nn.Module):
         batch_size, num_frames, _ = facial_features.shape
         labels = torch.arange(num_frames).unsqueeze(0).repeat(batch_size, 1).to(facial_features.device)
        
-        # Compute the InfoNCE loss
-        loss = F.cross_entropy(similarity_matrix, labels)
+        # ``cross_entropy`` interprets dimension 1 as the class axis.  Keep
+        # that exact [B, C=T, T] meaning while flattening the remaining axes
+        # into a 2-D input.  Besides being mathematically equivalent to the
+        # original call, this selects the deterministic-compatible 2-D NLL
+        # implementation when deterministic algorithms are required on CUDA.
+        similarity_matrix_2d = similarity_matrix.transpose(1, 2).reshape(
+            -1, num_frames
+        )
+        labels_1d = labels.reshape(-1)
+        loss = F.cross_entropy(similarity_matrix_2d, labels_1d)
        
         return loss
 

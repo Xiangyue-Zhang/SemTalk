@@ -137,6 +137,109 @@ class GlobalGpuLeaseTests(unittest.TestCase):
             )
         return command
 
+    def _archive_failed_command(
+        self,
+        acquired: dict[str, object],
+        status_sha256: str,
+        *,
+        return_code: int = 1,
+        confirmed_pid_offset: int = 9000,
+    ) -> list[str]:
+        command = self._command(
+            "archive-failed",
+            "--formal-host",
+            self.host,
+            "--lease-id",
+            str(acquired["lease_id"]),
+            "--lease-token",
+            str(acquired["lease_token"]),
+            "--expected-lease-receipt-sha256",
+            str(acquired["lease_receipt_sha256"]),
+            "--runner-status",
+            str(self.status),
+            "--expected-runner-status-sha256",
+            status_sha256,
+            "--expected-runner-return-code",
+            str(return_code),
+            "--confirm-no-live-descendants",
+            "--confirm-restored-guards-are-real-resnet18",
+        )
+        for gpu in range(8):
+            command.extend(
+                ["--confirmed-guard", f"{gpu}={confirmed_pid_offset + gpu}"]
+            )
+        return command
+
+    def _quarantine_failed_legacy_command(
+        self,
+        acquired: dict[str, object],
+        status_sha256: str,
+        *,
+        return_code: int = 1,
+        acquisition_utility_sha256: str | None = None,
+    ) -> list[str]:
+        from scripts.show_base import global_gpu_lease as module
+
+        command = self._command(
+            "quarantine-failed-legacy",
+            "--formal-host",
+            self.host,
+            "--lease-id",
+            str(acquired["lease_id"]),
+            "--lease-token",
+            str(acquired["lease_token"]),
+            "--expected-lease-receipt-sha256",
+            str(acquired["lease_receipt_sha256"]),
+            "--runner-status",
+            str(self.status),
+            "--expected-runner-status-sha256",
+            status_sha256,
+            "--expected-runner-return-code",
+            str(return_code),
+            "--expected-acquisition-utility-sha256",
+            acquisition_utility_sha256
+            or module.LEGACY_SUCCESS_ONLY_UTILITY_SHA256,
+            "--confirm-no-live-descendants",
+            "--confirm-restored-guards-are-real-resnet18",
+        )
+        for gpu in range(8):
+            command.extend(["--confirmed-guard", f"{gpu}={9000 + gpu}"])
+        return command
+
+    def _convert_acquired_receipt_to_exact_legacy(
+        self,
+        acquired: dict[str, object],
+        *,
+        policy_mutation: dict[str, object] | None = None,
+        utility_sha256: str | None = None,
+    ) -> dict[str, object]:
+        from scripts.show_base import global_gpu_lease as module
+
+        receipt_path = self.lease / "LEASE.json"
+        receipt = json.loads(receipt_path.read_text())
+        policy = dict(module.LEGACY_SUCCESS_ONLY_POLICY)
+        if policy_mutation:
+            policy.update(policy_mutation)
+        receipt["policy"] = policy
+        receipt["utility"] = {
+            "path": "/legacy/exact/global_gpu_lease.py",
+            "sha256": utility_sha256
+            or module.LEGACY_SUCCESS_ONLY_UTILITY_SHA256,
+        }
+        raw = (
+            json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode()
+        receipt_path.write_bytes(raw)
+        converted = dict(acquired)
+        converted["lease_receipt_sha256"] = sha256_bytes(raw)
+        return converted
+
     def _release_namespace(
         self,
         acquired: dict[str, object],
@@ -277,13 +380,27 @@ class GlobalGpuLeaseTests(unittest.TestCase):
         self.assertTrue(archive.is_dir())
         self.assertEqual(
             {path.name for path in archive.iterdir()},
-            {"LEASE.json", "RUNNER_STATUS.json", "RELEASE.json"},
+            {
+                "LEASE.json",
+                "TERMINAL_CLAIM.json",
+                "RUNNER_STATUS.json",
+                "RELEASE.json",
+            },
         )
         self.assertEqual(
             (archive / "RUNNER_STATUS.json").read_bytes(),
             self.status.read_bytes(),
         )
         evidence = json.loads((archive / "RELEASE.json").read_text())
+        claim = Path(result["terminal_claim_path"])
+        self.assertTrue(claim.is_file())
+        self.assertEqual(
+            result["terminal_claim_sha256"], sha256_bytes(claim.read_bytes())
+        )
+        self.assertEqual(
+            evidence["terminal_claim"]["sha256"],
+            result["terminal_claim_sha256"],
+        )
         self.assertTrue(
             evidence["caller_confirmations"]["no_live_workload_descendants"]
         )
@@ -295,6 +412,326 @@ class GlobalGpuLeaseTests(unittest.TestCase):
             set(evidence["runner_status"]["restored_guards"]),
             {str(gpu) for gpu in range(8)},
         )
+
+    def test_concurrent_terminal_calls_have_exactly_one_winner(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        status_sha256 = self._write_status()
+        command = self._release_command(acquired, status_sha256)
+        processes = [
+            subprocess.Popen(
+                command,
+                cwd=REPOSITORY,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(timeout=5) for process in processes]
+        self.assertEqual(
+            sorted(process.returncode for process in processes),
+            [0, 1],
+            results,
+        )
+        winner = json.loads(
+            next(stdout for process, (stdout, _stderr) in zip(processes, results)
+                 if process.returncode == 0)
+        )
+        archive = Path(winner["archive_dir"])
+        self.assertFalse(self.lease.exists())
+        self.assertTrue((archive / "TERMINAL_CLAIM.json").is_file())
+        self.assertTrue((archive / "RELEASE.json").is_file())
+
+    def test_failed_runner_is_archived_as_failure_without_false_success(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha256 = self._write_status(payload)
+        archived = subprocess.run(
+            self._archive_failed_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(archived.returncode, 0, archived.stderr)
+        result = json.loads(archived.stdout)
+        self.assertEqual(result["status"], "FAILED_ARCHIVED")
+        self.assertNotIn("release_receipt_sha256", result)
+        archive = Path(result["archive_dir"])
+        self.assertFalse(self.lease.exists())
+        self.assertEqual(
+            {path.name for path in archive.iterdir()},
+            {
+                "LEASE.json",
+                "TERMINAL_CLAIM.json",
+                "RUNNER_STATUS.json",
+                "FAILURE.json",
+            },
+        )
+        evidence = json.loads((archive / "FAILURE.json").read_text())
+        self.assertEqual(
+            evidence["terminal_claim"]["sha256"],
+            result["terminal_claim_sha256"],
+        )
+        self.assertEqual(evidence["state"], "FAILED_ARCHIVED")
+        self.assertEqual(evidence["runner_status"]["state"], "failed")
+        self.assertEqual(evidence["runner_status"]["return_code"], 1)
+        self.assertNotIn("released_time_ns", evidence)
+        self.assertNotIn("release_policy", evidence)
+
+    def test_failure_archive_rejects_success_or_wrong_return_code(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        status_sha256 = self._write_status()
+        success = subprocess.run(
+            self._archive_failed_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(success.returncode, 0)
+        self.assertTrue(self.lease.is_dir())
+
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 2
+        status_sha256 = self._write_status(payload)
+        mismatch = subprocess.run(
+            self._archive_failed_command(
+                acquired, status_sha256, return_code=1
+            ),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertTrue(self.lease.is_dir())
+
+    def test_exact_legacy_failure_is_quarantined_without_success_claim(self) -> None:
+        from scripts.show_base import global_gpu_lease as module
+
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        acquired = self._convert_acquired_receipt_to_exact_legacy(acquired)
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha256 = self._write_status(payload)
+        quarantined = subprocess.run(
+            self._quarantine_failed_legacy_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(quarantined.returncode, 0, quarantined.stderr)
+        result = json.loads(quarantined.stdout)
+        self.assertEqual(result["status"], "FAILED_QUARANTINED_LEGACY")
+        self.assertNotIn("archive_dir", result)
+        self.assertNotIn("release_receipt_sha256", result)
+        quarantine = Path(result["quarantine_dir"])
+        self.assertIn(".failed-quarantine.", quarantine.name)
+        self.assertFalse(self.lease.exists())
+        self.assertFalse(Path(acquired["archive_dir"]).exists())
+        self.assertEqual(
+            {path.name for path in quarantine.iterdir()},
+            {
+                "LEASE.json",
+                "TERMINAL_CLAIM.json",
+                "RUNNER_STATUS.json",
+                "LEGACY_FAILURE_QUARANTINE.json",
+            },
+        )
+        self.assertFalse((quarantine / "RELEASE.json").exists())
+        evidence_raw = (
+            quarantine / "LEGACY_FAILURE_QUARANTINE.json"
+        ).read_bytes()
+        self.assertEqual(
+            result["failure_receipt_sha256"], sha256_bytes(evidence_raw)
+        )
+        self.assertEqual(
+            (quarantine / "RUNNER_STATUS.json").read_bytes(),
+            self.status.read_bytes(),
+        )
+        evidence = json.loads(evidence_raw)
+        self.assertEqual(
+            evidence["terminal_claim"]["sha256"],
+            result["terminal_claim_sha256"],
+        )
+        self.assertEqual(evidence["state"], "FAILED_QUARANTINED_LEGACY")
+        self.assertEqual(
+            evidence["acquisition_policy"],
+            module.LEGACY_SUCCESS_ONLY_POLICY,
+        )
+        self.assertTrue(
+            evidence["policy_transition"]["no_success_release_claim"]
+        )
+        self.assertTrue(
+            evidence["policy_transition"]["no_stale_lease_steal"]
+        )
+        self.assertFalse(
+            evidence["policy_transition"]["source_lease_rewritten"]
+        )
+        self.assertFalse(
+            evidence["policy_transition"]["stale_lease_steal"]
+        )
+        self.assertFalse(evidence["policy_transition"]["success_claim"])
+        self.assertNotIn("released_time_ns", evidence)
+        self.assertNotIn("release_policy", evidence)
+
+    def test_legacy_quarantine_rejects_existing_archive_namespace(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        acquired = self._convert_acquired_receipt_to_exact_legacy(acquired)
+        archive = Path(acquired["archive_dir"])
+        archive.mkdir()
+        sentinel = archive / "sentinel"
+        sentinel.write_text("preserve\n")
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha256 = self._write_status(payload)
+        rejected = subprocess.run(
+            self._quarantine_failed_legacy_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(sentinel.read_text(), "preserve\n")
+        self.assertTrue(self.lease.is_dir())
+        quarantine = self.lease.with_name(
+            f"{self.lease.name}.failed-quarantine.{acquired['lease_id']}"
+        )
+        self.assertFalse(quarantine.exists())
+
+    def test_shared_terminal_claim_blocks_every_terminal_mode(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        claim = self.lease / "TERMINAL_CLAIM.json"
+        claim.write_text("preexisting terminal authority\n")
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha256 = self._write_status(payload)
+        rejected = subprocess.run(
+            self._archive_failed_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(claim.read_text(), "preexisting terminal authority\n")
+        self.assertTrue(self.lease.is_dir())
+        self.assertFalse(Path(acquired["archive_dir"]).exists())
+
+    def test_legacy_quarantine_rejects_policy_or_utility_mismatch(self) -> None:
+        for label, policy_mutation, utility_sha in (
+            ("policy", {"cross_mode": False}, None),
+            ("policy_bool_as_int", {"cross_mode": 1}, None),
+            ("utility", None, "b" * 64),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    original_root = self.root
+                    original_lease = self.lease
+                    original_status = self.status
+                    self.root = Path(directory).resolve()
+                    self.lease = self.root / "all-gpu.active"
+                    self.status = self.root / "runner-status.json"
+                    try:
+                        result, acquired = self._acquire()
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        assert acquired is not None
+                        acquired = self._convert_acquired_receipt_to_exact_legacy(
+                            acquired,
+                            policy_mutation=policy_mutation,
+                            utility_sha256=utility_sha,
+                        )
+                        payload = self._status_payload()
+                        payload["state"] = "failed"
+                        payload["return_code"] = 1
+                        status_sha = self._write_status(payload)
+                        rejected = subprocess.run(
+                            self._quarantine_failed_legacy_command(
+                                acquired, status_sha
+                            ),
+                            cwd=REPOSITORY,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertNotEqual(rejected.returncode, 0)
+                        self.assertTrue(self.lease.is_dir())
+                    finally:
+                        self.root = original_root
+                        self.lease = original_lease
+                        self.status = original_status
+
+    def test_current_policy_rejects_bool_as_equal_integer(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        receipt_path = self.lease / "LEASE.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["policy"]["cross_mode"] = 1
+        raw = (
+            json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode()
+        receipt_path.write_bytes(raw)
+        acquired = dict(acquired)
+        acquired["lease_receipt_sha256"] = sha256_bytes(raw)
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha256 = self._write_status(payload)
+        rejected = subprocess.run(
+            self._archive_failed_command(acquired, status_sha256),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertTrue(self.lease.is_dir())
+
+    def test_current_failure_archive_and_legacy_quarantine_are_not_interchangeable(self) -> None:
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        payload = self._status_payload()
+        payload["state"] = "failed"
+        payload["return_code"] = 1
+        status_sha = self._write_status(payload)
+        rejected = subprocess.run(
+            self._quarantine_failed_legacy_command(acquired, status_sha),
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertTrue(self.lease.is_dir())
 
     def test_release_rejects_failure_or_inexact_guard_restore(self) -> None:
         acquired_result, acquired = self._acquire()
@@ -418,6 +855,69 @@ class GlobalGpuLeaseTests(unittest.TestCase):
                 module._release(
                     self._release_namespace(acquired, status_sha256)
                 )
+        self.assertFalse(Path(acquired["archive_dir"]).exists())
+
+    def test_pinned_terminal_claim_rejects_mutation_after_first_read(self) -> None:
+        from scripts.show_base import global_gpu_lease as module
+
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        status_sha256 = self._write_status()
+        original = module._read_stable_regular_file_at
+        first_claim_read = True
+
+        def mutate_claim_after_first_read(*arguments, **keywords):
+            nonlocal first_claim_read
+            result = original(*arguments, **keywords)
+            if arguments[1] == module.TERMINAL_CLAIM_FILE and first_claim_read:
+                first_claim_read = False
+                (self.lease / module.TERMINAL_CLAIM_FILE).write_text("{}\n")
+            return result
+
+        module.GLOBAL_LEASE_DIR = self.lease
+        with mock.patch.object(
+            module,
+            "_read_stable_regular_file_at",
+            side_effect=mutate_claim_after_first_read,
+        ):
+            with self.assertRaisesRegex(module.LeaseError, "evidence changed"):
+                module._release(
+                    self._release_namespace(acquired, status_sha256)
+                )
+        self.assertTrue(self.lease.is_dir())
+        self.assertFalse(Path(acquired["archive_dir"]).exists())
+
+    def test_crash_after_internal_claim_is_permanently_fail_closed(self) -> None:
+        from scripts.show_base import global_gpu_lease as module
+
+        acquired_result, acquired = self._acquire()
+        self.assertEqual(acquired_result.returncode, 0, acquired_result.stderr)
+        assert acquired is not None
+        status_sha256 = self._write_status()
+        original = module._write_exclusive_at
+
+        def crash_after_claim(directory_fd, name, payload):
+            original(directory_fd, name, payload)
+            if name == module.TERMINAL_CLAIM_FILE:
+                raise RuntimeError("injected crash after terminal claim")
+
+        module.GLOBAL_LEASE_DIR = self.lease
+        with mock.patch.object(
+            module,
+            "_write_exclusive_at",
+            side_effect=crash_after_claim,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                module._release(
+                    self._release_namespace(acquired, status_sha256)
+                )
+        self.assertEqual(
+            {path.name for path in self.lease.iterdir()},
+            {"LEASE.json", "TERMINAL_CLAIM.json"},
+        )
+        with self.assertRaisesRegex(module.LeaseError, "unexpected"):
+            module._release(self._release_namespace(acquired, status_sha256))
         self.assertFalse(Path(acquired["archive_dir"]).exists())
 
     def test_pinned_directory_rejects_path_replacement_before_archive(self) -> None:

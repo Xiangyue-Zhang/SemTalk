@@ -8,10 +8,18 @@ mode.  This helper gives every formal caller one common fail-closed mutex:
 * ``acquire`` creates the active directory atomically and publishes one
   immutable, token-bound lease receipt;
 * an existing directory is never inspected for staleness and never stolen;
-* ``release`` accepts only the runner-status path bound at acquisition and
-  archives the whole directory with an atomic no-replace rename, but only
-  after successful runner exit, cleanup, and exact guard restoration are
-  proved and the caller explicitly confirms descendant/real-guard checks.
+* ``release`` accepts only a successful runner-status path bound at
+  acquisition;
+* ``archive-failed`` accepts only a failed, nonzero runner status bound at
+  acquisition.  It preserves the failure as immutable evidence instead of
+  either stealing the lease or falsely relabelling the run successful;
+* ``quarantine-failed-legacy`` is a deliberately separate, one-time migration
+  for the exact predecessor utility whose receipt allowed only successful
+  archival.  It never emits an archive/success claim and moves the exact
+  failed lease inode to a distinguishable failure-quarantine target;
+* both terminal operations archive the whole directory with an atomic
+  no-replace rename, but only after clean cleanup, exact guard restoration,
+  and explicit descendant/real-guard confirmations are proved.
 
 The helper is deliberately CPU-only and never starts, signals, or inspects a
 GPU workload.  Formal two-host W16 orchestration acquires host slot 0 first,
@@ -42,10 +50,30 @@ GLOBAL_LEASE_DIR = Path("/tmp/semtalk_formal_global_gpu_lease.active")
 LEASE_FILE = "LEASE.json"
 RUNNER_STATUS_FILE = "RUNNER_STATUS.json"
 RELEASE_FILE = "RELEASE.json"
+FAILURE_FILE = "FAILURE.json"
+LEGACY_FAILURE_QUARANTINE_FILE = "LEGACY_FAILURE_QUARANTINE.json"
+TERMINAL_CLAIM_FILE = "TERMINAL_CLAIM.json"
 EXPECTED_GPUS = tuple(range(8))
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_EVIDENCE_BYTES = 1 << 20
+LEGACY_SUCCESS_ONLY_UTILITY_SHA256 = (
+    "d64037552644c62333e5bb17f3443e541af4da910a214b473b3570a791a60c4e"
+)
+LEGACY_SUCCESS_ONLY_POLICY = {
+    "gpu_reservation": "0,1,2,3,4,5,6,7",
+    "cross_mode": True,
+    "stale_lease_stealing": False,
+    "archive_requires_successful_runner_and_caller_confirmation": True,
+}
+CURRENT_TERMINAL_POLICY = {
+    "gpu_reservation": "0,1,2,3,4,5,6,7",
+    "cross_mode": True,
+    "stale_lease_stealing": False,
+    "archive_requires_terminal_runner_and_caller_confirmation": True,
+    "successful_runner_requires_release": True,
+    "failed_runner_requires_failure_archive": True,
+}
 
 
 class LeaseError(RuntimeError):
@@ -76,8 +104,8 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _require_sha256(value: str, label: str) -> str:
-    if not HEX64_RE.fullmatch(value):
+def _require_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not HEX64_RE.fullmatch(value):
         raise LeaseError(f"{label} must be one lowercase SHA-256")
     return value
 
@@ -469,8 +497,16 @@ def _acquire(args: argparse.Namespace) -> dict[str, Any]:
     lease_id = uuid.uuid4().hex
     token = uuid.uuid4().hex + uuid.uuid4().hex
     archive_dir = lease_dir.with_name(f"{lease_dir.name}.archive.{lease_id}")
-    if archive_dir.exists() or archive_dir.is_symlink():
-        raise LeaseError("lease archive target already exists")
+    quarantine_dir = lease_dir.with_name(
+        f"{lease_dir.name}.failed-quarantine.{lease_id}"
+    )
+    if (
+        archive_dir.exists()
+        or archive_dir.is_symlink()
+        or quarantine_dir.exists()
+        or quarantine_dir.is_symlink()
+    ):
+        raise LeaseError("lease terminal namespace already exists")
     try:
         os.mkdir(lease_dir, 0o700)
     except FileExistsError as exc:
@@ -510,12 +546,7 @@ def _acquire(args: argparse.Namespace) -> dict[str, Any]:
             "path": str(Path(__file__).resolve()),
             "sha256": _sha256_file(Path(__file__).resolve()),
         },
-        "policy": {
-            "gpu_reservation": "0,1,2,3,4,5,6,7",
-            "cross_mode": True,
-            "stale_lease_stealing": False,
-            "archive_requires_successful_runner_and_caller_confirmation": True,
-        },
+        "policy": dict(CURRENT_TERMINAL_POLICY),
     }
     raw = _canonical_json_bytes(receipt)
     try:
@@ -559,27 +590,62 @@ def _parse_confirmed_guards(values: Sequence[str]) -> dict[str, int]:
 def _validate_runner_status(
     status: Mapping[str, Any],
     confirmed_guards: Mapping[str, int],
+    *,
+    expected_terminal_state: str = "finished",
+    expected_return_code: int = 0,
 ) -> dict[str, int]:
+    if expected_terminal_state not in {"finished", "failed"}:
+        raise LeaseError("expected runner terminal state is invalid")
+    if (
+        not _exact_int(expected_return_code)
+        or (expected_terminal_state == "finished" and expected_return_code != 0)
+        or (expected_terminal_state == "failed" and expected_return_code == 0)
+    ):
+        raise LeaseError("expected runner return code is incompatible with state")
     restored = status.get("restored_guards")
-    null_fields = (
-        "error",
-        "cleanup_error",
-        "restore_error",
-        "received_signal",
+    cleanup_is_clean = (
+        "cleanup_error" in status
+        and status["cleanup_error"] is None
+        and "restore_error" in status
+        and status["restore_error"] is None
+    )
+    failure_cause_is_well_formed = (
+        "error" in status
+        and (
+            status["error"] is None
+            or (
+                isinstance(status["error"], str)
+                and bool(status["error"].strip())
+            )
+        )
+        and "received_signal" in status
+        and (
+            status["received_signal"] is None
+            or _exact_int(status["received_signal"], minimum=1)
+        )
+    )
+    success_cause_is_clean = (
+        status.get("error") is None
+        and status.get("received_signal") is None
     )
     if (
-        status.get("state") != "finished"
+        status.get("state") != expected_terminal_state
         or not _exact_int(status.get("return_code"))
-        or status.get("return_code") != 0
-        or any(key not in status or status[key] is not None for key in null_fields)
+        or status.get("return_code") != expected_return_code
+        or not cleanup_is_clean
+        or not failure_cause_is_well_formed
+        or (
+            expected_terminal_state == "finished"
+            and not success_cause_is_clean
+        )
         or not isinstance(restored, dict)
         or set(restored) != {str(gpu) for gpu in EXPECTED_GPUS}
         or any(not _exact_int(pid, minimum=2) for pid in restored.values())
         or len(set(restored.values())) != len(EXPECTED_GPUS)
     ):
         raise LeaseError(
-            "guarded runner did not prove finished rc0, clean cleanup/restore, "
-            "and exact unique guards on GPU 0..7"
+            "guarded runner did not prove the expected terminal state/return "
+            "code, clean cleanup/restore, and exact unique guards on GPU 0..7"
         )
     normalized = {key: int(value) for key, value in restored.items()}
     if normalized != dict(confirmed_guards):
@@ -587,6 +653,80 @@ def _validate_runner_status(
             "caller-confirmed real guards differ from runner restoration evidence"
         )
     return normalized
+
+
+def _validate_terminal_policy(
+    lease: Mapping[str, Any],
+    *,
+    terminal_mode: str,
+    expected_legacy_utility_sha256: str | None,
+) -> dict[str, Any] | None:
+    """Bind terminal handling to the policy active at lease acquisition."""
+
+    if terminal_mode not in {"success", "failed_current", "failed_legacy"}:
+        raise LeaseError("terminal lease mode is invalid")
+    policy = lease.get("policy")
+    utility = lease.get("utility")
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(utility, dict)
+        or set(utility) != {"path", "sha256"}
+        or not isinstance(utility.get("path"), str)
+        or not Path(utility["path"]).is_absolute()
+    ):
+        raise LeaseError("acquisition policy/utility receipt is malformed")
+    acquisition_sha = _require_sha256(
+        utility.get("sha256"), "acquisition utility SHA-256"
+    )
+    policy_bytes = _canonical_json_bytes(policy)
+    legacy_policy_bytes = _canonical_json_bytes(LEGACY_SUCCESS_ONLY_POLICY)
+    current_policy_bytes = _canonical_json_bytes(CURRENT_TERMINAL_POLICY)
+    current_utility = {
+        "path": str(Path(__file__).resolve()),
+        "sha256": _sha256_file(Path(__file__).resolve()),
+    }
+    if terminal_mode == "failed_legacy":
+        expected = _require_sha256(
+            expected_legacy_utility_sha256 or "",
+            "expected legacy acquisition utility SHA-256",
+        )
+        if (
+            policy_bytes != legacy_policy_bytes
+            or acquisition_sha != LEGACY_SUCCESS_ONLY_UTILITY_SHA256
+            or expected != LEGACY_SUCCESS_ONLY_UTILITY_SHA256
+        ):
+            raise LeaseError(
+                "legacy failure quarantine requires the exact predecessor "
+                "success-only policy and acquisition utility"
+            )
+        return {
+            "kind": "explicit_legacy_success_only_failure_quarantine_v1",
+            "legacy_policy": dict(LEGACY_SUCCESS_ONLY_POLICY),
+            "legacy_acquisition_utility": dict(utility),
+            "quarantine_utility": current_utility,
+            "no_stale_lease_steal": True,
+            "no_success_release_claim": True,
+            "source_lease_rewritten": False,
+            "stale_lease_steal": False,
+            "success_claim": False,
+            "reason": (
+                "terminal failed runner with clean cleanup and exact restored "
+                "guards cannot satisfy the legacy success-only archive rule"
+            ),
+        }
+    if policy_bytes == current_policy_bytes:
+        if acquisition_sha != current_utility["sha256"]:
+            raise LeaseError(
+                "current terminal policy was not acquired by this exact utility"
+            )
+        return None
+    if (
+        terminal_mode == "success"
+        and policy_bytes == legacy_policy_bytes
+        and acquisition_sha == LEGACY_SUCCESS_ONLY_UTILITY_SHA256
+    ):
+        return None
+    raise LeaseError("lease acquisition policy does not authorize this terminal mode")
 
 
 def _release_pinned(
@@ -597,7 +737,12 @@ def _release_pinned(
     lease_identity: tuple[int, int, int, int],
     formal_host: str,
     confirmed_guards: Mapping[str, int],
+    terminal_mode: str,
+    expected_return_code: int,
 ) -> dict[str, Any]:
+    archive_failed = terminal_mode in {"failed_current", "failed_legacy"}
+    legacy_quarantine = terminal_mode == "failed_legacy"
+    expected_terminal_state = "failed" if archive_failed else "finished"
     if set(os.listdir(lease_fd)) != {LEASE_FILE}:
         raise LeaseError("active lease has unexpected or partial evidence")
     lease_raw, lease_artifact = _read_stable_regular_file_at(
@@ -626,8 +771,27 @@ def _release_pinned(
         != _sha256_bytes(args.lease_token.encode("ascii"))
     ):
         raise LeaseError("active lease identity/token/host binding mismatch")
-    if archive_dir.exists() or archive_dir.is_symlink():
-        raise LeaseError("lease archive target already exists")
+    policy_transition = _validate_terminal_policy(
+        lease,
+        terminal_mode=terminal_mode,
+        expected_legacy_utility_sha256=getattr(
+            args, "expected_acquisition_utility_sha256", None
+        ),
+    )
+    quarantine_dir = lease_dir.with_name(
+        f"{lease_dir.name}.failed-quarantine.{args.lease_id}"
+    )
+    # One lease ID has one terminal namespace.  In particular, a legacy
+    # failure must not coexist with an earlier success/archive target: that
+    # would make the same lease ID appear to have contradictory outcomes.
+    if (
+        archive_dir.exists()
+        or archive_dir.is_symlink()
+        or quarantine_dir.exists()
+        or quarantine_dir.is_symlink()
+    ):
+        raise LeaseError("lease terminal namespace already exists")
+    terminal_dir = quarantine_dir if legacy_quarantine else archive_dir
 
     status_path = _normalize_new_path(
         args.runner_status,
@@ -646,11 +810,76 @@ def _release_pinned(
     ):
         raise LeaseError("guarded-runner status SHA-256 mismatch")
     status = _decode_json_object(status_raw, "guarded-runner status")
-    restored = _validate_runner_status(status, confirmed_guards)
+    restored = _validate_runner_status(
+        status,
+        confirmed_guards,
+        expected_terminal_state=expected_terminal_state,
+        expected_return_code=expected_return_code,
+    )
+
+    # Every possible terminal mode for one lease ID contends on this one
+    # code-owned, create-new claim.  Separate archive/quarantine target names
+    # are useful forensic labels, but they are not the authority: only the
+    # process that atomically creates this shared claim may publish a terminal
+    # receipt.  A partial claim after a crash intentionally remains fail-closed
+    # evidence instead of permitting a contradictory second terminal state.
+    terminal_claim = {
+        "schema": SCHEMA,
+        "state": "TERMINAL_INTENT_CLAIMED",
+        "lease_id": args.lease_id,
+        "lease_receipt_sha256": lease_sha256,
+        "formal_host": formal_host,
+        "mode": lease.get("mode"),
+        "run_id": lease.get("run_id"),
+        "terminal_mode": terminal_mode,
+        "terminal_state": expected_terminal_state,
+        "terminal_return_code": expected_return_code,
+        "terminal_dir": str(terminal_dir),
+        "runner_status_path": str(status_path),
+        "runner_status_sha256": status_sha256,
+        "active_lease_identity": {
+            "st_dev": lease_identity[0],
+            "st_ino": lease_identity[1],
+            "st_uid": lease_identity[2],
+            "st_mode": lease_identity[3],
+        },
+        "created_time_ns": time.time_ns(),
+        "claim_policy": "atomic_create_new_shared_terminal_authority_v1",
+    }
+    terminal_claim_raw = _canonical_json_bytes(terminal_claim)
+    try:
+        _write_exclusive_at(lease_fd, TERMINAL_CLAIM_FILE, terminal_claim_raw)
+        os.fsync(lease_fd)
+    except FileExistsError as exc:
+        raise LeaseError(
+            "one terminal mode has already claimed this lease ID"
+        ) from exc
+    observed_claim_raw, terminal_claim_artifact = _read_stable_regular_file_at(
+        lease_fd,
+        TERMINAL_CLAIM_FILE,
+        "shared terminal claim",
+    )
+    if observed_claim_raw != terminal_claim_raw:
+        raise LeaseError("shared terminal claim changed after publication")
+    terminal_claim_sha256 = _sha256_bytes(terminal_claim_raw)
+
+    # Recheck after winning the shared claim so a namespace that appeared
+    # before atomic arbitration can never be accepted as part of this outcome.
+    if (
+        archive_dir.exists()
+        or archive_dir.is_symlink()
+        or quarantine_dir.exists()
+        or quarantine_dir.is_symlink()
+    ):
+        raise LeaseError("lease terminal namespace appeared during claim")
 
     release = {
         "schema": SCHEMA,
-        "state": "ARCHIVED",
+        "state": (
+            "FAILED_QUARANTINED_LEGACY"
+            if legacy_quarantine
+            else ("FAILED_ARCHIVED" if archive_failed else "ARCHIVED")
+        ),
         "lease_id": args.lease_id,
         "lease_receipt_sha256": lease_sha256,
         "formal_host": formal_host,
@@ -660,12 +889,12 @@ def _release_pinned(
             "path": str(status_path),
             "sha256": status_sha256,
             "artifact": status_artifact,
-            "state": "finished",
-            "return_code": 0,
-            "error": None,
+            "state": expected_terminal_state,
+            "return_code": expected_return_code,
+            "error": status["error"],
             "cleanup_error": None,
             "restore_error": None,
-            "received_signal": None,
+            "received_signal": status["received_signal"],
             "restored_guards": restored,
         },
         "caller_confirmations": {
@@ -675,15 +904,43 @@ def _release_pinned(
             "confirmed_guards": dict(confirmed_guards),
         },
         "lease_artifact": lease_artifact,
-        "released_time_ns": time.time_ns(),
-        "release_policy": "atomic_no_replace_archive_after_complete_evidence",
+        "acquisition_policy": lease.get("policy"),
+        "acquisition_utility": lease.get("utility"),
+        "policy_transition": policy_transition,
+        "terminal_claim": {
+            "path": str(terminal_dir / TERMINAL_CLAIM_FILE),
+            "sha256": terminal_claim_sha256,
+            "artifact": terminal_claim_artifact,
+            "state": "TERMINAL_INTENT_CLAIMED",
+            "terminal_mode": terminal_mode,
+        },
+        "terminal_time_ns": time.time_ns(),
+        "terminal_policy": (
+            "atomic_no_replace_legacy_failure_quarantine_after_complete_evidence"
+            if legacy_quarantine
+            else (
+                "atomic_no_replace_failure_archive_after_complete_evidence"
+                if archive_failed
+                else "atomic_no_replace_archive_after_complete_evidence"
+            )
+        ),
     }
     release_raw = _canonical_json_bytes(release)
     _write_exclusive_at(lease_fd, RUNNER_STATUS_FILE, status_raw)
-    _write_exclusive_at(lease_fd, RELEASE_FILE, release_raw)
+    terminal_file = (
+        LEGACY_FAILURE_QUARANTINE_FILE
+        if legacy_quarantine
+        else (FAILURE_FILE if archive_failed else RELEASE_FILE)
+    )
+    _write_exclusive_at(lease_fd, terminal_file, release_raw)
     os.fsync(lease_fd)
 
-    expected_entries = {LEASE_FILE, RUNNER_STATUS_FILE, RELEASE_FILE}
+    expected_entries = {
+        LEASE_FILE,
+        TERMINAL_CLAIM_FILE,
+        RUNNER_STATUS_FILE,
+        terminal_file,
+    }
     if set(os.listdir(lease_fd)) != expected_entries:
         raise LeaseError("lease evidence changed before archival")
     # Reopen every artifact through the pinned directory immediately before
@@ -701,21 +958,28 @@ def _release_pinned(
     )
     final_release_raw, _ = _read_stable_regular_file_at(
         lease_fd,
-        RELEASE_FILE,
-        "final release receipt",
+        terminal_file,
+        "final terminal archive receipt",
+    )
+    final_claim_raw, final_claim_artifact = _read_stable_regular_file_at(
+        lease_fd,
+        TERMINAL_CLAIM_FILE,
+        "final shared terminal claim",
     )
     if (
         _sha256_bytes(final_lease_raw) != lease_sha256
         or final_lease_artifact != lease_artifact
         or final_status_raw != status_raw
         or final_release_raw != release_raw
+        or final_claim_raw != terminal_claim_raw
+        or final_claim_artifact != terminal_claim_artifact
         or _directory_identity(os.fstat(lease_fd)) != lease_identity
     ):
         raise LeaseError("pinned lease evidence changed before archival")
 
-    _rename_noreplace(lease_dir, archive_dir, lease_identity)
+    _rename_noreplace(lease_dir, terminal_dir, lease_identity)
     # The descriptor remains pinned across rename.  Verify that the exact
-    # archived inode still contains the exact three byte-bound artifacts before
+    # archived inode still contains the exact byte-bound artifacts before
     # reporting success; a raced replacement can never yield ARCHIVED success.
     if (
         _directory_identity(os.fstat(lease_fd)) != lease_identity
@@ -729,22 +993,42 @@ def _release_pinned(
         )[0]
         != status_raw
         or _read_stable_regular_file_at(
-            lease_fd, RELEASE_FILE, "archived release receipt"
+            lease_fd, terminal_file, "archived terminal archive receipt"
         )[0]
         != release_raw
+        or _read_stable_regular_file_at(
+            lease_fd, TERMINAL_CLAIM_FILE, "archived shared terminal claim"
+        )
+        != (terminal_claim_raw, terminal_claim_artifact)
     ):
         raise LeaseError("archived lease evidence changed before success")
     return {
-        "status": "ARCHIVED",
+        "status": (
+            "FAILED_QUARANTINED_LEGACY"
+            if legacy_quarantine
+            else ("FAILED_ARCHIVED" if archive_failed else "ARCHIVED")
+        ),
         "lease_id": args.lease_id,
-        "archive_dir": str(archive_dir),
+        (
+            "quarantine_dir" if legacy_quarantine else "archive_dir"
+        ): str(terminal_dir),
         "lease_receipt_sha256": lease_sha256,
         "runner_status_sha256": status_sha256,
-        "release_receipt_sha256": _sha256_bytes(release_raw),
+        "terminal_claim_path": str(terminal_dir / TERMINAL_CLAIM_FILE),
+        "terminal_claim_sha256": terminal_claim_sha256,
+        (
+            "failure_receipt_sha256"
+            if archive_failed
+            else "release_receipt_sha256"
+        ): _sha256_bytes(release_raw),
     }
 
 
-def _release(args: argparse.Namespace) -> dict[str, Any]:
+def _archive_terminal(
+    args: argparse.Namespace,
+    *,
+    terminal_mode: str,
+) -> dict[str, Any]:
     if not args.confirm_no_live_descendants:
         raise LeaseError("caller must confirm that no workload descendant is live")
     if not args.confirm_restored_guards_are_real_resnet18:
@@ -753,6 +1037,14 @@ def _release(args: argparse.Namespace) -> dict[str, Any]:
             "ResNet18 globaldiff_gpu_guard_cnn"
         )
     confirmed_guards = _parse_confirmed_guards(args.confirmed_guard)
+    if terminal_mode == "success":
+        expected_return_code = 0
+    else:
+        expected_return_code = args.expected_runner_return_code
+        if not _exact_int(expected_return_code) or expected_return_code == 0:
+            raise LeaseError(
+                "failed terminal handling requires one exact nonzero return code"
+            )
     formal_host = _current_host(args.formal_host)
     lease_dir = _normalize_new_path(
         str(GLOBAL_LEASE_DIR),
@@ -779,9 +1071,27 @@ def _release(args: argparse.Namespace) -> dict[str, Any]:
             lease_identity=_directory_identity(lease_stat),
             formal_host=formal_host,
             confirmed_guards=confirmed_guards,
+            terminal_mode=terminal_mode,
+            expected_return_code=expected_return_code,
         )
     finally:
         os.close(lease_fd)
+
+
+def _release(args: argparse.Namespace) -> dict[str, Any]:
+    return _archive_terminal(args, terminal_mode="success")
+
+
+def _archive_failed(args: argparse.Namespace) -> dict[str, Any]:
+    """Archive an observed failed runner without weakening lease ownership."""
+
+    return _archive_terminal(args, terminal_mode="failed_current")
+
+
+def _quarantine_failed_legacy(args: argparse.Namespace) -> dict[str, Any]:
+    """Quarantine an exact legacy failed lease without claiming release."""
+
+    return _archive_terminal(args, terminal_mode="failed_legacy")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -821,7 +1131,72 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="GPU=PID",
     )
-    release.set_defaults(handler=_release)
+    release.set_defaults(
+        handler=_release,
+    )
+
+    archive_failed = subparsers.add_parser("archive-failed")
+    archive_failed.add_argument("--formal-host", required=True)
+    archive_failed.add_argument("--lease-id", required=True)
+    archive_failed.add_argument("--lease-token", required=True)
+    archive_failed.add_argument(
+        "--expected-lease-receipt-sha256", required=True
+    )
+    archive_failed.add_argument("--runner-status", required=True)
+    archive_failed.add_argument(
+        "--expected-runner-status-sha256", required=True
+    )
+    archive_failed.add_argument(
+        "--expected-runner-return-code", required=True, type=int
+    )
+    archive_failed.add_argument(
+        "--confirm-no-live-descendants",
+        action="store_true",
+    )
+    archive_failed.add_argument(
+        "--confirm-restored-guards-are-real-resnet18",
+        action="store_true",
+    )
+    archive_failed.add_argument(
+        "--confirmed-guard",
+        action="append",
+        default=[],
+        metavar="GPU=PID",
+    )
+    archive_failed.set_defaults(handler=_archive_failed)
+
+    quarantine_legacy = subparsers.add_parser("quarantine-failed-legacy")
+    quarantine_legacy.add_argument("--formal-host", required=True)
+    quarantine_legacy.add_argument("--lease-id", required=True)
+    quarantine_legacy.add_argument("--lease-token", required=True)
+    quarantine_legacy.add_argument(
+        "--expected-lease-receipt-sha256", required=True
+    )
+    quarantine_legacy.add_argument("--runner-status", required=True)
+    quarantine_legacy.add_argument(
+        "--expected-runner-status-sha256", required=True
+    )
+    quarantine_legacy.add_argument(
+        "--expected-runner-return-code", required=True, type=int
+    )
+    quarantine_legacy.add_argument(
+        "--expected-acquisition-utility-sha256", required=True
+    )
+    quarantine_legacy.add_argument(
+        "--confirm-no-live-descendants",
+        action="store_true",
+    )
+    quarantine_legacy.add_argument(
+        "--confirm-restored-guards-are-real-resnet18",
+        action="store_true",
+    )
+    quarantine_legacy.add_argument(
+        "--confirmed-guard",
+        action="append",
+        default=[],
+        metavar="GPU=PID",
+    )
+    quarantine_legacy.set_defaults(handler=_quarantine_failed_legacy)
     return parser
 
 

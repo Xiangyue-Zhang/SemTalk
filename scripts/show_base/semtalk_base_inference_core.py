@@ -116,9 +116,9 @@ INFERENCE_AUXILIARY_LOSS_BYPASS_ATTRS = (
 PINNED_SEMTALK_MODEL_SOURCE = {
     "relative_path": "models/semtalk.py",
     "sha256": (
-        "ddcc622c9778413b73c2b51b90354cd82dcedce62fea25006f8219de17f7ba2e"
+        "ed19e46b4844734fe57cbe9972d75649a11a7513b06e859b9e28ab0d190b6495"
     ),
-    "git_blob_sha1": "6e786a5f5d29c070145c49f2a277cc7667c78ace",
+    "git_blob_sha1": "78b5678007c150470639a6255e18327a294b89fc",
 }
 
 
@@ -136,7 +136,7 @@ PINNED_SEMTALK_BASE_FORWARD = {
 
 PINNED_RHYTHMIC_LOSS_FORWARD = {
     "source_sha256": (
-        "eae08dca9b9f7605dc4ff35576c9630380a365e4ab2b61429755aa490fef659e"
+        "2369515d0c75d5ab35653cb08a098d9ed6b5e620b22c5324b22c3578ed16ad79"
     ),
     "signature": "(self, facial_features, audio_features)",
 }
