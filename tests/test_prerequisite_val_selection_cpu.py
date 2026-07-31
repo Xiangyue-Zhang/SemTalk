@@ -595,7 +595,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_full_merge_and_exact_selection_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fixture = self.build_full_fixture(root)
             measurement_root = root / "measurements"
             measurement = merger.merge(
@@ -962,12 +962,14 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             list(contract.EXPECTED_CANDIDATE_EPOCHS[:-1]),
             [*contract.EXPECTED_CANDIDATE_EPOCHS, 200],
             [*contract.EXPECTED_CANDIDATE_EPOCHS, 221],
+            [*contract.EXPECTED_CANDIDATE_EPOCHS, 240],
+            [*contract.EXPECTED_CANDIDATE_EPOCHS, 220, 260],
             [*contract.EXPECTED_CANDIDATE_EPOCHS, 240, 220],
         ):
             with self.assertRaises(contract.ContractError):
                 contract.validate_candidate_epochs(invalid)
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             source = self.training_source_receipt(
                 root / "source",
                 "show_base_train.py",
@@ -1023,7 +1025,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_candidate_audit_exact_schema_and_status_final_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             stage = "face"
             epoch = 200
             source = {
@@ -1245,7 +1247,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_portable_source_identity_allows_different_absolute_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             first = self.training_source_receipt(
                 root / "host0",
                 "show_base_train.py",
@@ -1281,7 +1283,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_canonical_duplicate_clip_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (
                 rows,
                 manifest,
@@ -1321,7 +1323,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (
                 rows,
                 manifest,
@@ -1396,7 +1398,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_canonical_npz_paths_and_row_windows_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             (
                 rows,
                 manifest,
@@ -1475,7 +1477,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
 
     def test_limited_training_source_is_enriched_at_freeze(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "source"
+            root = Path(temporary).resolve() / "source"
             root.mkdir()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(

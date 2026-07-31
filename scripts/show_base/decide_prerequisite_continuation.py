@@ -282,13 +282,14 @@ def _load_receipt(
     path_value = binding["path"]
     if not isinstance(path_value, str) or not Path(path_value).is_absolute():
         raise ContinuationDecisionError(f"{label} path must be absolute")
-    path = Path(path_value)
-    if path.is_symlink() or not path.is_file():
-        raise ContinuationDecisionError(
-            f"{label} must be a regular non-symlink file"
+    try:
+        path, payload = selected_contract._safe_file_snapshot(
+            path_value,
+            label,
+            val_only=False,
         )
-    path = path.resolve(strict=True)
-    payload = path.read_bytes()
+    except selected_contract.SelectedPrerequisiteError as error:
+        raise ContinuationDecisionError(str(error)) from error
     observed_sha = hashlib.sha256(payload).hexdigest()
     expected_sha = _require_sha256(binding["sha256"], f"{label} SHA-256")
     if observed_sha != expected_sha:
@@ -624,12 +625,11 @@ def replay_decision(
         "continuation decision expected SHA-256",
     )
     try:
-        path = selected_contract.regular_file(
+        path, payload = selected_contract._safe_file_snapshot(
             decision_path,
             "continuation decision",
             val_only=False,
         )
-        payload = path.read_bytes()
     except (
         selected_contract.SelectedPrerequisiteError,
         OSError,

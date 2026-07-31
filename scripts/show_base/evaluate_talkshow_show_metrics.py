@@ -8,7 +8,7 @@ deterministic SemTalk prediction is interpreted as a delta distribution:
 
 * released2 uses logical slots 0 and 1;
 * paper16 uses logical slots 0 through 15;
-* released face and DiffSHEG use logical slot 0.
+* released face and the primary body reference use logical slot 0.
 
 Every logical slot is bound to the same physical prediction artifact.  The
 single prediction is repeated before the pinned metric models, producing the
@@ -23,15 +23,17 @@ import ast
 from dataclasses import dataclass
 import hashlib
 import importlib
+import importlib.abc
 import importlib.util
 import io
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 import wave
 import zipfile
@@ -41,18 +43,27 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 REPORT_FORMAT = "semtalk_show_talkshow_metrics_v1"
+PRIMARY_REAL_FEATURE_CACHE_FORMAT = (
+    "semtalk_show_released2_real_feature_cache_v1"
+)
+PRIMARY_REPLAY_FORMAT = (
+    "semtalk_show_released2_primary_fresh_replay_v1"
+)
+PRIMARY_METRIC_PATH = "body.released2.metrics.FGD"
 REPORT_PAYLOAD_HASH_ALGORITHM = (
     "canonical_json_utf8_sorted_compact_newline_v1"
 )
 DISTRIBUTION_PROTOCOL = (
     "deterministic_replication_of_single_prediction_v1"
 )
+DISTRIBUTION_RECEIPT_FORMAT = (
+    "semtalk_show_deterministic_distribution_receipt_v2"
+)
 REPLICATION_ALGORITHM = "logical_reference_v1"
 NUM_LOGICAL_SLOTS = 16
 RELEASED2_SLOTS = (0, 1)
 PAPER16_SLOTS = tuple(range(NUM_LOGICAL_SLOTS))
 FACE_SLOT = 0
-DIFFSHEG_SLOT = 0
 METRIC_INPUT_MATERIALIZATION = {
     "generator_inferences_per_clip": 1,
     "feature_extractor_batches": [2, 16],
@@ -145,36 +156,78 @@ TEST_PREDICTION_ROW_KEYS = {
     "ground_truth",
     "evaluation_index",
 }
+SHARD_TEST_PREDICTION_ROW_KEYS = (
+    TEST_PREDICTION_ROW_KEYS - {"evaluation_index"}
+)
+SHARD_SUMMARY_KEYS = {
+    "format",
+    "status",
+    "shard_id",
+    "num_shards",
+    "selected_clips",
+    "expected_test_clips",
+    "manifest_sha256",
+    "contract_sha256",
+    "runtime_sha256",
+    "finite",
+    "exact_once",
+}
+SHARD_LINEAGE_KEYS = {
+    "format",
+    "status",
+    "shard_id",
+    "num_shards",
+    "manifest_sha256",
+    "contract",
+    "contract_sha256",
+    "runtime",
+    "runtime_sha256",
+    "checkpoints",
+}
 ARTIFACT_KEYS = {"path", "bytes", "sha256"}
 SHA256_LENGTH = 64
 PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_v1"
-REPLICATION_GATE_MODULE_ENV = "SEMTALK_SHOW_REPLICATION_GATE_MODULE"
+BASE_FINAL_AUTHORITY_MODULE = "scripts.show_base.base_final_authority"
+
+FORMAL_SPLITS = {
+    "val": {
+        "count": 1_715,
+        "global_start": 13_687,
+        "global_stop": 15_402,
+    },
+    "test": {
+        "count": 1_708,
+        "global_start": 15_402,
+        "global_stop": 17_110,
+    },
+}
+FORMAL_MIN_FRAMES_EXCLUSIVE = 60
+CANONICAL_SOURCE_AUDIO_RATE = 22_000
+CANONICAL_WAV_SAMPLE_WIDTH = 2
+CANONICAL_WAV_MONO_POLICY = (
+    "librosa.load(sr=None,mono=True):arithmetic_channel_mean"
+)
 
 TALKSHOW_METRIC_COMMIT = "9aef82df5ff1082f0cfa0cfc116c0b7208e85d5b"
+TALKSHOW_METRIC_TREE = "d993229539e63442a1f1327bae6d80d35f97c521"
 FEATURE_EXTRACTOR_SHA256 = (
     "154259bfe8ae1e0fb477ba5afdd5674659ef9eb4d44d4ad49cd2ef4d20ccecfb"
 )
 SMPLX_SHA256 = (
     "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74"
 )
-TALKSHOW_PATCH_MARKERS = (
-    {
-        "upstream_commit": TALKSHOW_METRIC_COMMIT,
-        "patch_version": 6,
-    },
-    {
-        "upstream_commit": TALKSHOW_METRIC_COMMIT,
-        "patch_version": "globaldiff-show-metric-v1",
-        "scope": "released-show-body-feature-extractor-only",
-        "source_file": "nets/__init__.py",
-        "source_sha256": (
-            "d12f3ebd1b8f4b251085061404d72530df58bc972272995a3810236aefdd4d21"
-        ),
-        "patched_sha256": (
-            "e0e277d46475c203d78d355affd01a9e6f55462fbaa1911d140f91c438a0bef2"
-        ),
-    },
-)
+TALKSHOW_PATCH_MARKER = {
+    "upstream_commit": TALKSHOW_METRIC_COMMIT,
+    "patch_version": "globaldiff-show-metric-v1",
+    "scope": "released-show-body-feature-extractor-only",
+    "source_file": "nets/__init__.py",
+    "source_sha256": (
+        "d12f3ebd1b8f4b251085061404d72530df58bc972272995a3810236aefdd4d21"
+    ),
+    "patched_sha256": (
+        "e0e277d46475c203d78d355affd01a9e6f55462fbaa1911d140f91c438a0bef2"
+    ),
+}
 TALKSHOW_FGD_ENTRY_MODULES = ("nets.body_ae",)
 TALKSHOW_FGD_SOURCE_FILES = (
     "data_utils/__init__.py",
@@ -194,6 +247,68 @@ TALKSHOW_FGD_SOURCE_FILES = (
     "nets/spg/wav2vec.py",
 )
 TALKSHOW_FGD_IMPORT_ALGORITHM = "python-ast-local-import-closure-v1"
+TALKSHOW_TRUSTED_UPSTREAM_FILES = {
+    "data_utils/__init__.py": (
+        "6d36625d003d93a50fa708c64ba15ba47651148cc81e730e84bf86eaca7e2009",
+        "7c3cab8cad67c5e952924944f34319e2c6ff5985",
+    ),
+    "data_utils/consts.py": (
+        "3a57929470837cc55d9be5802fd778435ba71be3e5b6dcb8a469230ec1419097",
+        "70406b9d458588030508ca656492d274f48cbf3f",
+    ),
+    "data_utils/dataloader_torch.py": (
+        "93b9c47dae13ffd4be71f0e44451719e2bd57b691b43292b25cc1470bc439f99",
+        "dc0bf81c1ccc86580fdd013c0b3e81fae190a65d",
+    ),
+    "data_utils/lower_body.py": (
+        "6eae37ef17760b5ebad60bf25ae7149aa5244cba8d9627eafe77b71616931163",
+        "501a83c7c83bbcd97c6dee09b809b1c75be45213",
+    ),
+    "data_utils/mesh_dataset.py": (
+        "ae02bc017e3491a7e678bbad0a1f693a5d9900583310da0450a8d83ea682b193",
+        "9d19c1e512e3e1aaed645791acf88345af4c9bb9",
+    ),
+    "data_utils/rotation_conversion.py": (
+        "4f9cd089f2cdc031e16be435f116c10a5498772d834b4da9a03947041fa09f82",
+        "770c3bf36f05fcaf89cbb03e17035357f3c0a4df",
+    ),
+    "data_utils/utils.py": (
+        "75a8c844a62d962a88d61af745e0231ac6249138b23ebb602b3de000bd2a47f3",
+        "a6b9e713d75ff61dedab869e049dfba2db87ddb6",
+    ),
+    "nets/__init__.py": (
+        "d12f3ebd1b8f4b251085061404d72530df58bc972272995a3810236aefdd4d21",
+        "0669d82d7506b314fa3fccd7dd412445fa0b37e1",
+    ),
+    "nets/base.py": (
+        "e5b1931dfdcba45a068818c5543a75f8dcfdc843cfa733e846483b401a0d19bd",
+        "08c07caa27ba642dd5a48cebfcf51e4e79edd574",
+    ),
+    "nets/body_ae.py": (
+        "a4065c7a086b48dcb7b161202ebe9756dd8d7a4c0df379e16ad68532368fdc4b",
+        "3a9f8bc0ee92f8410da71d711bb19dbcc254d1af",
+    ),
+    "nets/layers.py": (
+        "19c6f29ae94131991575b9fa2cd36d6d8103d064c1abca626f4cc37d552deced",
+        "79251b42b6e0fe839ec04dc38472ef36165208ac",
+    ),
+    "nets/spg/s2glayers.py": (
+        "ad2f5d56d25f0e75131e3b524e14bdc7c9f0fa22a696539c89563f62c29d68d7",
+        "2a439e6bc0c4973586d39f3b113aa3752ff077fa",
+    ),
+    "nets/spg/vqvae_1d.py": (
+        "c4f8f2a7862a3835b250403e8533c3387523a057e3b244e73266b6f1034a783f",
+        "0cd15bd6439b949bf89098af274b3e7ccac9b5f5",
+    ),
+    "nets/spg/vqvae_modules.py": (
+        "6ae6e1c5860afc420876942616cbc547aceb245aa97ba4bf94f4ca51080fa012",
+        "5c83bc0399bc3bc034881407ed49d223d8c86ba9",
+    ),
+    "nets/spg/wav2vec.py": (
+        "96533ea3f33dc2908bb35c0b32ebdf919968226d2ce4e06200437a613b34c146",
+        "a5d0eff66e67de14ceba283fa6ce43f156c7ddc2",
+    ),
+}
 
 PROTOCOLS = {
     "released2": {
@@ -293,47 +408,47 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-_REPLICATION_GATE_MODULE: Any | None = None
+def _fresh_local_control_module(filename: str) -> Any:
+    expected = Path(__file__).resolve().parent / filename
+    path, payload = _safe_file_snapshot(
+        str(expected),
+        f"control module {filename}",
+    )
+    module_name = filename.removesuffix(".py")
+    module = ModuleType(f"scripts.show_base.{module_name}")
+    module.__file__ = str(path)
+    module.__package__ = "scripts.show_base"
+    module.__loader__ = None
+    try:
+        code = compile(
+            payload,
+            str(path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__)
+    except BaseException as exc:
+        raise MetricAdapterContractError(
+            f"cannot source-load control module {filename}"
+        ) from exc
+    return module
 
 
 def _replication_gate_module() -> Any:
     """Load the sole deterministic-replication receipt implementation."""
 
-    global _REPLICATION_GATE_MODULE
-    if _REPLICATION_GATE_MODULE is not None:
-        return _REPLICATION_GATE_MODULE
-    try:
-        module = importlib.import_module(
-            "scripts.show_base.deterministic_replication_gate"
-        )
-    except ModuleNotFoundError as exc:
-        override = os.environ.get(REPLICATION_GATE_MODULE_ENV)
-        if not override:
-            raise MetricAdapterContractError(
-                "deterministic_replication_gate is required; the metric "
-                "adapter does not maintain a second receipt schema"
-            ) from exc
-        source = Path(override).expanduser().resolve()
-        if not source.is_file():
-            raise MetricAdapterContractError(
-                f"{REPLICATION_GATE_MODULE_ENV} is not a file: {source}"
-            ) from exc
-        spec = importlib.util.spec_from_file_location(
-            "_semtalk_show_deterministic_replication_gate",
-            source,
-        )
-        if spec is None or spec.loader is None:
-            raise MetricAdapterContractError(
-                f"cannot load replication gate module {source}"
-            ) from exc
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+    module = _fresh_local_control_module(
+        "deterministic_replication_gate.py",
+    )
     if (
         getattr(module, "PAYLOAD_HASH_ALGORITHM", None)
         != PAYLOAD_HASH_ALGORITHM
         or getattr(module, "DISTRIBUTION_FORMAT", None)
-        != "semtalk_show_deterministic_distribution_receipt_v1"
+        != DISTRIBUTION_RECEIPT_FORMAT
         or getattr(module, "PROTOCOL", None) != DISTRIBUTION_PROTOCOL
+        or not callable(
+            getattr(module, "variation_policy_receipt", None)
+        )
         or not callable(
             getattr(module, "validate_distribution_receipt", None)
         )
@@ -348,8 +463,47 @@ def _replication_gate_module() -> Any:
         raise MetricAdapterContractError(
             "deterministic replication gate API/schema version mismatch"
         )
-    _REPLICATION_GATE_MODULE = module
     return module
+
+
+def _base_final_authority_module() -> Any:
+    module = _fresh_local_control_module("base_final_authority.py")
+    if (
+        getattr(module, "FORMAT", None)
+        != "semtalk_show_base_final_test_authority_v1"
+        or not callable(getattr(module, "validate_test_authority", None))
+    ):
+        raise MetricAdapterContractError(
+            "base_final_authority API/schema mismatch"
+        )
+    return module
+
+
+def _fresh_base_selector_module() -> Any:
+    authority = _base_final_authority_module()
+    loader = getattr(authority, "_control_module", None)
+    if not callable(loader):
+        raise MetricAdapterContractError(
+            "base_final_authority fresh control loader is unavailable"
+        )
+    try:
+        selector = loader("select_base_official_adapt")
+    except Exception as exc:
+        raise MetricAdapterContractError(
+            "cannot source-load the Base validation selector"
+        ) from exc
+    if any(
+        not callable(getattr(selector, name, None))
+        for name in (
+            "validate_val_inputs",
+            "validate_pipeline",
+            "validate_val_inference_lineage",
+        )
+    ):
+        raise MetricAdapterContractError(
+            "Base validation selector API/schema mismatch"
+        )
+    return selector
 
 
 def _require_sha256(value: Any, label: str) -> str:
@@ -392,16 +546,153 @@ def _finite_array(value: Any, *, name: str) -> np.ndarray:
 
 def _resolved_regular_file(path: str | Path, label: str) -> Path:
     candidate = Path(path).expanduser()
-    if candidate.is_symlink():
+    if not candidate.is_absolute():
         raise MetricAdapterContractError(
-            f"{label} must not be a symlink: {candidate}"
+            f"{label} must be an absolute path: {candidate}"
         )
-    resolved = candidate.resolve()
-    if not resolved.is_file() or resolved.is_symlink():
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
         raise MetricAdapterContractError(
-            f"{label} is not a regular file: {resolved}"
+            f"{label} is not a canonical regular file: {candidate}"
+        ) from exc
+    if resolved != candidate:
+        raise MetricAdapterContractError(
+            f"{label} path must be canonical and contain no symlink: "
+            f"{candidate}"
         )
-    return resolved
+    return candidate
+
+
+def _safe_file_snapshot(
+    path: str | Path,
+    label: str,
+) -> tuple[Path, bytes]:
+    candidate = _resolved_regular_file(path, label)
+    parts = candidate.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise MetricAdapterContractError(
+            f"{label} must be below the filesystem root"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise MetricAdapterContractError(
+                f"{label} must be a regular non-symlink file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise MetricAdapterContractError(
+                f"{label} changed while it was read"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise MetricAdapterContractError(
+                f"{label} size changed while it was read"
+            )
+        return candidate, payload
+    except MetricAdapterContractError:
+        raise
+    except OSError as exc:
+        raise MetricAdapterContractError(
+            f"cannot safely read {label}: {candidate}"
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _resolved_canonical_directory(
+    path: str | Path,
+    label: str,
+) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise MetricAdapterContractError(
+            f"{label} must be an absolute path: {candidate}"
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise MetricAdapterContractError(
+            f"{label} is not a canonical directory: {candidate}"
+        ) from exc
+    if resolved != candidate:
+        raise MetricAdapterContractError(
+            f"{label} path must be canonical and contain no symlink: "
+            f"{candidate}"
+        )
+    parts = candidate.parts
+    if not parts or parts[0] != os.sep:
+        raise MetricAdapterContractError(
+            f"{label} must be below the filesystem root"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise MetricAdapterContractError(
+                f"{label} must be a non-symlink directory"
+            )
+        return candidate
+    except MetricAdapterContractError:
+        raise
+    except OSError as exc:
+        raise MetricAdapterContractError(
+            f"cannot safely resolve {label}: {candidate}"
+        ) from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _verified_file_snapshot(
@@ -410,8 +701,7 @@ def _verified_file_snapshot(
     label: str,
 ) -> tuple[Path, bytes]:
     expected = _require_sha256(expected_sha256, f"{label} expected SHA")
-    resolved = _resolved_regular_file(path, label)
-    payload = resolved.read_bytes()
+    resolved, payload = _safe_file_snapshot(path, label)
     observed = sha256_bytes(payload)
     if observed != expected:
         raise MetricAdapterContractError(
@@ -494,7 +784,7 @@ class FeatureMoments:
     feature_sum: np.ndarray | None = None
     feature_outer_sum: np.ndarray | None = None
 
-    def update(self, features: Any, *, repeat: int = 1) -> None:
+    def update(self, features: Any) -> None:
         array = _finite_array(features, name="features")
         if array.ndim == 1:
             array = array.reshape(1, -1)
@@ -502,13 +792,6 @@ class FeatureMoments:
             raise MetricAdapterContractError(
                 f"features must be a non-empty matrix, got {array.shape}"
             )
-        repeats = _require_exact_int(repeat, "feature repeat", minimum=1)
-        if repeats != 1:
-            # Materialize the metric rows, not the prediction artifact.  This
-            # exactly matches np.repeat followed by the released sum and
-            # matrix-product reduction, including floating-point reduction
-            # order and the unbiased (N-1) denominator.
-            array = np.repeat(array, repeats, axis=0)
         if self.dimension not in (0, int(array.shape[1])):
             raise MetricAdapterContractError(
                 "feature dimension changed during evaluation"
@@ -583,6 +866,68 @@ class FeatureMoments:
             "covariance_denominator": self.count - 1,
             "covariance_estimator": "unbiased_ddof_1",
         }
+
+    @classmethod
+    def from_json(
+        cls,
+        value: Any,
+        *,
+        expected_count: int,
+        label: str,
+    ) -> "FeatureMoments":
+        if type(value) is not dict or set(value) != {
+            "count",
+            "dimension",
+            "sum",
+            "outer_sum",
+            "covariance_denominator",
+            "covariance_estimator",
+        }:
+            raise MetricAdapterContractError(
+                f"{label} feature-statistics schema mismatch"
+            )
+        count = _require_exact_int(
+            value["count"],
+            f"{label} count",
+            minimum=2,
+        )
+        dimension = _require_exact_int(
+            value["dimension"],
+            f"{label} dimension",
+            minimum=1,
+        )
+        if (
+            count != expected_count
+            or value["covariance_denominator"] != count - 1
+            or value["covariance_estimator"] != "unbiased_ddof_1"
+        ):
+            raise MetricAdapterContractError(
+                f"{label} unbiased-covariance receipt mismatch"
+            )
+        feature_sum = _finite_array(
+            value["sum"],
+            name=f"{label} sum",
+        )
+        outer_sum = _finite_array(
+            value["outer_sum"],
+            name=f"{label} outer sum",
+        )
+        if (
+            feature_sum.shape != (dimension,)
+            or outer_sum.shape != (dimension, dimension)
+        ):
+            raise MetricAdapterContractError(
+                f"{label} sufficient-statistics shape mismatch"
+            )
+        return cls(
+            count=count,
+            dimension=dimension,
+            feature_sum=np.asarray(feature_sum, dtype=np.float64).copy(),
+            feature_outer_sum=np.asarray(
+                outer_sum,
+                dtype=np.float64,
+            ).copy(),
+        )
 
 
 def frechet_distance(first: FeatureMoments, second: FeatureMoments) -> float:
@@ -926,6 +1271,9 @@ class MetricBackend(Protocol):
     ) -> np.ndarray:
         ...
 
+    def decode_audio_16k(self, snapshot: bytes) -> np.ndarray:
+        ...
+
 
 def _validate_backend_receipts(
     backend: MetricBackend,
@@ -958,7 +1306,15 @@ def _validate_backend_receipts(
         raise MetricAdapterContractError(
             "metric backend does not attest pinned TalkSHOW assets"
         )
-    common_runtime = {"python", "numpy", "torch", "smplx", "librosa"}
+    common_runtime = {
+        "python",
+        "numpy",
+        "torch",
+        "smplx",
+        "librosa",
+        "soundfile",
+        "soxr",
+    }
     if require_cuda:
         expected_runtime_keys = common_runtime | {
             "scipy",
@@ -1019,7 +1375,7 @@ def _git_output(root: Path, *arguments: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-        ).stdout.strip()
+        ).stdout.rstrip("\r\n")
     except (OSError, subprocess.CalledProcessError) as exc:
         raise MetricAdapterContractError(
             f"cannot inspect TalkSHOW metric root {root}: {exc}"
@@ -1032,14 +1388,24 @@ def _local_module_sources(
 ) -> list[tuple[str, Path]]:
     if not module:
         return []
-    pieces = module.split(".")
-    package = root.joinpath(*pieces, "__init__.py")
-    source = root.joinpath(*pieces).with_suffix(".py")
+    pieces = [piece for piece in module.split(".") if piece]
+    if not pieces:
+        return []
     result: list[tuple[str, Path]] = []
-    if package.is_file():
-        result.append((module, package))
+    for length in range(1, len(pieces)):
+        package_module = ".".join(pieces[:length])
+        initializer = root.joinpath(
+            *pieces[:length],
+            "__init__.py",
+        )
+        if initializer.is_file():
+            result.append((package_module, initializer))
+    source = root.joinpath(*pieces).with_suffix(".py")
+    package = root.joinpath(*pieces, "__init__.py")
     if source.is_file():
         result.append((module, source))
+    elif package.is_file():
+        result.append((module, package))
     return result
 
 
@@ -1065,15 +1431,17 @@ def _relative_import_module(
 
 
 def _talkshow_fgd_import_closure(root: Path) -> tuple[str, ...]:
-    root = root.resolve()
+    root = _resolved_canonical_directory(
+        root,
+        "TalkSHOW metric root",
+    )
     queue: list[tuple[str, Path]] = []
     queued: set[Path] = set()
     for entry in TALKSHOW_FGD_ENTRY_MODULES:
         for module, source in _local_module_sources(root, entry):
-            resolved = source.resolve()
-            if resolved not in queued:
-                queued.add(resolved)
-                queue.append((module, resolved))
+            if source not in queued:
+                queued.add(source)
+                queue.append((module, source))
     visited: set[Path] = set()
     cursor = 0
     while cursor < len(queue):
@@ -1083,8 +1451,12 @@ def _talkshow_fgd_import_closure(root: Path) -> tuple[str, ...]:
             continue
         visited.add(current_path)
         try:
+            _source_path, source_payload = _safe_file_snapshot(
+                current_path,
+                f"TalkSHOW metric source {current_path.relative_to(root)}",
+            )
             tree = ast.parse(
-                current_path.read_text(encoding="utf-8"),
+                source_payload.decode("utf-8"),
                 filename=str(current_path),
             )
         except (OSError, UnicodeDecodeError, SyntaxError) as exc:
@@ -1118,43 +1490,60 @@ def _talkshow_fgd_import_closure(root: Path) -> tuple[str, ...]:
                 root,
                 imported_module,
             ):
-                resolved = source.resolve()
-                if resolved not in queued:
-                    queued.add(resolved)
-                    queue.append((module, resolved))
+                if source not in queued:
+                    queued.add(source)
+                    queue.append((module, source))
     return tuple(
         sorted(path.relative_to(root).as_posix() for path in visited)
     )
 
 
 def validate_talkshow_metric_root(root: str | Path) -> dict[str, Any]:
-    candidate = Path(root).expanduser()
-    if candidate.is_symlink():
-        raise MetricAdapterContractError(
-            "TalkSHOW metric root must not be a symlink"
-        )
-    resolved = candidate.resolve()
-    if not resolved.is_dir():
-        raise MetricAdapterContractError(
-            f"TalkSHOW metric root is not a directory: {resolved}"
-        )
+    resolved = _resolved_canonical_directory(
+        root,
+        "TalkSHOW metric root",
+    )
     commit = _git_output(resolved, "rev-parse", "HEAD^{commit}")
     if commit != TALKSHOW_METRIC_COMMIT:
         raise MetricAdapterContractError(
             f"TalkSHOW metric commit {commit} != {TALKSHOW_METRIC_COMMIT}"
         )
-    marker_path = _resolved_regular_file(
+    tree = _git_output(resolved, "rev-parse", "HEAD^{tree}")
+    if tree != TALKSHOW_METRIC_TREE:
+        raise MetricAdapterContractError(
+            f"TalkSHOW metric tree {tree} != {TALKSHOW_METRIC_TREE}"
+        )
+    dirty = tuple(
+        line
+        for line in _git_output(
+            resolved,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).splitlines()
+        if line
+    )
+    if set(dirty) != {
+        " M nets/__init__.py",
+        "?? .paspa_talkshow_patch.json",
+    }:
+        raise MetricAdapterContractError(
+            "TalkSHOW metric root has an untrusted dirty-file set"
+        )
+    marker_path, marker_payload = _safe_file_snapshot(
         resolved / ".paspa_talkshow_patch.json",
         "TalkSHOW metric patch marker",
     )
-    marker_payload = marker_path.read_bytes()
     try:
         marker = json.loads(marker_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MetricAdapterContractError(
             "TalkSHOW patch marker is invalid JSON"
         ) from exc
-    if marker not in TALKSHOW_PATCH_MARKERS:
+    if (
+        marker != TALKSHOW_PATCH_MARKER
+        or marker_payload != canonical_json_bytes(TALKSHOW_PATCH_MARKER)
+    ):
         raise MetricAdapterContractError(
             f"unexpected TalkSHOW patch marker: {marker}"
         )
@@ -1165,27 +1554,55 @@ def validate_talkshow_metric_root(root: str | Path) -> dict[str, Any]:
         )
     files: dict[str, dict[str, Any]] = {}
     for relative in closure:
-        path = _resolved_regular_file(
+        path, payload = _safe_file_snapshot(
             resolved / relative,
             f"TalkSHOW metric source {relative}",
         )
-        payload = path.read_bytes()
+        trusted_sha, trusted_blob = TALKSHOW_TRUSTED_UPSTREAM_FILES[
+            relative
+        ]
+        observed_blob = _git_output(
+            resolved,
+            "rev-parse",
+            f"HEAD:{relative}",
+        )
+        try:
+            upstream_payload = subprocess.run(
+                ["git", "-C", str(resolved), "show", f"HEAD:{relative}"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise MetricAdapterContractError(
+                f"cannot read trusted TalkSHOW blob {relative}"
+            ) from exc
+        if (
+            observed_blob != trusted_blob
+            or sha256_bytes(upstream_payload) != trusted_sha
+        ):
+            raise MetricAdapterContractError(
+                f"TalkSHOW trusted Git blob changed: {relative}"
+            )
+        expected_live_sha = (
+            TALKSHOW_PATCH_MARKER["patched_sha256"]
+            if relative == "nets/__init__.py"
+            else trusted_sha
+        )
+        if sha256_bytes(payload) != expected_live_sha:
+            raise MetricAdapterContractError(
+                f"TalkSHOW live metric source changed: {relative}"
+            )
         files[relative] = {
             "sha256": sha256_bytes(payload),
             "bytes": len(payload),
+            "trusted_upstream_sha256": trusted_sha,
+            "trusted_git_blob_sha1": trusted_blob,
         }
-    metric_only = TALKSHOW_PATCH_MARKERS[1]
-    if (
-        marker == metric_only
-        and files["nets/__init__.py"]["sha256"]
-        != metric_only["patched_sha256"]
-    ):
-        raise MetricAdapterContractError(
-            "TalkSHOW metric-only import-isolation SHA mismatch"
-        )
     return {
         "path": str(resolved),
         "commit": commit,
+        "tree": tree,
         "entry_modules": list(TALKSHOW_FGD_ENTRY_MODULES),
         "import_closure_algorithm": TALKSHOW_FGD_IMPORT_ALGORITHM,
         "patch_marker": marker,
@@ -1207,6 +1624,305 @@ def _package_version(module: Any, distribution: str) -> str:
     return value
 
 
+def _import_pinned_body_feature_extractor(
+    talkshow: Mapping[str, Any],
+) -> Any:
+    """Import TalkSHOW's body extractor without trusting ``sys.modules``.
+
+    ``nets`` is an intentionally generic top-level package name.  A prior
+    import from another checkout must therefore never be allowed to satisfy
+    this evaluator import.  Temporarily remove that module subtree, import
+    from the attested root, verify every local module against the attested
+    closure, and then restore the caller's module table exactly.
+    """
+
+    root = _resolved_canonical_directory(
+        str(talkshow["path"]),
+        "attested TalkSHOW metric root",
+    )
+    files = talkshow.get("files")
+    if type(files) is not dict:
+        raise MetricAdapterContractError(
+            "TalkSHOW source receipt lacks its pinned file closure"
+        )
+    prefixes = {
+        relative.split("/", 1)[0]
+        for relative in files
+        if "/" in relative
+    }
+    if not {"nets", "data_utils"}.issubset(prefixes):
+        raise MetricAdapterContractError(
+            "TalkSHOW source receipt lacks required local package roots"
+        )
+    source_map: dict[str, tuple[Path, bytes, bool]] = {}
+    namespace_packages: dict[str, Path] = {}
+    for relative, expected in sorted(files.items()):
+        if type(relative) is not str or type(expected) is not dict:
+            raise MetricAdapterContractError(
+                "TalkSHOW source receipt has an invalid source entry"
+            )
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.suffix != ".py"
+        ):
+            raise MetricAdapterContractError(
+                f"TalkSHOW source receipt has unsafe path {relative!r}"
+            )
+        source_path, payload = _safe_file_snapshot(
+            root / relative_path,
+            f"attested TalkSHOW source {relative}",
+        )
+        if (
+            expected.get("sha256") != sha256_bytes(payload)
+            or expected.get("bytes") != len(payload)
+        ):
+            raise MetricAdapterContractError(
+                f"TalkSHOW source receipt changed before import: {relative}"
+            )
+        if relative_path.name == "__init__.py":
+            module_parts = relative_path.parts[:-1]
+            is_package = True
+        else:
+            module_parts = (*relative_path.parts[:-1], relative_path.stem)
+            is_package = False
+        module_name = ".".join(module_parts)
+        if not module_name or module_name in source_map:
+            raise MetricAdapterContractError(
+                f"TalkSHOW source receipt has duplicate module {module_name!r}"
+            )
+        source_map[module_name] = (source_path, payload, is_package)
+        for length in range(1, len(module_parts)):
+            parent_name = ".".join(module_parts[:length])
+            parent_path = root.joinpath(*module_parts[:length])
+            namespace_packages.setdefault(parent_name, parent_path)
+    for module_name in source_map:
+        namespace_packages.pop(module_name, None)
+    for module_name, directory in tuple(namespace_packages.items()):
+        namespace_packages[module_name] = _resolved_canonical_directory(
+            directory,
+            f"TalkSHOW namespace package {module_name}",
+        )
+
+    class _PinnedSnapshotLoader(importlib.abc.InspectLoader):
+        def __init__(
+            self,
+            fullname: str,
+            source_path: Path,
+            payload: bytes,
+            package: bool,
+        ) -> None:
+            self.fullname = fullname
+            self.source_path = source_path
+            self.payload = payload
+            self.package = package
+
+        def get_filename(self, fullname: str) -> str:
+            if fullname != self.fullname:
+                raise ImportError(fullname)
+            return str(self.source_path)
+
+        def get_source(self, fullname: str) -> str:
+            if fullname != self.fullname:
+                raise ImportError(fullname)
+            return self.payload.decode("utf-8")
+
+        def is_package(self, fullname: str) -> bool:
+            if fullname != self.fullname:
+                raise ImportError(fullname)
+            return self.package
+
+        def get_code(self, fullname: str) -> Any:
+            if fullname != self.fullname:
+                raise ImportError(fullname)
+            return compile(
+                self.payload,
+                str(self.source_path),
+                "exec",
+                dont_inherit=True,
+            )
+
+    namespace_token = object()
+
+    class _PinnedSnapshotFinder(importlib.abc.MetaPathFinder):
+        def find_spec(
+            self,
+            fullname: str,
+            path: Any = None,
+            target: Any = None,
+        ) -> Any:
+            entry = source_map.get(fullname)
+            if entry is not None:
+                source_path, payload, package = entry
+                loader = _PinnedSnapshotLoader(
+                    fullname,
+                    source_path,
+                    payload,
+                    package,
+                )
+                return importlib.util.spec_from_loader(
+                    fullname,
+                    loader,
+                    origin=str(source_path),
+                    is_package=package,
+                )
+            namespace_path = namespace_packages.get(fullname)
+            if namespace_path is not None:
+                specification = importlib.machinery.ModuleSpec(
+                    fullname,
+                    loader=None,
+                    is_package=True,
+                )
+                specification.submodule_search_locations = [
+                    str(namespace_path)
+                ]
+                specification.loader_state = namespace_token
+                return specification
+            if any(
+                fullname == prefix or fullname.startswith(f"{prefix}.")
+                for prefix in prefixes
+            ):
+                raise ModuleNotFoundError(
+                    f"TalkSHOW local import escaped pinned closure: {fullname}"
+                )
+            return None
+
+    finder = _PinnedSnapshotFinder()
+
+    def reject_bytecode_cache() -> None:
+        for prefix in sorted(prefixes):
+            package_root = _resolved_canonical_directory(
+                root / prefix,
+                f"TalkSHOW package root {prefix}",
+            )
+            for candidate in package_root.rglob("*"):
+                if (
+                    candidate.name == "__pycache__"
+                    or candidate.suffix in {".pyc", ".pyo"}
+                ):
+                    raise MetricAdapterContractError(
+                        "TalkSHOW pinned import forbids cached bytecode: "
+                        f"{candidate}"
+                    )
+
+    # Timestamp-valid bytecode can execute code that is not represented by
+    # the attested source SHA.  A formal import is therefore source-only:
+    # reject any pre-existing cache and suppress cache creation throughout
+    # the isolated import.
+    reject_bytecode_cache()
+
+    def is_local_module(name: str) -> bool:
+        return any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in prefixes
+        )
+
+    saved_modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if is_local_module(name)
+    }
+    for name in saved_modules:
+        del sys.modules[name]
+    original_cwd = Path.cwd()
+    original_sys_path = list(sys.path)
+    original_meta_path = list(sys.meta_path)
+    original_dont_write_bytecode = sys.dont_write_bytecode
+    imported_modules: dict[str, Any] = {}
+    try:
+        sys.dont_write_bytecode = True
+        importlib.invalidate_caches()
+        os.chdir(root)
+        sys.meta_path.insert(0, finder)
+        module = importlib.import_module("nets.body_ae")
+        imported_modules = {
+            name: value
+            for name, value in tuple(sys.modules.items())
+            if is_local_module(name)
+        }
+        for name, value in imported_modules.items():
+            source = getattr(value, "__file__", None)
+            specification = getattr(value, "__spec__", None)
+            if source is None and name in namespace_packages:
+                locations = getattr(
+                    specification,
+                    "submodule_search_locations",
+                    None,
+                )
+                if (
+                    specification is None
+                    or getattr(specification, "origin", None) is not None
+                    or getattr(specification, "loader_state", None)
+                    is not namespace_token
+                    or locations is None
+                    or list(locations)
+                    != [str(namespace_packages[name])]
+                ):
+                    raise MetricAdapterContractError(
+                        f"TalkSHOW namespace package {name} escaped the "
+                        "pinned closure"
+                    )
+                continue
+            if type(source) is not str:
+                raise MetricAdapterContractError(
+                    f"TalkSHOW imported module {name} has no source file"
+                )
+            path = Path(source)
+            origin = getattr(specification, "origin", None)
+            loader = getattr(specification, "loader", None)
+            if (
+                path.suffix != ".py"
+                or type(origin) is not str
+                or Path(origin) != path
+                or not isinstance(loader, _PinnedSnapshotLoader)
+            ):
+                raise MetricAdapterContractError(
+                    f"TalkSHOW imported module {name} was not loaded "
+                    "directly from pinned Python source"
+                )
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise MetricAdapterContractError(
+                    f"TalkSHOW imported module {name} escaped the pinned root"
+                ) from exc
+            expected = files.get(relative)
+            _source_path, payload = _safe_file_snapshot(
+                path,
+                f"imported TalkSHOW module {name}",
+            )
+            if (
+                type(expected) is not dict
+                or expected.get("sha256") != sha256_bytes(payload)
+                or expected.get("bytes") != len(payload)
+            ):
+                raise MetricAdapterContractError(
+                    f"TalkSHOW imported module {name} is outside the pinned "
+                    "source closure"
+                )
+        reject_bytecode_cache()
+        extractor = getattr(module, "TrainWrapper", None)
+        if not callable(extractor):
+            raise MetricAdapterContractError(
+                "pinned TalkSHOW body_ae lacks TrainWrapper"
+            )
+        return extractor
+    finally:
+        sys.dont_write_bytecode = original_dont_write_bytecode
+        os.chdir(original_cwd)
+        sys.path[:] = original_sys_path
+        sys.meta_path[:] = original_meta_path
+        for name in tuple(sys.modules):
+            if is_local_module(name):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
+        importlib.invalidate_caches()
+
+
+_FORMAL_BACKEND_CONSTRUCTION_TOKEN = object()
+
+
 class TalkShowCudaMetricBackend:
     """Pinned TalkSHOW feature/SMPL-X backend on one explicit CUDA device."""
 
@@ -1225,21 +1941,19 @@ class TalkShowCudaMetricBackend:
             minimum=1,
         )
         talkshow = validate_talkshow_metric_root(talkshow_root)
-        feature_path = _resolved_regular_file(
+        feature_path, feature_payload = _safe_file_snapshot(
             feature_extractor,
             "TalkSHOW released feature extractor",
         )
-        feature_payload = feature_path.read_bytes()
         feature_sha = sha256_bytes(feature_payload)
         if feature_sha != FEATURE_EXTRACTOR_SHA256:
             raise MetricAdapterContractError(
                 "TalkSHOW feature extractor SHA differs from the pinned release"
             )
-        smplx_path = _resolved_regular_file(
+        smplx_path, smplx_payload = _safe_file_snapshot(
             smplx_asset,
             "SMPL-X neutral asset",
         )
-        smplx_payload = smplx_path.read_bytes()
         smplx_sha = sha256_bytes(smplx_payload)
         if smplx_sha != SMPLX_SHA256:
             raise MetricAdapterContractError(
@@ -1250,10 +1964,12 @@ class TalkShowCudaMetricBackend:
             import smplx
             import librosa
             import scipy
+            import soundfile
+            import soxr
         except ImportError as exc:
             raise MetricAdapterContractError(
-                "torch, smplx, librosa, and scipy are required by the "
-                "formal CUDA metric backend"
+                "torch, smplx, librosa, scipy, soundfile, and soxr are "
+                "required by the formal CUDA metric backend"
             ) from exc
         if (
             type(device) is not str
@@ -1275,15 +1991,9 @@ class TalkShowCudaMetricBackend:
                 f"formal CUDA metric device is unavailable: {device}"
             )
         torch.set_num_threads(torch_threads)
-        original_cwd = Path.cwd()
-        original_sys_path = list(sys.path)
-        try:
-            os.chdir(Path(talkshow["path"]))
-            sys.path.insert(0, str(talkshow["path"]))
-            from nets.body_ae import TrainWrapper as BodyFeatureExtractor
-        finally:
-            os.chdir(original_cwd)
-            sys.path[:] = original_sys_path
+        BodyFeatureExtractor = _import_pinned_body_feature_extractor(
+            talkshow
+        )
         config = SimpleNamespace(
             Data=SimpleNamespace(
                 pose=SimpleNamespace(
@@ -1399,6 +2109,8 @@ class TalkShowCudaMetricBackend:
             "torch": str(torch.__version__),
             "smplx": _package_version(smplx, "smplx"),
             "librosa": _package_version(librosa, "librosa"),
+            "soundfile": _package_version(soundfile, "soundfile"),
+            "soxr": _package_version(soxr, "soxr"),
             "scipy": _package_version(scipy, "scipy"),
             "cuda": cuda_version,
             "cudnn": str(cudnn_version),
@@ -1407,6 +2119,9 @@ class TalkShowCudaMetricBackend:
             "device_index": device_index,
             "device_name": torch.cuda.get_device_name(torch_device),
         }
+        self._formal_construction_token = (
+            _FORMAL_BACKEND_CONSTRUCTION_TOKEN
+        )
 
     @property
     def asset_receipt(self) -> Mapping[str, Any]:
@@ -1498,19 +2213,46 @@ class TalkShowCudaMetricBackend:
             units="time",
         ).reshape(-1)
 
+    def decode_audio_16k(self, snapshot: bytes) -> np.ndarray:
+        if type(snapshot) is not bytes or not snapshot:
+            raise MetricAdapterContractError(
+                "audio snapshot must be non-empty immutable bytes"
+            )
+        try:
+            waveform, sample_rate = self._librosa.load(
+                io.BytesIO(snapshot),
+                sr=16_000,
+                mono=True,
+            )
+        except Exception as exc:
+            raise MetricAdapterContractError(
+                "librosa cannot decode the verified WAV snapshot"
+            ) from exc
+        array = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        if sample_rate != 16_000 or array.size < 1 or not np.isfinite(array).all():
+            raise MetricAdapterContractError(
+                "librosa returned an invalid 16 kHz mono waveform"
+            )
+        return array
 
-def _strict_npz_members(path: Path, fields: tuple[str, ...]) -> None:
+
+def _strict_npz_members(
+    payload: bytes,
+    fields: tuple[str, ...],
+    *,
+    label: str,
+) -> None:
     try:
-        with zipfile.ZipFile(path, mode="r") as archive:
+        with zipfile.ZipFile(io.BytesIO(payload), mode="r") as archive:
             members = tuple(info.filename for info in archive.infolist())
     except (OSError, zipfile.BadZipFile) as exc:
         raise MetricAdapterContractError(
-            f"cannot inspect NPZ {path}"
+            f"cannot inspect verified NPZ snapshot {label}"
         ) from exc
     expected = tuple(f"{field}.npy" for field in fields)
     if members != expected or len(members) != len(set(members)):
         raise MetricAdapterContractError(
-            f"{path}: NPZ members {members} != {expected}"
+            f"{label}: NPZ members {members} != {expected}"
         )
 
 
@@ -1521,14 +2263,18 @@ def _load_canonical_npz(
     frames: int,
     speaker_id: int,
 ) -> dict[str, np.ndarray]:
-    resolved, _payload = _verified_file_snapshot(
+    resolved, payload = _verified_file_snapshot(
         path,
         expected_sha256,
         "canonical SHOW NPZ",
     )
-    _strict_npz_members(resolved, CANONICAL_FIELDS)
+    _strict_npz_members(
+        payload,
+        CANONICAL_FIELDS,
+        label=str(resolved),
+    )
     try:
-        with np.load(resolved, allow_pickle=False) as archive:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
             if tuple(archive.files) != CANONICAL_FIELDS:
                 raise MetricAdapterContractError(
                     f"{resolved}: canonical NPZ field order mismatch"
@@ -1608,9 +2354,9 @@ def _load_output_npz(
         raise MetricAdapterContractError(
             f"{path}: output NPZ byte count mismatch"
         )
-    _strict_npz_members(path, OUTPUT_FIELDS)
+    _strict_npz_members(payload, OUTPUT_FIELDS, label=str(path))
     try:
-        with np.load(path, allow_pickle=False) as archive:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
             if tuple(archive.files) != OUTPUT_FIELDS:
                 raise MetricAdapterContractError(
                     f"{path}: output NPZ field order mismatch"
@@ -1668,6 +2414,7 @@ def _validate_wav_row_and_decode(
     row: Mapping[str, Any],
     *,
     motion_frames: int,
+    decode_audio_16k: Callable[[bytes], np.ndarray],
 ) -> np.ndarray:
     path, payload = _verified_file_snapshot(
         row["source_wav"],
@@ -1684,7 +2431,7 @@ def _validate_wav_row_and_decode(
             rate = int(handle.getframerate())
             wav_frames = int(handle.getnframes())
             compression = handle.getcomptype()
-            raw = handle.readframes(wav_frames)
+            handle.readframes(wav_frames)
     except (EOFError, wave.Error) as exc:
         raise MetricAdapterContractError(
             f"cannot decode canonical WAV {path}"
@@ -1692,31 +2439,46 @@ def _validate_wav_row_and_decode(
     if (
         channels not in (1, 2)
         or width != 2
-        or rate != 16000
+        or rate != CANONICAL_SOURCE_AUDIO_RATE
         or wav_frames < 1
         or compression != "NONE"
         or row.get("wav_channels") != channels
         or row.get("wav_sample_width") != width
         or row.get("wav_sample_rate") != rate
         or row.get("wav_frames") != wav_frames
+        or row.get("wav_mono_policy") != CANONICAL_WAV_MONO_POLICY
     ):
         raise MetricAdapterContractError(
             f"{path}: canonical WAV metadata mismatch"
         )
-    samples = np.frombuffer(raw, dtype="<i2")
-    if samples.size != wav_frames * channels:
+    if not callable(decode_audio_16k):
         raise MetricAdapterContractError(
-            f"{path}: decoded WAV sample count mismatch"
+            "verified WAV decoder is not callable"
         )
-    waveform = samples.reshape(wav_frames, channels).astype(np.float32)
-    waveform = waveform.mean(axis=1) / np.float32(32768.0)
+    try:
+        waveform = np.asarray(
+            decode_audio_16k(payload),
+            dtype=np.float32,
+        ).reshape(-1)
+    except MetricAdapterContractError:
+        raise
+    except Exception as exc:
+        raise MetricAdapterContractError(
+            f"{path}: verified snapshot audio decode failed"
+        ) from exc
+    if waveform.size < 1 or not np.isfinite(waveform).all():
+        raise MetricAdapterContractError(
+            f"{path}: verified snapshot decoder returned invalid audio"
+        )
     expected_audio_frames = 16000 * motion_frames // POSE_FPS
     if waveform.shape[0] < expected_audio_frames:
-        raise MetricAdapterContractError(
-            f"{path}: canonical WAV is shorter than the motion-aligned "
-            f"prefix {waveform.shape[0]} < {expected_audio_frames}"
+        waveform = np.pad(
+            waveform,
+            (0, expected_audio_frames - waveform.shape[0]),
+            mode="constant",
         )
-    waveform = waveform[:expected_audio_frames]
+    else:
+        waveform = waveform[:expected_audio_frames]
     if not np.isfinite(waveform).all():
         raise MetricAdapterContractError(
             f"{path}: decoded WAV is non-finite"
@@ -1729,6 +2491,8 @@ def _validate_canonical_rows(
     *,
     split: str,
     expected_clip_count: int,
+    formal_mode: bool,
+    test_only_allow_four_clip_subset: bool,
 ) -> dict[str, dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
     global_indices: set[int] = set()
@@ -1769,11 +2533,16 @@ def _validate_canonical_rows(
             raise MetricAdapterContractError(
                 f"{clip_id}: canonical speaker/frame-rate mismatch"
             )
-        _require_exact_int(
+        frames = _require_exact_int(
             row.get("frames"),
             f"{clip_id} frames",
             minimum=2,
         )
+        if frames <= FORMAL_MIN_FRAMES_EXCLUSIVE:
+            raise MetricAdapterContractError(
+                f"{clip_id}: SHOW metric clip must contain more than "
+                f"{FORMAL_MIN_FRAMES_EXCLUSIVE} frames"
+            )
         _require_sha256(
             row.get("canonical_npz_sha256"),
             f"{clip_id} canonical NPZ SHA",
@@ -1788,11 +2557,45 @@ def _validate_canonical_rows(
         raise MetricAdapterContractError(
             f"canonical {split} clips {len(selected)} != {expected_clip_count}"
         )
+    observed_order = [
+        row["global_index"] for row in selected.values()
+    ]
+    ordered = sorted(
+        selected.items(),
+        key=lambda item: item[1]["global_index"],
+    )
+    ordered_indices = [row["global_index"] for _key, row in ordered]
+    if formal_mode:
+        domain = FORMAL_SPLITS[split]
+        if (
+            test_only_allow_four_clip_subset
+            or expected_clip_count != domain["count"]
+            or ordered_indices
+            != list(range(domain["global_start"], domain["global_stop"]))
+        ):
+            raise MetricAdapterContractError(
+                f"formal {split} split is not the exact frozen global-index "
+                "domain"
+            )
+    elif test_only_allow_four_clip_subset:
+        if expected_clip_count != 4 or len(ordered_indices) != 4:
+            raise MetricAdapterContractError(
+                "CPU fixture mode requires exactly four clips"
+            )
+    else:
+        raise MetricAdapterContractError(
+            "non-formal evaluation is permitted only for the explicit "
+            "four-clip CPU fixture"
+        )
+    if observed_order != ordered_indices:
+        raise MetricAdapterContractError(
+            f"canonical {split} rows are not deterministically ordered"
+        )
     if set(row["speaker"] for row in selected.values()) != set(SPEAKER_NAMES):
         raise MetricAdapterContractError(
             "canonical metric split must contain all four SHOW speakers"
         )
-    return selected
+    return dict(ordered)
 
 
 def _validate_prediction_rows(
@@ -1807,6 +2610,7 @@ def _validate_prediction_rows(
         else TEST_PREDICTION_ROW_KEYS
     )
     by_id: dict[str, dict[str, Any]] = {}
+    observed_order: list[dict[str, Any]] = []
     for raw in rows:
         if type(raw) is not dict or set(raw) != expected_keys:
             raise MetricAdapterContractError(
@@ -1878,6 +2682,7 @@ def _validate_prediction_rows(
                 minimum=1,
             )
         by_id[output_id] = row
+        observed_order.append(row)
     if set(by_id) != set(canonical):
         missing = sorted(set(canonical) - set(by_id))
         extra = sorted(set(by_id) - set(canonical))
@@ -1886,20 +2691,28 @@ def _validate_prediction_rows(
             f"missing={missing[:8]}, extra={extra[:8]}"
         )
     if split == "test":
-        ordered = sorted(
-            by_id.values(),
-            key=lambda row: row["evaluation_index"],
-        )
+        ordered = observed_order
         indices = [row["evaluation_index"] for row in ordered]
-        if sorted(indices) != list(range(len(ordered))):
+        output_ids = [row["canonical_clip_id"] for row in ordered]
+        global_indices = sorted(row["global_index"] for row in ordered)
+        if (
+            indices != list(range(len(ordered)))
+            or output_ids != sorted(canonical)
+            or global_indices
+            != sorted(row["global_index"] for row in canonical.values())
+        ):
             raise MetricAdapterContractError(
-                "test evaluation_index does not cover an exact range"
+                "test prediction rows are not in the exact finalized "
+                "canonical-clip order"
             )
     else:
-        ordered = sorted(
-            by_id.values(),
-            key=lambda row: row["global_index"],
-        )
+        ordered = observed_order
+        if [row["global_index"] for row in ordered] != [
+            row["global_index"] for row in canonical.values()
+        ]:
+            raise MetricAdapterContractError(
+                "validation prediction rows are not in exact canonical order"
+            )
         epochs = {row["epoch"] for row in ordered}
         checkpoints = {
             row["candidate_checkpoint_sha256"] for row in ordered
@@ -2002,12 +2815,75 @@ def _validate_prediction_lineage(
     return payload_sha
 
 
+def _fresh_validate_formal_val_lineage(
+    *,
+    lineage_path: Path,
+    lineage_sha256: str,
+    lineage: Mapping[str, Any],
+    prediction_path: Path,
+    prediction_sha256: str,
+) -> None:
+    selector = _fresh_base_selector_module()
+    try:
+        epoch = _require_exact_int(
+            lineage.get("epoch"),
+            "formal val lineage epoch",
+            minimum=1,
+        )
+        val_inputs_receipt = lineage.get("val_inputs_receipt")
+        pipeline_receipt = lineage.get("pipeline_receipt")
+        candidate = lineage.get("candidate_checkpoint")
+        if (
+            type(val_inputs_receipt) is not dict
+            or type(pipeline_receipt) is not dict
+            or type(candidate) is not dict
+        ):
+            raise MetricAdapterContractError(
+                "formal val lineage omits authority artifacts"
+            )
+        val_inputs_artifact, coverage = selector.validate_val_inputs(
+            Path(val_inputs_receipt["path"]),
+            val_inputs_receipt["sha256"],
+        )
+        pipeline_artifact, _pipeline = selector.validate_pipeline(
+            Path(pipeline_receipt["path"]),
+            pipeline_receipt["sha256"],
+        )
+        _lineage_artifact, validated = (
+            selector.validate_val_inference_lineage(
+                lineage_path,
+                lineage_sha256,
+                epoch=epoch,
+                expected_candidate=candidate,
+                val_inputs_artifact=val_inputs_artifact,
+                pipeline_artifact=pipeline_artifact,
+                expected_coverage=coverage,
+            )
+        )
+    except Exception as exc:
+        if isinstance(exc, MetricAdapterContractError):
+            raise
+        raise MetricAdapterContractError(
+            f"formal val lineage fresh selector replay failed: {exc}"
+        ) from exc
+    final_manifest = validated.get("final_manifest")
+    if (
+        type(final_manifest) is not dict
+        or Path(final_manifest.get("path", "")).resolve()
+        != prediction_path
+        or final_manifest.get("sha256") != prediction_sha256
+    ):
+        raise MetricAdapterContractError(
+            "formal val selector replay produced another final manifest"
+        )
+
+
 def _validate_external_validation_gate(
     receipt: Mapping[str, Any],
     *,
     expected_scope: str,
     test_only_allow_four_clip_subset: bool = False,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if type(receipt) is not dict or set(receipt) != {
         "path",
         "sha256",
@@ -2056,7 +2932,908 @@ def _validate_external_validation_gate(
         raise MetricAdapterContractError(
             "validation gate artifact/payload contract mismatch"
         )
-    return dict(artifact)
+    return dict(artifact), dict(gate)
+
+
+def _load_gate_subset(gate: Mapping[str, Any]) -> dict[str, Any]:
+    artifact = gate.get("subset_manifest")
+    if type(artifact) is not dict or not {
+        "path",
+        "sha256",
+        "bytes",
+    }.issubset(artifact):
+        raise MetricAdapterContractError(
+            "replication gate lacks a frozen subset-manifest artifact"
+        )
+    path, payload = _verified_file_snapshot(
+        artifact["path"],
+        _require_sha256(
+            artifact["sha256"],
+            "gate subset-manifest SHA",
+        ),
+        "gate subset manifest",
+    )
+    if _require_exact_int(
+        artifact["bytes"],
+        "gate subset-manifest bytes",
+        minimum=1,
+    ) != len(payload):
+        raise MetricAdapterContractError(
+            f"{path}: gate subset-manifest byte count mismatch"
+        )
+    return _strict_json_snapshot(payload, "gate subset manifest")
+
+
+def _strong_bind_gate(
+    *,
+    gate: Mapping[str, Any],
+    split: str,
+    canonical_path: Path,
+    canonical_payload: bytes,
+    canonical_rows: Sequence[Mapping[str, Any]],
+    ordered_predictions: Sequence[Mapping[str, Any]],
+    lineage: Mapping[str, Any],
+    test_authority: Mapping[str, Any] | None,
+    formal_mode: bool,
+) -> None:
+    if not formal_mode:
+        return
+    source = gate.get("source_closure")
+    model_bundle = gate.get("model_bundle")
+    if (
+        type(source) is not dict
+        or source.get("origin")
+        != "git@github.com:Xiangyue-Zhang/SemTalk.git"
+        or type(model_bundle) is not dict
+        or type(model_bundle.get("checkpoints")) is not dict
+        or set(model_bundle["checkpoints"])
+        != {"base", "face", "hands", "upper", "lower", "global"}
+    ):
+        raise MetricAdapterContractError(
+            "replication gate lacks official Base source/model authority"
+        )
+    subset = _load_gate_subset(gate)
+    parent = subset.get("parent_authority")
+    if type(parent) is not dict:
+        raise MetricAdapterContractError(
+            "replication gate lacks parent val authority"
+        )
+    if split == "val":
+        expected_canonical = {
+            "path": str(canonical_path),
+            "sha256": sha256_bytes(canonical_payload),
+            "bytes": len(canonical_payload),
+        }
+        parent_canonical = parent.get("canonical_manifest")
+        if (
+            type(parent_canonical) is not dict
+            or {
+                key: parent_canonical.get(key)
+                for key in ("path", "sha256", "bytes")
+            }
+            != expected_canonical
+        ):
+            raise MetricAdapterContractError(
+                "val metric canonical manifest differs from gate authority"
+            )
+        if lineage.get("val_inputs_receipt") != parent.get(
+            "val_inputs_receipt"
+        ):
+            raise MetricAdapterContractError(
+                "val inference lineage differs from gate val-input authority"
+            )
+        subset_rows = subset.get("rows")
+        if (
+            type(subset_rows) is not list
+            or len(subset_rows) != len(ordered_predictions)
+            or [
+                row.get("canonical_row_sha256")
+                for row in subset_rows
+            ]
+            != [
+                compact_canonical_json_sha256(row)
+                for row in canonical_rows
+                if row.get("split") == "val"
+            ]
+            or [
+                row.get("source_clip_id") for row in subset_rows
+            ]
+            != [
+                row["source_clip_id"] for row in ordered_predictions
+            ]
+        ):
+            raise MetricAdapterContractError(
+                "val metric order/rows differ from gate parent authority"
+            )
+        base_checkpoint = {
+            row["candidate_checkpoint_sha256"]
+            for row in ordered_predictions
+        }
+        if (
+            len(base_checkpoint) != 1
+            or next(iter(base_checkpoint))
+            != model_bundle["checkpoints"]["base"].get("sha256")
+        ):
+            raise MetricAdapterContractError(
+                "val candidate checkpoint differs from replication gate"
+            )
+        pipeline_receipt = lineage.get("pipeline_receipt")
+        if type(pipeline_receipt) is not dict:
+            raise MetricAdapterContractError(
+                "val inference lineage lacks pipeline authority"
+            )
+        _pipeline_path, pipeline_payload = _verified_file_snapshot(
+            pipeline_receipt["path"],
+            _require_sha256(
+                pipeline_receipt["sha256"],
+                "val pipeline receipt SHA",
+            ),
+            "val pipeline receipt",
+        )
+        pipeline = _strict_json_snapshot(
+            pipeline_payload,
+            "val pipeline receipt",
+        )
+        producer = pipeline.get("source")
+        if (
+            type(producer) is not dict
+            or producer.get("origin") != source["origin"]
+            or producer.get("commit") != source["commit"]
+            or producer.get("tree") != source["tree"]
+        ):
+            raise MetricAdapterContractError(
+                "val inference source differs from replication gate"
+            )
+    else:
+        if type(test_authority) is not dict:
+            raise MetricAdapterContractError(
+                "formal test lacks final Base authority"
+            )
+        authority_source = test_authority["inference_source"]
+        if (
+            source.get("origin") != authority_source["origin"]
+            or source.get("commit") != authority_source["commit"]
+            or source.get("tree") != authority_source["tree"]
+        ):
+            raise MetricAdapterContractError(
+                "test authority source differs from replication gate"
+            )
+        for stage, checkpoint in test_authority["checkpoints"].items():
+            if model_bundle["checkpoints"].get(stage) != checkpoint:
+                raise MetricAdapterContractError(
+                    f"{stage} checkpoint differs between gate and test "
+                    "authority"
+                )
+
+
+def _validated_test_authority(
+    receipt: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if type(receipt) is not dict or set(receipt) != {
+        "path",
+        "sha256",
+        "bytes",
+        "receipt_payload_sha256",
+    }:
+        raise MetricAdapterContractError(
+            "test authority artifact schema mismatch"
+        )
+    module = _base_final_authority_module()
+    try:
+        return module.validate_test_authority(
+            receipt["path"],
+            expected_file_sha256=_require_sha256(
+                receipt["sha256"],
+                "test authority file SHA",
+            ),
+            expected_bytes=_require_exact_int(
+                receipt["bytes"],
+                "test authority bytes",
+                minimum=1,
+            ),
+            expected_receipt_payload_sha256=_require_sha256(
+                receipt["receipt_payload_sha256"],
+                "test authority payload SHA",
+            ),
+        )
+    except Exception as exc:
+        raise MetricAdapterContractError(
+            f"test authority fresh replay failed: {exc}"
+        ) from exc
+
+
+def _reject_forbidden_generator_identity(
+    value: Any,
+    label: str,
+    *,
+    semantic_identity: bool = False,
+) -> None:
+    generator_keys = {
+        "generator",
+        "generator_identity",
+        "generator_name",
+        "generator_source",
+        "model",
+        "model_identity",
+        "model_name",
+        "model_source",
+        "checkpoint",
+        "checkpoint_path",
+        "checkpoint_source",
+        "candidate_checkpoint",
+        "selected_checkpoint",
+        "fixed_checkpoints",
+        "checkpoints",
+    }
+    evaluator_asset_keys = {
+        "evaluator",
+        "evaluator_asset",
+        "feature_extractor",
+        "metric_asset",
+        "smplx",
+        "smplx_asset",
+        "talkshow",
+        "talkshow_asset",
+    }
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_name = str(key).casefold()
+            child_semantic = (
+                semantic_identity
+                or key_name in generator_keys
+                or key_name.endswith("_checkpoint")
+                or key_name.endswith("_checkpoint_path")
+                or key_name.endswith("_checkpoint_source")
+            )
+            if (
+                key_name in evaluator_asset_keys
+                or key_name.endswith("_evaluator")
+                or key_name.endswith("_metric_asset")
+                or key_name.endswith("_smplx_asset")
+            ):
+                child_semantic = False
+            _reject_forbidden_generator_identity(
+                child,
+                f"{label}.{key}",
+                semantic_identity=child_semantic,
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_forbidden_generator_identity(
+                child,
+                f"{label}[{index}]",
+                semantic_identity=semantic_identity,
+            )
+    elif isinstance(value, str) and semantic_identity:
+        normalized = value.casefold()
+        if any(
+            token in normalized
+            for token in ("speaker2", "sparse", "semgate", "globaldiff")
+        ):
+            raise MetricAdapterContractError(
+                f"{label} contains a forbidden generator identity"
+            )
+
+
+def _validate_exact_artifact_receipt(
+    receipt: Any,
+    *,
+    expected_path: Path,
+    label: str,
+) -> tuple[Path, bytes]:
+    """Verify one exact-path artifact receipt against the live source file."""
+
+    if (
+        type(receipt) is not dict
+        or set(receipt) != ARTIFACT_KEYS
+        or Path(str(receipt.get("path", ""))).resolve()
+        != expected_path.resolve()
+    ):
+        raise MetricAdapterContractError(
+            f"{label} escapes its exact artifact path"
+        )
+    path, payload = _verified_file_snapshot(
+        receipt["path"],
+        _require_sha256(receipt["sha256"], f"{label} SHA"),
+        label,
+    )
+    if (
+        _require_exact_int(
+            receipt["bytes"],
+            f"{label} bytes",
+            minimum=1,
+        )
+        != len(payload)
+    ):
+        raise MetricAdapterContractError(f"{label} byte count mismatch")
+    return path, payload
+
+
+def _validate_final_npz_provenance(
+    *,
+    root: Path,
+    ordered_predictions: Sequence[Mapping[str, Any]],
+    shard_rows_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Replay the finalizer's exact shard-copy and NPZ-root contract."""
+
+    if (
+        len(shard_rows_by_id) != len(ordered_predictions)
+        or set(shard_rows_by_id)
+        != {row["canonical_clip_id"] for row in ordered_predictions}
+    ):
+        raise MetricAdapterContractError(
+            "test shard manifests do not cover final clips exactly once"
+        )
+    final_npz_root = root / "npz" / "test"
+    expected_final_files: set[str] = set()
+    for final_row in ordered_predictions:
+        output_id = final_row["canonical_clip_id"]
+        shard_row = shard_rows_by_id[output_id]
+        if {
+            key: final_row[key]
+            for key in SHARD_TEST_PREDICTION_ROW_KEYS
+            if key not in {"prediction", "ground_truth"}
+        } != {
+            key: shard_row[key]
+            for key in SHARD_TEST_PREDICTION_ROW_KEYS
+            if key not in {"prediction", "ground_truth"}
+        }:
+            raise MetricAdapterContractError(
+                f"{output_id}: final/shard identity receipts differ"
+            )
+        for role_name, prefix in (
+            ("prediction", "res"),
+            ("ground_truth", "gt"),
+        ):
+            final_receipt = final_row[role_name]
+            shard_receipt = shard_row[role_name]
+            expected_name = f"{prefix}_{output_id}.npz"
+            expected_final_path = final_npz_root / expected_name
+            shard_id = _require_exact_int(
+                shard_row.get("global_index"),
+                f"{output_id} shard global_index",
+            ) % 8
+            expected_shard_path = (
+                root.parent
+                / "shards"
+                / f"shard-{shard_id:05d}-of-00008"
+                / "npz"
+                / "test"
+                / expected_name
+            )
+            _validate_exact_artifact_receipt(
+                final_receipt,
+                expected_path=expected_final_path,
+                label=f"{output_id} finalized {role_name}",
+            )
+            _validate_exact_artifact_receipt(
+                shard_receipt,
+                expected_path=expected_shard_path,
+                label=f"{output_id} shard {role_name}",
+            )
+            if {
+                key: final_receipt[key]
+                for key in ("sha256", "bytes")
+            } != {
+                key: shard_receipt[key]
+                for key in ("sha256", "bytes")
+            }:
+                raise MetricAdapterContractError(
+                    f"{output_id}: finalized {role_name} is not the exact "
+                    "authorized shard copy"
+                )
+            expected_final_files.add(expected_name)
+    if (
+        not final_npz_root.is_dir()
+        or final_npz_root.is_symlink()
+        or {
+            path.name
+            for path in final_npz_root.iterdir()
+            if path.is_file() and not path.is_symlink()
+        }
+        != expected_final_files
+        or any(
+            path.is_symlink() or not path.is_file()
+            for path in final_npz_root.iterdir()
+        )
+    ):
+        raise MetricAdapterContractError(
+            "test finalized NPZ root has an inexact regular-file inventory"
+        )
+
+
+def _validate_output_audio_authority(
+    *,
+    ordered_predictions: Sequence[Mapping[str, Any]],
+    authorized_audio_by_clip: Mapping[str, tuple[str, str]],
+) -> None:
+    if len(authorized_audio_by_clip) != len(ordered_predictions):
+        raise MetricAdapterContractError(
+            "authorized audio manifests do not cover output rows"
+        )
+    for row in ordered_predictions:
+        if (
+            authorized_audio_by_clip.get(row["source_clip_id"])
+            != (
+                str(Path(row["audio_feature_npz"]).resolve()),
+                row["audio_feature_npz_sha256"],
+            )
+        ):
+            raise MetricAdapterContractError(
+                f"{row['canonical_clip_id']}: final audio feature differs "
+                "from the authorized audio manifests"
+            )
+
+
+def _validate_frozen_inference_evidence(
+    *,
+    authority: Mapping[str, Any],
+    contract: Any | None = None,
+    checkpoint_receipts: Any | None = None,
+) -> None:
+    """Bind only live checkpoint identity; raw producer metadata is telemetry.
+
+    The final authority no longer freezes caller-authored inference contracts
+    or nested checkpoint audits.  Base training provenance and winner
+    selection are independently reconstructed by the Base-long and published
+    winner validators.  Here we accept no provenance from the producer: only
+    the six exact live ``path/sha256/bytes`` identities may agree with that
+    external authority.  The surrounding final/shard validators separately
+    bind source, canonical/audio inputs, output roots and exact-once coverage.
+    """
+
+    if contract is not None:
+        observed = contract.get("checkpoints")
+        if type(observed) is not dict or set(observed) != set(
+            authority["checkpoints"]
+        ):
+            raise MetricAdapterContractError(
+                "test final lineage checkpoint projection schema mismatch"
+            )
+        for stage, expected in authority["checkpoints"].items():
+            row = observed[stage]
+            if (
+                type(row) is not dict
+                or row.get("path") != expected["path"]
+                or row.get("expected_sha256") != expected["sha256"]
+            ):
+                raise MetricAdapterContractError(
+                    f"test final lineage changed the {stage} checkpoint"
+                )
+    if checkpoint_receipts is not None:
+        if type(checkpoint_receipts) is not dict or set(
+            checkpoint_receipts
+        ) != set(authority["checkpoints"]):
+            raise MetricAdapterContractError(
+                "test shard checkpoint projection schema mismatch"
+            )
+        for stage, expected in authority["checkpoints"].items():
+            row = checkpoint_receipts[stage]
+            if (
+                type(row) is not dict
+                or row.get("formal_stage") != stage
+                or row.get("path") != expected["path"]
+                or row.get("sha256") != expected["sha256"]
+                or row.get("bytes") != expected["bytes"]
+            ):
+                raise MetricAdapterContractError(
+                    f"test shard changed the {stage} checkpoint"
+                )
+
+
+def _cross_validate_test_outputs(
+    *,
+    authority: Mapping[str, Any],
+    canonical_path: Path,
+    canonical_payload: bytes,
+    canonical_rows: Sequence[Mapping[str, Any]],
+    prediction_path: Path,
+    prediction_payload: bytes,
+    ordered_predictions: Sequence[Mapping[str, Any]],
+    lineage_path: Path,
+    lineage: Mapping[str, Any],
+) -> None:
+    root = Path(authority["expected_output_root"]).resolve()
+    if (
+        prediction_path != root / "final_manifest.jsonl"
+        or lineage_path != root / "final_lineage.json"
+    ):
+        raise MetricAdapterContractError(
+            "test prediction outputs escape their authorized final root"
+        )
+    canonical_authority = authority["canonical"]
+    if canonical_authority["manifest"] != {
+        "path": str(canonical_path),
+        "sha256": sha256_bytes(canonical_payload),
+        "bytes": len(canonical_payload),
+    }:
+        raise MetricAdapterContractError(
+            "test metric canonical root differs from test authority"
+        )
+    selected = [
+        row for row in canonical_rows if row.get("split") == "test"
+    ]
+    if [
+        canonical_json_sha256(row) for row in selected
+    ] != canonical_authority["ordered_row_sha256"]:
+        raise MetricAdapterContractError(
+            "test metric canonical row hashes differ from test authority"
+        )
+    if (
+        set(lineage)
+        != {
+            "format",
+            "status",
+            "contract",
+            "contract_sha256",
+            "runtime",
+            "runtime_sha256",
+            "shards",
+            "final_manifest_sha256",
+            "clip_manifest_sha256",
+        }
+        or
+        lineage.get("format")
+        != "semtalk_show_base_inference_final_lineage_v1"
+        or lineage.get("status") != "complete"
+        or lineage.get("final_manifest_sha256")
+        != sha256_bytes(prediction_payload)
+        or type(lineage.get("contract")) is not dict
+        or lineage.get("contract_sha256")
+        != canonical_json_sha256(lineage["contract"])
+        or type(lineage.get("runtime")) is not dict
+        or lineage.get("runtime_sha256")
+        != canonical_json_sha256(lineage["runtime"])
+        or lineage.get("clip_manifest_sha256")
+        != sha256_bytes(
+            "".join(
+                f"{row['canonical_clip_id']}\n"
+                for row in ordered_predictions
+            ).encode("utf-8")
+        )
+    ):
+        raise MetricAdapterContractError(
+            "test final lineage is incomplete or self-inconsistent"
+        )
+    contract = lineage["contract"]
+    _validate_frozen_inference_evidence(
+        authority=authority,
+        contract=contract,
+    )
+    source = contract.get("source")
+    authorized_source = authority["inference_source"]
+    if (
+        type(source) is not dict
+        or any(
+            source.get(key) != authorized_source[key]
+            for key in ("origin", "commit", "tree", "source_root")
+        )
+    ):
+        raise MetricAdapterContractError(
+            "test final lineage source differs from test authority"
+        )
+    if (
+        contract.get("canonical_manifest") != str(canonical_path)
+        or contract.get("canonical_manifest_sha256")
+        != canonical_authority["manifest"]["sha256"]
+        or contract.get("canonical_summary_sha256")
+        != canonical_authority["summary"]["sha256"]
+        or contract.get("canonical_lineage_sha256")
+        != canonical_authority["lineage"]["sha256"]
+        or contract.get("test_clips") != FORMAL_SPLITS["test"]["count"]
+        or contract.get("num_shards") != 8
+        or contract.get("speaker_mapping") != SHOW_SPEAKER_IDS
+    ):
+        raise MetricAdapterContractError(
+            "test final lineage canonical/split contract changed"
+        )
+    expected_audio_manifest = {
+        shard["manifest"]["path"]: shard["manifest"]["sha256"]
+        for shard in authority["audio"]
+    }
+    expected_audio_summary = {
+        shard["summary"]["path"]: shard["summary"]["sha256"]
+        for shard in authority["audio"]
+    }
+    expected_audio_lineage = {
+        shard["lineage"]["path"]: shard["lineage"]["sha256"]
+        for shard in authority["audio"]
+    }
+    if (
+        contract.get("audio_manifest_sha256")
+        != expected_audio_manifest
+        or contract.get("audio_summary_sha256")
+        != expected_audio_summary
+        or contract.get("audio_lineage_sha256")
+        != expected_audio_lineage
+    ):
+        raise MetricAdapterContractError(
+            "test final lineage audio authorities changed"
+        )
+    authorized_audio_by_clip: dict[str, tuple[str, str]] = {}
+    for audio_shard in authority["audio"]:
+        manifest_receipt = audio_shard["manifest"]
+        _audio_path, audio_payload = _verified_file_snapshot(
+            manifest_receipt["path"],
+            manifest_receipt["sha256"],
+            f"authorized audio shard {audio_shard['shard_id']} manifest",
+        )
+        if manifest_receipt["bytes"] != len(audio_payload):
+            raise MetricAdapterContractError(
+                "authorized audio manifest byte count mismatch"
+            )
+        for audio_row in _strict_jsonl_snapshot(
+            audio_payload,
+            f"authorized audio shard {audio_shard['shard_id']} manifest",
+        ):
+            clip_id = audio_row.get("clip_id")
+            feature_path = audio_row.get("audio_feature_npz")
+            feature_sha = audio_row.get("audio_feature_npz_sha256")
+            if (
+                type(clip_id) is not str
+                or clip_id in authorized_audio_by_clip
+                or type(feature_path) is not str
+                or not Path(feature_path).is_absolute()
+            ):
+                raise MetricAdapterContractError(
+                    "authorized audio manifest row identity mismatch"
+                )
+            authorized_audio_by_clip[clip_id] = (
+                str(Path(feature_path).resolve()),
+                _require_sha256(
+                    feature_sha,
+                    f"authorized audio feature {clip_id} SHA",
+                ),
+            )
+    if len(authorized_audio_by_clip) != FORMAL_SPLITS["test"]["count"]:
+        raise MetricAdapterContractError(
+            "authorized audio manifests do not cover formal test"
+        )
+    checkpoints = contract.get("checkpoints")
+    if type(checkpoints) is not dict or set(checkpoints) != set(
+        authority["checkpoints"]
+    ):
+        raise MetricAdapterContractError(
+            "test final lineage checkpoint bundle schema mismatch"
+        )
+    for stage, authorized in authority["checkpoints"].items():
+        observed = checkpoints[stage]
+        if (
+            type(observed) is not dict
+            or observed.get("path") != authorized["path"]
+            or observed.get("expected_sha256") != authorized["sha256"]
+        ):
+            raise MetricAdapterContractError(
+                f"test final lineage changed the {stage} checkpoint"
+            )
+    shards = lineage.get("shards")
+    if type(shards) is not list or len(shards) != 8:
+        raise MetricAdapterContractError(
+            "test final lineage does not contain exactly eight shards"
+        )
+    shard_rows_by_id: dict[str, dict[str, Any]] = {}
+    shard_checkpoint_receipts: dict[str, Any] | None = None
+    final_runtime = lineage["runtime"]
+    final_runtime_sha256 = lineage["runtime_sha256"]
+    for shard_id, shard in enumerate(shards):
+        if (
+            type(shard) is not dict
+            or set(shard) != {
+                "shard_id",
+                "manifest",
+                "manifest_sha256",
+                "summary",
+                "summary_sha256",
+                "lineage",
+                "lineage_sha256",
+                "clips",
+            }
+            or shard.get("shard_id") != shard_id
+            or type(shard.get("clips")) is not int
+            or shard["clips"] < 1
+        ):
+            raise MetricAdapterContractError(
+                f"test final lineage shard {shard_id} schema mismatch"
+            )
+        expected_parent = (
+            root.parent
+            / "shards"
+            / f"shard-{shard_id:05d}-of-00008"
+        )
+        payloads: dict[str, bytes] = {}
+        expected_names = {
+            "manifest": "manifest.jsonl",
+            "summary": "summary.json",
+            "lineage": "lineage.json",
+        }
+        for role, expected_name in expected_names.items():
+            path, payload = _verified_file_snapshot(
+                shard[role],
+                _require_sha256(
+                    shard[f"{role}_sha256"],
+                    f"test shard {shard_id} {role} SHA",
+                ),
+                f"test shard {shard_id} {role}",
+            )
+            if path != expected_parent / expected_name:
+                raise MetricAdapterContractError(
+                    f"test shard {shard_id} {role} escapes its exact root"
+                )
+            payloads[role] = payload
+
+        rows = _strict_jsonl_snapshot(
+            payloads["manifest"],
+            f"test shard {shard_id} manifest",
+        )
+        manifest_sha256 = sha256_bytes(payloads["manifest"])
+        summary = _strict_json_snapshot(
+            payloads["summary"],
+            f"test shard {shard_id} summary",
+        )
+        shard_lineage = _strict_json_snapshot(
+            payloads["lineage"],
+            f"test shard {shard_id} lineage",
+        )
+        if (
+            set(summary) != SHARD_SUMMARY_KEYS
+            or summary.get("format")
+            != "semtalk_show_base_inference_shard_summary_v1"
+            or summary.get("status") != "complete"
+            or _require_exact_int(
+                summary.get("shard_id"),
+                f"test shard {shard_id} summary shard_id",
+            )
+            != shard_id
+            or _require_exact_int(
+                summary.get("num_shards"),
+                f"test shard {shard_id} summary num_shards",
+            )
+            != 8
+            or _require_exact_int(
+                summary.get("selected_clips"),
+                f"test shard {shard_id} summary selected_clips",
+                minimum=1,
+            )
+            != len(rows)
+            or _require_exact_int(
+                summary.get("expected_test_clips"),
+                f"test shard {shard_id} summary expected_test_clips",
+            )
+            != FORMAL_SPLITS["test"]["count"]
+            or summary.get("manifest_sha256") != manifest_sha256
+            or summary.get("contract_sha256")
+            != lineage["contract_sha256"]
+            or summary.get("runtime_sha256") != final_runtime_sha256
+            or summary.get("finite") is not True
+            or summary.get("exact_once") is not True
+        ):
+            raise MetricAdapterContractError(
+                f"test shard {shard_id} summary contract mismatch"
+            )
+        if (
+            set(shard_lineage) != SHARD_LINEAGE_KEYS
+            or shard_lineage.get("format")
+            != "semtalk_show_base_inference_shard_lineage_v1"
+            or shard_lineage.get("status") != "complete"
+            or _require_exact_int(
+                shard_lineage.get("shard_id"),
+                f"test shard {shard_id} lineage shard_id",
+            )
+            != shard_id
+            or _require_exact_int(
+                shard_lineage.get("num_shards"),
+                f"test shard {shard_id} lineage num_shards",
+            )
+            != 8
+            or shard_lineage.get("manifest_sha256") != manifest_sha256
+            or shard_lineage.get("contract") != contract
+            or shard_lineage.get("contract_sha256")
+            != lineage["contract_sha256"]
+            or shard_lineage.get("runtime") != final_runtime
+            or shard_lineage.get("runtime_sha256")
+            != final_runtime_sha256
+            or canonical_json_sha256(shard_lineage.get("runtime"))
+            != final_runtime_sha256
+        ):
+            raise MetricAdapterContractError(
+                f"test shard {shard_id} lineage contract mismatch"
+            )
+        observed_checkpoints = shard_lineage.get("checkpoints")
+        if (
+            type(observed_checkpoints) is not dict
+            or set(observed_checkpoints) != set(authority["checkpoints"])
+        ):
+            raise MetricAdapterContractError(
+                f"test shard {shard_id} checkpoint receipt schema mismatch"
+            )
+        _validate_frozen_inference_evidence(
+            authority=authority,
+            checkpoint_receipts=observed_checkpoints,
+        )
+        for stage, authorized in authority["checkpoints"].items():
+            observed = observed_checkpoints[stage]
+            if (
+                type(observed) is not dict
+                or observed.get("formal_stage") != stage
+                or observed.get("path") != authorized["path"]
+                or observed.get("sha256") != authorized["sha256"]
+            ):
+                raise MetricAdapterContractError(
+                    f"test shard {shard_id} changed the {stage} checkpoint "
+                    "receipt"
+                )
+        if shard_checkpoint_receipts is None:
+            shard_checkpoint_receipts = observed_checkpoints
+        elif observed_checkpoints != shard_checkpoint_receipts:
+            raise MetricAdapterContractError(
+                "test inference shards used different checkpoint receipts"
+            )
+        if len(rows) != shard["clips"]:
+            raise MetricAdapterContractError(
+                f"test shard {shard_id} manifest count mismatch"
+            )
+        expected_npz_root = expected_parent / "npz" / "test"
+        for row in rows:
+            if (
+                type(row) is not dict
+                or set(row) != SHARD_TEST_PREDICTION_ROW_KEYS
+            ):
+                raise MetricAdapterContractError(
+                    f"test shard {shard_id} row schema mismatch"
+                )
+            output_id = row.get("canonical_clip_id")
+            global_index = row.get("global_index")
+            if (
+                type(output_id) is not str
+                or output_id in shard_rows_by_id
+                or type(global_index) is not int
+                or isinstance(global_index, bool)
+                or global_index % 8 != shard_id
+            ):
+                raise MetricAdapterContractError(
+                    f"test shard {shard_id} row identity/sharding mismatch"
+                )
+            for role_name, prefix in (
+                ("prediction", "res"),
+                ("ground_truth", "gt"),
+            ):
+                _validate_exact_artifact_receipt(
+                    row.get(role_name),
+                    expected_path=(
+                        expected_npz_root
+                        / f"{prefix}_{output_id}.npz"
+                    ),
+                    label=(
+                        f"test shard {shard_id} {output_id} {role_name}"
+                    ),
+                )
+            shard_rows_by_id[output_id] = row
+    if len(shard_rows_by_id) != FORMAL_SPLITS["test"]["count"]:
+        raise MetricAdapterContractError(
+            "test shard manifests do not cover final clips exactly once"
+        )
+    _validate_final_npz_provenance(
+        root=root,
+        ordered_predictions=ordered_predictions,
+        shard_rows_by_id=shard_rows_by_id,
+    )
+    _validate_output_audio_authority(
+        ordered_predictions=ordered_predictions,
+        authorized_audio_by_clip=authorized_audio_by_clip,
+    )
+    if sorted(
+        row["global_index"] for row in ordered_predictions
+    ) != list(
+        range(
+            FORMAL_SPLITS["test"]["global_start"],
+            FORMAL_SPLITS["test"]["global_stop"],
+        )
+    ):
+        raise MetricAdapterContractError(
+            "test final manifest is not the exact canonical global domain"
+        )
+    _reject_forbidden_generator_identity(contract, "test final contract")
 
 
 def build_distribution_receipt(
@@ -2069,7 +3846,7 @@ def build_distribution_receipt(
 ) -> dict[str, Any]:
     """Delegate to the Base gate's sole canonical receipt constructor."""
 
-    gate_artifact = _validate_external_validation_gate(
+    gate_artifact, _gate = _validate_external_validation_gate(
         validation_gate,
         expected_scope=expected_scope,
         test_only_allow_four_clip_subset=(
@@ -2112,7 +3889,7 @@ def validate_distribution_declaration(
         ) from exc
     if (
         observed.get("format")
-        != "semtalk_show_deterministic_distribution_receipt_v1"
+        != DISTRIBUTION_RECEIPT_FORMAT
         or observed.get("payload_hash_algorithm")
         != PAYLOAD_HASH_ALGORITHM
         or observed.get("protocol") != DISTRIBUTION_PROTOCOL
@@ -2124,7 +3901,8 @@ def validate_distribution_declaration(
         or observed.get("released2_slots") != list(RELEASED2_SLOTS)
         or observed.get("paper16_slots") != list(PAPER16_SLOTS)
         or observed.get("face_slot") != FACE_SLOT
-        or observed.get("diffsheg_slot") != DIFFSHEG_SLOT
+        or observed.get("variation_policy")
+        != module.variation_policy_receipt()
         or observed.get("metric_input_materialization")
         != METRIC_INPUT_MATERIALIZATION
     ):
@@ -2149,6 +3927,18 @@ def _ground_truth_matches_canonical(
             raise MetricAdapterContractError(
                 f"ground-truth NPZ {name} differs from canonical SHOW"
             )
+
+
+def _require_concrete_formal_backend(backend: MetricBackend) -> None:
+    if (
+        type(backend) is not TalkShowCudaMetricBackend
+        or getattr(backend, "_formal_construction_token", None)
+        is not _FORMAL_BACKEND_CONSTRUCTION_TOKEN
+    ):
+        raise MetricAdapterContractError(
+            "formal metrics require the concretely constructed pinned "
+            "TalkSHOW CUDA backend"
+        )
 
 
 def _validated_backend_features(
@@ -2220,7 +4010,9 @@ def evaluate_canonical_bundle(
     backend: MetricBackend,
     split: str,
     expected_clip_count: int,
+    test_authority: Mapping[str, Any] | None = None,
     audio_beat_extractor: Callable[[np.ndarray], np.ndarray] | None = None,
+    audio_decoder_16k: Callable[[bytes], np.ndarray] | None = None,
     formal_mode: bool = True,
     test_only_allow_four_clip_gate: bool = False,
 ) -> dict[str, Any]:
@@ -2234,11 +4026,53 @@ def evaluate_canonical_bundle(
         minimum=1,
     )
     if (
+        formal_mode
+        and expected_clip_count != FORMAL_SPLITS[split]["count"]
+    ):
+        raise MetricAdapterContractError(
+            "formal evaluation clip count differs from frozen SHOW split"
+        )
+    if (
         type(formal_mode) is not bool
         or type(test_only_allow_four_clip_gate) is not bool
     ):
         raise MetricAdapterContractError(
             "formal/test-only mode flags must be boolean"
+        )
+    if formal_mode and test_only_allow_four_clip_gate:
+        raise MetricAdapterContractError(
+            "formal evaluation cannot use the four-clip CPU fixture"
+        )
+    if formal_mode:
+        _require_concrete_formal_backend(backend)
+    if split == "val" and test_authority is not None:
+        raise MetricAdapterContractError(
+            "validation metrics must not consume test authority"
+        )
+    validated_test_authority = (
+        _validated_test_authority(test_authority)
+        if split == "test" and formal_mode
+        else None
+    )
+    if split == "test" and formal_mode and validated_test_authority is None:
+        raise MetricAdapterContractError(
+            "formal test metrics require an externally pinned test authority"
+        )
+    if formal_mode and (
+        audio_decoder_16k is not None
+        or audio_beat_extractor is not None
+    ):
+        raise MetricAdapterContractError(
+            "formal evaluation forbids injected audio decoder/beat extractor"
+        )
+    decoder = (
+        getattr(backend, "decode_audio_16k", None)
+        if audio_decoder_16k is None
+        else audio_decoder_16k
+    )
+    if not callable(decoder):
+        raise MetricAdapterContractError(
+            "metric backend lacks a verified-snapshot 16 kHz decoder"
         )
     assets, runtime = _validate_backend_receipts(
         backend,
@@ -2257,6 +4091,10 @@ def evaluate_canonical_bundle(
         canonical_rows,
         split=split,
         expected_clip_count=expected_clip_count,
+        formal_mode=formal_mode,
+        test_only_allow_four_clip_subset=(
+            test_only_allow_four_clip_gate
+        ),
     )
     prediction_path, prediction_payload = _verified_file_snapshot(
         prediction_manifest,
@@ -2288,6 +4126,27 @@ def evaluate_canonical_bundle(
         prediction_manifest_sha256=sha256_bytes(prediction_payload),
         expected_clip_count=expected_clip_count,
     )
+    if split == "val" and formal_mode:
+        _fresh_validate_formal_val_lineage(
+            lineage_path=lineage_path,
+            lineage_sha256=sha256_bytes(lineage_payload),
+            lineage=lineage,
+            prediction_path=prediction_path,
+            prediction_sha256=sha256_bytes(prediction_payload),
+        )
+    if split == "test" and formal_mode:
+        assert validated_test_authority is not None
+        _cross_validate_test_outputs(
+            authority=validated_test_authority,
+            canonical_path=canonical_path,
+            canonical_payload=canonical_payload,
+            canonical_rows=canonical_rows,
+            prediction_path=prediction_path,
+            prediction_payload=prediction_payload,
+            ordered_predictions=ordered_predictions,
+            lineage_path=lineage_path,
+            lineage=lineage,
+        )
     artifact_rows = [
         {
             "canonical_clip_id": row["canonical_clip_id"],
@@ -2296,7 +4155,7 @@ def evaluate_canonical_bundle(
         }
         for row in ordered_predictions
     ]
-    gate_artifact = _validate_external_validation_gate(
+    gate_artifact, gate = _validate_external_validation_gate(
         validation_gate,
         expected_scope=(
             "validation_candidate_family"
@@ -2306,6 +4165,17 @@ def evaluate_canonical_bundle(
         test_only_allow_four_clip_subset=(
             test_only_allow_four_clip_gate
         ),
+    )
+    _strong_bind_gate(
+        gate=gate,
+        split=split,
+        canonical_path=canonical_path,
+        canonical_payload=canonical_payload,
+        canonical_rows=canonical_rows,
+        ordered_predictions=ordered_predictions,
+        lineage=lineage,
+        test_authority=validated_test_authority,
+        formal_mode=formal_mode,
     )
     prediction_manifest_artifact = {
         "path": str(prediction_path),
@@ -2323,6 +4193,7 @@ def evaluate_canonical_bundle(
             "real": FeatureMoments(),
             "generated": FeatureMoments(),
             "variation_sum": 0.0,
+            "variation_integrity_tolerance_sum": 0.0,
             "bc_numerator": 0.0,
             "bc_denominator": 0,
             "bc_sample_evaluations": 0,
@@ -2394,6 +4265,7 @@ def evaluate_canonical_bundle(
         waveform = _validate_wav_row_and_decode(
             canonical_row,
             motion_frames=frames,
+            decode_audio_16k=decoder,
         )
         beats = _audio_beats(
             backend,
@@ -2442,12 +4314,13 @@ def evaluate_canonical_bundle(
                 raise MetricAdapterContractError(
                     f"{output_id}: delta-distribution Variation is not zero"
                 )
-            # The distribution is a mathematically exact point mass.  The
-            # released np.var implementation can leave a few floating-point
-            # ulps after subtracting its recomputed mean, so canonicalize that
-            # proven roundoff to the protocol's exact value.
-            variation = 0.0
-            state["variation_sum"] += variation
+            # Preserve the exact released primitive result.  The tolerance is
+            # only an integrity bound for a physically repeated point mass;
+            # it is never used to rewrite the reported value to zero.
+            state["variation_sum"] += observed_variation
+            state["variation_integrity_tolerance_sum"] += (
+                roundoff_tolerance
+            )
             bc_numerator, bc_denominator = bc_components_for_batch(
                 physically_repeated,
                 beats,
@@ -2496,10 +4369,7 @@ def evaluate_canonical_bundle(
             "Variation": state["variation_sum"] / expected_clip_count,
             "BC": state["bc_numerator"] / state["bc_denominator"],
         }
-        if (
-            metrics["Variation"] != 0.0
-            or not all(math.isfinite(value) for value in metrics.values())
-        ):
+        if not all(math.isfinite(value) for value in metrics.values()):
             raise MetricAdapterContractError(
                 f"{protocol} metrics violate the finite delta contract"
             )
@@ -2523,6 +4393,14 @@ def evaluate_canonical_bundle(
                 "real": state["real"].to_json(),
                 "generated": state["generated"].to_json(),
             },
+            "primitive_receipt": {
+                "variation_sum": state["variation_sum"],
+                "variation_integrity_tolerance_sum": state[
+                    "variation_integrity_tolerance_sum"
+                ],
+                "bc_numerator": state["bc_numerator"],
+                "bc_denominator": state["bc_denominator"],
+            },
         }
     face_means = {
         name: value / expected_clip_count
@@ -2545,7 +4423,7 @@ def evaluate_canonical_bundle(
         },
         "split": split,
         "selection_protocol": {
-            "primary_metric": "body.released2.metrics.FGD",
+            "primary_metric": PRIMARY_METRIC_PATH,
             "mode": "min",
             "validation_only_for_selection": True,
             "test_evaluations": 0 if split == "val" else 1,
@@ -2571,6 +4449,18 @@ def evaluate_canonical_bundle(
                 "bytes": len(lineage_payload),
                 "payload_sha256": lineage_payload_sha,
             },
+            "test_authority": (
+                None
+                if validated_test_authority is None
+                else {
+                    "path": str(Path(test_authority["path"]).resolve()),
+                    "sha256": test_authority["sha256"],
+                    "bytes": test_authority["bytes"],
+                    "receipt_payload_sha256": test_authority[
+                        "receipt_payload_sha256"
+                    ],
+                }
+            ),
         },
         "metric_assets": assets,
         "counts": {
@@ -2632,44 +4522,12 @@ def _validate_report_feature_statistics(
     *,
     expected_count: int,
     label: str,
-) -> None:
-    if type(value) is not dict or set(value) != {
-        "count",
-        "dimension",
-        "sum",
-        "outer_sum",
-        "covariance_denominator",
-        "covariance_estimator",
-    }:
-        raise MetricAdapterContractError(
-            f"{label} feature-statistics schema mismatch"
-        )
-    count = _require_exact_int(value["count"], f"{label} count", minimum=2)
-    dimension = _require_exact_int(
-        value["dimension"],
-        f"{label} dimension",
-        minimum=1,
+) -> FeatureMoments:
+    return FeatureMoments.from_json(
+        value,
+        expected_count=expected_count,
+        label=label,
     )
-    if (
-        count != expected_count
-        or value["covariance_denominator"] != count - 1
-        or value["covariance_estimator"] != "unbiased_ddof_1"
-    ):
-        raise MetricAdapterContractError(
-            f"{label} unbiased-covariance receipt mismatch"
-        )
-    feature_sum = _finite_array(value["sum"], name=f"{label} sum")
-    outer_sum = _finite_array(
-        value["outer_sum"],
-        name=f"{label} outer sum",
-    )
-    if (
-        feature_sum.shape != (dimension,)
-        or outer_sum.shape != (dimension, dimension)
-    ):
-        raise MetricAdapterContractError(
-            f"{label} sufficient-statistics shape mismatch"
-        )
 
 
 def validate_report(
@@ -2680,6 +4538,8 @@ def validate_report(
     expected_prediction_manifest: Mapping[str, Any],
     expected_distribution_receipt: Mapping[str, Any],
     expected_selection_protocol: Mapping[str, Any],
+    expected_test_authority: Mapping[str, Any] | None = None,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> dict[str, Any]:
     """Fresh, fail-closed validator for selector/merge consumers.
 
@@ -2696,6 +4556,17 @@ def validate_report(
         "expected report clip count",
         minimum=1,
     )
+    fixture_mode = (
+        test_only_allow_four_clip_subset
+        and expected_clip_count == 4
+    )
+    if (
+        not fixture_mode
+        and expected_clip_count != FORMAL_SPLITS[expected_split]["count"]
+    ):
+        raise MetricAdapterContractError(
+            "formal report clip count differs from frozen SHOW split"
+        )
     expected_manifest = dict(expected_prediction_manifest)
     if set(expected_manifest) != {"path", "sha256", "bytes"}:
         raise MetricAdapterContractError(
@@ -2718,7 +4589,7 @@ def validate_report(
         minimum=1,
     )
     frozen_selection_protocol = {
-        "primary_metric": "body.released2.metrics.FGD",
+        "primary_metric": PRIMARY_METRIC_PATH,
         "mode": "min",
         "validation_only_for_selection": True,
         "test_evaluations": 0 if expected_split == "val" else 1,
@@ -2766,12 +4637,25 @@ def validate_report(
         or report["status"] != "complete"
         or report["generator"] != "SemTalk Base-only"
         or report["split"] != expected_split
-        or report["formal_mode"] is not True
-        or report["test_only_mode"] is not False
         or report["selection_protocol"] != frozen_selection_protocol
     ):
         raise MetricAdapterContractError(
             "metric report identity/selection protocol mismatch"
+        )
+    if fixture_mode:
+        if (
+            report["formal_mode"] is not False
+            or report["test_only_mode"] is not True
+        ):
+            raise MetricAdapterContractError(
+                "four-clip report is not explicit CPU fixture output"
+            )
+    elif (
+        report["formal_mode"] is not True
+        or report["test_only_mode"] is not False
+    ):
+        raise MetricAdapterContractError(
+            "formal report identity/selection protocol mismatch"
         )
     if report["dataset"] != {
         "name": "SHOW",
@@ -2786,7 +4670,7 @@ def validate_report(
     if (
         distribution != dict(expected_distribution_receipt)
         or distribution.get("format")
-        != "semtalk_show_deterministic_distribution_receipt_v1"
+        != DISTRIBUTION_RECEIPT_FORMAT
         or distribution.get("payload_hash_algorithm")
         != PAYLOAD_HASH_ALGORITHM
         or distribution.get("protocol") != DISTRIBUTION_PROTOCOL
@@ -2800,7 +4684,8 @@ def validate_report(
         != list(RELEASED2_SLOTS)
         or distribution.get("paper16_slots") != list(PAPER16_SLOTS)
         or distribution.get("face_slot") != FACE_SLOT
-        or distribution.get("diffsheg_slot") != DIFFSHEG_SLOT
+        or distribution.get("variation_policy")
+        != _replication_gate_module().variation_policy_receipt()
         or distribution.get("metric_input_materialization")
         != METRIC_INPUT_MATERIALIZATION
     ):
@@ -2824,8 +4709,30 @@ def validate_report(
         "canonical_manifest",
         "prediction_manifest",
         "prediction_lineage",
+        "test_authority",
     }:
         raise MetricAdapterContractError("metric report inputs schema mismatch")
+    if expected_split == "val":
+        if (
+            expected_test_authority is not None
+            or inputs["test_authority"] is not None
+        ):
+            raise MetricAdapterContractError(
+                "validation report must not contain test authority"
+            )
+    else:
+        if (
+            type(expected_test_authority) is not dict
+            or inputs["test_authority"]
+            != dict(expected_test_authority)
+            or _validated_test_authority(
+                expected_test_authority
+            )["receipt_payload_sha256"]
+            != expected_test_authority["receipt_payload_sha256"]
+        ):
+            raise MetricAdapterContractError(
+                "test report authority binding mismatch"
+            )
     prediction_input = inputs["prediction_manifest"]
     if (
         type(prediction_input) is not dict
@@ -2892,43 +4799,44 @@ def validate_report(
             asset_receipt=assets,
             runtime_receipt=runtime,
         ),
-        require_cuda=True,
+        require_cuda=not fixture_mode,
     )
-    talkshow = assets["talkshow"]
-    if (
-        not isinstance(talkshow, dict)
-        or "path" not in talkshow
-        or validate_talkshow_metric_root(talkshow["path"]) != talkshow
-    ):
-        raise MetricAdapterContractError(
-            "metric report TalkSHOW source closure changed"
-        )
-    for role, expected_sha, expected_dtype in (
-        ("feature_extractor", FEATURE_EXTRACTOR_SHA256, "float32"),
-        ("smplx", SMPLX_SHA256, "float64"),
-    ):
-        artifact = assets[role]
+    if not fixture_mode:
+        talkshow = assets["talkshow"]
         if (
-            type(artifact) is not dict
-            or set(artifact)
-            != {"path", "sha256", "bytes", "runtime_dtype"}
-            or artifact["runtime_dtype"] != expected_dtype
+            not isinstance(talkshow, dict)
+            or "path" not in talkshow
+            or validate_talkshow_metric_root(talkshow["path"]) != talkshow
         ):
             raise MetricAdapterContractError(
-                f"metric report {role} schema/dtype mismatch"
+                "metric report TalkSHOW source closure changed"
             )
-        _path, payload = _verified_file_snapshot(
-            artifact["path"],
-            expected_sha,
-            f"metric report {role}",
-        )
-        if (
-            artifact["sha256"] != expected_sha
-            or artifact["bytes"] != len(payload)
+        for role, expected_sha, expected_dtype in (
+            ("feature_extractor", FEATURE_EXTRACTOR_SHA256, "float32"),
+            ("smplx", SMPLX_SHA256, "float64"),
         ):
-            raise MetricAdapterContractError(
-                f"metric report {role} artifact changed"
+            artifact = assets[role]
+            if (
+                type(artifact) is not dict
+                or set(artifact)
+                != {"path", "sha256", "bytes", "runtime_dtype"}
+                or artifact["runtime_dtype"] != expected_dtype
+            ):
+                raise MetricAdapterContractError(
+                    f"metric report {role} schema/dtype mismatch"
+                )
+            _path, payload = _verified_file_snapshot(
+                artifact["path"],
+                expected_sha,
+                f"metric report {role}",
             )
+            if (
+                artifact["sha256"] != expected_sha
+                or artifact["bytes"] != len(payload)
+            ):
+                raise MetricAdapterContractError(
+                    f"metric report {role} artifact changed"
+                )
     counts = report["counts"]
     if type(counts) is not dict or set(counts) != {
         "clips",
@@ -2952,7 +4860,8 @@ def validate_report(
         or any(type(value) is not int or value < 1 for value in per_speaker.values())
         or sum(per_speaker.values()) != expected_clip_count
         or type(counts["frames"]) is not int
-        or counts["frames"] < expected_clip_count * 2
+        or counts["frames"]
+        < expected_clip_count * (FORMAL_MIN_FRAMES_EXCLUSIVE + 1)
     ):
         raise MetricAdapterContractError(
             "metric report exact-once counts mismatch"
@@ -2970,6 +4879,7 @@ def validate_report(
             "counts",
             "metrics",
             "feature_statistics",
+            "primitive_receipt",
         }:
             raise MetricAdapterContractError(
                 f"metric report {protocol} schema mismatch"
@@ -3035,9 +4945,58 @@ def validate_report(
             f"{protocol} BC",
             nonnegative=True,
         )
-        if variation != 0.0 or bc > 1.0 or not math.isfinite(fgd):
+        if bc > 1.0 or not math.isfinite(fgd):
             raise MetricAdapterContractError(
                 f"metric report {protocol} metric contract mismatch"
+            )
+        primitive = value["primitive_receipt"]
+        if type(primitive) is not dict or set(primitive) != {
+            "variation_sum",
+            "variation_integrity_tolerance_sum",
+            "bc_numerator",
+            "bc_denominator",
+        }:
+            raise MetricAdapterContractError(
+                f"metric report {protocol} primitive receipt mismatch"
+            )
+        variation_sum = _report_number(
+            primitive["variation_sum"],
+            f"{protocol} variation sum",
+            nonnegative=True,
+        )
+        variation_tolerance_sum = _report_number(
+            primitive["variation_integrity_tolerance_sum"],
+            f"{protocol} variation tolerance sum",
+            nonnegative=True,
+        )
+        bc_numerator = _report_number(
+            primitive["bc_numerator"],
+            f"{protocol} BC numerator",
+            nonnegative=True,
+        )
+        bc_denominator = _require_exact_int(
+            primitive["bc_denominator"],
+            f"{protocol} BC denominator",
+            minimum=1,
+        )
+        if (
+            bc_denominator != protocol_counts["bc_denominator"]
+            or variation_sum > variation_tolerance_sum
+            or not math.isclose(
+                variation,
+                variation_sum / expected_clip_count,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            or not math.isclose(
+                bc,
+                bc_numerator / bc_denominator,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+        ):
+            raise MetricAdapterContractError(
+                f"metric report {protocol} primitive recomputation mismatch"
             )
         statistics = value["feature_statistics"]
         if type(statistics) is not dict or set(statistics) != {
@@ -3047,16 +5006,29 @@ def validate_report(
             raise MetricAdapterContractError(
                 f"metric report {protocol} statistics schema mismatch"
             )
-        _validate_report_feature_statistics(
+        real_moments = _validate_report_feature_statistics(
             statistics["real"],
             expected_count=protocol_counts["real_features"],
             label=f"{protocol} real",
         )
-        _validate_report_feature_statistics(
+        generated_moments = _validate_report_feature_statistics(
             statistics["generated"],
             expected_count=protocol_counts["generated_features"],
             label=f"{protocol} generated",
         )
+        recomputed_fgd = frechet_distance(
+            real_moments,
+            generated_moments,
+        )
+        if not math.isclose(
+            fgd,
+            recomputed_fgd,
+            rel_tol=1e-13,
+            abs_tol=1e-13 * max(1.0, abs(fgd), abs(recomputed_fgd)),
+        ):
+            raise MetricAdapterContractError(
+                f"metric report {protocol} FGD does not match its moments"
+            )
     face = report["face"]
     if (
         type(face) is not dict
@@ -3110,7 +5082,7 @@ def validate_report(
         "status": "pass",
         "split": expected_split,
         "clips": expected_clip_count,
-        "primary_metric_path": "body.released2.metrics.FGD",
+        "primary_metric_path": PRIMARY_METRIC_PATH,
         "primary_metric": float(
             body["released2"]["metrics"]["FGD"]
         ),
@@ -3118,16 +5090,650 @@ def validate_report(
     }
 
 
+def _payload_json_artifact(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if type(value) is not dict or set(value) != {
+        "path",
+        "sha256",
+        "bytes",
+        "receipt_payload_sha256",
+    }:
+        raise MetricAdapterContractError(
+            f"{label} payload-artifact schema mismatch"
+        )
+    path, payload = _verified_file_snapshot(
+        value["path"],
+        _require_sha256(value["sha256"], f"{label} file SHA"),
+        label,
+    )
+    if (
+        _require_exact_int(value["bytes"], f"{label} bytes", minimum=1)
+        != len(payload)
+    ):
+        raise MetricAdapterContractError(f"{label} byte count mismatch")
+    decoded = _strict_json_snapshot(payload, label)
+    if payload != canonical_json_bytes(decoded):
+        raise MetricAdapterContractError(
+            f"{label} is not canonical JSON"
+        )
+    unsigned = dict(decoded)
+    payload_sha = _require_sha256(
+        unsigned.pop("receipt_payload_sha256", None),
+        f"{label} payload SHA",
+    )
+    if (
+        payload_sha != value["receipt_payload_sha256"]
+        or canonical_json_sha256(unsigned) != payload_sha
+    ):
+        raise MetricAdapterContractError(
+            f"{label} payload hash mismatch"
+        )
+    return dict(value), decoded
+
+
+def _validate_primary_metric_assets(
+    assets: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    *,
+    fixture_mode: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized_assets, normalized_runtime = _validate_backend_receipts(
+        SimpleNamespace(
+            asset_receipt=assets,
+            runtime_receipt=runtime,
+        ),
+        require_cuda=not fixture_mode,
+    )
+    if fixture_mode:
+        return normalized_assets, normalized_runtime
+    talkshow = normalized_assets["talkshow"]
+    if (
+        type(talkshow) is not dict
+        or "path" not in talkshow
+        or validate_talkshow_metric_root(talkshow["path"]) != talkshow
+    ):
+        raise MetricAdapterContractError(
+            "primary replay TalkSHOW source closure changed"
+        )
+    feature = normalized_assets["feature_extractor"]
+    if (
+        type(feature) is not dict
+        or set(feature)
+        != {"path", "sha256", "bytes", "runtime_dtype"}
+        or feature["runtime_dtype"] != "float32"
+        or feature["sha256"] != FEATURE_EXTRACTOR_SHA256
+    ):
+        raise MetricAdapterContractError(
+            "primary replay feature-extractor receipt mismatch"
+        )
+    _path, payload = _verified_file_snapshot(
+        feature["path"],
+        FEATURE_EXTRACTOR_SHA256,
+        "primary replay feature extractor",
+    )
+    if feature["bytes"] != len(payload):
+        raise MetricAdapterContractError(
+            "primary replay feature-extractor byte count mismatch"
+        )
+    return normalized_assets, normalized_runtime
+
+
+def _metric_runtime_signature(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in runtime.items()
+        if key not in {"device", "device_index", "device_name"}
+    }
+
+
+def build_released2_real_feature_cache(
+    *,
+    canonical_manifest: str | Path,
+    expected_canonical_manifest_sha256: str,
+    backend: MetricBackend,
+    split: str,
+    expected_clip_count: int,
+    formal_mode: bool = True,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Freshly compute the candidate-independent released2 real moments."""
+
+    if split != "val":
+        raise MetricAdapterContractError(
+            "released2 primary cache is validation-selection-only"
+        )
+    fixture_mode = (
+        not formal_mode
+        and test_only_allow_four_clip_subset
+        and expected_clip_count == 4
+    )
+    if formal_mode:
+        _require_concrete_formal_backend(backend)
+    assets, runtime = _validate_primary_metric_assets(
+        backend.asset_receipt,
+        backend.runtime_receipt,
+        fixture_mode=fixture_mode,
+    )
+    canonical_path, canonical_payload = _verified_file_snapshot(
+        canonical_manifest,
+        expected_canonical_manifest_sha256,
+        "primary-cache canonical manifest",
+    )
+    canonical_rows = _strict_jsonl_snapshot(
+        canonical_payload,
+        "primary-cache canonical manifest",
+    )
+    canonical_by_id = _validate_canonical_rows(
+        canonical_rows,
+        split=split,
+        expected_clip_count=expected_clip_count,
+        formal_mode=formal_mode,
+        test_only_allow_four_clip_subset=(
+            test_only_allow_four_clip_subset
+        ),
+    )
+    moments = FeatureMoments()
+    for output_id, row in canonical_by_id.items():
+        arrays = _load_canonical_npz(
+            row["canonical_npz"],
+            expected_sha256=row["canonical_npz_sha256"],
+            frames=row["frames"],
+            speaker_id=row["speaker_id"],
+        )
+        features = _validated_backend_features(
+            backend,
+            reorder_to_talkshow(
+                arrays["pose"],
+                arrays["facial"],
+            )[None],
+        )
+        moments.update(features)
+    if moments.count < 2:
+        raise MetricAdapterContractError(
+            "primary real-feature cache is empty or singular"
+        )
+    result: dict[str, Any] = {
+        "format": PRIMARY_REAL_FEATURE_CACHE_FORMAT,
+        "status": "complete",
+        "split": split,
+        "clip_count": expected_clip_count,
+        "canonical_manifest": {
+            "path": str(canonical_path),
+            "sha256": sha256_bytes(canonical_payload),
+            "bytes": len(canonical_payload),
+            "rows": len(canonical_rows),
+            "selected_rows": len(canonical_by_id),
+        },
+        "metric_assets": assets,
+        "runtime": runtime,
+        "real_feature_statistics": moments.to_json(),
+        "formal_mode": formal_mode,
+        "test_only_mode": fixture_mode,
+    }
+    result["receipt_payload_sha256"] = canonical_json_sha256(result)
+    return result
+
+
+def _validate_released2_real_feature_cache(
+    cache: Mapping[str, Any],
+    *,
+    expected_artifact: Mapping[str, Any],
+    expected_canonical_manifest: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    fixture_mode: bool,
+) -> tuple[dict[str, Any], FeatureMoments]:
+    artifact, decoded = _payload_json_artifact(
+        expected_artifact,
+        label="released2 real-feature cache",
+    )
+    if decoded != cache:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache object/file mismatch"
+        )
+    if type(decoded) is not dict or set(decoded) != {
+        "format",
+        "status",
+        "split",
+        "clip_count",
+        "canonical_manifest",
+        "metric_assets",
+        "runtime",
+        "real_feature_statistics",
+        "formal_mode",
+        "test_only_mode",
+        "receipt_payload_sha256",
+    }:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache schema mismatch"
+        )
+    if (
+        decoded["format"] != PRIMARY_REAL_FEATURE_CACHE_FORMAT
+        or decoded["status"] != "complete"
+        or decoded["split"] != expected_split
+        or decoded["clip_count"] != expected_clip_count
+        or decoded["canonical_manifest"]
+        != dict(expected_canonical_manifest)
+        or decoded["formal_mode"] is not (not fixture_mode)
+        or decoded["test_only_mode"] is not fixture_mode
+    ):
+        raise MetricAdapterContractError(
+            "released2 real-feature cache authority mismatch"
+        )
+    _validate_primary_metric_assets(
+        decoded["metric_assets"],
+        decoded["runtime"],
+        fixture_mode=fixture_mode,
+    )
+    statistics = decoded["real_feature_statistics"]
+    if type(statistics) is not dict:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache moments schema mismatch"
+        )
+    count = _require_exact_int(
+        statistics.get("count"),
+        "released2 real-feature cache count",
+        minimum=2,
+    )
+    moments = FeatureMoments.from_json(
+        statistics,
+        expected_count=count,
+        label="released2 real-feature cache",
+    )
+    return artifact, moments
+
+
+def fresh_replay_released2_primary(
+    report: Mapping[str, Any],
+    backend: MetricBackend,
+    *,
+    real_feature_cache: Mapping[str, Any],
+    expected_real_feature_cache_artifact: Mapping[str, Any],
+    expected_prediction_manifest: Mapping[str, Any],
+    expected_distribution_receipt: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    expected_test_authority: Mapping[str, Any] | None = None,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Freshly replay only the released2 FGD used for Base selection."""
+
+    fixture_mode = (
+        test_only_allow_four_clip_subset
+        and expected_clip_count == 4
+    )
+    if expected_split != "val" or expected_test_authority is not None:
+        raise MetricAdapterContractError(
+            "released2 primary replay is validation-selection-only"
+        )
+    if not fixture_mode:
+        _require_concrete_formal_backend(backend)
+    validated_report = validate_report(
+        report,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        expected_prediction_manifest=expected_prediction_manifest,
+        expected_distribution_receipt=expected_distribution_receipt,
+        expected_selection_protocol=expected_selection_protocol,
+        expected_test_authority=expected_test_authority,
+        test_only_allow_four_clip_subset=fixture_mode,
+    )
+    assets, runtime = _validate_primary_metric_assets(
+        backend.asset_receipt,
+        backend.runtime_receipt,
+        fixture_mode=fixture_mode,
+    )
+    if (
+        assets != report["metric_assets"]
+        or runtime != report["runtime"]
+    ):
+        raise MetricAdapterContractError(
+            "primary replay backend differs from report backend authority"
+        )
+    canonical_input = report["inputs"]["canonical_manifest"]
+    cache_artifact, real_moments = (
+        _validate_released2_real_feature_cache(
+            real_feature_cache,
+            expected_artifact=expected_real_feature_cache_artifact,
+            expected_canonical_manifest=canonical_input,
+            expected_split=expected_split,
+            expected_clip_count=expected_clip_count,
+            fixture_mode=fixture_mode,
+        )
+    )
+    cache_assets = real_feature_cache["metric_assets"]
+    if any(
+        cache_assets[role] != assets[role]
+        for role in ("talkshow", "feature_extractor", "smplx")
+    ) or _metric_runtime_signature(
+        real_feature_cache["runtime"]
+    ) != _metric_runtime_signature(runtime):
+        raise MetricAdapterContractError(
+            "primary replay cache used different metric assets/runtime"
+        )
+    canonical_path, canonical_payload = _verified_file_snapshot(
+        canonical_input["path"],
+        canonical_input["sha256"],
+        "primary replay canonical manifest",
+    )
+    prediction_path, prediction_payload = _verified_file_snapshot(
+        expected_prediction_manifest["path"],
+        expected_prediction_manifest["sha256"],
+        "primary replay prediction manifest",
+    )
+    if (
+        canonical_input["bytes"] != len(canonical_payload)
+        or expected_prediction_manifest["bytes"] != len(prediction_payload)
+    ):
+        raise MetricAdapterContractError(
+            "primary replay manifest byte count mismatch"
+        )
+    canonical_rows = _strict_jsonl_snapshot(
+        canonical_payload,
+        "primary replay canonical manifest",
+    )
+    prediction_rows = _strict_jsonl_snapshot(
+        prediction_payload,
+        "primary replay prediction manifest",
+    )
+    canonical_by_id = _validate_canonical_rows(
+        canonical_rows,
+        split=expected_split,
+        expected_clip_count=expected_clip_count,
+        formal_mode=not fixture_mode,
+        test_only_allow_four_clip_subset=fixture_mode,
+    )
+    ordered_predictions = _validate_prediction_rows(
+        prediction_rows,
+        canonical=canonical_by_id,
+        split=expected_split,
+    )
+    generated_moments = FeatureMoments()
+    for row in ordered_predictions:
+        output_id = row["canonical_clip_id"]
+        canonical_row = canonical_by_id[output_id]
+        arrays = _load_output_npz(
+            row["prediction"],
+            frames=canonical_row["frames"],
+            prediction=True,
+            expected_name=f"res_{output_id}.npz",
+        )
+        canonical_arrays = _load_canonical_npz(
+            canonical_row["canonical_npz"],
+            expected_sha256=canonical_row["canonical_npz_sha256"],
+            frames=canonical_row["frames"],
+            speaker_id=canonical_row["speaker_id"],
+        )
+        if not np.array_equal(
+            arrays["betas"],
+            canonical_arrays["beta"][0],
+        ):
+            raise MetricAdapterContractError(
+                f"{output_id}: replay prediction betas changed"
+            )
+        features = _validated_backend_features(
+            backend,
+            np.repeat(
+                reorder_to_talkshow(
+                    arrays["poses"],
+                    arrays["expressions"],
+                )[None],
+                len(RELEASED2_SLOTS),
+                axis=0,
+            ),
+        )
+        generated_moments.update(features)
+    if generated_moments.count != real_moments.count * len(
+        RELEASED2_SLOTS
+    ):
+        raise MetricAdapterContractError(
+            "primary replay real/generated feature counts disagree"
+        )
+    fresh_fgd = frechet_distance(real_moments, generated_moments)
+    report_fgd = float(validated_report["primary_metric"])
+    if not math.isclose(
+        fresh_fgd,
+        report_fgd,
+        rel_tol=1e-9,
+        abs_tol=1e-9 * max(1.0, abs(fresh_fgd), abs(report_fgd)),
+    ):
+        raise MetricAdapterContractError(
+            "fresh released2 FGD differs from the report"
+        )
+    result: dict[str, Any] = {
+        "format": PRIMARY_REPLAY_FORMAT,
+        "status": "pass",
+        "split": expected_split,
+        "clip_count": expected_clip_count,
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": fresh_fgd,
+        "report_primary_metric": report_fgd,
+        "report_payload_sha256": validated_report[
+            "report_payload_sha256"
+        ],
+        "canonical_manifest": dict(canonical_input),
+        "prediction_manifest": {
+            "path": str(prediction_path),
+            "sha256": sha256_bytes(prediction_payload),
+            "bytes": len(prediction_payload),
+        },
+        "distribution_receipt_payload_sha256": (
+            expected_distribution_receipt["receipt_payload_sha256"]
+        ),
+        "selection_protocol": dict(expected_selection_protocol),
+        "real_feature_cache": cache_artifact,
+        "metric_assets": assets,
+        "runtime": runtime,
+        "real_feature_statistics": real_moments.to_json(),
+        "generated_feature_statistics": generated_moments.to_json(),
+        "formal_mode": not fixture_mode,
+        "test_only_mode": fixture_mode,
+    }
+    result["receipt_payload_sha256"] = canonical_json_sha256(result)
+    return result
+
+
+def validate_released2_primary_replay_receipt(
+    value: Mapping[str, Any],
+    *,
+    expected_report: Mapping[str, Any],
+    expected_prediction_manifest: Mapping[str, Any],
+    expected_distribution_receipt: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Purely validate one externally byte-pinned fresh-replay receipt."""
+
+    artifact, receipt = _payload_json_artifact(
+        value,
+        label="released2 primary replay receipt",
+    )
+    fixture_mode = (
+        test_only_allow_four_clip_subset
+        and expected_clip_count == 4
+    )
+    if expected_split != "val":
+        raise MetricAdapterContractError(
+            "released2 primary replay receipt is validation-selection-only"
+        )
+    validated_report = validate_report(
+        expected_report,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        expected_prediction_manifest=expected_prediction_manifest,
+        expected_distribution_receipt=expected_distribution_receipt,
+        expected_selection_protocol=expected_selection_protocol,
+        test_only_allow_four_clip_subset=fixture_mode,
+    )
+    if type(receipt) is not dict or set(receipt) != {
+        "format",
+        "status",
+        "split",
+        "clip_count",
+        "primary_metric_path",
+        "primary_metric",
+        "report_primary_metric",
+        "report_payload_sha256",
+        "canonical_manifest",
+        "prediction_manifest",
+        "distribution_receipt_payload_sha256",
+        "selection_protocol",
+        "real_feature_cache",
+        "metric_assets",
+        "runtime",
+        "real_feature_statistics",
+        "generated_feature_statistics",
+        "formal_mode",
+        "test_only_mode",
+        "receipt_payload_sha256",
+    }:
+        raise MetricAdapterContractError(
+            "released2 primary replay receipt schema mismatch"
+        )
+    if (
+        receipt["format"] != PRIMARY_REPLAY_FORMAT
+        or receipt["status"] != "pass"
+        or receipt["split"] != expected_split
+        or receipt["clip_count"] != expected_clip_count
+        or receipt["primary_metric_path"] != PRIMARY_METRIC_PATH
+        or receipt["report_payload_sha256"]
+        != validated_report["report_payload_sha256"]
+        or receipt["canonical_manifest"]
+        != expected_report["inputs"]["canonical_manifest"]
+        or receipt["prediction_manifest"]
+        != dict(expected_prediction_manifest)
+        or receipt["distribution_receipt_payload_sha256"]
+        != expected_distribution_receipt["receipt_payload_sha256"]
+        or receipt["selection_protocol"]
+        != dict(expected_selection_protocol)
+        or receipt["metric_assets"] != expected_report["metric_assets"]
+        or receipt["runtime"] != expected_report["runtime"]
+        or receipt["formal_mode"] is not (not fixture_mode)
+        or receipt["test_only_mode"] is not fixture_mode
+    ):
+        raise MetricAdapterContractError(
+            "released2 primary replay authority mismatch"
+        )
+    cache_artifact, real_moments = _validate_released2_real_feature_cache(
+        _payload_json_artifact(
+            receipt["real_feature_cache"],
+            label="released2 replay bound real-feature cache",
+        )[1],
+        expected_artifact=receipt["real_feature_cache"],
+        expected_canonical_manifest=receipt["canonical_manifest"],
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    if cache_artifact != receipt["real_feature_cache"]:
+        raise MetricAdapterContractError(
+            "released2 primary replay cache binding changed"
+        )
+    _cache_artifact, cache_payload = _payload_json_artifact(
+        receipt["real_feature_cache"],
+        label="released2 replay runtime-bound real-feature cache",
+    )
+    if any(
+        cache_payload["metric_assets"][role]
+        != receipt["metric_assets"][role]
+        for role in ("talkshow", "feature_extractor", "smplx")
+    ) or _metric_runtime_signature(
+        cache_payload["runtime"]
+    ) != _metric_runtime_signature(receipt["runtime"]):
+        raise MetricAdapterContractError(
+            "released2 primary replay cache assets/runtime differ"
+        )
+    real_statistics = receipt["real_feature_statistics"]
+    generated_statistics = receipt["generated_feature_statistics"]
+    if real_statistics != real_moments.to_json():
+        raise MetricAdapterContractError(
+            "released2 primary replay real moments differ from cache"
+        )
+    generated_count = _require_exact_int(
+        generated_statistics.get("count")
+        if type(generated_statistics) is dict
+        else None,
+        "released2 primary replay generated count",
+        minimum=2,
+    )
+    generated_moments = FeatureMoments.from_json(
+        generated_statistics,
+        expected_count=generated_count,
+        label="released2 primary replay generated",
+    )
+    if generated_count != real_moments.count * len(RELEASED2_SLOTS):
+        raise MetricAdapterContractError(
+            "released2 primary replay feature counts changed"
+        )
+    recomputed = frechet_distance(real_moments, generated_moments)
+    primary = _report_number(
+        receipt["primary_metric"],
+        "released2 primary replay metric",
+        nonnegative=True,
+    )
+    report_primary = _report_number(
+        receipt["report_primary_metric"],
+        "released2 primary replay report metric",
+        nonnegative=True,
+    )
+    if (
+        not math.isclose(
+            primary,
+            recomputed,
+            rel_tol=1e-13,
+            abs_tol=1e-13 * max(1.0, abs(primary), abs(recomputed)),
+        )
+        or not math.isclose(
+            report_primary,
+            float(validated_report["primary_metric"]),
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+        or not math.isclose(
+            primary,
+            report_primary,
+            rel_tol=1e-9,
+            abs_tol=1e-9
+            * max(1.0, abs(primary), abs(report_primary)),
+        )
+    ):
+        raise MetricAdapterContractError(
+            "released2 primary replay metric derivation mismatch"
+        )
+    return {
+        "artifact": artifact,
+        "receipt_payload_sha256": receipt[
+            "receipt_payload_sha256"
+        ],
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": primary,
+        "report_payload_sha256": receipt["report_payload_sha256"],
+        "prediction_manifest": dict(receipt["prediction_manifest"]),
+        "real_feature_cache": dict(receipt["real_feature_cache"]),
+        "metric_assets": dict(receipt["metric_assets"]),
+        "runtime": dict(receipt["runtime"]),
+    }
+
+
 def _atomic_write_new(path: Path, payload: bytes) -> None:
     destination = path.expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    created = False
     try:
         with destination.open("xb") as handle:
+            created = True
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
-        destination.unlink(missing_ok=True)
+        if created:
+            destination.unlink(missing_ok=True)
         raise
 
 
@@ -3169,6 +5775,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-distribution-declaration-sha256",
         required=True,
     )
+    parser.add_argument("--test-authority-json", type=Path)
+    parser.add_argument("--expected-test-authority-sha256")
+    parser.add_argument("--expected-test-authority-bytes", type=int)
+    parser.add_argument(
+        "--expected-test-authority-receipt-payload-sha256"
+    )
     parser.add_argument("--talkshow-metric-root", type=Path, required=True)
     parser.add_argument("--feature-extractor", type=Path, required=True)
     parser.add_argument("--smplx-asset", type=Path, required=True)
@@ -3185,7 +5797,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--output-json", type=Path, required=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    authority_values = (
+        args.test_authority_json,
+        args.expected_test_authority_sha256,
+        args.expected_test_authority_bytes,
+        args.expected_test_authority_receipt_payload_sha256,
+    )
+    if args.split == "test" and any(value is None for value in authority_values):
+        parser.error(
+            "test split requires authority JSON plus SHA/bytes/payload SHA"
+        )
+    if args.split == "val" and any(
+        value is not None for value in authority_values
+    ):
+        parser.error("val split forbids every test-authority option")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -3211,6 +5838,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validation gate payload SHA",
         ),
     }
+    test_authority = (
+        None
+        if args.split == "val"
+        else {
+            "path": str(args.test_authority_json.resolve()),
+            "sha256": args.expected_test_authority_sha256,
+            "bytes": args.expected_test_authority_bytes,
+            "receipt_payload_sha256": (
+                args.expected_test_authority_receipt_payload_sha256
+            ),
+        }
+    )
     backend = TalkShowCudaMetricBackend(
         talkshow_root=args.talkshow_metric_root,
         feature_extractor=args.feature_extractor,
@@ -3233,6 +5872,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         validation_gate=validation_gate,
         distribution_declaration=declaration,
+        test_authority=test_authority,
         backend=backend,
         split=args.split,
         expected_clip_count=args.expected_clip_count,

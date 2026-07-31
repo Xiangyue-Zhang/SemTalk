@@ -64,7 +64,9 @@ class SelectorFixture:
     def build(self) -> dict[str, object]:
         adapter = self.base.adapter()
         with mock.patch.object(
-            AUTHORITY.importlib, "import_module", return_value=adapter
+            AUTHORITY,
+            "_fresh_local_module",
+            side_effect=lambda name: self.base.source_module(name, adapter),
         ):
             return SELECTOR.build_published_base_winner_selection(
                 self.evidence_artifact,
@@ -140,7 +142,12 @@ class PublishedBaseSelectorTests(unittest.TestCase):
         ]
         adapter = self.fixture.base.adapter()
         with mock.patch.object(
-            AUTHORITY.importlib, "import_module", return_value=adapter
+            AUTHORITY,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.base.source_module(
+                name,
+                adapter,
+            ),
         ):
             normalized, replayed, winner = AUTHORITY._validate_winner_selection(
                 artifact,
@@ -209,7 +216,12 @@ class PublishedBaseSelectorTests(unittest.TestCase):
             )
         )
         with mock.patch.object(
-            AUTHORITY.importlib, "import_module", return_value=adapter
+            AUTHORITY,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.base.source_module(
+                name,
+                adapter,
+            ),
         ), self.assertRaisesRegex(
             SELECTOR.PublishedBaseSelectionError,
             "neutral TalkSHOW report replay failed",

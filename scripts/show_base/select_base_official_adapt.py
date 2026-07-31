@@ -189,12 +189,144 @@ def canonical_json_sha256(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _safe_file_snapshot(
+    value: Any,
+    label: str,
+) -> tuple[Path, bytes]:
+    if not isinstance(value, (str, os.PathLike)):
+        raise SelectionContractError(f"{label} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise SelectionContractError(f"{label} must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise SelectionContractError(f"{label} does not exist: {path}") from error
+    if resolved != path:
+        raise SelectionContractError(
+            f"{label} must be canonical with no symlink ancestor: {path}"
+        )
+    parts = path.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise SelectionContractError(
+            f"{label} must be below the filesystem root"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise SelectionContractError(
+                f"{label} must be a regular non-symlink file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in fields
+        ):
+            raise SelectionContractError(
+                f"{label} changed while it was read"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise SelectionContractError(
+                f"{label} size changed while it was read"
+            )
+        return path, payload
+    except SelectionContractError:
+        raise
+    except OSError as error:
+        raise SelectionContractError(
+            f"cannot safely read {label}: {path}"
+        ) from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _safe_directory(value: Any, label: str) -> Path:
+    if not isinstance(value, (str, os.PathLike)):
+        raise SelectionContractError(f"{label} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise SelectionContractError(f"{label} must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise SelectionContractError(f"{label} does not exist: {path}") from error
+    if resolved != path:
+        raise SelectionContractError(
+            f"{label} must be canonical with no symlink ancestor: {path}"
+        )
+    parts = path.parts
+    if not parts or parts[0] != os.sep:
+        raise SelectionContractError(
+            f"{label} must be below the filesystem root"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise SelectionContractError(
+                f"{label} must be a non-symlink directory"
+            )
+        return path
+    except SelectionContractError:
+        raise
+    except OSError as error:
+        raise SelectionContractError(
+            f"cannot safely resolve {label}: {path}"
+        ) from error
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    _resolved, payload = _safe_file_snapshot(
+        path,
+        f"SHA-256 input {path}",
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -298,15 +430,7 @@ def reject_test_path(path: Path, label: str) -> None:
 
 def require_directory(value: Any, label: str) -> Path:
     path = require_val_only_path(value, label)
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        raise FileNotFoundError(path) from None
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        raise SelectionContractError(
-            f"{label} must be a non-symlink directory: {path}"
-        )
-    resolved = path.resolve(strict=True)
+    resolved = _safe_directory(path, label)
     reject_forbidden_source_labels(resolved)
     reject_test_path(resolved, label)
     return resolved
@@ -337,15 +461,7 @@ def canonical_clip_id(source_clip_id: str) -> str:
 
 def _regular_file(path: Path, label: str) -> Path:
     reject_forbidden_source_labels(path)
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        raise FileNotFoundError(path) from None
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise SelectionContractError(
-            f"{label} must be a regular non-symlink file: {path}"
-        )
-    resolved = path.resolve(strict=True)
+    resolved, _payload = _safe_file_snapshot(path, label)
     reject_forbidden_source_labels(resolved)
     return resolved
 
@@ -356,8 +472,8 @@ def _verified_bytes(
     label: str,
 ) -> tuple[Path, bytes, str]:
     expected = require_sha256(expected_sha256, f"{label} SHA-256")
-    resolved = _regular_file(path, label)
-    payload = resolved.read_bytes()
+    resolved, payload = _safe_file_snapshot(path, label)
+    reject_forbidden_source_labels(resolved)
     observed = hashlib.sha256(payload).hexdigest()
     if observed != expected:
         raise SelectionContractError(

@@ -120,9 +120,10 @@ def _validate_source_receipt(
     if observed_relative != relative:
         raise contract.ContractError(f"{label}.script_relative mismatch")
     if reprove_local:
-        if root.is_symlink() or not root.is_dir():
-            raise contract.ContractError(f"{label}.source_root is invalid")
-        resolved_root = root.resolve(strict=True)
+        resolved_root = contract._safe_directory(
+            root,
+            f"{label}.source_root",
+        )
         resolved_script = contract.regular_file(
             script,
             f"{label}.script",
@@ -400,8 +401,10 @@ def _read_shard(
     expected_rows: Sequence[Mapping[str, Any]],
     canonical_receipt: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    resolved = contract.regular_file(path, f"{stage} epoch {epoch} shard")
-    payload_bytes = resolved.read_bytes()
+    resolved, payload_bytes = contract._safe_file_snapshot(
+        path,
+        f"{stage} epoch {epoch} shard",
+    )
     payload = contract.verify_receipt_payload(
         contract.strict_json_bytes(payload_bytes, str(resolved)),
         f"{stage} epoch {epoch} shard {shard_index}",

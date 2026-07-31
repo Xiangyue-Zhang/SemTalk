@@ -27,6 +27,7 @@ import json
 import math
 import os
 import random
+import stat
 import subprocess
 import sys
 import tempfile
@@ -221,12 +222,88 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _safe_file_snapshot(
+    value: Any,
+    label: str,
+) -> tuple[Path, bytes]:
+    if not isinstance(value, (str, os.PathLike)):
+        raise TypeError(f"{label} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise FileNotFoundError(path) from error
+    if resolved != path:
+        raise RuntimeError(
+            f"{label} must be canonical with no symlink ancestor: {path}"
+        )
+    parts = path.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise RuntimeError(f"{label} must be below the filesystem root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(
+                f"{label} must be a regular non-symlink file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in fields
+        ):
+            raise RuntimeError(f"{label} changed while it was read")
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise RuntimeError(f"{label} size changed while it was read")
+        return path, payload
+    except (TypeError, ValueError, RuntimeError):
+        raise
+    except OSError as error:
+        raise RuntimeError(f"cannot safely read {label}: {path}") from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    _resolved, payload = _safe_file_snapshot(
+        path,
+        f"SHA-256 input {path}",
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -266,12 +343,7 @@ def require_finite_number(value: Any, label: str) -> float:
 
 def read_verified_bytes(path: Path, expected_sha256: str, label: str) -> tuple[Path, bytes]:
     require_sha256(expected_sha256, f"{label} expected SHA-256")
-    if path.is_symlink():
-        raise RuntimeError(f"{label} must not be a symlink: {path}")
-    resolved = path.resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(resolved)
-    payload = resolved.read_bytes()
+    resolved, payload = _safe_file_snapshot(path, label)
     actual = sha256_bytes(payload)
     if actual != expected_sha256:
         raise RuntimeError(

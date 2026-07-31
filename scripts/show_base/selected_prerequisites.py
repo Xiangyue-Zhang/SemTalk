@@ -235,11 +235,15 @@ def canonical_json_sha256(value: Any) -> str:
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    try:
+        _resolved, payload = raw_contract._safe_file_snapshot(
+            path,
+            f"SHA-256 input {path}",
+            val_only=False,
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(str(error)) from error
+    return hashlib.sha256(payload).hexdigest()
 
 
 def require_sha256(value: Any, label: str) -> str:
@@ -326,27 +330,36 @@ def regular_file(
     *,
     val_only: bool = True,
 ) -> Path:
-    if not isinstance(value, (str, os.PathLike)):
-        raise SelectedPrerequisiteError(f"{label} must be a path")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        raise SelectedPrerequisiteError(f"{label} must be absolute")
+    try:
+        path, _payload = raw_contract._safe_file_snapshot(
+            value,
+            label,
+            val_only=False,
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(str(error)) from error
     if val_only:
         reject_forbidden(path, label)
+    return path
+
+
+def _safe_file_snapshot(
+    value: Any,
+    label: str,
+    *,
+    val_only: bool = True,
+) -> tuple[Path, bytes]:
     try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        raise SelectedPrerequisiteError(
-            f"{label} does not exist: {path}"
-        ) from None
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise SelectedPrerequisiteError(
-            f"{label} must be a regular non-symlink file: {path}"
+        path, payload = raw_contract._safe_file_snapshot(
+            value,
+            label,
+            val_only=False,
         )
-    resolved = path.resolve(strict=True)
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(str(error)) from error
     if val_only:
-        reject_forbidden(resolved, label)
-    return resolved
+        reject_forbidden(path, label)
+    return path, payload
 
 
 def strict_json_bytes(payload: bytes, label: str) -> dict[str, Any]:
@@ -414,9 +427,12 @@ def _read_artifact(
     parse_json: bool = True,
 ) -> tuple[Path, bytes, dict[str, Any] | None, dict[str, Any]]:
     binding = exact_keys(value, keys, f"{label} artifact")
-    path = regular_file(binding["path"], label, val_only=val_only)
+    path, payload = _safe_file_snapshot(
+        binding["path"],
+        label,
+        val_only=val_only,
+    )
     expected_sha = require_sha256(binding["sha256"], f"{label} SHA-256")
-    payload = path.read_bytes()
     observed_sha = hashlib.sha256(payload).hexdigest()
     if observed_sha != expected_sha:
         raise SelectedPrerequisiteError(
@@ -542,10 +558,13 @@ def _validate_show_all_training_dataset(
 def _validate_producer_source(value: Any, label: str) -> dict[str, Any]:
     source = exact_keys(value, PRODUCER_SOURCE_KEYS, label)
     _validate_training_source(source, label)
-    root = Path(source["source_root"])
-    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
-        raise SelectedPrerequisiteError(f"{label}.source_root is invalid")
-    root = root.resolve(strict=True)
+    try:
+        root = raw_contract._safe_directory(
+            source["source_root"],
+            f"{label}.source_root",
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(str(error)) from error
     script = regular_file(source["script"], f"{label}.script", val_only=False)
     try:
         relative = str(script.relative_to(root))
@@ -1322,12 +1341,14 @@ def load_selected_prerequisites(
 ) -> dict[str, Any]:
     """Load and fully revalidate one five-stage selection transaction."""
 
-    path = regular_file(path_value, "prerequisite selection")
+    path, payload_bytes = _safe_file_snapshot(
+        path_value,
+        "prerequisite selection",
+    )
     expected_file_sha = require_sha256(
         expected_sha256,
         "prerequisite selection expected SHA-256",
     )
-    payload_bytes = path.read_bytes()
     observed_file_sha = hashlib.sha256(payload_bytes).hexdigest()
     if observed_file_sha != expected_file_sha:
         raise SelectedPrerequisiteError(

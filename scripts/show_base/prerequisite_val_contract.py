@@ -68,14 +68,14 @@ def validate_candidate_epochs(value: Any) -> tuple[int, ...]:
         or any(
             epoch <= 0
             or epoch % 20 != 0
-            or (index and epoch <= epochs[index - 1])
+            or (index and epoch != epochs[index - 1] + 20)
             for index, epoch in enumerate(epochs)
         )
         or any(epoch <= required[-1] for epoch in epochs[len(required) :])
     ):
         raise ContractError(
             "candidate epochs must be the e20..e200 prefix followed by "
-            "strictly increasing 20-epoch append-only boundaries"
+            "contiguous +20-epoch append-only boundaries"
         )
     return epochs
 
@@ -251,12 +251,144 @@ def canonical_payload_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+def _safe_file_snapshot(
+    value: Any,
+    label: str,
+    *,
+    val_only: bool = True,
+) -> tuple[Path, bytes]:
+    if not isinstance(value, (str, os.PathLike)):
+        raise ContractError(f"{label} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ContractError(f"{label} must be absolute")
+    if val_only:
+        reject_forbidden_label(path, label)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"{label} does not exist: {path}") from error
+    if val_only:
+        reject_forbidden_label(resolved, label)
+    if resolved != path:
+        raise ContractError(
+            f"{label} must be a regular non-symlink file at a canonical "
+            f"path with no symlink ancestor: {path}"
+        )
+    parts = path.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise ContractError(f"{label} must be below the filesystem root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ContractError(
+                f"{label} must be a regular non-symlink file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in fields
+        ):
+            raise ContractError(f"{label} changed while it was read")
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise ContractError(f"{label} size changed while it was read")
+        if val_only:
+            reject_forbidden_label(path, label)
+        return path, payload
+    except ContractError:
+        raise
+    except OSError as error:
+        raise ContractError(f"cannot safely read {label}: {path}") from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _safe_directory(value: Any, label: str) -> Path:
+    if not isinstance(value, (str, os.PathLike)):
+        raise ContractError(f"{label} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ContractError(f"{label} must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"{label} does not exist: {path}") from error
+    if resolved != path:
+        raise ContractError(
+            f"{label} must be canonical with no symlink ancestor: {path}"
+        )
+    parts = path.parts
+    if not parts or parts[0] != os.sep:
+        raise ContractError(f"{label} must be below the filesystem root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        if not stat.S_ISDIR(os.fstat(directory_fd).st_mode):
+            raise ContractError(
+                f"{label} must be a non-symlink directory"
+            )
+        return path
+    except ContractError:
+        raise
+    except OSError as error:
+        raise ContractError(
+            f"cannot safely resolve {label}: {path}"
+        ) from error
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    _resolved, payload = _safe_file_snapshot(
+        path,
+        f"SHA-256 input {path}",
+        val_only=False,
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def window_count(frames: Any) -> int:
@@ -355,23 +487,12 @@ def regular_file(
     *,
     val_only: bool = True,
 ) -> Path:
-    if not isinstance(value, (str, os.PathLike)):
-        raise ContractError(f"{label} must be a path")
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        raise ContractError(f"{label} must be absolute")
-    if val_only:
-        reject_forbidden_label(path, label)
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        raise ContractError(f"{label} does not exist: {path}") from None
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise ContractError(f"{label} must be a regular non-symlink file")
-    resolved = path.resolve(strict=True)
-    if val_only:
-        reject_forbidden_label(resolved, label)
-    return resolved
+    path, _payload = _safe_file_snapshot(
+        value,
+        label,
+        val_only=val_only,
+    )
+    return path
 
 
 def read_verified_file(
@@ -382,8 +503,11 @@ def read_verified_file(
     val_only: bool = True,
 ) -> tuple[Path, bytes, str]:
     expected = require_sha256(expected_sha256, f"{label} expected SHA-256")
-    path = regular_file(value, label, val_only=val_only)
-    payload = path.read_bytes()
+    path, payload = _safe_file_snapshot(
+        value,
+        label,
+        val_only=val_only,
+    )
     observed = hashlib.sha256(payload).hexdigest()
     if observed != expected:
         raise ContractError(
@@ -478,7 +602,11 @@ def freeze_training_audit_source(
         label,
         reprove_entrypoint=True,
     )
-    entrypoint = Path(training_audit["entrypoint"]).resolve(strict=True)
+    entrypoint, _entrypoint_payload = _safe_file_snapshot(
+        training_audit["entrypoint"],
+        f"{label}.entrypoint",
+        val_only=False,
+    )
 
     def git(*arguments: str, check: bool = True) -> str:
         result = subprocess.run(
@@ -490,8 +618,9 @@ def freeze_training_audit_source(
         return result.stdout.strip()
 
     try:
-        source_root = Path(git("rev-parse", "--show-toplevel")).resolve(
-            strict=True
+        source_root = _safe_directory(
+            git("rev-parse", "--show-toplevel"),
+            f"{label}.source_root",
         )
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         raise ContractError(f"{label} entrypoint is not in Git") from error

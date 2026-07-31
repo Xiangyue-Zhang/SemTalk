@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import importlib
@@ -8,29 +9,35 @@ import io
 import json
 import os
 from pathlib import Path
+import py_compile
+import shutil
+import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 import wave
 
 import numpy as np
 
+import scripts.show_base as SHOW_BASE_PACKAGE
 
 METRICS = importlib.import_module(
     "scripts.show_base.evaluate_talkshow_show_metrics"
+)
+PRIMARY_CLI = importlib.import_module(
+    "scripts.show_base.replay_released2_primary"
 )
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_external_gate_test_module() -> object:
-    gate_source = Path(
-        os.environ.get(
-            METRICS.REPLICATION_GATE_MODULE_ENV,
-            ROOT
-            / "scripts"
-            / "show_base"
-            / "deterministic_replication_gate.py",
-        )
+    gate_source = (
+        ROOT
+        / "scripts"
+        / "show_base"
+        / "deterministic_replication_gate.py"
     ).resolve()
     source = (
         gate_source.parents[2]
@@ -96,8 +103,28 @@ class SyntheticBackend:
             "torch": "synthetic-test",
             "smplx": "synthetic-test",
             "librosa": "synthetic-test",
+            "soundfile": "synthetic-test",
+            "soxr": "synthetic-test",
             "device": "cpu",
         }
+
+    def decode_audio_16k(self, snapshot: bytes) -> np.ndarray:
+        with wave.open(io.BytesIO(snapshot), "rb") as handle:
+            channels = handle.getnchannels()
+            rate = handle.getframerate()
+            frames = handle.getnframes()
+            samples = np.frombuffer(
+                handle.readframes(frames),
+                dtype="<i2",
+            ).reshape(frames, channels)
+        mono = samples.astype(np.float32).mean(axis=1) / np.float32(32768.0)
+        output_frames = int(np.ceil(mono.size * 16000 / rate))
+        positions = np.arange(output_frames, dtype=np.float64) * rate / 16000
+        return np.interp(
+            positions,
+            np.arange(mono.size, dtype=np.float64),
+            mono,
+        ).astype(np.float32)
 
     def extract_body_features(self, parameters_265: np.ndarray) -> np.ndarray:
         array = np.asarray(parameters_265)
@@ -133,31 +160,6 @@ class ShapeRecordingCudaBackend(SyntheticBackend):
         self.feature_call_shapes: list[tuple[int, ...]] = []
         self.joint_call_shapes: list[tuple[int, ...]] = []
 
-    @property
-    def asset_receipt(self) -> dict[str, object]:
-        receipt = super().asset_receipt
-        receipt["execution_device"] = "cuda:0"
-        receipt["feature_extractor"]["runtime_dtype"] = "float32"
-        receipt["smplx"]["runtime_dtype"] = "float64"
-        return receipt
-
-    @property
-    def runtime_receipt(self) -> dict[str, object]:
-        return {
-            "python": "3.12-test",
-            "numpy": np.__version__,
-            "torch": "2.test",
-            "smplx": "synthetic-test",
-            "librosa": "synthetic-test",
-            "scipy": "synthetic-test",
-            "cuda": "12.test",
-            "cudnn": "9.test",
-            "device": "cuda:0",
-            "device_type": "cuda",
-            "device_index": 0,
-            "device_name": "Synthetic H200",
-        }
-
     def extract_body_features(self, parameters_265: np.ndarray) -> np.ndarray:
         self.feature_call_shapes.append(tuple(parameters_265.shape))
         return super().extract_body_features(parameters_265)
@@ -172,9 +174,10 @@ class ShapeRecordingCudaBackend(SyntheticBackend):
 
 
 class SyntheticBundle:
-    def __init__(self, root: Path, *, clips: int = 4, frames: int = 12):
+    def __init__(self, root: Path, *, clips: int = 4, frames: int = 64):
         if clips != 4:
             raise ValueError("fixture uses one clip per SHOW speaker")
+        root = root.resolve()
         self.root = root
         self.frames = frames
         self.canonical_manifest = root / "canonical_manifest.jsonl"
@@ -187,16 +190,22 @@ class SyntheticBundle:
         self._build()
 
     @staticmethod
-    def _wav(path: Path, frames: int = 6400) -> None:
-        samples = (
-            np.sin(np.arange(frames) * (2.0 * np.pi * 220.0 / 16000.0))
+    def _wav(path: Path, frames: int = 48_000) -> None:
+        time = np.arange(frames)
+        left = (
+            np.sin(time * (2.0 * np.pi * 220.0 / 22_000.0))
             * 12000.0
         ).astype("<i2")
+        right = (
+            np.cos(time * (2.0 * np.pi * 330.0 / 22_000.0))
+            * 9000.0
+        ).astype("<i2")
+        samples = np.stack((left, right), axis=1)
         payload = io.BytesIO()
         with wave.open(payload, "wb") as handle:
-            handle.setnchannels(1)
+            handle.setnchannels(2)
             handle.setsampwidth(2)
-            handle.setframerate(16000)
+            handle.setframerate(22000)
             handle.writeframes(samples.tobytes())
         path.write_bytes(payload.getvalue())
 
@@ -277,11 +286,11 @@ class SyntheticBundle:
                 "lower_foot_local_relative": f"{output_id}.lower.npy",
                 "frames": self.frames,
                 "pose_fps": 30,
-                "wav_channels": 1,
+                "wav_channels": 2,
                 "wav_sample_width": 2,
-                "wav_sample_rate": 16000,
-                "wav_frames": 6400,
-                "wav_mono_policy": "synthetic_mono",
+                "wav_sample_rate": 22000,
+                "wav_frames": 48000,
+                "wav_mono_policy": METRICS.CANONICAL_WAV_MONO_POLICY,
                 "source_pkl_sha256": dummy_sha,
                 "source_wav_sha256": sha256_file(wav),
                 "canonical_npz_sha256": sha256_file(canonical_npz),
@@ -485,7 +494,7 @@ class FeatureMomentsTest(unittest.TestCase):
         )
         for repeats in (2, 16):
             logical = METRICS.FeatureMoments()
-            logical.update(values, repeat=repeats)
+            logical.update(np.repeat(values, repeats, axis=0))
             physical = METRICS.FeatureMoments()
             physical.update(np.repeat(values, repeats, axis=0))
             self.assertEqual(logical.count, physical.count)
@@ -566,7 +575,9 @@ class FormulaTest(unittest.TestCase):
         }
         for repeats, expected in expected_fgd.items():
             generated_moments = METRICS.FeatureMoments()
-            generated_moments.update(generated, repeat=repeats)
+            generated_moments.update(
+                np.repeat(generated, repeats, axis=0)
+            )
             self.assertAlmostEqual(
                 METRICS.frechet_distance(
                     real_moments,
@@ -611,13 +622,988 @@ class FormulaTest(unittest.TestCase):
 
 
 class OfflineAdapterTest(unittest.TestCase):
+    def test_primary_cli_supports_direct_script_execution(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(
+                    ROOT
+                    / "scripts"
+                    / "show_base"
+                    / "replay_released2_primary.py"
+                ),
+                "--help",
+            ],
+            cwd="/",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("build-cache", completed.stdout)
+        self.assertIn("replay", completed.stdout)
+
+    def test_primary_cli_is_wired_and_create_new_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "cache.json"
+            canonical = root / "canonical.jsonl"
+            canonical.write_bytes(b"fixture\n")
+            result = {
+                "format": METRICS.PRIMARY_REAL_FEATURE_CACHE_FORMAT,
+                "receipt_payload_sha256": "1" * 64,
+            }
+            argv = [
+                "build-cache",
+                "--talkshow-metric-root",
+                str(root),
+                "--feature-extractor",
+                str(root / "feature.pth"),
+                "--smplx-asset",
+                str(root / "smplx.npz"),
+                "--device",
+                "cuda:0",
+                "--split",
+                "val",
+                "--expected-clip-count",
+                "1715",
+                "--output-json",
+                str(output),
+                "--canonical-manifest",
+                str(canonical),
+                "--expected-canonical-manifest-sha256",
+                "2" * 64,
+            ]
+            with (
+                mock.patch.object(
+                    PRIMARY_CLI,
+                    "_backend",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    METRICS,
+                    "build_released2_real_feature_cache",
+                    return_value=result,
+                ) as builder,
+            ):
+                self.assertEqual(PRIMARY_CLI.main(argv), 0)
+                self.assertEqual(
+                    json.loads(output.read_bytes()),
+                    result,
+                )
+                builder.assert_called_once()
+                with self.assertRaises(FileExistsError):
+                    PRIMARY_CLI.main(argv)
+
+    def test_final_npz_provenance_rejects_relocation_and_unrelated_shard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "final"
+            npz_root = root / "npz" / "test"
+            npz_root.mkdir(parents=True)
+            output_id = "oliver_clip00"
+            source_clip_id = "oliver/video/clip00"
+            common = {
+                "global_index": 15402,
+                "source_clip_id": source_clip_id,
+                "canonical_clip_id": output_id,
+                "speaker": "oliver",
+                "speaker_id": 0,
+                "frames": 64,
+                "canonical_npz": str((root / "canonical.npz").resolve()),
+                "canonical_npz_sha256": "1" * 64,
+                "audio_feature_npz": str((root / "audio.npz").resolve()),
+                "audio_feature_npz_sha256": "2" * 64,
+            }
+            receipts = {}
+            shard_receipts = {}
+            shard_npz_root = (
+                Path(directory)
+                / "shards"
+                / "shard-00002-of-00008"
+                / "npz"
+                / "test"
+            )
+            shard_npz_root.mkdir(parents=True)
+            for role, prefix in (
+                ("prediction", "res"),
+                ("ground_truth", "gt"),
+            ):
+                path = npz_root / f"{prefix}_{output_id}.npz"
+                path.write_bytes(role.encode())
+                receipts[role] = {
+                    "path": str(path.resolve()),
+                    "sha256": sha256_file(path),
+                    "bytes": path.stat().st_size,
+                }
+                shard_path = shard_npz_root / path.name
+                shutil.copyfile(path, shard_path)
+                shard_receipts[role] = {
+                    "path": str(shard_path.resolve()),
+                    "sha256": sha256_file(shard_path),
+                    "bytes": shard_path.stat().st_size,
+                }
+            shard = {**common, **copy.deepcopy(shard_receipts)}
+            final = {
+                **common,
+                **copy.deepcopy(receipts),
+                "evaluation_index": 0,
+            }
+            METRICS._validate_final_npz_provenance(
+                root=root.resolve(),
+                ordered_predictions=[final],
+                shard_rows_by_id={output_id: shard},
+            )
+            relocated = Path(directory) / f"res_{output_id}.npz"
+            shutil.copyfile(receipts["prediction"]["path"], relocated)
+            relocated_row = copy.deepcopy(final)
+            relocated_row["prediction"]["path"] = str(relocated.resolve())
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "exact artifact path",
+            ):
+                METRICS._validate_final_npz_provenance(
+                    root=root.resolve(),
+                    ordered_predictions=[relocated_row],
+                    shard_rows_by_id={output_id: shard},
+                )
+            unrelated = copy.deepcopy(shard)
+            unrelated["source_clip_id"] = "oliver/video/other"
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "identity receipts",
+            ):
+                METRICS._validate_final_npz_provenance(
+                    root=root.resolve(),
+                    ordered_predictions=[final],
+                    shard_rows_by_id={output_id: unrelated},
+                )
+            missing_source = Path(shard["prediction"]["path"])
+            missing_source.unlink()
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "regular file",
+            ):
+                METRICS._validate_final_npz_provenance(
+                    root=root.resolve(),
+                    ordered_predictions=[final],
+                    shard_rows_by_id={output_id: shard},
+                )
+            missing_source.write_bytes(b"different")
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "SHA-256",
+            ):
+                METRICS._validate_final_npz_provenance(
+                    root=root.resolve(),
+                    ordered_predictions=[final],
+                    shard_rows_by_id={output_id: shard},
+                )
+
+    def test_final_order_is_canonical_id_not_global_index_order(self) -> None:
+        canonical = {}
+        rows = []
+        definitions = (
+            ("oliver/video/z", 100, "oliver"),
+            ("chemistry/video/a", 101, "chemistry"),
+        )
+        for clip_id, global_index, speaker in definitions:
+            output_id = METRICS.canonical_clip_id(clip_id)
+            canonical[output_id] = {
+                "clip_id": clip_id,
+                "global_index": global_index,
+                "frames": 64,
+                "speaker": speaker,
+                "speaker_id": METRICS.SHOW_SPEAKER_IDS[speaker],
+                "canonical_npz": f"/fixture/{output_id}.npz",
+                "canonical_npz_sha256": "1" * 64,
+            }
+        for evaluation_index, output_id in enumerate(sorted(canonical)):
+            value = canonical[output_id]
+            rows.append(
+                {
+                    "global_index": value["global_index"],
+                    "source_clip_id": value["clip_id"],
+                    "canonical_clip_id": output_id,
+                    "speaker": value["speaker"],
+                    "speaker_id": value["speaker_id"],
+                    "frames": 64,
+                    "canonical_npz": value["canonical_npz"],
+                    "canonical_npz_sha256": "1" * 64,
+                    "audio_feature_npz": f"/fixture/{output_id}-audio.npz",
+                    "audio_feature_npz_sha256": "2" * 64,
+                    "prediction": {
+                        "path": f"/fixture/res_{output_id}.npz",
+                        "sha256": "3" * 64,
+                        "bytes": 1,
+                    },
+                    "ground_truth": {
+                        "path": f"/fixture/gt_{output_id}.npz",
+                        "sha256": "4" * 64,
+                        "bytes": 1,
+                    },
+                    "evaluation_index": evaluation_index,
+                }
+            )
+        validated = METRICS._validate_prediction_rows(
+            rows,
+            canonical=canonical,
+            split="test",
+        )
+        self.assertEqual(
+            [row["canonical_clip_id"] for row in validated],
+            sorted(canonical),
+        )
+        self.assertNotEqual(
+            [row["global_index"] for row in validated],
+            sorted(row["global_index"] for row in validated),
+        )
+
+    def test_output_audio_must_match_authorized_audio_manifest(self) -> None:
+        row = {
+            "source_clip_id": "oliver/video/clip00",
+            "canonical_clip_id": "oliver_clip00",
+            "audio_feature_npz": "/authorized/audio.npz",
+            "audio_feature_npz_sha256": "1" * 64,
+        }
+        authority = {
+            row["source_clip_id"]: (
+                row["audio_feature_npz"],
+                row["audio_feature_npz_sha256"],
+            )
+        }
+        METRICS._validate_output_audio_authority(
+            ordered_predictions=[row],
+            authorized_audio_by_clip=authority,
+        )
+        tampered = dict(row)
+        tampered["audio_feature_npz"] = "/other/audio.npz"
+        tampered["audio_feature_npz_sha256"] = "2" * 64
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "authorized audio",
+        ):
+            METRICS._validate_output_audio_authority(
+                ordered_predictions=[tampered],
+                authorized_audio_by_clip=authority,
+            )
+
+    def test_final_inference_evidence_uses_external_checkpoint_projection(
+        self,
+    ) -> None:
+        stages = ("base", "face", "hands", "upper", "lower", "global")
+        authority = {
+            "checkpoints": {
+                stage: {
+                    "path": f"/fixture/{stage}.bin",
+                    "sha256": hashlib.sha256(stage.encode()).hexdigest(),
+                    "bytes": len(stage),
+                }
+                for stage in stages
+            }
+        }
+        contract = {
+            "checkpoints": {
+                stage: {
+                    "path": authority["checkpoints"][stage]["path"],
+                    "expected_sha256": authority["checkpoints"][stage][
+                        "sha256"
+                    ],
+                }
+                for stage in stages
+            },
+            "untrusted_training_summary": "telemetry-only",
+        }
+        receipts = {
+            stage: {
+                **authority["checkpoints"][stage],
+                "formal_stage": stage,
+                "audit": {"telemetry_only": True},
+            }
+            for stage in stages
+        }
+        METRICS._validate_frozen_inference_evidence(
+            authority=authority,
+            contract=contract,
+            checkpoint_receipts=receipts,
+        )
+        changed_contract = copy.deepcopy(contract)
+        changed_contract["checkpoints"]["base"]["expected_sha256"] = "1" * 64
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "changed the base checkpoint",
+        ):
+            METRICS._validate_frozen_inference_evidence(
+                authority=authority,
+                contract=changed_contract,
+            )
+        changed_receipts = copy.deepcopy(receipts)
+        changed_receipts["face"]["bytes"] += 1
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "changed the face checkpoint",
+        ):
+            METRICS._validate_frozen_inference_evidence(
+                authority=authority,
+                checkpoint_receipts=changed_receipts,
+            )
+
+    def test_pinned_talkshow_import_ignores_poisoned_module_caches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nets").mkdir()
+            (root / "data_utils").mkdir()
+            sources = {
+                "nets/__init__.py": "",
+                "nets/body_ae.py": (
+                    "from data_utils.consts import VALUE\n"
+                    "class TrainWrapper:\n"
+                    "    source = VALUE\n"
+                ),
+                "data_utils/__init__.py": "",
+                "data_utils/consts.py": "VALUE = 'pinned'\n",
+            }
+            files = {}
+            for relative, source in sources.items():
+                path = root / relative
+                path.write_text(source)
+                payload = path.read_bytes()
+                files[relative] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                }
+            fake_nets = types.ModuleType("nets")
+            fake_body = types.ModuleType("nets.body_ae")
+            fake_body.TrainWrapper = type(
+                "Poisoned",
+                (),
+                {"source": "poisoned"},
+            )
+            fake_data = types.ModuleType("data_utils")
+            fake_consts = types.ModuleType("data_utils.consts")
+            fake_consts.VALUE = "poisoned"
+            poisoned = {
+                "nets": fake_nets,
+                "nets.body_ae": fake_body,
+                "data_utils": fake_data,
+                "data_utils.consts": fake_consts,
+            }
+            with mock.patch.dict(sys.modules, poisoned, clear=False):
+                wrapper = METRICS._import_pinned_body_feature_extractor(
+                    {"path": str(root.resolve()), "files": files}
+                )
+                self.assertEqual(wrapper.source, "pinned")
+                self.assertIs(sys.modules["nets.body_ae"], fake_body)
+                self.assertIs(sys.modules["data_utils.consts"], fake_consts)
+
+    def test_pinned_talkshow_import_rejects_timestamp_valid_bytecode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nets").mkdir()
+            (root / "data_utils").mkdir()
+            pinned_body = (
+                "class TrainWrapper:\n"
+                "    source = 'PINNED'\n"
+            )
+            stale_body = (
+                "class TrainWrapper:\n"
+                "    source = 'STALED'\n"
+            )
+            self.assertEqual(len(pinned_body), len(stale_body))
+            sources = {
+                "nets/__init__.py": "",
+                "nets/body_ae.py": pinned_body,
+                "data_utils/__init__.py": "",
+            }
+            files = {}
+            for relative, source in sources.items():
+                path = root / relative
+                path.write_text(source)
+                payload = path.read_bytes()
+                files[relative] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                }
+            body_path = root / "nets" / "body_ae.py"
+            fixed_timestamp = 1_700_000_000
+            body_path.write_text(stale_body)
+            os.utime(
+                body_path,
+                (fixed_timestamp, fixed_timestamp),
+            )
+            bytecode_path = (
+                body_path.parent
+                / "__pycache__"
+                / f"body_ae.{sys.implementation.cache_tag}.pyc"
+            )
+            bytecode_path.parent.mkdir()
+            py_compile.compile(
+                str(body_path),
+                cfile=str(bytecode_path),
+                doraise=True,
+            )
+            body_path.write_text(pinned_body)
+            os.utime(
+                body_path,
+                (fixed_timestamp, fixed_timestamp),
+            )
+            self.assertEqual(
+                hashlib.sha256(body_path.read_bytes()).hexdigest(),
+                files["nets/body_ae.py"]["sha256"],
+            )
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "cached bytecode",
+            ):
+                METRICS._import_pinned_body_feature_extractor(
+                    {"path": str(root.resolve()), "files": files}
+                )
+
+    def test_pinned_talkshow_import_executes_namespace_from_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "nets" / "spg").mkdir(parents=True)
+            (root / "data_utils").mkdir()
+            sources = {
+                "nets/__init__.py": "",
+                "nets/body_ae.py": (
+                    "from nets.spg.helper import VALUE\n"
+                    "class TrainWrapper:\n"
+                    "    source = VALUE\n"
+                ),
+                "nets/spg/helper.py": "VALUE = 'snapshot-namespace'\n",
+                "data_utils/__init__.py": "",
+            }
+            files = {}
+            for relative, source in sources.items():
+                path = root / relative
+                path.write_text(source, encoding="utf-8")
+                payload = path.read_bytes()
+                files[relative] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                }
+            wrapper = METRICS._import_pinned_body_feature_extractor(
+                {"path": str(root), "files": files}
+            )
+            self.assertEqual(wrapper.source, "snapshot-namespace")
+            self.assertNotIn("nets.spg", sys.modules)
+
+    def test_pinned_talkshow_import_executes_attested_bytes_during_swap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "nets").mkdir()
+            (root / "data_utils").mkdir()
+            pinned = (
+                "class TrainWrapper:\n"
+                "    source = 'pinned-bytes'\n"
+            )
+            transient = (
+                "class TrainWrapper:\n"
+                "    source = 'swapped-code'\n"
+            )
+            sources = {
+                "nets/__init__.py": "",
+                "nets/body_ae.py": pinned,
+                "data_utils/__init__.py": "",
+            }
+            files = {}
+            for relative, source in sources.items():
+                path = root / relative
+                path.write_text(source, encoding="utf-8")
+                payload = path.read_bytes()
+                files[relative] = {
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "bytes": len(payload),
+                }
+            body_path = root / "nets" / "body_ae.py"
+            real_import = importlib.import_module
+
+            def swap_around_import(name: str, package: str | None = None):
+                body_path.write_text(transient, encoding="utf-8")
+                try:
+                    return real_import(name, package)
+                finally:
+                    body_path.write_text(pinned, encoding="utf-8")
+
+            with mock.patch.object(
+                METRICS.importlib,
+                "import_module",
+                side_effect=swap_around_import,
+            ):
+                wrapper = METRICS._import_pinned_body_feature_extractor(
+                    {"path": str(root), "files": files}
+                )
+            self.assertEqual(wrapper.source, "pinned-bytes")
+
+    def test_fresh_primary_replay_defeats_coordinated_report_forgery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SyntheticBundle(Path(directory))
+            backend = SyntheticBackend()
+            report = fixture.evaluate(backend=backend)
+            cache = METRICS.build_released2_real_feature_cache(
+                canonical_manifest=fixture.canonical_manifest,
+                expected_canonical_manifest_sha256=sha256_file(
+                    fixture.canonical_manifest
+                ),
+                backend=backend,
+                split="val",
+                expected_clip_count=4,
+                formal_mode=False,
+                test_only_allow_four_clip_subset=True,
+            )
+            cache_path = Path(directory) / "real-cache.json"
+            canonical_json_write(cache_path, cache)
+            cache_artifact = {
+                "path": str(cache_path.resolve()),
+                "sha256": sha256_file(cache_path),
+                "bytes": cache_path.stat().st_size,
+                "receipt_payload_sha256": cache[
+                    "receipt_payload_sha256"
+                ],
+            }
+            prediction_artifact = report["distribution_receipt"][
+                "prediction_manifest"
+            ]
+            replay = METRICS.fresh_replay_released2_primary(
+                report,
+                backend,
+                real_feature_cache=cache,
+                expected_real_feature_cache_artifact=cache_artifact,
+                expected_prediction_manifest=prediction_artifact,
+                expected_distribution_receipt=report[
+                    "distribution_receipt"
+                ],
+                expected_selection_protocol=report[
+                    "selection_protocol"
+                ],
+                expected_split="val",
+                expected_clip_count=4,
+                test_only_allow_four_clip_subset=True,
+            )
+            replay_path = Path(directory) / "replay.json"
+            canonical_json_write(replay_path, replay)
+            replay_artifact = {
+                "path": str(replay_path.resolve()),
+                "sha256": sha256_file(replay_path),
+                "bytes": replay_path.stat().st_size,
+                "receipt_payload_sha256": replay[
+                    "receipt_payload_sha256"
+                ],
+            }
+            validated = (
+                METRICS.validate_released2_primary_replay_receipt(
+                    replay_artifact,
+                    expected_report=report,
+                    expected_prediction_manifest=prediction_artifact,
+                    expected_distribution_receipt=report[
+                        "distribution_receipt"
+                    ],
+                    expected_selection_protocol=report[
+                        "selection_protocol"
+                    ],
+                    expected_split="val",
+                    expected_clip_count=4,
+                    test_only_allow_four_clip_subset=True,
+                )
+            )
+            self.assertEqual(
+                validated["primary_metric"],
+                replay["primary_metric"],
+            )
+            incompatible_cache = copy.deepcopy(cache)
+            incompatible_cache["runtime"]["torch"] = "different-runtime"
+            incompatible_cache.pop("receipt_payload_sha256")
+            incompatible_cache["receipt_payload_sha256"] = (
+                METRICS.canonical_json_sha256(incompatible_cache)
+            )
+            incompatible_path = Path(directory) / "incompatible-cache.json"
+            canonical_json_write(incompatible_path, incompatible_cache)
+            incompatible_artifact = {
+                "path": str(incompatible_path.resolve()),
+                "sha256": sha256_file(incompatible_path),
+                "bytes": incompatible_path.stat().st_size,
+                "receipt_payload_sha256": incompatible_cache[
+                    "receipt_payload_sha256"
+                ],
+            }
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "assets/runtime",
+            ):
+                METRICS.fresh_replay_released2_primary(
+                    report,
+                    backend,
+                    real_feature_cache=incompatible_cache,
+                    expected_real_feature_cache_artifact=(
+                        incompatible_artifact
+                    ),
+                    expected_prediction_manifest=prediction_artifact,
+                    expected_distribution_receipt=report[
+                        "distribution_receipt"
+                    ],
+                    expected_selection_protocol=report[
+                        "selection_protocol"
+                    ],
+                    expected_split="val",
+                    expected_clip_count=4,
+                    test_only_allow_four_clip_subset=True,
+                )
+
+            forged = copy.deepcopy(report)
+            released = forged["body"]["released2"]
+            real = METRICS.FeatureMoments.from_json(
+                released["feature_statistics"]["real"],
+                expected_count=released["counts"]["real_features"],
+                label="fixture real",
+            )
+            dimensions = real.dimension
+            fake = METRICS.FeatureMoments()
+            fake.update(
+                np.full(
+                    (
+                        released["counts"]["generated_features"],
+                        dimensions,
+                    ),
+                    7.0,
+                    dtype=np.float64,
+                )
+            )
+            released["feature_statistics"]["generated"] = fake.to_json()
+            released["metrics"]["FGD"] = METRICS.frechet_distance(
+                real,
+                fake,
+            )
+            forged.pop("report_payload_sha256")
+            forged["report_payload_sha256"] = (
+                METRICS.canonical_json_sha256(forged)
+            )
+            METRICS.validate_report(
+                forged,
+                expected_split="val",
+                expected_clip_count=4,
+                expected_prediction_manifest=prediction_artifact,
+                expected_distribution_receipt=forged[
+                    "distribution_receipt"
+                ],
+                expected_selection_protocol=forged[
+                    "selection_protocol"
+                ],
+                test_only_allow_four_clip_subset=True,
+            )
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "Fresh|fresh",
+            ):
+                METRICS.fresh_replay_released2_primary(
+                    forged,
+                    backend,
+                    real_feature_cache=cache,
+                    expected_real_feature_cache_artifact=cache_artifact,
+                    expected_prediction_manifest=prediction_artifact,
+                    expected_distribution_receipt=forged[
+                        "distribution_receipt"
+                    ],
+                    expected_selection_protocol=forged[
+                        "selection_protocol"
+                    ],
+                    expected_split="val",
+                    expected_clip_count=4,
+                    test_only_allow_four_clip_subset=True,
+                )
+
+    def test_formal_mode_forbids_injected_audio_primitives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SyntheticBundle(Path(directory))
+            with (
+                mock.patch.object(
+                    METRICS,
+                    "_require_concrete_formal_backend",
+                ),
+                mock.patch.dict(
+                    METRICS.FORMAL_SPLITS,
+                    {
+                        "val": {
+                            "count": 4,
+                            "global_start": 100,
+                            "global_stop": 104,
+                        }
+                    },
+                ),
+                self.assertRaisesRegex(
+                    METRICS.MetricAdapterContractError,
+                    "forbids injected audio",
+                ),
+            ):
+                METRICS.evaluate_canonical_bundle(
+                    canonical_manifest=fixture.canonical_manifest,
+                    expected_canonical_manifest_sha256=sha256_file(
+                        fixture.canonical_manifest
+                    ),
+                    prediction_manifest=fixture.prediction_manifest,
+                    expected_prediction_manifest_sha256=sha256_file(
+                        fixture.prediction_manifest
+                    ),
+                    prediction_lineage=fixture.prediction_lineage,
+                    expected_prediction_lineage_sha256=sha256_file(
+                        fixture.prediction_lineage
+                    ),
+                    validation_gate=fixture.validation_gate(),
+                    distribution_declaration=fixture.distribution(),
+                    backend=SyntheticBackend(),
+                    split="val",
+                    expected_clip_count=4,
+                    audio_beat_extractor=lambda _waveform: np.asarray([0.1]),
+                    formal_mode=True,
+                    test_only_allow_four_clip_gate=False,
+                )
+
+    def test_same_path_cached_replication_gate_is_ignored(self) -> None:
+        expected = (
+            Path(METRICS.__file__).resolve().parent
+            / "deterministic_replication_gate.py"
+        )
+        fake = types.SimpleNamespace(
+            __file__=str(expected),
+            PAYLOAD_HASH_ALGORITHM=METRICS.PAYLOAD_HASH_ALGORITHM,
+            DISTRIBUTION_FORMAT=METRICS.DISTRIBUTION_RECEIPT_FORMAT,
+            PROTOCOL=METRICS.DISTRIBUTION_PROTOCOL,
+            variation_policy_receipt=lambda: {"poisoned": True},
+            validate_distribution_receipt=lambda *_args, **_kwargs: {
+                "poisoned": True
+            },
+            build_distribution_receipt_from_validated_artifacts=(
+                lambda *_args, **_kwargs: {"poisoned": True}
+            ),
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {"scripts.show_base.deterministic_replication_gate": fake},
+        ):
+            observed = METRICS._replication_gate_module()
+        self.assertIsNot(observed, fake)
+        self.assertEqual(
+            observed.DISTRIBUTION_FORMAT,
+            "semtalk_show_deterministic_distribution_receipt_v2",
+        )
+
+    def test_same_path_cached_final_authority_is_ignored(self) -> None:
+        expected = (
+            Path(METRICS.__file__).resolve().parent
+            / "base_final_authority.py"
+        )
+        fake = types.SimpleNamespace(
+            __file__=str(expected),
+            FORMAT="semtalk_show_base_final_test_authority_v1",
+            validate_test_authority=lambda *_args, **_kwargs: {
+                "poisoned": True
+            },
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {"scripts.show_base.base_final_authority": fake},
+        ):
+            observed = METRICS._base_final_authority_module()
+        self.assertIsNot(observed, fake)
+        self.assertEqual(
+            observed.FORMAT,
+            "semtalk_show_base_final_test_authority_v1",
+        )
+
+    def test_same_path_cached_base_selector_is_ignored(self) -> None:
+        expected = (
+            Path(METRICS.__file__).resolve().parent
+            / "select_base_official_adapt.py"
+        )
+        fake = types.SimpleNamespace(
+            __file__=str(expected),
+            validate_val_inputs=lambda *_args, **_kwargs: {
+                "poisoned": True
+            },
+            validate_pipeline=lambda *_args, **_kwargs: {
+                "poisoned": True
+            },
+            validate_val_inference_lineage=lambda *_args, **_kwargs: {
+                "poisoned": True
+            },
+        )
+        full_name = "scripts.show_base.select_base_official_adapt"
+        with (
+            mock.patch.dict(sys.modules, {full_name: fake}),
+            mock.patch.object(
+                SHOW_BASE_PACKAGE,
+                "select_base_official_adapt",
+                fake,
+                create=True,
+            ),
+        ):
+            observed = METRICS._fresh_base_selector_module()
+        self.assertIsNot(observed, fake)
+        self.assertTrue(callable(observed.validate_val_inputs))
+
+    def test_verified_snapshot_rejects_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            real = root / "real"
+            real.mkdir()
+            payload = b"immutable"
+            target = real / "artifact.json"
+            target.write_bytes(payload)
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "canonical and contain no symlink",
+            ):
+                METRICS._verified_file_snapshot(
+                    alias / target.name,
+                    hashlib.sha256(payload).hexdigest(),
+                    "symlinked fixture",
+                )
+
+    def test_git_porcelain_leading_status_column_is_preserved(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=0,
+            stdout=" M nets/__init__.py\n?? marker.json\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            METRICS.subprocess,
+            "run",
+            return_value=completed,
+        ):
+            observed = METRICS._git_output(Path("/metric-root"), "status")
+        self.assertEqual(
+            observed.splitlines(),
+            [" M nets/__init__.py", "?? marker.json"],
+        )
+
+    def test_production_dependency_closure_excludes_legacy_evaluator(self) -> None:
+        production = (
+            ROOT / "scripts" / "show_base" / "evaluate_talkshow_show_metrics.py",
+            ROOT / "scripts" / "show_base" / "base_final_authority.py",
+        )
+        for path in production:
+            source = path.read_text(encoding="utf-8")
+            forbidden = [
+                "diff" + "sheg",
+                "base_long_selection_bridge",
+                "validate_base_long_test_winner",
+            ]
+            if path.name == "evaluate_talkshow_show_metrics.py":
+                forbidden.append("base_long_val_contract")
+            for token in forbidden:
+                self.assertNotIn(token, source.casefold(), path.name)
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""] + [
+                        alias.name for alias in node.names
+                    ]
+                elif isinstance(node, ast.Name):
+                    names = [node.id]
+                elif isinstance(node, ast.Attribute):
+                    names = [node.attr]
+                else:
+                    continue
+                self.assertTrue(
+                    all(
+                        token not in name.casefold()
+                        for token in forbidden
+                        for name in names
+                    ),
+                    f"{path.name}: forbidden production dependency {names}",
+                )
+
+    def test_generator_identity_filter_is_semantic_not_path_global(self) -> None:
+        METRICS._reject_forbidden_generator_identity(
+            {
+                "metric_assets": {
+                    "smplx_asset": (
+                        "/frozen/globaldiff-show-evaluator/"
+                        "SMPLX_NEUTRAL.npz"
+                    ),
+                    "talkshow_asset": (
+                        "/frozen/globaldiff-show-evaluator/body_ae.pth"
+                    ),
+                }
+            },
+            "frozen evaluator",
+        )
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "forbidden generator identity",
+        ):
+            METRICS._reject_forbidden_generator_identity(
+                {
+                    "checkpoints": {
+                        "base": {
+                            "path": "/models/globaldiff/speaker2/base.pth"
+                        }
+                    }
+                },
+                "generator contract",
+            )
+
+    def test_import_closure_matches_frozen_globaldiff_evaluator(self) -> None:
+        frozen_evaluator = Path(
+            "/private/tmp/globaldiff_show_eval_twostage_20260729/"
+            "scripts/show_eval.py"
+        )
+        upstream_talkshow = Path(
+            "/private/tmp/talkshow_upstream_9aef82d_20260731"
+        )
+        if not frozen_evaluator.is_file() or not upstream_talkshow.is_dir():
+            self.skipTest("frozen differential oracle is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            metric_root = Path(directory).resolve() / "TalkSHOW"
+            shutil.copytree(upstream_talkshow, metric_root)
+            (metric_root / "nets/__init__.py").write_text(
+                '"""Metric-only TalkSHOW package."""\n',
+                encoding="utf-8",
+            )
+            specification = importlib.util.spec_from_file_location(
+                "frozen_globaldiff_show_eval_for_test",
+                frozen_evaluator,
+            )
+            if specification is None or specification.loader is None:
+                self.fail("cannot load frozen GlobalDiff evaluator oracle")
+            frozen = importlib.util.module_from_spec(specification)
+            specification.loader.exec_module(frozen)
+            expected = frozen._talkshow_fgd_import_closure(metric_root)
+            observed = METRICS._talkshow_fgd_import_closure(metric_root)
+            self.assertEqual(observed, expected)
+            self.assertEqual(observed, METRICS.TALKSHOW_FGD_SOURCE_FILES)
+
+    def test_atomic_write_preserves_existing_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_bytes(b"existing")
+            with self.assertRaises(FileExistsError):
+                METRICS._atomic_write_new(path, b"replacement")
+            self.assertEqual(path.read_bytes(), b"existing")
+
     def test_validate_report_returns_released2_primary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture = SyntheticBundle(root)
             report = fixture.evaluate(
                 backend=ShapeRecordingCudaBackend(),
-                formal_mode=True,
             )
             talkshow_root = root / "talkshow-metric-root"
             talkshow_root.mkdir()
@@ -640,6 +1626,24 @@ class OfflineAdapterTest(unittest.TestCase):
                 "bytes": 5,
                 "runtime_dtype": "float64",
             }
+            report["metric_assets"]["execution_device"] = "cuda:0"
+            report["runtime"] = {
+                "python": "3.12-test",
+                "numpy": np.__version__,
+                "torch": "2.test",
+                "smplx": "synthetic-test",
+                "librosa": "synthetic-test",
+                "soundfile": "synthetic-test",
+                "soxr": "synthetic-test",
+                "scipy": "synthetic-test",
+                "cuda": "12.test",
+                "cudnn": "9.test",
+                "device": "cuda:0",
+                "device_type": "cuda",
+                "device_index": 0,
+                "device_name": "Synthetic H200",
+            }
+            report["formal_mode"] = True
             report["test_only_mode"] = False
             report.pop("report_payload_sha256")
             report["report_payload_sha256"] = (
@@ -670,6 +1674,16 @@ class OfflineAdapterTest(unittest.TestCase):
                     "_verified_file_snapshot",
                     side_effect=snapshot,
                 ),
+                mock.patch.dict(
+                    METRICS.FORMAL_SPLITS,
+                    {
+                        "val": {
+                            "count": 4,
+                            "global_start": 100,
+                            "global_stop": 104,
+                        }
+                    },
+                ),
             ):
                 validation = METRICS.validate_report(
                     report,
@@ -687,6 +1701,46 @@ class OfflineAdapterTest(unittest.TestCase):
                         report["selection_protocol"]
                     ),
                 )
+                tampered_reports = []
+                fgd_tamper = copy.deepcopy(report)
+                fgd_tamper["body"]["released2"]["feature_statistics"][
+                    "generated"
+                ]["sum"][0] += 1.0
+                tampered_reports.append(fgd_tamper)
+                variation_tamper = copy.deepcopy(report)
+                variation_tamper["body"]["released2"][
+                    "primitive_receipt"
+                ]["variation_sum"] += 1.0
+                tampered_reports.append(variation_tamper)
+                bc_tamper = copy.deepcopy(report)
+                bc_tamper["body"]["released2"]["primitive_receipt"][
+                    "bc_numerator"
+                ] += 1.0
+                tampered_reports.append(bc_tamper)
+                for tampered in tampered_reports:
+                    tampered.pop("report_payload_sha256")
+                    tampered["report_payload_sha256"] = (
+                        METRICS.canonical_json_sha256(tampered)
+                    )
+                    with self.assertRaises(
+                        METRICS.MetricAdapterContractError
+                    ):
+                        METRICS.validate_report(
+                            tampered,
+                            expected_split="val",
+                            expected_clip_count=4,
+                            expected_prediction_manifest=(
+                                report["distribution_receipt"][
+                                    "prediction_manifest"
+                                ]
+                            ),
+                            expected_distribution_receipt=(
+                                report["distribution_receipt"]
+                            ),
+                            expected_selection_protocol=(
+                                report["selection_protocol"]
+                            ),
+                        )
             self.assertEqual(validation["status"], "pass")
             self.assertEqual(
                 validation["primary_metric_path"],
@@ -703,19 +1757,18 @@ class OfflineAdapterTest(unittest.TestCase):
             backend = ShapeRecordingCudaBackend()
             report = fixture.evaluate(
                 backend=backend,
-                formal_mode=True,
             )
-        self.assertTrue(report["formal_mode"])
-        self.assertEqual(report["runtime"]["device"], "cuda:0")
+        self.assertFalse(report["formal_mode"])
+        self.assertEqual(report["runtime"]["device"], "cpu")
         self.assertEqual(
             backend.feature_call_shapes,
             [
                 shape
                 for _clip in range(4)
                 for shape in (
-                    (1, 12, 265),
-                    (2, 12, 265),
-                    (16, 12, 265),
+                    (1, 64, 265),
+                    (2, 64, 265),
+                    (16, 64, 265),
                 )
             ],
         )
@@ -725,8 +1778,8 @@ class OfflineAdapterTest(unittest.TestCase):
                 shape
                 for _clip in range(4)
                 for shape in (
-                    (16, 12, 265),
-                    (2, 12, 265),
+                    (16, 64, 265),
+                    (2, 64, 265),
                 )
             ],
         )
@@ -742,7 +1795,7 @@ class OfflineAdapterTest(unittest.TestCase):
             fixture = SyntheticBundle(Path(directory))
             with self.assertRaisesRegex(
                 METRICS.MetricAdapterContractError,
-                "CUDA runtime attestation",
+                "formal evaluation clip count",
             ):
                 fixture.evaluate(formal_mode=True)
 
@@ -767,8 +1820,17 @@ class OfflineAdapterTest(unittest.TestCase):
         self.assertEqual(len(slot_hashes), 1)
         released = report["body"]["released2"]
         paper = report["body"]["paper16"]
-        self.assertEqual(released["metrics"]["Variation"], 0.0)
-        self.assertEqual(paper["metrics"]["Variation"], 0.0)
+        for value in (released, paper):
+            self.assertLessEqual(
+                value["primitive_receipt"]["variation_sum"],
+                value["primitive_receipt"][
+                    "variation_integrity_tolerance_sum"
+                ],
+            )
+            self.assertEqual(
+                value["metrics"]["Variation"],
+                value["primitive_receipt"]["variation_sum"] / 4,
+            )
         self.assertEqual(
             released["counts"]["generated_features"],
             2 * released["counts"]["real_features"],

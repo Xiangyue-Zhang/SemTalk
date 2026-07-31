@@ -11,14 +11,15 @@ Only then is the claim allowed to authorize one test evaluation.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import stat
-from typing import Any, Iterable, Mapping
+import sys
+import types
+from typing import Any, Iterable, Mapping, Sequence
 
 
 CLAIM_FORMAT = "semtalk_show_base_published_test_winner_claim_v1"
@@ -64,6 +65,9 @@ STAGE_SELECTION_METRICS = {
     "lower": "lower_rotation_contact_objective_v1",
     "global": "global_root_contact_objective_v1",
 }
+# Mandatory prefix retained for compatibility/documentation only.  Formal
+# receipts may append e220, e240, ...; every consumer below derives the actual
+# inventory through prerequisite_val_contract.validate_candidate_epochs().
 PREREQUISITE_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
 PREREQUISITE_UPDATES_PER_EPOCH = 497
 BASE_CANDIDATE_EPOCHS = (
@@ -109,6 +113,33 @@ TEST_POLICY = {
     "num_shards": EXPECTED_SHARDS,
     "canonical_test_clips": EXPECTED_TEST_CLIPS,
 }
+_LOCAL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "gate_released_all_speakers_on_show": (),
+    "prerequisite_val_contract": (),
+    "merge_prerequisite_val_shards": (
+        "gate_released_all_speakers_on_show",
+        "prerequisite_val_contract",
+    ),
+    "selected_prerequisites": (
+        "prerequisite_val_contract",
+        "merge_prerequisite_val_shards",
+    ),
+    "decide_prerequisite_continuation": (
+        "prerequisite_val_contract",
+        "selected_prerequisites",
+    ),
+    "prerequisite_boundary_state": (),
+    "prerequisite_continuation_wave": (
+        "prerequisite_val_contract",
+        "merge_prerequisite_val_shards",
+        "selected_prerequisites",
+        "decide_prerequisite_continuation",
+        "prerequisite_boundary_state",
+    ),
+    "deterministic_replication_gate": (),
+    "base_final_authority": (),
+    "evaluate_talkshow_show_metrics": (),
+}
 
 _FORBIDDEN_COMPACT_TOKENS = (
     "speaker2",
@@ -121,6 +152,184 @@ _GLOBAL_MODEL_TOKEN = "globaldiff"
 
 class PublishedWinnerClaimError(RuntimeError):
     """Raised when a published winner claim is not self-contained and exact."""
+
+
+def _canonical_regular_path(path_value: Any, label: str) -> Path:
+    if not isinstance(path_value, (str, os.PathLike)):
+        raise PublishedWinnerClaimError(f"{label} path must be path-like")
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise PublishedWinnerClaimError(f"{label} path must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PublishedWinnerClaimError(
+            f"cannot resolve {label}: {path}"
+        ) from error
+    if resolved != path:
+        raise PublishedWinnerClaimError(
+            f"{label} path must be canonical and contain no symlink"
+        )
+    return path
+
+
+def _safe_file_snapshot(
+    path_value: Any,
+    label: str,
+) -> tuple[Path, bytes]:
+    path = _canonical_regular_path(path_value, label)
+    parts = path.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise PublishedWinnerClaimError(
+            f"{label} must be below the filesystem root"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise PublishedWinnerClaimError(
+                f"{label} must be a regular non-symlink file"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise PublishedWinnerClaimError(
+                f"{label} changed while it was read"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise PublishedWinnerClaimError(
+                f"{label} size changed while it was read"
+            )
+        return path, payload
+    except PublishedWinnerClaimError:
+        raise
+    except OSError as error:
+        raise PublishedWinnerClaimError(
+            f"cannot safely read {label}: {path}"
+        ) from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _fresh_local_module(name: str) -> Any:
+    if name not in _LOCAL_DEPENDENCIES:
+        raise PublishedWinnerClaimError(
+            f"unknown local validator {name}"
+        )
+    source_root = Path(__file__).resolve().parent
+    package = sys.modules.get("scripts.show_base")
+    if package is None:
+        package = __import__("scripts.show_base", fromlist=["*"])
+    expected_package = source_root / "__init__.py"
+    package_source = getattr(package, "__file__", None)
+    if (
+        type(package_source) is not str
+        or Path(package_source).resolve() != expected_package
+    ):
+        raise PublishedWinnerClaimError(
+            "scripts.show_base package is not this source tree"
+        )
+    _safe_file_snapshot(
+        str(expected_package),
+        "scripts.show_base package",
+    )
+
+    missing = object()
+    saved_modules: dict[str, Any] = {}
+    saved_attributes: dict[str, Any] = {}
+    loaded: dict[str, Any] = {}
+
+    def load(module_name: str) -> Any:
+        if module_name in loaded:
+            return loaded[module_name]
+        for dependency in _LOCAL_DEPENDENCIES[module_name]:
+            load(dependency)
+        source_path, source = _safe_file_snapshot(
+            str(source_root / f"{module_name}.py"),
+            f"local validator {module_name}",
+        )
+        full_name = f"scripts.show_base.{module_name}"
+        saved_modules.setdefault(full_name, sys.modules.get(full_name, missing))
+        saved_attributes.setdefault(
+            module_name,
+            getattr(package, module_name, missing),
+        )
+        module = types.ModuleType(full_name)
+        module.__file__ = str(source_path)
+        module.__package__ = "scripts.show_base"
+        module.__loader__ = None
+        sys.modules[full_name] = module
+        setattr(package, module_name, module)
+        loaded[module_name] = module
+        code = compile(
+            source,
+            str(source_path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__)
+        return module
+
+    try:
+        return load(name)
+    except PublishedWinnerClaimError:
+        raise
+    except BaseException as error:
+        raise PublishedWinnerClaimError(
+            f"cannot source-load local validator {name}"
+        ) from error
+    finally:
+        for full_name, previous in saved_modules.items():
+            if previous is missing:
+                sys.modules.pop(full_name, None)
+            else:
+                sys.modules[full_name] = previous
+        for attribute, previous in saved_attributes.items():
+            if previous is missing:
+                try:
+                    delattr(package, attribute)
+                except AttributeError:
+                    pass
+            else:
+                setattr(package, attribute, previous)
 
 
 def _canonical_json_bytes(value: Any, *, newline: bool = False) -> bytes:
@@ -215,22 +424,8 @@ def _require_number(value: Any, label: str) -> float:
 
 
 def _regular_file(path_value: Any, label: str) -> Path:
-    if not isinstance(path_value, (str, os.PathLike)):
-        raise PublishedWinnerClaimError(f"{label} path must be path-like")
-    path = Path(path_value)
-    if not path.is_absolute():
-        raise PublishedWinnerClaimError(f"{label} path must be absolute")
-    try:
-        mode = os.lstat(path).st_mode
-    except OSError as error:
-        raise PublishedWinnerClaimError(
-            f"cannot stat {label}: {path}"
-        ) from error
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise PublishedWinnerClaimError(
-            f"{label} must be a regular non-symlink file"
-        )
-    return path.resolve(strict=True)
+    path, _payload = _safe_file_snapshot(path_value, label)
+    return path
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -245,8 +440,7 @@ def _normalize_artifact(
 ) -> tuple[dict[str, Any], bytes]:
     keys = PAYLOAD_ARTIFACT_KEYS if with_payload else ARTIFACT_KEYS
     artifact = _exact_mapping(value, keys, f"{label} artifact")
-    path = _regular_file(artifact["path"], label)
-    payload = path.read_bytes()
+    path, payload = _safe_file_snapshot(artifact["path"], label)
     expected_sha = _require_sha256(
         artifact["sha256"], f"{label} file SHA-256"
     )
@@ -305,8 +499,7 @@ def _verify_compact_reference(
         {"path", "sha256", "receipt_payload_sha256"},
         f"{label} artifact",
     )
-    path = _regular_file(artifact["path"], label)
-    payload = path.read_bytes()
+    path, payload = _safe_file_snapshot(artifact["path"], label)
     file_sha = _require_sha256(artifact["sha256"], f"{label} file SHA-256")
     payload_sha = _require_sha256(
         artifact["receipt_payload_sha256"], f"{label} payload SHA-256"
@@ -413,10 +606,46 @@ def _validate_prerequisite_selection(
         raise PublishedWinnerClaimError(
             "prerequisite selection identity mismatch"
         )
-    if selection["protocol"] != {
+    protocol = selection["protocol"]
+    if not isinstance(protocol, dict):
+        raise PublishedWinnerClaimError(
+            "prerequisite selection protocol mismatch"
+        )
+    prerequisite_contract = _fresh_local_module(
+        "prerequisite_val_contract"
+    )
+    if (
+        getattr(prerequisite_contract, "REQUIRED_CANDIDATE_EPOCHS", None)
+        != PREREQUISITE_CANDIDATE_EPOCHS
+        or getattr(
+            prerequisite_contract,
+            "EXPECTED_UPDATES_PER_EPOCH",
+            None,
+        )
+        != PREREQUISITE_UPDATES_PER_EPOCH
+        or not callable(
+            getattr(
+                prerequisite_contract,
+                "validate_candidate_epochs",
+                None,
+            )
+        )
+    ):
+        raise PublishedWinnerClaimError(
+            "prerequisite schedule validator ABI mismatch"
+        )
+    try:
+        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
+            protocol.get("candidate_epochs")
+        )
+    except Exception as error:
+        raise PublishedWinnerClaimError(
+            f"prerequisite candidate schedule is invalid: {error}"
+        ) from error
+    if protocol != {
         "name": "five_independent_show_prerequisite_validation_v1",
-        "candidate_epochs": list(PREREQUISITE_CANDIDATE_EPOCHS),
-        "candidates_per_stage": len(PREREQUISITE_CANDIDATE_EPOCHS),
+        "candidate_epochs": list(candidate_epochs),
+        "candidates_per_stage": len(candidate_epochs),
         "clips_per_candidate": EXPECTED_VAL_CLIPS,
         "shards_per_candidate": EXPECTED_SHARDS,
         "window_length": 64,
@@ -472,13 +701,12 @@ def _validate_prerequisite_selection(
             stage["stage"] != expected_stage
             or stage["selection_metric"]
             != STAGE_SELECTION_METRICS[expected_stage]
-            or epoch not in PREREQUISITE_CANDIDATE_EPOCHS
+            or epoch not in candidate_epochs
             or stage["optimizer_updates"]
             != epoch * PREREQUISITE_UPDATES_PER_EPOCH
             or not isinstance(stage["candidate_index"], int)
             or isinstance(stage["candidate_index"], bool)
-            or not 0 <= stage["candidate_index"]
-            < len(PREREQUISITE_CANDIDATE_EPOCHS)
+            or stage["candidate_index"] != candidate_epochs.index(epoch)
             or _require_number(
                 stage["selection_score"],
                 f"prerequisite {expected_stage} selection score",
@@ -569,6 +797,17 @@ def _validate_continuation_decision(
         raise PublishedWinnerClaimError(
             "continuation decision does not bind the pinned selection"
         )
+    prerequisite_contract = _fresh_local_module(
+        "prerequisite_val_contract"
+    )
+    try:
+        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
+            prerequisite_selection["protocol"]["candidate_epochs"]
+        )
+    except Exception as error:
+        raise PublishedWinnerClaimError(
+            f"continuation prerequisite schedule is invalid: {error}"
+        ) from error
     stage_rows = prerequisite_selection["stages"]
     decision_stages = decision["stages"]
     if not isinstance(decision_stages, list) or len(decision_stages) != len(
@@ -600,6 +839,7 @@ def _validate_continuation_decision(
         if (
             stage["stage"] != expected_stage
             or stage["winner_epoch"] != selected["epoch"]
+            or stage["latest_epoch"] != candidate_epochs[-1]
             or stage["requests_continuation"] is not False
         ):
             raise PublishedWinnerClaimError(
@@ -609,7 +849,7 @@ def _validate_continuation_decision(
         recent_scores = stage["recent_selection_scores"]
         if (
             not isinstance(recent_epochs, list)
-            or len(recent_epochs) != 3
+            or recent_epochs != list(candidate_epochs[-3:])
             or not all(
                 isinstance(epoch, int) and not isinstance(epoch, bool)
                 for epoch in recent_epochs
@@ -651,6 +891,114 @@ def _validate_continuation_decision(
                 )
     _reject_forbidden_tree(decision, "prerequisite continuation")
     return artifact, decision
+
+
+def _replay_continuation_wave_file(
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    module = _fresh_local_module("prerequisite_continuation_wave")
+    replay = getattr(module, "replay_wave_file", None)
+    if not callable(replay):
+        raise PublishedWinnerClaimError(
+            "continuation wave fresh replay ABI mismatch"
+        )
+    try:
+        value = replay(Path(artifact["path"]), artifact["sha256"])
+    except Exception as error:
+        raise PublishedWinnerClaimError(
+            f"continuation wave fresh replay failed: {error}"
+        ) from error
+    if type(value) is not dict:
+        raise PublishedWinnerClaimError(
+            "continuation wave fresh replay returned no receipt"
+        )
+    return value
+
+
+def _validate_continuation_waves(
+    values: Any,
+    *,
+    prerequisite_selection: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    protocol = prerequisite_selection.get("protocol")
+    raw_epochs = (
+        protocol.get("candidate_epochs")
+        if isinstance(protocol, dict)
+        else None
+    )
+    prerequisite_contract = _fresh_local_module(
+        "prerequisite_val_contract"
+    )
+    try:
+        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
+            raw_epochs
+        )
+    except Exception as error:
+        raise PublishedWinnerClaimError(
+            f"continuation wave candidate schedule is invalid: {error}"
+        ) from error
+    if type(values) is not list:
+        raise PublishedWinnerClaimError(
+            "continuation waves must be a JSON list"
+        )
+    expected_count = len(candidate_epochs) - len(
+        PREREQUISITE_CANDIDATE_EPOCHS
+    )
+    if len(values) != expected_count:
+        raise PublishedWinnerClaimError(
+            "continuation waves do not cover every appended boundary"
+        )
+    result: list[dict[str, Any]] = []
+    predecessor: dict[str, Any] | None = None
+    for index, raw_artifact in enumerate(values):
+        artifact, _payload = _normalize_artifact(
+            raw_artifact,
+            f"continuation wave {index}",
+            with_payload=True,
+        )
+        receipt = _replay_continuation_wave_file(artifact)
+        boundary = PREREQUISITE_CANDIDATE_EPOCHS[-1] + index * 20
+        target = boundary + 20
+        if (
+            receipt.get("format")
+            != "semtalk_show_prerequisite_continuation_wave_v1"
+            or receipt.get("status") != "authorized"
+            or receipt.get("test_visible") is not False
+            or receipt.get("boundary_epoch") != boundary
+            or receipt.get("target_epoch") != target
+            or receipt.get("receipt_payload_sha256")
+            != artifact["receipt_payload_sha256"]
+            or not isinstance(receipt.get("trigger_stages"), list)
+            or not receipt["trigger_stages"]
+            or not isinstance(receipt.get("stages"), list)
+            or len(receipt["stages"]) != len(STAGES)
+        ):
+            raise PublishedWinnerClaimError(
+                f"continuation wave {index} identity/boundary mismatch"
+            )
+        for expected_stage, stage in zip(STAGES, receipt["stages"]):
+            old = stage.get("old_segment") if isinstance(stage, dict) else None
+            if (
+                not isinstance(stage, dict)
+                or stage.get("stage") != expected_stage
+                or not isinstance(old, dict)
+                or old.get("predecessor_wave") != predecessor
+            ):
+                raise PublishedWinnerClaimError(
+                    f"continuation wave {index} predecessor chain mismatch"
+                )
+        predecessor = {
+            key: artifact[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+        result.append(artifact)
+    if result and candidate_epochs[-1] != (
+        PREREQUISITE_CANDIDATE_EPOCHS[-1] + len(result) * 20
+    ):
+        raise PublishedWinnerClaimError(
+            "continuation wave tail differs from prerequisite schedule"
+        )
+    return result
 
 
 def _validate_distribution(
@@ -847,8 +1195,8 @@ def _validate_metric_report(
             "TalkSHOW report input bindings changed"
         )
     try:
-        metric_adapter = importlib.import_module(
-            "scripts.show_base.evaluate_talkshow_show_metrics"
+        metric_adapter = _fresh_local_module(
+            "evaluate_talkshow_show_metrics"
         )
         validation = metric_adapter.validate_report(
             report,
@@ -907,8 +1255,8 @@ def _validate_primary_replay_receipt(
         "released2 primary replay artifact",
     )
     try:
-        metric_adapter = importlib.import_module(
-            "scripts.show_base.evaluate_talkshow_show_metrics"
+        metric_adapter = _fresh_local_module(
+            "evaluate_talkshow_show_metrics"
         )
         replay = metric_adapter.validate_released2_primary_replay_receipt(
             artifact,
@@ -1167,16 +1515,20 @@ def validate_published_test_winner_claim(
     expected_output_root: str | os.PathLike[str],
     prerequisite_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
+    continuation_waves: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Validate and return one immutable, one-shot SHOW test authorization.
 
-    ``prerequisite_selection`` and ``continuation_decision`` are externally
-    pinned artifact mappings.  No checkpoint mapping is accepted from the
-    caller: all six checkpoints are recovered from fresh receipt replay.
+    ``prerequisite_selection``, ``continuation_decision`` and every
+    ``continuation_waves`` artifact are externally pinned.  No checkpoint
+    mapping is accepted from the caller: all six checkpoints are recovered
+    from fresh receipt replay.
     """
 
-    claim_file = _regular_file(claim_path, "published winner claim")
-    claim_payload = claim_file.read_bytes()
+    claim_file, claim_payload = _safe_file_snapshot(
+        claim_path,
+        "published winner claim",
+    )
     expected_file_sha = _require_sha256(
         expected_claim_sha256, "published claim file SHA-256"
     )
@@ -1205,6 +1557,7 @@ def validate_published_test_winner_claim(
             "winner_selection",
             "prerequisite_selection",
             "continuation_decision",
+            "continuation_waves",
             "real_feature_cache",
             "selected_base_checkpoint",
             "fixed_checkpoints",
@@ -1251,6 +1604,10 @@ def validate_published_test_winner_claim(
             prerequisite_selection=prerequisite_payload,
         )
     )
+    normalized_waves = _validate_continuation_waves(
+        list(continuation_waves),
+        prerequisite_selection=prerequisite_payload,
+    )
     real_feature_cache, _cache_payload = _normalize_artifact(
         claim["real_feature_cache"],
         "published released2 real-feature cache",
@@ -1265,6 +1622,7 @@ def validate_published_test_winner_claim(
     if (
         claim["prerequisite_selection"] != prerequisite_artifact
         or claim["continuation_decision"] != continuation_artifact
+        or claim["continuation_waves"] != normalized_waves
         or claim["winner_selection"] != winner_artifact
         or claim["selected_base_checkpoint"]
         != winner["candidate_checkpoint"]
@@ -1287,6 +1645,7 @@ def validate_published_test_winner_claim(
         "fixed_checkpoints": {
             stage: dict(fixed_checkpoints[stage]) for stage in STAGES
         },
+        "continuation_waves": normalized_waves,
         "expected_output_root": expected_root,
         "test_policy": dict(TEST_POLICY),
     }

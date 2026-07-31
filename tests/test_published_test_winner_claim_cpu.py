@@ -6,10 +6,14 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+from scripts.show_base import prerequisite_val_contract as PREREQUISITE_CONTRACT
+import scripts.show_base as SHOW_BASE_PACKAGE
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "show_base" / "published_test_winner_claim.py"
@@ -51,6 +55,45 @@ def _write_receipt(path: Path, value: dict[str, object]) -> dict[str, object]:
     artifact = _write_json(path, receipt)
     artifact["receipt_payload_sha256"] = receipt["receipt_payload_sha256"]
     return artifact
+
+
+def _write_wave(
+    path: Path,
+    *,
+    boundary: int,
+    predecessor: dict[str, object] | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    receipt: dict[str, object] = {
+        "format": "semtalk_show_prerequisite_continuation_wave_v1",
+        "status": "authorized",
+        "test_visible": False,
+        "decision": {
+            "path": str((path.parent / f"continue-e{boundary}.json").resolve()),
+            "sha256": hashlib.sha256(
+                f"continue-file-{boundary}".encode()
+            ).hexdigest(),
+            "receipt_payload_sha256": hashlib.sha256(
+                f"continue-payload-{boundary}".encode()
+            ).hexdigest(),
+        },
+        "trigger_stages": ["face"],
+        "boundary_epoch": boundary,
+        "target_epoch": boundary + 20,
+        "stages": [
+            {
+                "stage": stage,
+                "old_segment": {
+                    "predecessor_wave": copy.deepcopy(predecessor)
+                },
+            }
+            for stage in CLAIM.STAGES
+        ],
+    }
+    artifact = _write_receipt(path, receipt)
+    receipt["receipt_payload_sha256"] = artifact[
+        "receipt_payload_sha256"
+    ]
+    return artifact, receipt
 
 
 def _reference(artifact: dict[str, object]) -> dict[str, object]:
@@ -170,6 +213,7 @@ class ClaimFixture:
             root / "continuation-decision.json",
             self.continuation_payload,
         )
+        self.continuation_waves: list[dict[str, object]] = []
         self.real_feature_cache = _write_receipt(
             root / "released2-real-feature-cache.json",
             {
@@ -443,6 +487,7 @@ class ClaimFixture:
             "winner_selection": self.winner_artifact,
             "prerequisite_selection": self.prerequisite_artifact,
             "continuation_decision": self.continuation_artifact,
+            "continuation_waves": self.continuation_waves,
             "real_feature_cache": self.real_feature_cache,
             "selected_base_checkpoint": self.winner_payload["selected"][
                 "candidate_checkpoint"
@@ -541,7 +586,9 @@ class ClaimFixture:
     def validate(self) -> dict[str, object]:
         adapter = self.adapter()
         with mock.patch.object(
-            CLAIM.importlib, "import_module", return_value=adapter
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: self.source_module(name, adapter),
         ):
             return CLAIM.validate_published_test_winner_claim(
                 self.claim_artifact["path"],
@@ -553,7 +600,16 @@ class ClaimFixture:
                 expected_output_root=self.output_root,
                 prerequisite_selection=self.prerequisite_artifact,
                 continuation_decision=self.continuation_artifact,
+                continuation_waves=self.continuation_waves,
             )
+
+    @staticmethod
+    def source_module(name: str, adapter: object) -> object:
+        if name == "evaluate_talkshow_show_metrics":
+            return adapter
+        if name == "prerequisite_val_contract":
+            return PREREQUISITE_CONTRACT
+        raise AssertionError(f"unexpected local module {name}")
 
     def rewrite_claim(self, mutate) -> None:
         payload = copy.deepcopy(self.claim_payload)
@@ -582,6 +638,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 "winner_selection",
                 "selected_base_checkpoint",
                 "fixed_checkpoints",
+                "continuation_waves",
                 "expected_output_root",
                 "test_policy",
             },
@@ -604,7 +661,11 @@ class PublishedWinnerClaimTests(unittest.TestCase):
     def test_wrong_output_root_fails(self) -> None:
         adapter = self.fixture.adapter()
         with mock.patch.object(
-            CLAIM.importlib, "import_module", return_value=adapter
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.source_module(
+                name, adapter
+            ),
         ), self.assertRaisesRegex(
             CLAIM.PublishedWinnerClaimError, "claim identity changed"
         ):
@@ -620,6 +681,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 ).resolve(),
                 prerequisite_selection=self.fixture.prerequisite_artifact,
                 continuation_decision=self.fixture.continuation_artifact,
+                continuation_waves=self.fixture.continuation_waves,
             )
 
     def test_more_than_one_test_evaluation_fails(self) -> None:
@@ -677,6 +739,160 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         ):
             fixture.validate()
 
+    def test_appended_e220_schedule_can_publish_a_fresh_stop(self) -> None:
+        fixture = ClaimFixture(Path(self.temporary.name) / "e220-stop")
+        fixture.prerequisite_payload["protocol"]["candidate_epochs"].append(
+            220
+        )
+        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = 11
+        fixture.prerequisite_artifact = _write_receipt(
+            Path(fixture.prerequisite_artifact["path"]),
+            fixture.prerequisite_payload,
+        )
+        prerequisite_artifact, prerequisite, _fixed = (
+            CLAIM._validate_prerequisite_selection(
+                fixture.prerequisite_artifact
+            )
+        )
+        fixture.continuation_payload = fixture._continuation_payload("stop")
+        for stage in fixture.continuation_payload["stages"]:
+            stage["recent_candidate_epochs"] = [180, 200, 220]
+            stage["latest_epoch"] = 220
+        fixture.continuation_artifact = _write_receipt(
+            Path(fixture.continuation_artifact["path"]),
+            fixture.continuation_payload,
+        )
+        continuation_artifact, decision = (
+            CLAIM._validate_continuation_decision(
+                fixture.continuation_artifact,
+                prerequisite_artifact=prerequisite_artifact,
+                prerequisite_selection=prerequisite,
+            )
+        )
+        self.assertEqual(
+            prerequisite["protocol"]["candidate_epochs"][-1],
+            220,
+        )
+        self.assertEqual(decision["decision"], "stop")
+        self.assertEqual(
+            continuation_artifact,
+            fixture.continuation_artifact,
+        )
+        with self.assertRaisesRegex(
+            CLAIM.PublishedWinnerClaimError,
+            "do not cover every appended boundary",
+        ):
+            CLAIM._validate_continuation_waves(
+                [],
+                prerequisite_selection=prerequisite,
+            )
+        wave, receipt = _write_wave(
+            fixture.root / "wave-e200-e220.json",
+            boundary=200,
+            predecessor=None,
+        )
+        with mock.patch.object(
+            CLAIM,
+            "_replay_continuation_wave_file",
+            return_value=receipt,
+        ):
+            self.assertEqual(
+                CLAIM._validate_continuation_waves(
+                    [wave],
+                    prerequisite_selection=prerequisite,
+                ),
+                [wave],
+            )
+
+    def test_self_signed_extension_cannot_forge_candidate_index(self) -> None:
+        fixture = ClaimFixture(
+            Path(self.temporary.name) / "forged-e220-selection"
+        )
+        fixture.prerequisite_payload["protocol"]["candidate_epochs"].append(
+            220
+        )
+        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = 11
+        face = fixture.prerequisite_payload["stages"][0]
+        face["epoch"] = 220
+        face["optimizer_updates"] = (
+            220 * CLAIM.PREREQUISITE_UPDATES_PER_EPOCH
+        )
+        # The forged receipt is rehashed but still claims candidate slot zero.
+        fixture.prerequisite_artifact = _write_receipt(
+            Path(fixture.prerequisite_artifact["path"]),
+            fixture.prerequisite_payload,
+        )
+        with self.assertRaisesRegex(
+            CLAIM.PublishedWinnerClaimError,
+            "face selection changed",
+        ):
+            CLAIM._validate_prerequisite_selection(
+                fixture.prerequisite_artifact
+            )
+
+    def test_continuation_wave_intermediate_tamper_is_rejected(self) -> None:
+        root = Path(self.temporary.name) / "wave-chain"
+        root.mkdir()
+        first, first_receipt = _write_wave(
+            root / "wave-e200-e220.json",
+            boundary=200,
+            predecessor=None,
+        )
+        predecessor = {
+            key: first[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+        second, second_receipt = _write_wave(
+            root / "wave-e220-e240.json",
+            boundary=220,
+            predecessor=predecessor,
+        )
+        receipts = {
+            first["path"]: first_receipt,
+            second["path"]: second_receipt,
+        }
+        selection = {
+            "protocol": {
+                "candidate_epochs": [
+                    *range(20, 201, 20),
+                    220,
+                    240,
+                ]
+            }
+        }
+        with (
+            mock.patch.object(
+                CLAIM,
+                "_fresh_local_module",
+                return_value=PREREQUISITE_CONTRACT,
+            ),
+            mock.patch.object(
+                CLAIM,
+                "_replay_continuation_wave_file",
+                side_effect=lambda artifact: copy.deepcopy(
+                    receipts[artifact["path"]]
+                ),
+            ),
+        ):
+            self.assertEqual(
+                CLAIM._validate_continuation_waves(
+                    [first, second],
+                    prerequisite_selection=selection,
+                ),
+                [first, second],
+            )
+            receipts[second["path"]]["stages"][2]["old_segment"][
+                "predecessor_wave"
+            ] = None
+            with self.assertRaisesRegex(
+                CLAIM.PublishedWinnerClaimError,
+                "predecessor chain mismatch",
+            ):
+                CLAIM._validate_continuation_waves(
+                    [first, second],
+                    prerequisite_selection=selection,
+                )
+
     def test_metric_adapter_failure_has_no_fallback(self) -> None:
         adapter = SimpleNamespace(
             validate_report=lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -684,7 +900,11 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             )
         )
         with mock.patch.object(
-            CLAIM.importlib, "import_module", return_value=adapter
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.source_module(
+                name, adapter
+            ),
         ), self.assertRaisesRegex(
             CLAIM.PublishedWinnerClaimError,
             "neutral TalkSHOW report replay failed",
@@ -699,6 +919,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 expected_output_root=self.fixture.output_root,
                 prerequisite_selection=self.fixture.prerequisite_artifact,
                 continuation_decision=self.fixture.continuation_artifact,
+                continuation_waves=self.fixture.continuation_waves,
             )
 
     def test_primary_replay_failure_has_no_report_fgd_fallback(self) -> None:
@@ -709,7 +930,11 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             )
         )
         with mock.patch.object(
-            CLAIM.importlib, "import_module", return_value=adapter
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.source_module(
+                name, adapter
+            ),
         ), self.assertRaisesRegex(
             CLAIM.PublishedWinnerClaimError,
             "released2 primary fresh replay verification failed",
@@ -724,6 +949,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 expected_output_root=self.fixture.output_root,
                 prerequisite_selection=self.fixture.prerequisite_artifact,
                 continuation_decision=self.fixture.continuation_artifact,
+                continuation_waves=self.fixture.continuation_waves,
             )
 
     def test_external_prerequisite_artifact_swap_fails(self) -> None:
@@ -731,7 +957,11 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         swapped["sha256"] = "0" * 64
         adapter = self.fixture.adapter()
         with mock.patch.object(
-            CLAIM.importlib, "import_module", return_value=adapter
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: self.fixture.source_module(
+                name, adapter
+            ),
         ), self.assertRaisesRegex(
             CLAIM.PublishedWinnerClaimError, "artifact changed"
         ):
@@ -745,6 +975,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 expected_output_root=self.fixture.output_root,
                 prerequisite_selection=swapped,
                 continuation_decision=self.fixture.continuation_artifact,
+                continuation_waves=self.fixture.continuation_waves,
             )
 
     def test_claim_real_feature_cache_is_an_independent_pin(self) -> None:
@@ -764,6 +995,35 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             "winner selection identity changed",
         ):
             self.fixture.validate()
+
+    def test_same_path_cached_schedule_validator_is_ignored(self) -> None:
+        expected = (
+            Path(CLAIM.__file__).resolve().parent
+            / "prerequisite_val_contract.py"
+        )
+        poisoned = types.SimpleNamespace(
+            __file__=str(expected),
+            REQUIRED_CANDIDATE_EPOCHS=(999,),
+            EXPECTED_UPDATES_PER_EPOCH=1,
+            validate_candidate_epochs=lambda _value: (999,),
+        )
+        full_name = "scripts.show_base.prerequisite_val_contract"
+        with (
+            mock.patch.dict(sys.modules, {full_name: poisoned}),
+            mock.patch.object(
+                SHOW_BASE_PACKAGE,
+                "prerequisite_val_contract",
+                poisoned,
+            ),
+        ):
+            observed = CLAIM._fresh_local_module(
+                "prerequisite_val_contract"
+            )
+        self.assertIsNot(observed, poisoned)
+        self.assertEqual(
+            observed.REQUIRED_CANDIDATE_EPOCHS,
+            tuple(range(20, 201, 20)),
+        )
 
 
 if __name__ == "__main__":
