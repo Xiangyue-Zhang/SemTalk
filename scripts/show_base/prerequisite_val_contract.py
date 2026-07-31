@@ -23,6 +23,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 EXPECTED_VAL_CLIPS = 1_715
+EXPECTED_SHOW_SPLIT_COUNTS = {"train": 13_687, "val": 1_715, "test": 1_708}
+EXPECTED_VAL_GLOBAL_INDEX_START = EXPECTED_SHOW_SPLIT_COUNTS["train"]
+EXPECTED_VAL_GLOBAL_INDEX_STOP = (
+    EXPECTED_VAL_GLOBAL_INDEX_START + EXPECTED_VAL_CLIPS
+)
 EXPECTED_SHARDS = 8
 EXPECTED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
 EXPECTED_UPDATES_PER_EPOCH = 497
@@ -970,6 +975,30 @@ def load_val_canonical(
         strict_json_bytes(lineage_bytes, str(lineage)),
         "validation canonical lineage",
     )
+    summary_index_start = require_exact_int(
+        summary_value.get("global_index_start"),
+        "validation canonical summary global_index_start",
+    )
+    summary_index_stop = require_exact_int(
+        summary_value.get("global_index_stop_exclusive"),
+        "validation canonical summary global_index_stop_exclusive",
+    )
+    lineage_index_start = require_exact_int(
+        lineage_value.get("global_index_start"),
+        "validation canonical lineage global_index_start",
+    )
+    lineage_index_stop = require_exact_int(
+        lineage_value.get("global_index_stop_exclusive"),
+        "validation canonical lineage global_index_stop_exclusive",
+    )
+    summary_indices_sha = require_sha256(
+        summary_value.get("global_indices_sha256"),
+        "validation canonical summary global_indices_sha256",
+    )
+    lineage_indices_sha = require_sha256(
+        lineage_value.get("global_indices_sha256"),
+        "validation canonical lineage global_indices_sha256",
+    )
     if (
         summary_value.get("format") != VAL_CANONICAL_SUMMARY_FORMAT
         or summary_value.get("status") != "complete"
@@ -978,6 +1007,11 @@ def load_val_canonical(
         or summary_value.get("clip_count") != EXPECTED_VAL_CLIPS
         or summary_value.get("manifest_sha256") != manifest_sha
         or summary_value.get("lineage_sha256") != lineage_sha
+        or summary_index_start != EXPECTED_VAL_GLOBAL_INDEX_START
+        or summary_index_stop != EXPECTED_VAL_GLOBAL_INDEX_STOP
+        or lineage_index_start != summary_index_start
+        or lineage_index_stop != summary_index_stop
+        or lineage_indices_sha != summary_indices_sha
         or lineage_value.get("format") != VAL_CANONICAL_LINEAGE_FORMAT
         or lineage_value.get("status") != "complete"
         or lineage_value.get("split") != "val"
@@ -1046,7 +1080,8 @@ def load_val_canonical(
         canonical_paths.append(canonical_path)
         speakers.add(speaker)
     if (
-        indices != list(range(EXPECTED_VAL_CLIPS))
+        indices != list(range(summary_index_start, summary_index_stop))
+        or canonical_payload_sha256(indices) != summary_indices_sha
         or len(set(clip_ids)) != EXPECTED_VAL_CLIPS
         or len(set(canonical_paths)) != EXPECTED_VAL_CLIPS
         or speakers != set(SHOW_SPEAKERS)

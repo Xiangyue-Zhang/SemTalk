@@ -27,31 +27,22 @@ def write_json(path: Path, value: object) -> str:
 class BuildValCanonicalViewTest(unittest.TestCase):
     def fixture(self, root: Path):
         manifest = root / "full.jsonl"
-        rows = [
-            {
-                "global_index": index,
-                "clip_id": f"oliver/video-{index}/sequence-{index}",
-                "split": "val",
-                "lineage_contract_sha256": "a" * 64,
-            }
-            for index in range(VIEW.EXPECTED_VAL_CLIPS)
-        ]
-        rows.extend(
-            [
-                {
-                    "global_index": VIEW.EXPECTED_VAL_CLIPS,
-                    "clip_id": "oliver/not-visible/test-row",
-                    "split": "test",
-                    "lineage_contract_sha256": "a" * 64,
-                },
-                {
-                    "global_index": VIEW.EXPECTED_VAL_CLIPS + 1,
-                    "clip_id": "oliver/not-visible/train-row",
-                    "split": "train",
-                    "lineage_contract_sha256": "a" * 64,
-                },
-            ]
-        )
+        rows = []
+        global_index = 0
+        for split, count in VIEW.EXPECTED_SPLIT_COUNTS.items():
+            for ordinal in range(count):
+                rows.append(
+                    {
+                        "global_index": global_index,
+                        "clip_id": (
+                            f"oliver/{split}-video-{ordinal}/"
+                            f"sequence-{ordinal}"
+                        ),
+                        "split": split,
+                        "lineage_contract_sha256": "a" * 64,
+                    }
+                )
+                global_index += 1
         manifest.write_text(
             "".join(
                 json.dumps(row, sort_keys=True, separators=(",", ":"))
@@ -82,11 +73,7 @@ class BuildValCanonicalViewTest(unittest.TestCase):
                 "status": "complete",
                 "manifest_sha256": manifest_sha,
                 "lineage_sha256": lineage_sha,
-                "split_counts": {
-                    "train": 1,
-                    "val": VIEW.EXPECTED_VAL_CLIPS,
-                    "test": 1,
-                },
+                "split_counts": VIEW.EXPECTED_SPLIT_COUNTS,
             },
         )
         args = VIEW.parser().parse_args(
@@ -128,8 +115,14 @@ class BuildValCanonicalViewTest(unittest.TestCase):
             ]
             self.assertEqual(len(rows), VIEW.EXPECTED_VAL_CLIPS)
             self.assertTrue(all(row["split"] == "val" for row in rows))
-            self.assertFalse(
-                any("not-visible" in row["clip_id"] for row in rows)
+            self.assertEqual(
+                [row["global_index"] for row in rows],
+                list(
+                    range(
+                        VIEW.EXPECTED_VAL_GLOBAL_INDEX_START,
+                        VIEW.EXPECTED_VAL_GLOBAL_INDEX_STOP,
+                    )
+                ),
             )
             summary = json.loads((output / "summary.json").read_text())
             lineage = json.loads((output / "lineage.json").read_text())
@@ -137,6 +130,18 @@ class BuildValCanonicalViewTest(unittest.TestCase):
             self.assertFalse(lineage["test_visible"])
             self.assertFalse(
                 lineage["projection"]["test_rows_materialized"]
+            )
+            self.assertEqual(
+                summary["global_index_start"],
+                VIEW.EXPECTED_VAL_GLOBAL_INDEX_START,
+            )
+            self.assertEqual(
+                summary["global_index_stop_exclusive"],
+                VIEW.EXPECTED_VAL_GLOBAL_INDEX_STOP,
+            )
+            self.assertEqual(
+                summary["global_indices_sha256"],
+                lineage["global_indices_sha256"],
             )
             self.assertEqual(
                 receipt["manifest_sha256"],
@@ -165,9 +170,27 @@ class BuildValCanonicalViewTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = self.fixture(root)
-            lines = args.full_manifest.read_text().splitlines()
+            rows = [
+                json.loads(line)
+                for line in args.full_manifest.read_text().splitlines()
+            ]
+            removed = False
+            kept = []
+            for row in rows:
+                if row["split"] == "val" and not removed:
+                    removed = True
+                    continue
+                kept.append(row)
             args.full_manifest.write_text(
-                "\n".join(lines[1:]) + "\n",
+                "".join(
+                    json.dumps(
+                        row,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                    for row in kept
+                ),
                 encoding="utf-8",
             )
             args.expected_full_manifest_sha256 = hashlib.sha256(
@@ -180,6 +203,46 @@ class BuildValCanonicalViewTest(unittest.TestCase):
                 summary,
             )
             with self.assertRaisesRegex(VIEW.ValViewError, "val row count"):
+                VIEW.build(args)
+
+    def test_refuses_rebased_validation_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.fixture(root)
+            rows = [
+                json.loads(line)
+                for line in args.full_manifest.read_text().splitlines()
+            ]
+            rebased = 0
+            for row in rows:
+                if row["split"] == "val":
+                    row["global_index"] = rebased
+                    rebased += 1
+            args.full_manifest.write_text(
+                "".join(
+                    json.dumps(
+                        row,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                    for row in rows
+                ),
+                encoding="utf-8",
+            )
+            args.expected_full_manifest_sha256 = hashlib.sha256(
+                args.full_manifest.read_bytes()
+            ).hexdigest()
+            summary = json.loads(args.full_summary.read_text())
+            summary["manifest_sha256"] = args.expected_full_manifest_sha256
+            args.expected_full_summary_sha256 = write_json(
+                args.full_summary,
+                summary,
+            )
+            with self.assertRaisesRegex(
+                VIEW.ValViewError,
+                "official global-index range",
+            ):
                 VIEW.build(args)
 
 

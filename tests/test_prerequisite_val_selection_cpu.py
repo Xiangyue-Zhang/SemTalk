@@ -13,6 +13,7 @@ import unittest
 
 from scripts.show_base import merge_prerequisite_val_shards as merger
 from scripts.show_base import build_prerequisite_candidate_index as builder
+from scripts.show_base import build_val_canonical_view as val_view_builder
 from scripts.show_base import prerequisite_val_contract as contract
 from scripts.show_base import select_prerequisite_candidates as selector
 
@@ -117,19 +118,33 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         Path,
         str,
     ]:
+        self.assertEqual(
+            contract.EXPECTED_SHOW_SPLIT_COUNTS,
+            val_view_builder.EXPECTED_SPLIT_COUNTS,
+        )
+        self.assertEqual(
+            contract.EXPECTED_VAL_GLOBAL_INDEX_START,
+            val_view_builder.EXPECTED_VAL_GLOBAL_INDEX_START,
+        )
         canonical_root = root / "canonical_npz"
         canonical_root.mkdir(parents=True)
         speakers = tuple(contract.SHOW_SPEAKERS)
-        rows: list[dict[str, object]] = []
-        for index in range(contract.EXPECTED_VAL_CLIPS):
-            speaker = speakers[index % len(speakers)]
-            canonical = canonical_root / f"clip_{index:04d}.npz"
-            canonical.write_bytes(f"canonical:{index}\n".encode())
-            rows.append(
+        val_rows: list[dict[str, object]] = []
+        for ordinal, global_index in enumerate(
+            range(
+                contract.EXPECTED_VAL_GLOBAL_INDEX_START,
+                contract.EXPECTED_VAL_GLOBAL_INDEX_STOP,
+            )
+        ):
+            speaker = speakers[ordinal % len(speakers)]
+            canonical = canonical_root / f"clip_{global_index:05d}.npz"
+            canonical.write_bytes(f"canonical:{global_index}\n".encode())
+            val_rows.append(
                 {
-                    "global_index": index,
+                    "global_index": global_index,
                     "clip_id": (
-                        f"{speaker}/video-{index}/sequence-{index}"
+                        f"{speaker}/video-{global_index}/"
+                        f"sequence-{global_index}"
                     ),
                     "split": "val",
                     "speaker": speaker,
@@ -139,43 +154,95 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     "canonical_npz_sha256": hashlib.sha256(
                         canonical.read_bytes()
                     ).hexdigest(),
+                    "lineage_contract_sha256": "1" * 64,
                 }
             )
-        manifest = root / "canonical" / "manifest.jsonl"
-        manifest_sha = write_jsonl(manifest, rows)
-        lineage = root / "canonical" / "lineage.json"
-        lineage_payload = contract.receipt_payload(
+        full_rows: list[dict[str, object]] = []
+        val_by_index = {
+            int(row["global_index"]): row for row in val_rows
+        }
+        global_index = 0
+        for split, count in val_view_builder.EXPECTED_SPLIT_COUNTS.items():
+            for ordinal in range(count):
+                if split == "val":
+                    row = val_by_index[global_index]
+                else:
+                    row = {
+                        "global_index": global_index,
+                        "clip_id": (
+                            f"oliver/{split}-video-{ordinal}/"
+                            f"sequence-{ordinal}"
+                        ),
+                        "split": split,
+                        "lineage_contract_sha256": "1" * 64,
+                    }
+                full_rows.append(row)
+                global_index += 1
+        full_manifest = root / "full_canonical" / "manifest.jsonl"
+        full_manifest_sha = write_jsonl(full_manifest, full_rows)
+        full_lineage = root / "full_canonical" / "lineage.json"
+        full_lineage_sha = write_json(
+            full_lineage,
             {
-                "format": contract.VAL_CANONICAL_LINEAGE_FORMAT,
-                "status": "complete",
-                "split": "val",
-                "test_visible": False,
-                "clip_count": contract.EXPECTED_VAL_CLIPS,
-                "manifest_sha256": manifest_sha,
-            }
+                "lineage_contract_sha256": "1" * 64,
+                "lineage_contract": {
+                    "source_receipt": {
+                        "origin": contract.EXPECTED_ORIGIN,
+                        "commit": "2" * 40,
+                        "tree": "3" * 40,
+                    }
+                },
+            },
         )
-        lineage_sha = write_json(lineage, lineage_payload)
-        summary = root / "canonical" / "summary.json"
-        summary_payload = contract.receipt_payload(
+        full_summary = root / "full_canonical" / "summary.json"
+        full_summary_sha = write_json(
+            full_summary,
             {
-                "format": contract.VAL_CANONICAL_SUMMARY_FORMAT,
                 "status": "complete",
-                "split": "val",
-                "test_visible": False,
-                "clip_count": contract.EXPECTED_VAL_CLIPS,
-                "manifest_sha256": manifest_sha,
-                "lineage_sha256": lineage_sha,
-            }
+                "manifest_sha256": full_manifest_sha,
+                "lineage_sha256": full_lineage_sha,
+                "split_counts": val_view_builder.EXPECTED_SPLIT_COUNTS,
+            },
         )
-        summary_sha = write_json(summary, summary_payload)
+        output = val_view_builder.build(
+            val_view_builder.parser().parse_args(
+                [
+                    "--full-manifest",
+                    str(full_manifest),
+                    "--full-summary",
+                    str(full_summary),
+                    "--full-lineage",
+                    str(full_lineage),
+                    "--expected-full-manifest-sha256",
+                    full_manifest_sha,
+                    "--expected-full-summary-sha256",
+                    full_summary_sha,
+                    "--expected-full-lineage-sha256",
+                    full_lineage_sha,
+                    "--expected-source-commit",
+                    "2" * 40,
+                    "--expected-source-tree",
+                    "3" * 40,
+                    "--output-root",
+                    str(root / "canonical"),
+                ]
+            )
+        )
+        manifest = Path(str(output["manifest"]))
+        summary = Path(str(output["summary"]))
+        lineage = Path(str(output["lineage"]))
+        rows = [
+            json.loads(line)
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+        ]
         return (
             rows,
             manifest,
-            manifest_sha,
+            str(output["manifest_sha256"]),
             summary,
-            summary_sha,
+            str(output["summary_sha256"]),
             lineage,
-            lineage_sha,
+            str(output["lineage_sha256"]),
         )
 
     def rewrite_canonical_receipts(
@@ -185,16 +252,24 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         summary: Path,
         lineage: Path,
     ) -> tuple[str, str, str]:
+        indices = [int(row["global_index"]) for row in rows]
+        indices_sha = contract.canonical_payload_sha256(indices)
         manifest_sha = write_jsonl(manifest, rows)
         lineage_payload = json.loads(lineage.read_text())
         lineage_payload.pop("receipt_payload_sha256")
         lineage_payload["manifest_sha256"] = manifest_sha
+        lineage_payload["global_index_start"] = indices[0]
+        lineage_payload["global_index_stop_exclusive"] = indices[-1] + 1
+        lineage_payload["global_indices_sha256"] = indices_sha
         lineage_payload = contract.receipt_payload(lineage_payload)
         lineage_sha = write_json(lineage, lineage_payload)
         summary_payload = json.loads(summary.read_text())
         summary_payload.pop("receipt_payload_sha256")
         summary_payload["manifest_sha256"] = manifest_sha
         summary_payload["lineage_sha256"] = lineage_sha
+        summary_payload["global_index_start"] = indices[0]
+        summary_payload["global_index_stop_exclusive"] = indices[-1] + 1
+        summary_payload["global_indices_sha256"] = indices_sha
         summary_payload = contract.receipt_payload(summary_payload)
         summary_sha = write_json(summary, summary_payload)
         return manifest_sha, summary_sha, lineage_sha
@@ -1176,6 +1251,83 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 contract.ContractError,
                 "not exact-once",
+            ):
+                contract.load_val_canonical(
+                    manifest_path=manifest,
+                    manifest_sha256=manifest_sha,
+                    summary_path=summary,
+                    summary_sha256=summary_sha,
+                    lineage_path=lineage,
+                    lineage_sha256=lineage_sha,
+                )
+
+    def test_canonical_global_indices_preserve_official_full_manifest_range(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                rows,
+                manifest,
+                manifest_sha,
+                summary,
+                summary_sha,
+                lineage,
+                lineage_sha,
+            ) = self.canonical_fixture(root)
+            loaded, _ = contract.load_val_canonical(
+                manifest_path=manifest,
+                manifest_sha256=manifest_sha,
+                summary_path=summary,
+                summary_sha256=summary_sha,
+                lineage_path=lineage,
+                lineage_sha256=lineage_sha,
+            )
+            indices = [int(row["global_index"]) for row in loaded]
+            self.assertEqual(
+                indices,
+                list(
+                    range(
+                        contract.EXPECTED_VAL_GLOBAL_INDEX_START,
+                        contract.EXPECTED_VAL_GLOBAL_INDEX_STOP,
+                    )
+                ),
+            )
+            partitions = [
+                [
+                    index
+                    for index in indices
+                    if index % contract.EXPECTED_SHARDS == shard
+                ]
+                for shard in range(contract.EXPECTED_SHARDS)
+            ]
+            self.assertEqual(
+                [len(partition) for partition in partitions],
+                [215, 215, 214, 214, 214, 214, 214, 215],
+            )
+            self.assertEqual(
+                sorted(
+                    index
+                    for partition in partitions
+                    for index in partition
+                ),
+                indices,
+            )
+
+            rebased = copy.deepcopy(rows)
+            for index, row in enumerate(rebased):
+                row["global_index"] = index
+            manifest_sha, summary_sha, lineage_sha = (
+                self.rewrite_canonical_receipts(
+                    rebased,
+                    manifest,
+                    summary,
+                    lineage,
+                )
+            )
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "receipt binding mismatch",
             ):
                 contract.load_val_canonical(
                     manifest_path=manifest,

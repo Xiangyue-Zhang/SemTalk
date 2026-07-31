@@ -13,7 +13,12 @@ import uuid
 
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
-EXPECTED_VAL_CLIPS = 1_715
+EXPECTED_SPLIT_COUNTS = {"train": 13_687, "val": 1_715, "test": 1_708}
+EXPECTED_VAL_CLIPS = EXPECTED_SPLIT_COUNTS["val"]
+EXPECTED_VAL_GLOBAL_INDEX_START = EXPECTED_SPLIT_COUNTS["train"]
+EXPECTED_VAL_GLOBAL_INDEX_STOP = (
+    EXPECTED_VAL_GLOBAL_INDEX_START + EXPECTED_VAL_CLIPS
+)
 SUMMARY_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_summary_v1"
 )
@@ -168,7 +173,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         or full_summary.get("lineage_sha256")
         != args.expected_full_lineage_sha256
         or not isinstance(split_counts, dict)
-        or split_counts.get("val") != EXPECTED_VAL_CLIPS
+        or split_counts != EXPECTED_SPLIT_COUNTS
         or not isinstance(source, dict)
         or source.get("origin") != EXPECTED_ORIGIN
         or source.get("commit") != source_commit
@@ -209,12 +214,18 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         )
     indices = [int(row["global_index"]) for row in val_rows]
     clip_ids = [str(row["clip_id"]) for row in val_rows]
-    if (
-        indices != sorted(indices)
-        or len(indices) != len(set(indices))
-        or len(clip_ids) != len(set(clip_ids))
+    if indices != list(
+        range(
+            EXPECTED_VAL_GLOBAL_INDEX_START,
+            EXPECTED_VAL_GLOBAL_INDEX_STOP,
+        )
     ):
-        raise ValViewError("validation rows are not unique global-index order")
+        raise ValViewError(
+            "validation rows do not preserve the official global-index range"
+        )
+    if len(clip_ids) != len(set(clip_ids)):
+        raise ValViewError("validation clip IDs are not unique")
+    global_indices_sha256 = _compact_payload_sha256(indices)
 
     manifest_bytes = b"".join(
         (
@@ -244,6 +255,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         "split": "val",
         "test_visible": False,
         "clip_count": EXPECTED_VAL_CLIPS,
+        "global_index_start": EXPECTED_VAL_GLOBAL_INDEX_START,
+        "global_index_stop_exclusive": EXPECTED_VAL_GLOBAL_INDEX_STOP,
+        "global_indices_sha256": global_indices_sha256,
         "manifest_sha256": manifest_sha256,
         "lineage_contract_sha256": lineage_contract_sha256,
         "projection": {
@@ -262,6 +276,9 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         "split": "val",
         "test_visible": False,
         "clip_count": EXPECTED_VAL_CLIPS,
+        "global_index_start": EXPECTED_VAL_GLOBAL_INDEX_START,
+        "global_index_stop_exclusive": EXPECTED_VAL_GLOBAL_INDEX_STOP,
+        "global_indices_sha256": global_indices_sha256,
         "manifest_sha256": manifest_sha256,
         "lineage_sha256": lineage_sha256,
         "lineage_contract_sha256": lineage_contract_sha256,
