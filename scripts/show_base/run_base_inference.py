@@ -59,6 +59,8 @@ import zipfile
 
 import numpy as np
 
+from scripts.show_base import prerequisite_val_contract as prerequisite_contract
+
 
 # Formal source cleanliness is rechecked at completion; local model imports must
 # therefore never create untracked bytecode inside the immutable source tree.
@@ -391,7 +393,20 @@ MODEL_V2_AUDIT_KEYS = {
     "source_receipt",
     "source_receipt_sha256",
     "optimizer_updates",
+    "smplx_training_pool_mode",
+    "distributed_training_receipt",
+    "optimizer_runtime_receipt",
+    "rvq_rank_state_receipt",
+    "initialization_receipt",
+    "rvq_ema_prior_receipt",
+    "latest_representation_candidate",
+    "smplx_training_pool_runtime_evidence",
     "base_candidate_manifest",
+}
+MODEL_V2_OPTIONAL_AUDIT_KEYS = {
+    "continuation_wave_receipt",
+    "smplx_training_pool_gate",
+    "lower_target_joints_cache",
 }
 LOWER_TARGET_CACHE_RECEIPT_KEY = "lower_target_joints_cache"
 LOWER_TARGET_CACHE_RECEIPT_KEYS = {
@@ -453,6 +468,7 @@ LOWER_TARGET_BACKEND_RECEIPT_KEYS = {
 BASE_CANDIDATE_AUDIT_KEYS = {
     "format",
     "formal_stage",
+    "smplx_training_pool_mode",
     "candidate_epoch",
     "optimizer_updates",
     "config_sha256",
@@ -3272,11 +3288,15 @@ def _validate_model_v2_audit(
     source_receipt: Mapping[str, Any],
     optimizer_updates: int,
     base_candidate_manifest: Mapping[str, Any] | None,
+    status: Mapping[str, Any],
     path: Path,
 ) -> None:
     expected_audit_keys = set(MODEL_V2_AUDIT_KEYS)
     if formal_stage == "lower":
         expected_audit_keys.add(LOWER_TARGET_BACKEND_RECEIPT_KEY)
+    for key in MODEL_V2_OPTIONAL_AUDIT_KEYS:
+        if key in status:
+            expected_audit_keys.add(key)
     if (
         set(audit) != expected_audit_keys
         or audit.get("format") != "semtalk_show_model_v2"
@@ -3304,6 +3324,156 @@ def _validate_model_v2_audit(
         raise InferenceContractError(
             f"{path}: invalid model_v2 formal audit for {formal_stage}"
         )
+    bound_training_keys = (
+        "smplx_training_pool_mode",
+        "distributed_training_receipt",
+        "optimizer_runtime_receipt",
+        "rvq_rank_state_receipt",
+        "initialization_receipt",
+        "rvq_ema_prior_receipt",
+        "latest_representation_candidate",
+        "smplx_training_pool_runtime_evidence",
+    )
+    if any(audit.get(key) != status.get(key) for key in bound_training_keys):
+        raise InferenceContractError(
+            f"{path}: model_v2 training binding differs from formal status"
+        )
+    for key in MODEL_V2_OPTIONAL_AUDIT_KEYS:
+        if key in status and audit.get(key) != status.get(key):
+            raise InferenceContractError(
+                f"{path}: model_v2 optional training binding differs"
+            )
+    gate = dataset_receipt.get("smplx_training_pool_gate")
+    expected_pool_mode = (
+        gate.get("mode") if isinstance(gate, Mapping) else "disabled"
+    )
+    if (
+        audit.get("smplx_training_pool_mode") != expected_pool_mode
+        or audit.get("smplx_training_pool_gate") != gate
+        or audit.get("lower_target_joints_cache")
+        != dataset_receipt.get("lower_target_joints_cache")
+    ):
+        raise InferenceContractError(
+            f"{path}: model_v2 dataset accelerator binding mismatch"
+        )
+    runtime_evidence = audit.get("smplx_training_pool_runtime_evidence")
+    if expected_pool_mode == "disabled":
+        if runtime_evidence is not None:
+            raise InferenceContractError(
+                f"{path}: disabled SMPL-X pool has runtime evidence"
+            )
+    else:
+        try:
+            prerequisite_contract.verify_named_compact_hash(
+                runtime_evidence,
+                hash_key="receipt_sha256",
+                label=f"{formal_stage} SMPL-X pool runtime evidence",
+            )
+        except prerequisite_contract.ContractError as exc:
+            raise InferenceContractError(str(exc)) from exc
+    try:
+        if formal_stage == "base":
+            distributed = prerequisite_contract.exact_keys(
+                prerequisite_contract.verify_named_compact_hash(
+                    audit.get("distributed_training_receipt"),
+                    hash_key="receipt_sha256",
+                    label="Base distributed training receipt",
+                ),
+                (
+                    "format",
+                    "formal_stage",
+                    "world_size",
+                    "local_batch_size",
+                    "global_batch_size",
+                    "train_samples",
+                    "available_train_samples",
+                    "consumed_samples_per_epoch",
+                    "dropped_samples_per_epoch",
+                    "padding_or_duplicate_samples_per_epoch",
+                    "updates_per_epoch",
+                    "loader_drop_last",
+                    "sampler",
+                    "rvq_ema",
+                    "receipt_sha256",
+                ),
+                "Base distributed training receipt",
+            )
+            sampler = distributed.get("sampler")
+            sampler_seed = prerequisite_contract.require_exact_int(
+                sampler.get("seed") if isinstance(sampler, dict) else None,
+                "Base distributed training receipt sampler seed",
+            )
+            if (
+                distributed.get("format")
+                != "semtalk_show_representation_ddp_v1"
+                or distributed.get("formal_stage") != "base"
+                or distributed.get("world_size") != 1
+                or distributed.get("local_batch_size") != 64
+                or distributed.get("global_batch_size") != 64
+                or distributed.get("train_samples") != 127_286
+                or distributed.get("available_train_samples") != 127_286
+                or distributed.get("consumed_samples_per_epoch") != 127_232
+                or distributed.get("dropped_samples_per_epoch") != 54
+                or distributed.get("padding_or_duplicate_samples_per_epoch") != 0
+                or distributed.get("updates_per_epoch") != 1_988
+                or distributed.get("loader_drop_last") is not True
+                or sampler_seed < 0
+                or sampler
+                != {
+                    "class": "RandomSampler",
+                    "shuffle": True,
+                    "seed": sampler_seed,
+                    "drop_last": True,
+                    "set_epoch": None,
+                }
+                or distributed.get("rvq_ema") != {"enabled": False}
+            ):
+                raise prerequisite_contract.ContractError(
+                    "Base distributed training receipt mismatch"
+                )
+            if any(
+                audit.get(key) is not None
+                for key in (
+                    "rvq_rank_state_receipt",
+                    "initialization_receipt",
+                    "rvq_ema_prior_receipt",
+                    "latest_representation_candidate",
+                )
+            ):
+                raise prerequisite_contract.ContractError(
+                    "Base model_v2 has representation-only bindings"
+                )
+        else:
+            distributed = prerequisite_contract.validate_distributed_training_receipt(
+                audit.get("distributed_training_receipt"),
+                stage=formal_stage,
+                label=f"{formal_stage} distributed training receipt",
+            )
+            prerequisite_contract.validate_initialization_receipt(
+                audit.get("initialization_receipt"),
+                stage=formal_stage,
+                label=f"{formal_stage} initialization receipt",
+                reprove_path=False,
+            )
+            prerequisite_contract.validate_rvq_ema_prior_receipt(
+                audit.get("rvq_ema_prior_receipt"),
+                stage=formal_stage,
+                label=f"{formal_stage} RVQ EMA-prior receipt",
+            )
+            prerequisite_contract.validate_rvq_rank_state_receipt(
+                audit.get("rvq_rank_state_receipt"),
+                stage=formal_stage,
+                distributed=distributed,
+                label=f"{formal_stage} RVQ rank-state receipt",
+            )
+        prerequisite_contract.validate_optimizer_runtime_receipt(
+            audit.get("optimizer_runtime_receipt"),
+            stage=formal_stage,
+            label=f"{formal_stage} optimizer runtime receipt",
+            required=True,
+        )
+    except prerequisite_contract.ContractError as exc:
+        raise InferenceContractError(str(exc)) from exc
     _validate_lower_target_backend_binding(
         formal_stage=formal_stage,
         audit=audit,
@@ -3333,6 +3503,7 @@ def _base_candidate_audit(
     return {
         "format": "semtalk_show_base_candidate_model_v1",
         "formal_stage": "base",
+        "smplx_training_pool_mode": "disabled",
         "candidate_epoch": epoch,
         "optimizer_updates": optimizer_updates,
         "config_sha256": config_sha256,
@@ -3756,6 +3927,7 @@ def _base_candidate_payload_and_receipt(
         source_receipt=source_receipt,
         optimizer_updates=expected_optimizer_updates,
         base_candidate_manifest=manifest_receipt,
+        status=status,
         path=final_path,
     )
     if (
@@ -4917,6 +5089,15 @@ def _checkpoint_payload_and_receipt(
         "lower": 600,
         "global": 1700,
     }[formal_stage]
+    expected_updates_per_epoch = (
+        497 if formal_stage in prerequisite_contract.RVQ_STAGES else 1_988
+    )
+    distributed_receipt = status.get("distributed_training_receipt")
+    expected_world_size = (
+        distributed_receipt.get("world_size")
+        if isinstance(distributed_receipt, dict)
+        else None
+    )
     dataset_receipt = status.get("dataset_receipt")
     status_final_path = _resolved_regular_file(
         Path(str(status.get("final_checkpoint", ""))),
@@ -4925,7 +5106,8 @@ def _checkpoint_payload_and_receipt(
     if (
         status.get("status") != "complete"
         or status.get("formal_stage") != formal_stage
-        or _require_exact_int(status.get("world_size"), "world_size") != 1
+        or _require_exact_int(status.get("world_size"), "world_size")
+        != expected_world_size
         or _require_exact_int(status.get("epochs"), "epochs")
         != expected_epochs
         or _require_exact_int(
@@ -4939,12 +5121,12 @@ def _checkpoint_payload_and_receipt(
             status.get("updates_per_epoch"),
             "updates_per_epoch",
         )
-        != 1_988
+        != expected_updates_per_epoch
         or _require_exact_int(
             status.get("optimizer_updates"),
             "optimizer_updates",
         )
-        != expected_epochs * 1_988
+        != expected_epochs * expected_updates_per_epoch
         or status.get("lineage_manifest_sha256")
         != expected_training_lineage_sha256
         or status.get("config_sha256") != config_sha
@@ -5030,12 +5212,13 @@ def _checkpoint_payload_and_receipt(
             ),
             expected_data_mdb_sha256=expected_data_mdb_sha256,
             source_receipt=audit_source,
-            optimizer_updates=expected_epochs * FORMAL_UPDATES_PER_EPOCH,
+            optimizer_updates=expected_epochs * expected_updates_per_epoch,
             base_candidate_manifest=(
                 candidate_manifest_receipt
                 if formal_stage == "base"
                 else None
             ),
+            status=status,
             path=resolved,
         )
     parity = dataset_receipt.get("global_fastpath_parity")
@@ -5075,8 +5258,8 @@ def _checkpoint_payload_and_receipt(
         "training_accounting": {
             "epochs": expected_epochs,
             "train_samples": 127_286,
-            "updates_per_epoch": 1_988,
-            "optimizer_updates": expected_epochs * 1_988,
+            "updates_per_epoch": expected_updates_per_epoch,
+            "optimizer_updates": expected_epochs * expected_updates_per_epoch,
         },
     }
 

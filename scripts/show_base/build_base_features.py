@@ -47,6 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 
 from scripts.show_base import selected_prerequisites as selected_contract
+from scripts.show_base import prerequisite_val_contract as prerequisite_contract
 
 
 AUDIO_FIELDS = ("beat", "hubert")
@@ -189,7 +190,20 @@ MODEL_V2_AUDIT_KEYS = {
     "source_receipt",
     "source_receipt_sha256",
     "optimizer_updates",
+    "smplx_training_pool_mode",
+    "distributed_training_receipt",
+    "optimizer_runtime_receipt",
+    "rvq_rank_state_receipt",
+    "initialization_receipt",
+    "rvq_ema_prior_receipt",
+    "latest_representation_candidate",
+    "smplx_training_pool_runtime_evidence",
     "base_candidate_manifest",
+}
+MODEL_V2_OPTIONAL_AUDIT_KEYS = {
+    "continuation_wave_receipt",
+    "smplx_training_pool_gate",
+    "lower_target_joints_cache",
 }
 LOWER_TARGET_CACHE_RECEIPT_KEY = "lower_target_joints_cache"
 LOWER_TARGET_CACHE_RECEIPT_KEYS = {
@@ -2492,6 +2506,98 @@ def _strict_load_freeze_eval(
         raise RuntimeError(f"{path}: released model did not freeze in eval mode")
 
 
+def _validate_model_v2_training_bindings(
+    *,
+    audit: Mapping[str, Any],
+    status: Mapping[str, Any],
+    dataset_receipt: Mapping[str, Any],
+    formal_stage: str,
+    path: Path,
+) -> set[str]:
+    expected_keys = set(MODEL_V2_AUDIT_KEYS)
+    if formal_stage == "lower":
+        expected_keys.add(LOWER_TARGET_BACKEND_RECEIPT_KEY)
+    for key in MODEL_V2_OPTIONAL_AUDIT_KEYS:
+        if key in status:
+            expected_keys.add(key)
+    bound_keys = (
+        "smplx_training_pool_mode",
+        "distributed_training_receipt",
+        "optimizer_runtime_receipt",
+        "rvq_rank_state_receipt",
+        "initialization_receipt",
+        "rvq_ema_prior_receipt",
+        "latest_representation_candidate",
+        "smplx_training_pool_runtime_evidence",
+    )
+    if any(audit.get(key) != status.get(key) for key in bound_keys):
+        raise RuntimeError(
+            f"{path}: model_v2 training binding differs from formal status"
+        )
+    for key in MODEL_V2_OPTIONAL_AUDIT_KEYS:
+        if key in status and audit.get(key) != status.get(key):
+            raise RuntimeError(
+                f"{path}: model_v2 optional training binding differs"
+            )
+    gate = dataset_receipt.get("smplx_training_pool_gate")
+    expected_pool_mode = (
+        gate.get("mode") if isinstance(gate, Mapping) else "disabled"
+    )
+    if (
+        audit.get("smplx_training_pool_mode") != expected_pool_mode
+        or audit.get("smplx_training_pool_gate") != gate
+        or audit.get("lower_target_joints_cache")
+        != dataset_receipt.get("lower_target_joints_cache")
+    ):
+        raise RuntimeError(
+            f"{path}: model_v2 dataset accelerator binding mismatch"
+        )
+    runtime_evidence = audit.get("smplx_training_pool_runtime_evidence")
+    try:
+        if expected_pool_mode == "disabled":
+            if runtime_evidence is not None:
+                raise prerequisite_contract.ContractError(
+                    "disabled SMPL-X pool has runtime evidence"
+                )
+        else:
+            prerequisite_contract.verify_named_compact_hash(
+                runtime_evidence,
+                hash_key="receipt_sha256",
+                label=f"{formal_stage} SMPL-X pool runtime evidence",
+            )
+        distributed = prerequisite_contract.validate_distributed_training_receipt(
+            audit.get("distributed_training_receipt"),
+            stage=formal_stage,
+            label=f"{formal_stage} distributed training receipt",
+        )
+        prerequisite_contract.validate_optimizer_runtime_receipt(
+            audit.get("optimizer_runtime_receipt"),
+            stage=formal_stage,
+            label=f"{formal_stage} optimizer runtime receipt",
+            required=True,
+        )
+        prerequisite_contract.validate_initialization_receipt(
+            audit.get("initialization_receipt"),
+            stage=formal_stage,
+            label=f"{formal_stage} initialization receipt",
+            reprove_path=False,
+        )
+        prerequisite_contract.validate_rvq_ema_prior_receipt(
+            audit.get("rvq_ema_prior_receipt"),
+            stage=formal_stage,
+            label=f"{formal_stage} RVQ EMA-prior receipt",
+        )
+        prerequisite_contract.validate_rvq_rank_state_receipt(
+            audit.get("rvq_rank_state_receipt"),
+            stage=formal_stage,
+            distributed=distributed,
+            label=f"{formal_stage} RVQ rank-state receipt",
+        )
+    except prerequisite_contract.ContractError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return expected_keys
+
+
 def checkpoint_record(
     path: Path,
     *,
@@ -2573,11 +2679,21 @@ def checkpoint_record(
         "lower": 600,
         "global": 1700,
     }[formal_stage]
+    expected_updates_per_epoch = (
+        497 if formal_stage in prerequisite_contract.RVQ_STAGES else 1_988
+    )
+    distributed_receipt = status.get("distributed_training_receipt")
+    expected_world_size = (
+        distributed_receipt.get("world_size")
+        if isinstance(distributed_receipt, dict)
+        else None
+    )
     if (
         not isinstance(status, dict)
         or status.get("status") != "complete"
         or status.get("formal_stage") != formal_stage
-        or require_exact_int(status.get("world_size"), "world_size") != 1
+        or require_exact_int(status.get("world_size"), "world_size")
+        != expected_world_size
         or require_exact_int(status.get("epochs"), "epochs")
         != expected_epochs
         or require_exact_int(
@@ -2664,7 +2780,7 @@ def checkpoint_record(
     )
     if (
         train_samples != 127_286
-        or updates_per_epoch != 1_988
+        or updates_per_epoch != expected_updates_per_epoch
         or optimizer_updates != expected_epochs * updates_per_epoch
     ):
         raise RuntimeError(
@@ -2679,9 +2795,13 @@ def checkpoint_record(
         status=status,
         path=resolved,
     )
-    expected_audit_keys = set(MODEL_V2_AUDIT_KEYS)
-    if formal_stage == "lower":
-        expected_audit_keys.add(LOWER_TARGET_BACKEND_RECEIPT_KEY)
+    expected_audit_keys = _validate_model_v2_training_bindings(
+        audit=audit,
+        status=status,
+        dataset_receipt=dataset_receipt,
+        formal_stage=formal_stage,
+        path=resolved,
+    )
     if (
         set(audit) != expected_audit_keys
         or not isinstance(dataset_receipt, dict)

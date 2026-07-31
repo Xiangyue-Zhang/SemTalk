@@ -1110,7 +1110,7 @@ def _git_output(
 def build_fresh_pipeline_source_receipt(source_root: Path) -> dict[str, Any]:
     """Freeze the single detached official SemTalk source used by Base val."""
 
-    root = require_directory(source_root, "fresh Base source root")
+    root = require_directory(str(source_root), "fresh Base source root")
     _, remotes_raw = _git_output(root, ["remote"], label="remote names")
     remotes = [
         line

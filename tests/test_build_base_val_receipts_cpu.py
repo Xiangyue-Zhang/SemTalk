@@ -45,6 +45,50 @@ def _with_payload_hash(payload: dict[str, object]) -> dict[str, object]:
 
 
 class BaseValReceiptBuilderTests(unittest.TestCase):
+    def _build_fresh_source_fixture(self, root: Path) -> Path:
+        source_root = (root / "fresh-source").resolve()
+        for relative in selector.FRESH_PIPELINE_SOURCE_FILES:
+            source = ROOT / relative
+            target = source_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+
+        def git(*arguments: str) -> str:
+            process = subprocess.run(
+                ["git", "-C", str(source_root), *arguments],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return process.stdout.strip()
+
+        git("init", "--quiet")
+        git(
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:Xiangyue-Zhang/SemTalk.git",
+        )
+        git("add", "--", *selector.FRESH_PIPELINE_SOURCE_FILES)
+        git(
+            "-c",
+            "user.name=Xiangyue-Zhang",
+            "-c",
+            "user.email=85532891+Xiangyue-Zhang@users.noreply.github.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fresh source fixture",
+        )
+        branch = git("symbolic-ref", "--short", "HEAD")
+        commit = git("rev-parse", "HEAD")
+        git("checkout", "--quiet", "--detach", commit)
+        git("branch", "-D", branch)
+        return source_root
+
     def _build_input_fixture(
         self,
         root: Path,
@@ -313,6 +357,32 @@ class BaseValReceiptBuilderTests(unittest.TestCase):
             "historical pipeline builder is retired",
         ):
             builder.build_pipeline(argparse.Namespace())
+
+    def test_fresh_pipeline_source_accepts_argparse_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            source_root = self._build_fresh_source_fixture(Path(directory))
+            parsed = builder.build_parser().parse_args(
+                [
+                    "fresh-pipeline",
+                    "--output",
+                    str(Path(directory) / "fresh-pipeline.json"),
+                    "--source-root",
+                    str(source_root),
+                    "--prerequisite-selection",
+                    str(Path(directory) / "selection.json"),
+                    "--expected-prerequisite-selection-sha256",
+                    "a" * 64,
+                ]
+            )
+            self.assertIsInstance(parsed.source_root, Path)
+            receipt = selector.build_fresh_pipeline_source_receipt(
+                parsed.source_root
+            )
+            self.assertEqual(receipt["source_root"], str(source_root))
+            self.assertEqual(
+                set(receipt["files"]),
+                set(selector.FRESH_PIPELINE_SOURCE_FILES),
+            )
 
 
     def test_rejects_symlink_and_forbidden_labels(self) -> None:

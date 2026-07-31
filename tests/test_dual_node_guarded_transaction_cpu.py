@@ -281,6 +281,10 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         if workload_suffix:
             workload.extend(workload_suffix)
         common_sha256 = common_sha256 or argv_sha256(workload)
+        # Linux production nodes need multiple /proc censuses to prove that
+        # the exact descendant set is gone.  Keep the CPU fixture short, but
+        # leave enough time for those real scans instead of assuming a
+        # sub-200 ms cleanup path.
         arguments = [
             "--transaction-root",
             str(transaction_root),
@@ -318,21 +322,21 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             "--max-restarts",
             "0",
             "--heartbeat-ms",
-            "35",
+            "250",
             "--stale-ms",
-            "220",
+            "1500",
             "--prepare-timeout-ms",
-            "1800",
+            "5000",
             "--decision-timeout-ms",
-            "1800",
+            "5000",
             "--arm-timeout-ms",
-            "1800",
+            "5000",
             "--start-timeout-ms",
-            "1800",
+            "5000",
             "--completion-timeout-ms",
-            "2600",
+            "8000",
             "--shutdown-grace-ms",
-            "180",
+            "2500",
         ]
         for name in allow_env or []:
             arguments.extend(["--allow-env", name])

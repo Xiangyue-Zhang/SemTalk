@@ -834,6 +834,119 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def current_training_bindings(
+        *,
+        root: Path,
+        stage: str,
+        epochs: int,
+        model: object,
+    ) -> tuple[SimpleNamespace, dict[str, object]]:
+        rvq = stage in {"face", "hands", "upper", "lower"}
+        world_size = 2 if rvq else 1
+        local_batch_size = 128 if rvq else 64
+        updates_per_epoch = 497 if rvq else 1_988
+        distributed = FORMAL.representation_ddp_receipt(
+            formal_stage=stage,
+            world_size=world_size,
+            local_batch_size=local_batch_size,
+            train_samples=127_286,
+            updates_per_epoch=updates_per_epoch,
+            seed=43,
+        )
+        optimizer = {
+            "format": "semtalk_show_optimizer_runtime_v1",
+            "formal_stage": stage,
+            "class": "torch.optim.Adam",
+            "base_learning_rate": (
+                6e-4 if rvq else (1.5e-4 if stage == "global" else 5e-5)
+            ),
+            "betas": [0.5, 0.999],
+            "weight_decay": 0.0,
+            "eps": 1e-8,
+            "amsgrad": False,
+            "parameter_groups": 1,
+            "trained_parameter_tensors": len(list(model.parameters())),
+        }
+        optimizer["receipt_sha256"] = MODULE.compact_json_sha256(optimizer)
+        initialization = None
+        rvq_prior = None
+        rank_state = None
+        latest = None
+        if stage != "base":
+            specification = MODULE.RELEASED_ALL_SPEAKERS_MODELS[stage]
+            initialization = {
+                "stage": stage,
+                "path": str(root / str(specification["filename"])),
+                "filename": specification["filename"],
+                "sha256": specification["sha256"],
+                "official_all_speakers": True,
+                "withdrawn_e30_allowed": False,
+                "model_state_sha256": "8" * 64,
+            }
+            latest = {
+                "path": str(
+                    root
+                    / "representation_candidates"
+                    / (
+                        f"{stage}_epoch_{epochs:04d}_step_"
+                        f"{epochs * updates_per_epoch:09d}.bin"
+                    )
+                ),
+                "sha256": "9" * 64,
+                "completed_epochs": epochs,
+                "optimizer_updates": epochs * updates_per_epoch,
+                "selection_status": "offline_validation_pending",
+            }
+        if rvq:
+            rvq_prior = {
+                "format": "semtalk_show_official_rvq_ema_prior_v2",
+                "layers": [
+                    {
+                        "name": f"module.quantizer.layers.{index}",
+                        "ema_decay": 0.99,
+                        "prior_count": 100.0,
+                    }
+                    for index in range(6)
+                ],
+                "init": True,
+                "code_sum": (
+                    "loaded codebook multiplied by decay-aware prior_count"
+                ),
+                "code_count": "1 / (1 - ema_decay) per code",
+                "first_forward_codebook_reset": False,
+                "unused_code_grace": (
+                    "legacy reset only after the decay-aware prior falls "
+                    "below one"
+                ),
+            }
+            rank_state = {
+                "format": "semtalk_show_rvq_rank_state_v1",
+                "world_size": world_size,
+                "state_sha256": "a" * 64,
+                "all_ranks_exact": True,
+            }
+        trainer = SimpleNamespace(
+            model=model,
+            optimizer_runtime_receipt=optimizer,
+            initialization_receipt=initialization,
+            rvq_ema_prior_receipt=rvq_prior,
+            latest_representation_candidate=latest,
+        )
+        return trainer, {
+            "world_size": world_size,
+            "batch_size": local_batch_size,
+            "updates_per_epoch": updates_per_epoch,
+            "distributed_training_receipt": distributed,
+            "optimizer_runtime_receipt": optimizer,
+            "rvq_rank_state_receipt": rank_state,
+            "initialization_receipt": initialization,
+            "rvq_ema_prior_receipt": rvq_prior,
+            "latest_representation_candidate": latest,
+            "smplx_training_pool_mode": "disabled",
+            "smplx_training_pool_runtime_evidence": None,
+        }
+
     def test_producer_model_v2_is_strictly_consumed_by_both_readers(
         self,
     ) -> None:
@@ -857,8 +970,13 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 data_sha=data_sha,
                 smplx_asset=smplx_asset,
             )
-            trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
-            optimizer_updates = 600 * 1_988
+            trainer, bindings = self.current_training_bindings(
+                root=root,
+                stage="face",
+                epochs=600,
+                model=torch.nn.Linear(3, 2),
+            )
+            optimizer_updates = 600 * bindings["updates_per_epoch"]
             payload = FORMAL._model_payload(
                 trainer,
                 formal_stage="face",
@@ -868,22 +986,27 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 source_receipt=source,
                 optimizer_updates=optimizer_updates,
                 candidate_manifest_receipt=None,
+                distributed_training_receipt=(
+                    bindings["distributed_training_receipt"]
+                ),
+                rvq_rank_state_receipt=bindings["rvq_rank_state_receipt"],
             )
             torch.save(payload, checkpoint)
             checkpoint_sha = MODULE.sha256_file(checkpoint)
             status = {
                 "status": "complete",
                 "formal_stage": "face",
-                "world_size": 1,
+                "world_size": bindings["world_size"],
                 "epochs": 600,
                 "completed_epochs": 600,
                 "train_samples": 127_286,
-                "updates_per_epoch": 1_988,
+                "updates_per_epoch": bindings["updates_per_epoch"],
                 "optimizer_updates": optimizer_updates,
                 "lineage_manifest_sha256": lineage_sha,
                 "config_sha256": config_sha,
                 "dataset_receipt": dataset,
                 "smplx_asset_receipt": smplx_asset,
+                **bindings,
                 "base_candidate_manifest": None,
                 "source_receipt": source,
                 "source_receipt_sha256": MODULE.compact_json_sha256(
@@ -938,6 +1061,10 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 source_receipt=source,
                 optimizer_updates=optimizer_updates,
                 candidate_manifest_receipt=None,
+                distributed_training_receipt=(
+                    bindings["distributed_training_receipt"]
+                ),
+                rvq_rank_state_receipt=bindings["rvq_rank_state_receipt"],
             )
             injected_status = copy.deepcopy(status)
             injected_status["dataset_receipt"] = injected_dataset
@@ -1095,8 +1222,13 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 smplx_asset=smplx_asset,
             )
             dataset["lower_target_backend"] = backend_receipt
-            trainer = SimpleNamespace(model=torch.nn.Linear(3, 2))
-            optimizer_updates = 600 * 1_988
+            trainer, bindings = self.current_training_bindings(
+                root=root,
+                stage="lower",
+                epochs=600,
+                model=torch.nn.Linear(3, 2),
+            )
+            optimizer_updates = 600 * bindings["updates_per_epoch"]
             payload = FORMAL._model_payload(
                 trainer,
                 formal_stage="lower",
@@ -1106,21 +1238,26 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
                 source_receipt=source,
                 optimizer_updates=optimizer_updates,
                 candidate_manifest_receipt=None,
+                distributed_training_receipt=(
+                    bindings["distributed_training_receipt"]
+                ),
+                rvq_rank_state_receipt=bindings["rvq_rank_state_receipt"],
             )
             status = {
                 "status": "complete",
                 "formal_stage": "lower",
-                "world_size": 1,
+                "world_size": bindings["world_size"],
                 "epochs": 600,
                 "completed_epochs": 600,
                 "train_samples": 127_286,
-                "updates_per_epoch": 1_988,
+                "updates_per_epoch": bindings["updates_per_epoch"],
                 "optimizer_updates": optimizer_updates,
                 "lineage_manifest_sha256": lineage_sha,
                 "config_sha256": config_sha,
                 "dataset_receipt": dataset,
                 "smplx_asset_receipt": smplx_asset,
                 "lower_target_backend": backend_receipt,
+                **bindings,
                 "base_candidate_manifest": None,
                 "source_receipt": source,
                 "source_receipt_sha256": MODULE.compact_json_sha256(
@@ -1395,8 +1532,14 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             "last_optimizer_updates": 400 * 1_988,
         }
         final_path = root / "semtalk_base_epoch_400.bin"
+        final_trainer, final_bindings = self.current_training_bindings(
+            root=root,
+            stage="base",
+            epochs=400,
+            model=model,
+        )
         final_payload = FORMAL._model_payload(
-            SimpleNamespace(model=model),
+            final_trainer,
             formal_stage="base",
             config_sha256=config_sha,
             lineage_sha256=lineage_sha,
@@ -1404,6 +1547,10 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             source_receipt=source,
             optimizer_updates=400 * 1_988,
             candidate_manifest_receipt=manifest_receipt,
+            distributed_training_receipt=(
+                final_bindings["distributed_training_receipt"]
+            ),
+            rvq_rank_state_receipt=final_bindings["rvq_rank_state_receipt"],
         )
         torch.save(final_payload, final_path)
         status_path = root / "formal_status.json"
@@ -1420,6 +1567,7 @@ class FormalCheckpointConsumerCompatibilityTest(unittest.TestCase):
             "config_sha256": config_sha,
             "dataset_receipt": dataset,
             "smplx_asset_receipt": None,
+            **final_bindings,
             "base_candidate_manifest": manifest_receipt,
             "source_receipt": source,
             "source_receipt_sha256": MODULE.compact_json_sha256(source),

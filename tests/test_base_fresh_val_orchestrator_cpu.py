@@ -1014,7 +1014,10 @@ class BaseFreshValOrchestratorCpuTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertRegex(result.stderr, r"guarded[- ]runner")
+            self.assertRegex(
+                result.stderr,
+                r"(?:guarded[-_ ]runner|globaldiff_guarded_runner\.py)",
+            )
             self.assertFalse(run_root.exists())
 
     def test_unmocked_1715_clip_eight_shard_transaction_round_trip(self) -> None:
