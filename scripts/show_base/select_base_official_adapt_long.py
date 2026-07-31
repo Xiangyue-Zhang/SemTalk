@@ -7,7 +7,16 @@ import argparse
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import sys
 from typing import Any, Mapping, Sequence
+
+
+sys.dont_write_bytecode = True
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from scripts.show_base import base_long_val_contract as long_contract
 from scripts.show_base import select_base_official_adapt as legacy
@@ -46,6 +55,7 @@ def _profile_values() -> dict[str, Any]:
         "VAL_INFERENCE_LINEAGE_FORMAT": (
             long_contract.VAL_INFERENCE_LINEAGE_FORMAT
         ),
+        "VAL_INFERENCE_SOURCE": long_contract.VAL_INFERENCE_SOURCE,
     }
 
 
@@ -188,7 +198,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_measurement_sha256=args.expected_measurement_sha256,
     )
     try:
-        legacy._receipt.atomic_json_new(args.output_json, selection)
+        legacy._receipt.atomic_json_new(output, selection)
     except (OSError, ValueError, RuntimeError) as error:
         raise legacy.SelectionContractError(str(error)) from error
     print(

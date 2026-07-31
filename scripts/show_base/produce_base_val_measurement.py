@@ -12,7 +12,17 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any, Mapping, Sequence
+import uuid
+
+
+sys.dont_write_bytecode = True
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from scripts.show_base import base_long_val_contract as contract
 from scripts.show_base import select_base_official_adapt as legacy
@@ -171,17 +181,32 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         inference_lineage_artifact=lineage_artifact,
         diffsheg_report_artifact=report_artifact,
     )
-    legacy._receipt.atomic_json_new(output, measurement)
+    staging = output.parent / (
+        f".{output.name}.validated-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     try:
-        output_sha = legacy.sha256_file(output)
+        legacy._receipt.atomic_json_new(staging, measurement)
+        output_sha = legacy.sha256_file(staging)
         audited, row = long_selector.validate_measurement(
-            measurement_path=output,
+            measurement_path=staging,
             expected_measurement_sha256=output_sha,
             candidate_bundle=candidate_bundle,
         )
-    except BaseException:
-        output.unlink(missing_ok=True)
-        raise
+        try:
+            os.link(staging, output, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError(f"refusing to overwrite {output}") from None
+        directory_fd = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        audited = {
+            **audited,
+            "path": str(output),
+        }
+    finally:
+        staging.unlink(missing_ok=True)
     return {
         "status": "complete",
         "split": "val",
