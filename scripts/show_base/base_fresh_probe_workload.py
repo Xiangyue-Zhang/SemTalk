@@ -38,6 +38,7 @@ from scripts.show_base import base_fresh_probe_producer as producer
 from scripts.show_base import base_fresh_val_orchestrator as orchestrator
 from scripts.show_base import evaluate_talkshow_show_metrics as metrics
 from scripts.show_base import published_test_winner_claim as authority
+from scripts.show_base import run_base_val_inference as val_inference
 
 
 WORKLOAD_EXECUTION_FORMAT = "semtalk_show_base_probe_workload_execution_v1"
@@ -289,6 +290,18 @@ def _payload_artifact(path: Path, label: str) -> tuple[dict[str, Any], dict[str,
     if authority.canonical_json_sha256(body) != claimed:
         raise ProbeWorkloadError(f"{label} payload does not replay")
     return {**artifact, "receipt_payload_sha256": claimed}, payload
+
+
+def _final_lineage_path(output_root: Path, epoch: int) -> Path:
+    """Resolve the source-bound final inference lineage path."""
+
+    return (
+        output_root
+        / f"e{epoch}"
+        / "inference"
+        / val_inference.FINAL_DIRECTORY
+        / val_inference.LINEAGE_FILENAME
+    )
 
 
 @dataclass
@@ -864,7 +877,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             )
         finalize_records = _finish_commands(finalizers)
         for epoch, finalize_record in zip(wave, finalize_records):
-            lineage_path = output_root / f"e{epoch}" / "inference" / "final" / "lineage.json"
+            lineage_path = _final_lineage_path(output_root, epoch)
             lineage_artifact, _lineage = _payload_artifact(
                 lineage_path, f"Base e{epoch} real inference lineage"
             )

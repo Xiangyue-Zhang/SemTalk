@@ -784,6 +784,83 @@ def _payload_artifact(value: Any, label: str) -> tuple[dict[str, Any], dict[str,
     return {**plain, "receipt_payload_sha256": expected_payload}, decoded
 
 
+def _validate_representation_lmdb_authority(
+    value: Mapping[str, Any],
+    *,
+    selected_authority: Mapping[str, Any],
+    selected_dataset: Any,
+) -> dict[str, dict[str, Any]]:
+    """Bind probe LMDB bytes to the candidate trainer's frozen dataset."""
+
+    if not isinstance(selected_dataset, dict):
+        raise ProbeProducerError("candidate bundle lacks audited LMDB provenance")
+    expected_dataset_keys = {
+        "format",
+        "lmdb",
+        "summary",
+        "summary_sha256",
+        "lineage",
+        "lineage_sha256",
+        "entries",
+        "train_clips",
+        "split",
+        "test_visible",
+        "data_mdb_sha256",
+        "lock_mdb_sha256",
+        "prerequisite_selection",
+        "selected_prerequisite_sha256",
+        "lmdb_binding_scope",
+        "node_lmdb_inode_bindings",
+    }
+    if set(selected_dataset) != expected_dataset_keys:
+        raise ProbeProducerError("candidate bundle LMDB provenance schema changed")
+    normalized: dict[str, dict[str, Any]] = {}
+    payloads: dict[str, bytes] = {}
+    for role in ("summary", "data", "lock"):
+        normalized[role], payloads[role] = _plain_artifact(
+            value[role], f"probe LMDB {role}"
+        )
+    summary = _strict_json_document(payloads["summary"], "probe LMDB summary")
+    lmdb_root = Path(selected_dataset["lmdb"])
+    selected_receipt = selected_dataset["prerequisite_selection"]
+    compact_keys = {"path", "sha256", "receipt_payload_sha256"}
+    if (
+        not isinstance(summary, dict)
+        or summary.get("format") != "semtalk_show_base_lmdb_summary_v1"
+        or summary.get("status") != "complete"
+        or summary.get("scope") != "SemTalk Base only"
+        or summary.get("entries") != selected_dataset["entries"]
+        or summary.get("train_clips") != selected_dataset["train_clips"]
+        or summary.get("lmdb") != selected_dataset["lmdb"]
+        or summary.get("data_mdb_sha256")
+        != selected_dataset["data_mdb_sha256"]
+        or summary.get("lock_mdb_sha256")
+        != selected_dataset["lock_mdb_sha256"]
+        or summary.get("lineage_json") != selected_dataset["lineage"]
+        or summary.get("lineage_json_sha256")
+        != selected_dataset["lineage_sha256"]
+        or normalized["summary"]["path"] != selected_dataset["summary"]
+        or normalized["summary"]["sha256"]
+        != selected_dataset["summary_sha256"]
+        or normalized["data"]["path"] != str(lmdb_root / "data.mdb")
+        or normalized["data"]["sha256"]
+        != selected_dataset["data_mdb_sha256"]
+        or normalized["lock"]["path"] != str(lmdb_root / "lock.mdb")
+        or normalized["lock"]["sha256"]
+        != selected_dataset["lock_mdb_sha256"]
+        or not isinstance(selected_receipt, dict)
+        or set(selected_receipt) != compact_keys
+        or any(
+            selected_receipt.get(key) != selected_authority.get(key)
+            for key in compact_keys
+        )
+    ):
+        raise ProbeProducerError(
+            "probe LMDB/selected-five authority differs from candidate training"
+        )
+    return normalized
+
+
 def _pin_input_artifact(
     artifact: Mapping[str, Any],
     *,
@@ -961,8 +1038,6 @@ def _validate_quality_input(
     lmdb = _exact(
         value["representation_lmdb"], {"summary", "data", "lock"}, "probe LMDB"
     )
-    for role, raw in lmdb.items():
-        _plain_artifact(raw, f"probe LMDB {role}")
     training_metrics, training_metrics_payload = _plain_artifact(
         value["training_metrics"], "probe trainer epoch metrics"
     )
@@ -1024,7 +1099,6 @@ def _validate_quality_input(
     selected, selected_payload = _payload_artifact(
         value["selected_five_authority"], "selected-five authority"
     )
-    del selected
     candidate_bundle = _exact(
         value["candidate_bundle"],
         {"manifest", "status", "frozen_inputs"},
@@ -1079,6 +1153,11 @@ def _validate_quality_input(
         raise ProbeProducerError(
             "probe candidate bundle failed exact training replay"
         ) from error
+    normalized_lmdb = _validate_representation_lmdb_authority(
+        lmdb,
+        selected_authority=selected,
+        selected_dataset=audited_bundle.get("selected_dataset"),
+    )
     expected_probe_candidates = {
         row["epoch"]: row["candidate_checkpoint"]
         for row in binding["candidate_checkpoints"]
@@ -1094,6 +1173,7 @@ def _validate_quality_input(
         or value["pipeline"] != binding["pipeline"]
         or value["selected_five_authority"] != binding["prerequisite_selection"]
         or normalized_bundle != candidate_bundle
+        or normalized_lmdb != lmdb
         or value["val_inputs"] != binding["val_inputs"]
         or any(
             audited_bundle["candidates"].get(epoch) != checkpoint
@@ -1112,7 +1192,11 @@ def _validate_quality_input(
         }
     ):
         raise ProbeProducerError("probe quality input authority/topology changed")
-    return artifact, {**value, "_audited_candidate_bundle": audited_bundle}
+    return artifact, {
+        **value,
+        "representation_lmdb": normalized_lmdb,
+        "_audited_candidate_bundle": audited_bundle,
+    }
 
 
 def validate_execution_spec(
@@ -1946,6 +2030,19 @@ def _same_compact_artifact(
     )
 
 
+def _same_lineage_authority_receipt(
+    value: Any, authority_receipt: Mapping[str, Any]
+) -> bool:
+    """Compare the inference lineage's compact three-field authority pin."""
+
+    keys = {"path", "sha256", "receipt_payload_sha256"}
+    return (
+        isinstance(value, dict)
+        and set(value) == keys
+        and _same_compact_artifact(value, authority_receipt)
+    )
+
+
 def _validate_full_inference_lineage(
     *,
     lineage_artifact: Mapping[str, Any],
@@ -2136,8 +2233,12 @@ def _validate_native_candidate(
         or lineage.get("epoch") != epoch
         or lineage.get("candidate_checkpoint")
         != {"path": checkpoint["path"], "sha256": checkpoint["sha256"]}
-        or lineage.get("val_inputs_receipt") != binding["val_inputs"]
-        or lineage.get("pipeline_receipt") != binding["pipeline"]
+        or not _same_lineage_authority_receipt(
+            lineage.get("val_inputs_receipt"), binding["val_inputs"]
+        )
+        or not _same_lineage_authority_receipt(
+            lineage.get("pipeline_receipt"), binding["pipeline"]
+        )
         or lineage.get("clip_count") != orchestrator.EXPECTED_CLIPS
         or lineage.get("prediction_files") != orchestrator.EXPECTED_CLIPS
         or lineage.get("ground_truth_files") != orchestrator.EXPECTED_CLIPS

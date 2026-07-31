@@ -178,7 +178,7 @@ def _validate_frozen(
     frozen: dict[str, Any],
     *,
     expected_selected_prerequisite_sha256: dict[str, str] | None = None,
-) -> tuple[str, dict[str, str], dict[str, Any]]:
+) -> tuple[str, dict[str, str], dict[str, Any], dict[str, Any]]:
     claimed = require_sha256(
         frozen.get("receipt_sha256"),
         "long Base frozen-input payload SHA-256",
@@ -273,6 +273,122 @@ def _validate_frozen(
         )
     for stage, digest in dataset["selected_prerequisite_sha256"].items():
         require_sha256(digest, f"selected {stage} checkpoint SHA-256")
+    selection = dataset.get("prerequisite_selection")
+    node_bindings = dataset.get("node_lmdb_inode_bindings")
+    expected_identity_keys = {
+        "device",
+        "inode",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    }
+    dataset_paths = {
+        role: dataset.get(role)
+        for role in ("lmdb", "summary", "lineage")
+    }
+    if (
+        dataset.get("format")
+        != "semtalk_show_base_selected_feature_dataset_receipt_v1"
+        or dataset.get("split") != "train"
+        or dataset.get("test_visible") is not False
+        or any(
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or ".." in Path(path).parts
+            for path in dataset_paths.values()
+        )
+        or require_sha256(
+            dataset.get("summary_sha256"), "selected dataset summary SHA-256"
+        )
+        != dataset.get("summary_sha256")
+        or require_sha256(
+            dataset.get("lineage_sha256"), "selected dataset lineage SHA-256"
+        )
+        != dataset.get("lineage_sha256")
+        or require_sha256(
+            dataset.get("data_mdb_sha256"), "selected dataset data.mdb SHA-256"
+        )
+        != dataset.get("data_mdb_sha256")
+        or require_sha256(
+            dataset.get("lock_mdb_sha256"), "selected dataset lock.mdb SHA-256"
+        )
+        != dataset.get("lock_mdb_sha256")
+        or not isinstance(selection, dict)
+        or set(selection)
+        != {"path", "sha256", "receipt_payload_sha256"}
+        or not isinstance(selection.get("path"), str)
+        or not Path(selection["path"]).is_absolute()
+        or require_sha256(
+            selection.get("sha256"), "selected prerequisite receipt SHA-256"
+        )
+        != selection.get("sha256")
+        or require_sha256(
+            selection.get("receipt_payload_sha256"),
+            "selected prerequisite payload SHA-256",
+        )
+        != selection.get("receipt_payload_sha256")
+        or dataset.get("lmdb_binding_scope")
+        != "ordered_node_local_inode_bindings_with_global_content_sha256"
+        or not isinstance(node_bindings, list)
+        or len(node_bindings) != topology["node_count"]
+    ):
+        raise LongCandidateContractError(
+            "long Base frozen dataset provenance is incomplete"
+        )
+    observed_hostnames: set[str] = set()
+    for expected_rank, node in enumerate(node_bindings):
+        if not isinstance(node, dict) or set(node) != {
+            "node_rank",
+            "hostname",
+            "binding",
+        }:
+            raise LongCandidateContractError(
+                "long Base frozen dataset node binding schema changed"
+            )
+        binding = node["binding"]
+        files = binding.get("files") if isinstance(binding, dict) else None
+        hostname = node["hostname"]
+        if (
+            node["node_rank"] != expected_rank
+            or not isinstance(hostname, str)
+            or not hostname
+            or hostname in observed_hostnames
+            or not isinstance(binding, dict)
+            or set(binding) != {"format", "directory_identity", "files"}
+            or binding.get("format")
+            != "semtalk_show_base_lmdb_inode_binding_v1"
+            or not isinstance(binding.get("directory_identity"), dict)
+            or set(binding["directory_identity"]) != expected_identity_keys
+            or any(
+                type(value) is not int or value < 0
+                for value in binding["directory_identity"].values()
+            )
+            or not isinstance(files, dict)
+            or set(files) != {"data.mdb", "lock.mdb"}
+        ):
+            raise LongCandidateContractError(
+                "long Base frozen dataset node binding changed"
+            )
+        observed_hostnames.add(hostname)
+        for filename, expected_sha in (
+            ("data.mdb", dataset["data_mdb_sha256"]),
+            ("lock.mdb", dataset["lock_mdb_sha256"]),
+        ):
+            file_receipt = files[filename]
+            if (
+                not isinstance(file_receipt, dict)
+                or set(file_receipt) != {"sha256", "identity"}
+                or file_receipt.get("sha256") != expected_sha
+                or not isinstance(file_receipt.get("identity"), dict)
+                or set(file_receipt["identity"]) != expected_identity_keys
+                or any(
+                    type(value) is not int or value < 0
+                    for value in file_receipt["identity"].values()
+                )
+            ):
+                raise LongCandidateContractError(
+                    "long Base frozen dataset file binding changed"
+                )
     selected = dict(dataset["selected_prerequisite_sha256"])
     if (
         expected_selected_prerequisite_sha256 is not None
@@ -281,11 +397,33 @@ def _validate_frozen(
         raise LongCandidateContractError(
             "long Base frozen inputs use different selected SHOW prerequisites"
         )
-    return claimed, selected, {
-        "mode": topology_mode,
-        **dict(topology),
-        "topology_receipt_sha256": topology_receipt["receipt_sha256"],
-    }
+    return (
+        claimed,
+        selected,
+        {
+            "mode": topology_mode,
+            **dict(topology),
+            "topology_receipt_sha256": topology_receipt["receipt_sha256"],
+        },
+        {
+            "format": dataset["format"],
+            "lmdb": dataset["lmdb"],
+            "summary": dataset["summary"],
+            "summary_sha256": dataset["summary_sha256"],
+            "lineage": dataset["lineage"],
+            "lineage_sha256": dataset["lineage_sha256"],
+            "entries": dataset["entries"],
+            "train_clips": dataset["train_clips"],
+            "split": dataset["split"],
+            "test_visible": dataset["test_visible"],
+            "data_mdb_sha256": dataset["data_mdb_sha256"],
+            "lock_mdb_sha256": dataset["lock_mdb_sha256"],
+            "prerequisite_selection": dict(selection),
+            "selected_prerequisite_sha256": selected,
+            "lmdb_binding_scope": dataset["lmdb_binding_scope"],
+            "node_lmdb_inode_bindings": [dict(row) for row in node_bindings],
+        },
+    )
 
 
 def validate_candidate_bundle(
@@ -309,6 +447,7 @@ def validate_candidate_bundle(
         frozen_receipt_sha,
         selected_prerequisite_sha256,
         selected_topology,
+        selected_dataset,
     ) = _validate_frozen(
         frozen,
         expected_selected_prerequisite_sha256=(
@@ -453,6 +592,7 @@ def validate_candidate_bundle(
         "producer_source": dict(frozen["source"]),
         "selected_prerequisite_sha256": selected_prerequisite_sha256,
         "selected_topology": selected_topology,
+        "selected_dataset": selected_dataset,
         "updates_per_epoch": updates_per_epoch,
         "candidates": candidates,
     }

@@ -12,6 +12,7 @@ from scripts.show_base import base_fresh_probe_producer as PRODUCER
 from scripts.show_base import base_fresh_probe_workload as WORKLOAD
 from scripts.show_base import base_fresh_val_orchestrator as ORCHESTRATOR
 from scripts.show_base import published_test_winner_claim as AUTHORITY
+from scripts.show_base import run_base_val_inference as VAL_INFERENCE
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -38,6 +39,20 @@ def _write(path: Path, payload: bytes) -> dict[str, object]:
 
 
 class WorkloadCpuTests(unittest.TestCase):
+    def test_final_lineage_path_is_source_bound_to_inference_contract(self) -> None:
+        root = Path("/fresh-workload")
+        self.assertEqual(
+            WORKLOAD._final_lineage_path(root, 17),
+            root
+            / "e17"
+            / "inference"
+            / VAL_INFERENCE.FINAL_DIRECTORY
+            / VAL_INFERENCE.LINEAGE_FILENAME,
+        )
+        self.assertEqual(
+            VAL_INFERENCE.LINEAGE_FILENAME, "val-inference-lineage.json"
+        )
+
     def test_regular_pinned_receipt_replays_exact_payload(self) -> None:
         if sys.platform == "linux":
             self.skipTest("formal Linux requires a producer-owned sealed memfd")

@@ -587,8 +587,22 @@ class ProducerFixture:
                         "path": checkpoints[epoch]["path"],
                         "sha256": checkpoints[epoch]["sha256"],
                     },
-                    "val_inputs_receipt": self.binding["val_inputs"],
-                    "pipeline_receipt": self.binding["pipeline"],
+                    "val_inputs_receipt": {
+                        key: self.binding["val_inputs"][key]
+                        for key in (
+                            "path",
+                            "sha256",
+                            "receipt_payload_sha256",
+                        )
+                    },
+                    "pipeline_receipt": {
+                        key: self.binding["pipeline"][key]
+                        for key in (
+                            "path",
+                            "sha256",
+                            "receipt_payload_sha256",
+                        )
+                    },
                     "clip_count": ORCHESTRATOR.EXPECTED_CLIPS,
                     "prediction_files": ORCHESTRATOR.EXPECTED_CLIPS,
                     "ground_truth_files": ORCHESTRATOR.EXPECTED_CLIPS,
@@ -912,6 +926,122 @@ class ProducerFixture:
 
 
 class BaseFreshConcurrencyProducerCpuTests(unittest.TestCase):
+    def test_lineage_authority_requires_exact_compact_receipt(self) -> None:
+        full = {
+            "path": "/authority.json",
+            "sha256": "1" * 64,
+            "bytes": 17,
+            "receipt_payload_sha256": "2" * 64,
+        }
+        compact = {
+            key: full[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+        self.assertTrue(
+            PRODUCER._same_lineage_authority_receipt(compact, full)
+        )
+        self.assertFalse(
+            PRODUCER._same_lineage_authority_receipt(full, full)
+        )
+        attacked = dict(compact)
+        attacked["sha256"] = "3" * 64
+        self.assertFalse(
+            PRODUCER._same_lineage_authority_receipt(attacked, full)
+        )
+
+    def test_common_valid_alternate_lmdb_and_selection_fail_training_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            selected = _write_receipt(
+                root / "selected-five.json",
+                {"format": "selected-five", "status": "selected"},
+            )
+            lmdb_root = root / "base.lmdb"
+            data = _write_bytes(lmdb_root / "data.mdb", b"selected data\n")
+            lock = _write_bytes(lmdb_root / "lock.mdb", b"selected lock\n")
+            lineage = _write_bytes(root / "lineage.json", b"{}\n")
+            summary_body = {
+                "format": "semtalk_show_base_lmdb_summary_v1",
+                "status": "complete",
+                "scope": "SemTalk Base only",
+                "entries": 127_286,
+                "train_clips": 13_687,
+                "lmdb": str(lmdb_root),
+                "data_mdb_sha256": data["sha256"],
+                "lock_mdb_sha256": lock["sha256"],
+                "lineage_json": lineage["path"],
+                "lineage_json_sha256": lineage["sha256"],
+            }
+            summary = _write_json(root / "summary.json", summary_body)
+            selected_compact = {
+                key: selected[key]
+                for key in ("path", "sha256", "receipt_payload_sha256")
+            }
+            selected_dataset = {
+                "format": (
+                    "semtalk_show_base_selected_feature_dataset_receipt_v1"
+                ),
+                "lmdb": str(lmdb_root),
+                "summary": summary["path"],
+                "summary_sha256": summary["sha256"],
+                "lineage": lineage["path"],
+                "lineage_sha256": lineage["sha256"],
+                "entries": 127_286,
+                "train_clips": 13_687,
+                "split": "train",
+                "test_visible": False,
+                "data_mdb_sha256": data["sha256"],
+                "lock_mdb_sha256": lock["sha256"],
+                "prerequisite_selection": selected_compact,
+                "selected_prerequisite_sha256": {
+                    stage: f"{index + 1:x}" * 64
+                    for index, stage in enumerate(AUTHORITY.STAGES)
+                },
+                "lmdb_binding_scope": (
+                    "ordered_node_local_inode_bindings_with_global_content_sha256"
+                ),
+                "node_lmdb_inode_bindings": [],
+            }
+            normalized = PRODUCER._validate_representation_lmdb_authority(
+                {"summary": summary, "data": data, "lock": lock},
+                selected_authority=selected,
+                selected_dataset=selected_dataset,
+            )
+            self.assertEqual(normalized["data"], data)
+
+            alternate_selected = _write_receipt(
+                root / "alternate-selected-five.json",
+                {"format": "selected-five", "status": "selected"},
+            )
+            alternate_root = root / "alternate-base.lmdb"
+            alternate_data = _write_bytes(
+                alternate_root / "data.mdb", b"alternate valid data\n"
+            )
+            alternate_lock = _write_bytes(
+                alternate_root / "lock.mdb", b"alternate valid lock\n"
+            )
+            alternate_summary = _write_json(
+                root / "alternate-summary.json",
+                {
+                    **summary_body,
+                    "lmdb": str(alternate_root),
+                    "data_mdb_sha256": alternate_data["sha256"],
+                    "lock_mdb_sha256": alternate_lock["sha256"],
+                },
+            )
+            with self.assertRaises(PRODUCER.ProbeProducerError):
+                PRODUCER._validate_representation_lmdb_authority(
+                    {
+                        "summary": alternate_summary,
+                        "data": alternate_data,
+                        "lock": alternate_lock,
+                    },
+                    selected_authority=alternate_selected,
+                    selected_dataset=selected_dataset,
+                )
+
     def test_caller_scalar_and_capture_producers_are_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             fixture = ProducerFixture(Path(raw))
