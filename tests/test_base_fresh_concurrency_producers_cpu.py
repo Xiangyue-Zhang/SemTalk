@@ -702,6 +702,18 @@ class ProducerFixture:
         self.fake_pid += 100
         runner_pid = self.fake_pid
         child_pid = runner_pid + 1
+        execution_input_path = workload_argv[
+            workload_argv.index("--execution-spec-path") + 1
+        ]
+        proc_input_parts = execution_input_path.split("/")
+        runner_parent_pid = (
+            int(proc_input_parts[2])
+            if len(proc_input_parts) == 5
+            and proc_input_parts[1] == "proc"
+            and proc_input_parts[2].isdigit()
+            and proc_input_parts[3] == "fd"
+            else 40000
+        )
         restored = {
             str(index): runner_pid + 10 + index
             for index in PRODUCER.EXPECTED_GPUS
@@ -759,7 +771,7 @@ class ProducerFixture:
         )
         runner_identity = {
             "pid": runner_pid,
-            "ppid": 40000,
+            "ppid": runner_parent_pid,
             "pgid": runner_pid,
             "sid": 40000,
             "starttime_ticks": 1234,
