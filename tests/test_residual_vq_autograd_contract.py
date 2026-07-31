@@ -49,6 +49,9 @@ class ResidualVQAutogradContractTest(unittest.TestCase):
         quantizer.layers = nn.ModuleList(
             [DifferentiableDummyQuantizer() for _ in range(3)]
         )
+        # Keep this legacy-style fixture free of fields introduced after the
+        # original ResidualVQ contract.  Missing diagnostics must default off.
+        self.assertFalse(hasattr(quantizer, "check_finite_every_step"))
 
         leaf = torch.randn(2, 8, 16, requires_grad=True)
         encoded = leaf * 1.0

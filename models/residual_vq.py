@@ -108,6 +108,11 @@ class ResidualVQ(nn.Module):
 
     def forward(self, x, return_all_codes=False, sample_codebook_temp=None, force_dropout_index=-1):
         num_quant = self.num_quantizers
+        check_finite_every_step = getattr(
+            self,
+            "check_finite_every_step",
+            False,
+        )
         quantized_out = 0.
         residual = x
         all_losses = []
@@ -139,7 +144,7 @@ class ResidualVQ(nn.Module):
             embed_indices, loss, perplexity = rest
 
             if (
-                self.check_finite_every_step
+                check_finite_every_step
                 and not torch.isfinite(quantized).all()
             ):
                 print(f"NaN or Inf detected in quantizer output at layer {quantizer_index}")
@@ -153,7 +158,7 @@ class ResidualVQ(nn.Module):
         all_perplexity = sum(all_perplexity) / len(all_perplexity)
 
         if (
-            self.check_finite_every_step
+            check_finite_every_step
             and not torch.isfinite(all_losses).all()
         ):
             print("NaN or Inf detected in accumulated quantizer losses")
