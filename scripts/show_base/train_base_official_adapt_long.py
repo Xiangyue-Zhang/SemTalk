@@ -319,7 +319,7 @@ FRESH_TRAJECTORY_MODE = "fresh_lineage_gate_v1"
 FRESH_TRAJECTORY_FORMAT = (
     "semtalk_show_base_fresh_lineage_trajectory_contract_v1"
 )
-TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v2"
+TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v3"
 TRAJECTORY_PROBE_UPDATES = (
     THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
 )
@@ -582,8 +582,10 @@ def _tensor_sha256(tensor: Any) -> str:
     return hashlib.sha256(contiguous.numpy().tobytes(order="C")).hexdigest()
 
 
-def _model_state_semantic_sha256(state: Mapping[str, Any]) -> str:
-    rows = [
+def _model_state_semantic_rows(
+    state: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    return [
         {
             "key": key,
             "shape": list(value.shape),
@@ -592,7 +594,10 @@ def _model_state_semantic_sha256(state: Mapping[str, Any]) -> str:
         }
         for key, value in sorted(state.items())
     ]
-    return canonical_json_sha256(rows)
+
+
+def _model_state_semantic_sha256(state: Mapping[str, Any]) -> str:
+    return canonical_json_sha256(_model_state_semantic_rows(state))
 
 
 def read_official_base_checkpoint(
@@ -1696,7 +1701,8 @@ def validate_long_contract_receipts(
             "probe_optimizer_updates": TRAJECTORY_PROBE_UPDATES,
             "probe_source": "matching_frozen_receipt_throughput_gate",
             "comparison": (
-                "byte_exact_all_rank_model_adam_rng_and_sample_order_v2"
+                "byte_exact_rank_local_model_buffers_all_rank_parameters_"
+                "adam_rng_and_sample_order_v3"
             ),
             "seed": args.seed,
             "precision": args.precision,
@@ -2010,7 +2016,8 @@ def protocol_receipt(
                 else None
             ),
             "comparison": (
-                "byte_exact_all_rank_model_adam_rng_and_sample_order_v2"
+                "byte_exact_rank_local_model_buffers_all_rank_parameters_"
+                "adam_rng_and_sample_order_v3"
                 if fresh_trajectory
                 else None
             ),
@@ -2625,13 +2632,77 @@ def _trajectory_rank_probe(
     sample_order_sha256: str,
     sample_count: int,
 ) -> dict[str, Any]:
-    state = _unwrap_model(model).state_dict()
+    unwrapped_model = _unwrap_model(model)
+    state = unwrapped_model.state_dict()
+    # DDP synchronizes trainable parameters and their gradients, but the
+    # formal DDP adaptations deliberately retain per-rank BatchNorm running
+    # statistics (``broadcast_buffers=False``).  Preserve the complete model
+    # state for exact same-rank trajectory replay while projecting parameters
+    # and persistent buffers separately for the cross-rank consensus checks.
+    # ``remove_duplicate=False`` mirrors state_dict's registered-name view for
+    # tied parameters/modules instead of silently dropping an alias.
+    parameter_names = {
+        name
+        for name, _ in unwrapped_model.named_parameters(
+            remove_duplicate=False
+        )
+    }
+    buffer_names = {
+        name
+        for name, _ in unwrapped_model.named_buffers(remove_duplicate=False)
+    }
+    state_names = set(state)
+    overlap = state_names & parameter_names & buffer_names
+    unclassified = state_names - parameter_names - buffer_names
+    if overlap or unclassified:
+        raise AdaptationContractError(
+            "trajectory model state cannot be partitioned into exact "
+            f"parameters and persistent buffers: overlap={sorted(overlap)}, "
+            f"unclassified={sorted(unclassified)}"
+        )
+    parameter_state = {
+        name: value for name, value in state.items() if name in parameter_names
+    }
+    buffer_state = {
+        name: value for name, value in state.items() if name in buffer_names
+    }
+    if (
+        not parameter_state
+        or len(parameter_state) + len(buffer_state) != len(state)
+    ):
+        raise AdaptationContractError(
+            "trajectory model state parameter/buffer partition is incomplete"
+        )
+    # Hash each tensor payload once.  A formal Base model has thousands of
+    # tensors, so independently hashing the complete, parameter, and buffer
+    # projections would copy every CUDA parameter to CPU twice at the probe.
+    # Filtering the already-hashed canonical rows keeps all three digests
+    # byte-for-byte identical to separate semantic-hash calls.
+    semantic_rows = _model_state_semantic_rows(state)
+    parameter_semantic_rows = [
+        row for row in semantic_rows if row["key"] in parameter_names
+    ]
+    buffer_semantic_rows = [
+        row for row in semantic_rows if row["key"] in buffer_names
+    ]
     return {
         "rank": rank,
         "optimizer_updates": optimizer_updates,
         "model_state_tensors": len(state),
         "model_state_schema_sha256": _state_schema_sha256(state),
-        "model_state_semantic_sha256": _model_state_semantic_sha256(state),
+        "model_state_semantic_sha256": canonical_json_sha256(semantic_rows),
+        "parameter_state_tensors": len(parameter_state),
+        "parameter_state_schema_sha256": _state_schema_sha256(
+            parameter_state
+        ),
+        "parameter_state_semantic_sha256": canonical_json_sha256(
+            parameter_semantic_rows
+        ),
+        "buffer_state_tensors": len(buffer_state),
+        "buffer_state_schema_sha256": _state_schema_sha256(buffer_state),
+        "buffer_state_semantic_sha256": canonical_json_sha256(
+            buffer_semantic_rows
+        ),
         "optimizer_state_semantic_sha256": _state_tree_semantic_sha256(
             optimizer.state_dict()
         ),
@@ -2655,6 +2726,12 @@ def _assemble_trajectory_probe(
         "model_state_tensors",
         "model_state_schema_sha256",
         "model_state_semantic_sha256",
+        "parameter_state_tensors",
+        "parameter_state_schema_sha256",
+        "parameter_state_semantic_sha256",
+        "buffer_state_tensors",
+        "buffer_state_schema_sha256",
+        "buffer_state_semantic_sha256",
         "optimizer_state_semantic_sha256",
         "python_random_state_sha256",
         "numpy_random_state_sha256",
@@ -2676,10 +2753,21 @@ def _assemble_trajectory_probe(
         )
     for probe in rank_probes:
         if (
-            probe["optimizer_updates"] != optimizer_updates
+            type(probe["rank"]) is not int
+            or type(probe["optimizer_updates"]) is not int
+            or probe["optimizer_updates"] != optimizer_updates
+            or type(probe["sample_count"]) is not int
             or probe["sample_count"]
             != optimizer_updates * LOCAL_BATCH_SIZE
+            or type(probe["model_state_tensors"]) is not int
             or probe["model_state_tensors"] <= 0
+            or type(probe["parameter_state_tensors"]) is not int
+            or probe["parameter_state_tensors"] <= 0
+            or type(probe["buffer_state_tensors"]) is not int
+            or probe["buffer_state_tensors"] <= 0
+            or probe["model_state_tensors"]
+            != probe["parameter_state_tensors"]
+            + probe["buffer_state_tensors"]
         ):
             raise AdaptationContractError(
                 f"trajectory rank {probe['rank']} metadata mismatch"
@@ -2687,27 +2775,61 @@ def _assemble_trajectory_probe(
         for key, value in probe.items():
             if key.endswith("_sha256"):
                 _require_sha256(value, f"trajectory rank {probe['rank']} {key}")
-    model_consensus = {
+    model_schema_consensus = {
         (
             probe["model_state_tensors"],
             probe["model_state_schema_sha256"],
-            probe["model_state_semantic_sha256"],
         )
         for probe in rank_probes
+    }
+    parameter_schema_consensus = {
+        (
+            probe["parameter_state_tensors"],
+            probe["parameter_state_schema_sha256"],
+        )
+        for probe in rank_probes
+    }
+    buffer_schema_consensus = {
+        (
+            probe["buffer_state_tensors"],
+            probe["buffer_state_schema_sha256"],
+        )
+        for probe in rank_probes
+    }
+    parameter_consensus = {
+        probe["parameter_state_semantic_sha256"] for probe in rank_probes
+    }
+    model_consensus = {
+        probe["model_state_semantic_sha256"] for probe in rank_probes
+    }
+    buffer_consensus = {
+        probe["buffer_state_semantic_sha256"] for probe in rank_probes
     }
     optimizer_consensus = {
         probe["optimizer_state_semantic_sha256"] for probe in rank_probes
     }
-    if len(model_consensus) != 1 or len(optimizer_consensus) != 1:
+    if (
+        len(model_schema_consensus) != 1
+        or len(parameter_schema_consensus) != 1
+        or len(buffer_schema_consensus) != 1
+    ):
         raise AdaptationContractError(
-            "DDP ranks disagree on model or Adam state at trajectory probe"
+            "DDP ranks disagree on model parameter/buffer schema at "
+            "trajectory probe"
+        )
+    if len(parameter_consensus) != 1 or len(optimizer_consensus) != 1:
+        raise AdaptationContractError(
+            "DDP ranks disagree on parameter or Adam state at trajectory "
+            "probe"
         )
     return {
         "format": TRAJECTORY_PROBE_FORMAT,
         "optimizer_updates": optimizer_updates,
         "world_size": WORLD_SIZE,
         "rank_order": list(range(WORLD_SIZE)),
-        "all_rank_model_state_identical": True,
+        "all_rank_model_state_identical": len(model_consensus) == 1,
+        "all_rank_parameter_state_identical": True,
+        "all_rank_buffer_state_identical": len(buffer_consensus) == 1,
         "all_rank_optimizer_state_identical": True,
         "ranks": [dict(probe) for probe in rank_probes],
     }
@@ -2772,6 +2894,8 @@ def _validate_trajectory_probe(
         "world_size",
         "rank_order",
         "all_rank_model_state_identical",
+        "all_rank_parameter_state_identical",
+        "all_rank_buffer_state_identical",
         "all_rank_optimizer_state_identical",
         "ranks",
     }
@@ -2781,9 +2905,14 @@ def _validate_trajectory_probe(
         probe.get("format") != TRAJECTORY_PROBE_FORMAT
         or type(probe.get("optimizer_updates")) is not int
         or probe["optimizer_updates"] != TRAJECTORY_PROBE_UPDATES
-        or probe.get("world_size") != WORLD_SIZE
-        or probe.get("rank_order") != list(range(WORLD_SIZE))
-        or probe.get("all_rank_model_state_identical") is not True
+        or type(probe.get("world_size")) is not int
+        or probe["world_size"] != WORLD_SIZE
+        or type(probe.get("rank_order")) is not list
+        or any(type(rank) is not int for rank in probe["rank_order"])
+        or probe["rank_order"] != list(range(WORLD_SIZE))
+        or type(probe.get("all_rank_model_state_identical")) is not bool
+        or probe.get("all_rank_parameter_state_identical") is not True
+        or type(probe.get("all_rank_buffer_state_identical")) is not bool
         or probe.get("all_rank_optimizer_state_identical") is not True
         or not isinstance(probe.get("ranks"), list)
     ):

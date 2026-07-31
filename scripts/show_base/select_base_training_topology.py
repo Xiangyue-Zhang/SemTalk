@@ -233,6 +233,8 @@ def _fresh_trajectory_probe(
         "world_size",
         "rank_order",
         "all_rank_model_state_identical",
+        "all_rank_parameter_state_identical",
+        "all_rank_buffer_state_identical",
         "all_rank_optimizer_state_identical",
         "ranks",
     }
@@ -242,6 +244,12 @@ def _fresh_trajectory_probe(
         "model_state_tensors",
         "model_state_schema_sha256",
         "model_state_semantic_sha256",
+        "parameter_state_tensors",
+        "parameter_state_schema_sha256",
+        "parameter_state_semantic_sha256",
+        "buffer_state_tensors",
+        "buffer_state_schema_sha256",
+        "buffer_state_semantic_sha256",
         "optimizer_state_semantic_sha256",
         "python_random_state_sha256",
         "numpy_random_state_sha256",
@@ -255,11 +263,17 @@ def _fresh_trajectory_probe(
         not isinstance(value, dict)
         or set(value) != required
         or value.get("format") != contract.TRAJECTORY_PROBE_FORMAT
-        or value.get("optimizer_updates")
+        or type(value.get("optimizer_updates")) is not int
+        or value["optimizer_updates"]
         != contract.TRAJECTORY_PROBE_UPDATES
-        or value.get("world_size") != world_size
-        or value.get("rank_order") != list(range(world_size))
-        or value.get("all_rank_model_state_identical") is not True
+        or type(value.get("world_size")) is not int
+        or value["world_size"] != world_size
+        or type(value.get("rank_order")) is not list
+        or any(type(rank) is not int for rank in value["rank_order"])
+        or value["rank_order"] != list(range(world_size))
+        or type(value.get("all_rank_model_state_identical")) is not bool
+        or value.get("all_rank_parameter_state_identical") is not True
+        or type(value.get("all_rank_buffer_state_identical")) is not bool
         or value.get("all_rank_optimizer_state_identical") is not True
         or not isinstance(ranks, list)
         or len(ranks) != world_size
@@ -271,11 +285,20 @@ def _fresh_trajectory_probe(
         if (
             not isinstance(rank, dict)
             or set(rank) != rank_required
-            or rank.get("optimizer_updates")
+            or type(rank.get("rank")) is not int
+            or type(rank.get("optimizer_updates")) is not int
+            or rank["optimizer_updates"]
             != contract.TRAJECTORY_PROBE_UPDATES
             or type(rank.get("model_state_tensors")) is not int
             or rank["model_state_tensors"] <= 0
-            or rank.get("sample_count")
+            or type(rank.get("parameter_state_tensors")) is not int
+            or rank["parameter_state_tensors"] <= 0
+            or type(rank.get("buffer_state_tensors")) is not int
+            or rank["buffer_state_tensors"] <= 0
+            or rank["model_state_tensors"]
+            != rank["parameter_state_tensors"] + rank["buffer_state_tensors"]
+            or type(rank.get("sample_count")) is not int
+            or rank["sample_count"]
             != contract.TRAJECTORY_PROBE_UPDATES * local_batch_size
             or any(
                 re.fullmatch(r"[0-9a-f]{64}", str(item)) is None
@@ -292,10 +315,49 @@ def _fresh_trajectory_probe(
         )
         for rank in ranks
     }
+    model_schema_consensus = {
+        (
+            rank["model_state_tensors"],
+            rank["model_state_schema_sha256"],
+        )
+        for rank in ranks
+    }
+    parameter_consensus = {
+        (
+            rank["parameter_state_tensors"],
+            rank["parameter_state_schema_sha256"],
+            rank["parameter_state_semantic_sha256"],
+        )
+        for rank in ranks
+    }
+    buffer_consensus = {
+        (
+            rank["buffer_state_tensors"],
+            rank["buffer_state_schema_sha256"],
+            rank["buffer_state_semantic_sha256"],
+        )
+        for rank in ranks
+    }
+    buffer_schema_consensus = {
+        (
+            rank["buffer_state_tensors"],
+            rank["buffer_state_schema_sha256"],
+        )
+        for rank in ranks
+    }
     optimizer_consensus = {
         rank["optimizer_state_semantic_sha256"] for rank in ranks
     }
-    if len(model_consensus) != 1 or len(optimizer_consensus) != 1:
+    if (
+        len(model_schema_consensus) != 1
+        or len(parameter_consensus) != 1
+        or len(buffer_schema_consensus) != 1
+        or len(optimizer_consensus) != 1
+        or value["all_rank_model_state_identical"]
+        is not (len(model_consensus) == 1)
+        or value["all_rank_buffer_state_identical"]
+        is not (len(buffer_consensus) == 1)
+    ):
         raise TopologySelectionError(f"{label} changed")
     return dict(value)
 

@@ -85,7 +85,13 @@ def _probe(seed: str = "a") -> dict[str, object]:
                 "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
                 "model_state_tensors": 1790,
                 "model_state_schema_sha256": seed * 64,
-                "model_state_semantic_sha256": "b" * 64,
+                "model_state_semantic_sha256": rank_hex * 64,
+                "parameter_state_tensors": 1784,
+                "parameter_state_schema_sha256": "a" * 64,
+                "parameter_state_semantic_sha256": "b" * 64,
+                "buffer_state_tensors": 6,
+                "buffer_state_schema_sha256": "c" * 64,
+                "buffer_state_semantic_sha256": rank_hex * 64,
                 "optimizer_state_semantic_sha256": "c" * 64,
                 "python_random_state_sha256": rank_hex * 64,
                 "numpy_random_state_sha256": "d" * 63 + rank_hex,
@@ -1576,6 +1582,38 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             ]
         )
 
+    def test_fixed_global_batch_ddp_must_match_w1_at_every_quality_epoch(self) -> None:
+        probes, quality = _topology_selection_inputs(
+            {
+                ADAPT.OFFICIAL_W1_REFERENCE_MODE: 10_000.0,
+                ADAPT.W8_GLOBAL64_MODE: 1_000.0,
+                ADAPT.W16_GLOBAL64_MODE: 2_000.0,
+                ADAPT.W8_GLOBAL512_MODE: 90_000.0,
+                ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+            },
+            failing_quality_modes={
+                ADAPT.W8_GLOBAL64_MODE,
+                ADAPT.W16_GLOBAL64_MODE,
+            },
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(
+            selection["selected"]["mode"],
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+        )
+        for mode in (ADAPT.W8_GLOBAL64_MODE, ADAPT.W16_GLOBAL64_MODE):
+            decision = selection["quality_decisions"][mode]
+            self.assertFalse(decision["all_trajectory_epochs_pass"])
+            self.assertEqual(
+                [row["epoch"] for row in decision["comparisons"]],
+                [1, 2, 4, 8],
+            )
+
     def test_nonfinite_eta_is_never_ranked(self) -> None:
         probes, quality = _topology_selection_inputs(
             {
@@ -2314,18 +2352,61 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
         ):
             ADAPT._require_matching_trajectory_probe(expected, changed)
 
-    def test_all_rank_model_and_adam_consensus_is_mandatory(self) -> None:
+    def test_rank_local_buffers_preserve_parameter_and_adam_consensus(self) -> None:
+        probe = _probe()
+        self.assertFalse(probe["all_rank_model_state_identical"])
+        self.assertTrue(probe["all_rank_parameter_state_identical"])
+        self.assertFalse(probe["all_rank_buffer_state_identical"])
+        self.assertTrue(probe["all_rank_optimizer_state_identical"])
+
+    def test_all_rank_parameter_and_adam_consensus_is_mandatory(self) -> None:
         probe = _probe()
         ranks = json.loads(json.dumps(probe["ranks"]))
-        ranks[7]["optimizer_state_semantic_sha256"] = "9" * 64
-        with self.assertRaisesRegex(
-            ADAPT.AdaptationContractError,
-            "model or Adam",
-        ):
+        ranks[7]["parameter_state_semantic_sha256"] = "9" * 64
+        with self.assertRaises(ADAPT.AdaptationContractError):
             ADAPT._assemble_trajectory_probe(
                 ranks,
                 optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
             )
+        ranks = json.loads(json.dumps(probe["ranks"]))
+        ranks[7]["optimizer_state_semantic_sha256"] = "9" * 64
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT._assemble_trajectory_probe(
+                ranks,
+                optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
+            )
+
+    def test_selector_rejects_false_buffer_consensus_claim(self) -> None:
+        probe = _probe()
+        changed = json.loads(json.dumps(probe))
+        changed["all_rank_buffer_state_identical"] = True
+        with self.assertRaises(SELECTOR.TopologySelectionError):
+            SELECTOR._fresh_trajectory_probe(
+                ADAPT.W8_GLOBAL512_MODE,
+                changed,
+                "changed buffer consensus",
+            )
+        changed = json.loads(json.dumps(probe))
+        changed["ranks"][0]["rank"] = False
+        with self.assertRaises(SELECTOR.TopologySelectionError):
+            SELECTOR._fresh_trajectory_probe(
+                ADAPT.W8_GLOBAL512_MODE,
+                changed,
+                "non-exact rank type",
+            )
+
+    def test_trainer_rejects_bool_world_size_and_rank_order(self) -> None:
+        _activate(ADAPT.OFFICIAL_W1_REFERENCE_MODE)
+        self.addCleanup(_activate, ADAPT.W8_GLOBAL512_MODE)
+        probe = _probe()
+        changed = json.loads(json.dumps(probe))
+        changed["world_size"] = True
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT._validate_trajectory_probe(changed, label="bool world size")
+        changed = json.loads(json.dumps(probe))
+        changed["rank_order"][0:2] = [False, True]
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT._validate_trajectory_probe(changed, label="bool rank order")
 
     def test_fresh_throughput_gate_carries_lineage_bound_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2422,6 +2503,135 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
     "PyTorch is optional in the local CPU contract environment",
 )
 class OfficialBaseAdaptTorchContracts(unittest.TestCase):
+    def test_trajectory_probe_partitions_rank_local_batchnorm_buffers(self) -> None:
+        import copy
+        import torch
+
+        _activate(ADAPT.W8_GLOBAL512_MODE)
+
+        class Tiny(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.projection = torch.nn.Linear(3, 4)
+                self.normalization = torch.nn.BatchNorm1d(4)
+
+        torch.manual_seed(7)
+        reference = Tiny()
+        reference_optimizer = torch.optim.Adam(
+            reference.parameters(), lr=3e-5, betas=(0.5, 0.999)
+        )
+        reference_optimizer.zero_grad(set_to_none=True)
+        synthetic_loss = sum(
+            parameter.square().sum() for parameter in reference.parameters()
+        )
+        synthetic_loss.backward()
+        reference_optimizer.step()
+        rank_models = [copy.deepcopy(reference) for _ in range(ADAPT.WORLD_SIZE)]
+        for rank, model in enumerate(rank_models):
+            with torch.no_grad():
+                model.normalization.running_mean.fill_(float(rank))
+                model.normalization.running_var.fill_(float(rank + 1))
+                model.normalization.num_batches_tracked.fill_(rank)
+        optimizers = [
+            torch.optim.Adam(model.parameters(), lr=3e-5, betas=(0.5, 0.999))
+            for model in rank_models
+        ]
+        for optimizer in optimizers:
+            optimizer.load_state_dict(reference_optimizer.state_dict())
+        before_model_hashes = [
+            ADAPT._model_state_semantic_sha256(model.state_dict())
+            for model in rank_models
+        ]
+        before_optimizer_hashes = [
+            ADAPT._state_tree_semantic_sha256(optimizer.state_dict())
+            for optimizer in optimizers
+        ]
+        fixed_rng = {
+            "python_random_state_sha256": "1" * 64,
+            "numpy_random_state_sha256": "2" * 64,
+            "torch_cpu_rng_state_sha256": "3" * 64,
+            "torch_cuda_rng_state_sha256": "4" * 64,
+        }
+        rank_probes = []
+        with mock.patch.object(
+            ADAPT,
+            "_rng_state_hashes",
+            return_value=fixed_rng,
+        ):
+            for rank, (model, optimizer) in enumerate(
+                zip(rank_models, optimizers)
+            ):
+                rank_probes.append(
+                    ADAPT._trajectory_rank_probe(
+                        model,
+                        optimizer,
+                        ADAPT.TRAJECTORY_PROBE_UPDATES,
+                        rank=rank,
+                        device=torch.device("cpu"),
+                        sample_order_sha256=f"{rank + 1:064x}",
+                        sample_count=(
+                            ADAPT.TRAJECTORY_PROBE_UPDATES
+                            * ADAPT.LOCAL_BATCH_SIZE
+                        ),
+                    )
+                )
+
+        self.assertEqual(
+            before_model_hashes,
+            [
+                ADAPT._model_state_semantic_sha256(model.state_dict())
+                for model in rank_models
+            ],
+        )
+        self.assertEqual(
+            before_optimizer_hashes,
+            [
+                ADAPT._state_tree_semantic_sha256(optimizer.state_dict())
+                for optimizer in optimizers
+            ],
+        )
+        probe = ADAPT._assemble_trajectory_probe(
+            rank_probes,
+            optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
+        )
+        self.assertFalse(probe["all_rank_model_state_identical"])
+        self.assertTrue(probe["all_rank_parameter_state_identical"])
+        self.assertFalse(probe["all_rank_buffer_state_identical"])
+        self.assertTrue(probe["all_rank_optimizer_state_identical"])
+        self.assertEqual(rank_probes[0]["parameter_state_tensors"], 4)
+        self.assertEqual(rank_probes[0]["buffer_state_tensors"], 3)
+        self.assertEqual(
+            len(
+                {
+                    rank_probe["parameter_state_semantic_sha256"]
+                    for rank_probe in rank_probes
+                }
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                {
+                    rank_probe["buffer_state_semantic_sha256"]
+                    for rank_probe in rank_probes
+                }
+            ),
+            ADAPT.WORLD_SIZE,
+        )
+
+        changed_rank_probes = copy.deepcopy(rank_probes)
+        changed_rank_probes[3]["model_state_semantic_sha256"] = "d" * 64
+        changed_rank_probes[3]["buffer_state_semantic_sha256"] = "e" * 64
+        changed_probe = ADAPT._assemble_trajectory_probe(
+            changed_rank_probes,
+            optimizer_updates=ADAPT.TRAJECTORY_PROBE_UPDATES,
+        )
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "does not reproduce",
+        ):
+            ADAPT._require_matching_trajectory_probe(probe, changed_probe)
+
     def test_strict_load_and_mean_initializes_only_four_rows(self) -> None:
         import torch
 
