@@ -104,6 +104,7 @@ PARTIAL_CANDIDATE_INDEX_FORMAT = (
 SEGMENTED_UNION_FORMAT = (
     "semtalk_show_prerequisite_segmented_candidate_union_v1"
 )
+CONTINUATION_WAVE_FORMAT = "semtalk_show_prerequisite_continuation_wave_v1"
 SHARD_FORMAT = "semtalk_show_prerequisite_val_shard_v1"
 STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
@@ -259,6 +260,7 @@ def _safe_file_snapshot(
     label: str,
     *,
     val_only: bool = True,
+    require_path_identity: bool = False,
 ) -> tuple[Path, bytes]:
     if not isinstance(value, (str, os.PathLike)):
         raise ContractError(f"{label} must be a path")
@@ -325,6 +327,17 @@ def _safe_file_snapshot(
         payload = b"".join(chunks)
         if len(payload) != after.st_size:
             raise ContractError(f"{label} size changed while it was read")
+        if require_path_identity:
+            current = os.stat(
+                parts[-1],
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(current.st_mode) or any(
+                getattr(after, field) != getattr(current, field)
+                for field in fields
+            ):
+                raise ContractError(f"{label} path changed while it was read")
         if val_only:
             reject_forbidden_label(path, label)
         return path, payload
@@ -498,18 +511,36 @@ def regular_file(
     return path
 
 
+def read_file_snapshot(
+    value: Any,
+    label: str,
+    *,
+    val_only: bool = True,
+) -> tuple[Path, bytes]:
+    """Return one O_NOFOLLOW, same-descriptor snapshot of a regular file."""
+
+    return _safe_file_snapshot(
+        value,
+        label,
+        val_only=val_only,
+        require_path_identity=True,
+    )
+
+
 def read_verified_file(
     value: Any,
     expected_sha256: Any,
     label: str,
     *,
     val_only: bool = True,
+    require_path_identity: bool = False,
 ) -> tuple[Path, bytes, str]:
     expected = require_sha256(expected_sha256, f"{label} expected SHA-256")
     path, payload = _safe_file_snapshot(
         value,
         label,
         val_only=val_only,
+        require_path_identity=require_path_identity,
     )
     observed = hashlib.sha256(payload).hexdigest()
     if observed != expected:
@@ -1447,12 +1478,58 @@ def stage_metrics(
     return metrics, score
 
 
+def _validate_bound_prior_candidate_index(
+    value: Any,
+    *,
+    path: Path,
+    artifact_stack: frozenset[Path],
+) -> dict[str, Any]:
+    return validate_candidate_index(
+        value,
+        path=path,
+        allow_partial=False,
+        _artifact_stack=artifact_stack,
+    )
+
+
+def _replay_bound_continuation_wave(
+    value: Any,
+    *,
+    path: Path,
+    expected_sha256: str,
+    artifact_stack: frozenset[Path],
+) -> dict[str, Any]:
+    # Late import avoids the contract/wave module import cycle.
+    from scripts.show_base import prerequisite_continuation_wave as wave_contract
+
+    try:
+        replayed = wave_contract.replay_wave_file(
+            path,
+            expected_sha256,
+            _artifact_stack=artifact_stack,
+        )
+    except (wave_contract.ContinuationWaveError, ContractError) as error:
+        raise ContractError(
+            f"continuation wave semantic replay failed: {error}"
+        ) from error
+    if replayed != value:
+        raise ContractError("continuation wave semantic replay changed payload")
+    return replayed
+
+
 def validate_candidate_index(
     value: Any,
     *,
     path: Path | None = None,
     allow_partial: bool = False,
+    _artifact_stack: frozenset[Path] | None = None,
 ) -> dict[str, Any]:
+    artifact_stack = frozenset() if _artifact_stack is None else _artifact_stack
+    if path is not None:
+        candidate_path = Path(path)
+        if candidate_path in artifact_stack:
+            raise ContractError("segmented candidate index cycle detected")
+        artifact_stack = artifact_stack | {candidate_path}
     payload = verify_receipt_payload(value, "candidate index")
     is_partial = payload.get("format") == PARTIAL_CANDIDATE_INDEX_FORMAT
     expected_stages = STAGES[:-1] if is_partial else STAGES
@@ -1519,7 +1596,7 @@ def validate_candidate_index(
                 or updates != epoch * EXPECTED_UPDATES_PER_EPOCH
             ):
                 raise ContractError(f"{stage} candidate schedule mismatch")
-            checkpoint = regular_file(
+            checkpoint, checkpoint_payload = read_file_snapshot(
                 entry["checkpoint"],
                 f"{stage} candidate checkpoint",
             )
@@ -1535,8 +1612,8 @@ def validate_candidate_index(
                 f"{stage} checkpoint audit SHA-256",
             )
             if (
-                sha256_file(checkpoint) != expected_sha
-                or checkpoint.stat().st_size
+                hashlib.sha256(checkpoint_payload).hexdigest() != expected_sha
+                or len(checkpoint_payload)
                 != require_exact_int(
                     entry["checkpoint_bytes"],
                     f"{stage} checkpoint bytes",
@@ -1572,42 +1649,75 @@ def validate_candidate_index(
         ):
             raise ContractError("segmented candidate union protocol mismatch")
 
-        def validate_binding(value: Any, label: str) -> dict[str, Any]:
+        def validate_binding(
+            value: Any,
+            label: str,
+            *,
+            expected_format: str,
+        ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
             binding = exact_keys(
                 value,
                 ("path", "sha256", "bytes", "receipt_payload_sha256"),
                 label,
             )
-            artifact_path = regular_file(binding["path"], label)
             artifact_sha = require_sha256(binding["sha256"], f"{label} SHA")
             artifact_bytes = require_exact_int(
                 binding["bytes"], f"{label} bytes"
             )
-            require_sha256(
+            expected_payload_sha = require_sha256(
                 binding["receipt_payload_sha256"],
                 f"{label} payload SHA",
             )
-            if (
-                artifact_bytes <= 0
-                or artifact_path.stat().st_size != artifact_bytes
-                or sha256_file(artifact_path) != artifact_sha
-            ):
+            artifact_path, artifact_payload, _observed_sha = read_verified_file(
+                binding["path"],
+                artifact_sha,
+                label,
+                require_path_identity=True,
+            )
+            if artifact_bytes <= 0 or len(artifact_payload) != artifact_bytes:
                 raise ContractError(f"{label} changed")
-            return dict(binding)
+            artifact_value = strict_json_bytes(
+                artifact_payload, str(artifact_path)
+            )
+            artifact_value = verify_receipt_payload(artifact_value, label)
+            if artifact_value.get("format") != expected_format:
+                raise ContractError(f"{label} format mismatch")
+            if (
+                artifact_value["receipt_payload_sha256"]
+                != expected_payload_sha
+            ):
+                raise ContractError(f"{label} payload SHA mismatch")
+            return dict(binding), artifact_path, artifact_value
 
-        prior = validate_binding(
+        prior, prior_path, prior_value = validate_binding(
             segmented["prior_candidate_index"],
             "prior candidate index",
+            expected_format=CANDIDATE_INDEX_FORMAT,
         )
         if path is not None and prior["path"] == str(path):
             raise ContractError("segmented candidate index is self-referential")
+        _validate_bound_prior_candidate_index(
+            prior_value,
+            path=prior_path,
+            artifact_stack=artifact_stack,
+        )
         waves = segmented["continuation_waves"]
         if not isinstance(waves, list) or not waves:
             raise ContractError("segmented candidate union has no waves")
-        normalized_waves = [
-            validate_binding(value, f"continuation wave {index}")
-            for index, value in enumerate(waves)
-        ]
+        normalized_waves = []
+        for index, value in enumerate(waves):
+            binding, wave_path, wave_value = validate_binding(
+                value,
+                f"continuation wave {index}",
+                expected_format=CONTINUATION_WAVE_FORMAT,
+            )
+            _replay_bound_continuation_wave(
+                wave_value,
+                path=wave_path,
+                expected_sha256=binding["sha256"],
+                artifact_stack=artifact_stack,
+            )
+            normalized_waves.append(binding)
         if len({value["path"] for value in normalized_waves}) != len(waves):
             raise ContractError("segmented continuation wave path was reused")
         chains = segmented["candidate_segment_chain"]
@@ -1690,8 +1800,6 @@ def validate_candidate_index(
                     raise ContractError(
                         f"{stage} candidate escapes its immutable segment"
                     )
-    if path is not None:
-        regular_file(path, "candidate index")
     return payload
 
 
@@ -1700,11 +1808,13 @@ def load_candidate_index(
     expected_sha256: str,
     *,
     allow_partial: bool = False,
+    _artifact_stack: frozenset[Path] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     resolved, payload, sha = read_verified_file(
         path,
         expected_sha256,
         "candidate index",
+        require_path_identity=True,
     )
     value = strict_json_bytes(payload, str(resolved))
     return (
@@ -1712,6 +1822,7 @@ def load_candidate_index(
             value,
             path=resolved,
             allow_partial=allow_partial,
+            _artifact_stack=_artifact_stack,
         ),
         _artifact(resolved, sha),
     )

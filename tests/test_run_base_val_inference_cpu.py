@@ -484,6 +484,154 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             inspect.getsource(PRODUCER._load_models),
         )
 
+    def test_verified_bytes_rejects_preopen_rename_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "input.json"
+            archived = root / "input.before-open.json"
+            original = b"original-input"
+            target.write_bytes(original)
+            expected = hashlib.sha256(original).hexdigest()
+            real_open = os.open
+            replaced = False
+
+            def replace_then_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if (
+                    not replaced
+                    and path == target.name
+                    and dir_fd is not None
+                ):
+                    target.rename(archived)
+                    target.write_bytes(b"replaced-input")
+                    replaced = True
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                PRODUCER.os,
+                "open",
+                side_effect=replace_then_open,
+            ), self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "changed before it was opened",
+            ):
+                PRODUCER._verified_bytes(target, expected, "raced input")
+            self.assertTrue(replaced)
+
+    def test_artifact_builders_reject_postopen_rename_replacement(
+        self,
+    ) -> None:
+        for function in (PRODUCER._artifact, PRODUCER._output_artifact):
+            with self.subTest(
+                function=function.__name__
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                target = root / "artifact.json"
+                archived = root / "artifact.opened.json"
+                target.write_bytes(b"original-artifact")
+                real_open = os.open
+                replaced = False
+
+                def open_then_replace(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal replaced
+                    descriptor = real_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    if (
+                        not replaced
+                        and path == target.name
+                        and dir_fd is not None
+                    ):
+                        target.rename(archived)
+                        target.write_bytes(b"replaced-artifact")
+                        replaced = True
+                    return descriptor
+
+                with mock.patch.object(
+                    PRODUCER.os,
+                    "open",
+                    side_effect=open_then_replace,
+                ), self.assertRaisesRegex(
+                    PRODUCER.ValInferenceContractError,
+                    "changed",
+                ):
+                    function(target)
+                self.assertTrue(replaced)
+
+    def test_copy_rejects_postopen_source_rename_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "source.npz"
+            archived = root / "source.opened.npz"
+            destination = root / "destination.npz"
+            original = b"original-shard-output"
+            source.write_bytes(original)
+            expected = hashlib.sha256(original).hexdigest()
+            real_open = os.open
+            replaced = False
+
+            def open_then_replace(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                descriptor = real_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+                if (
+                    not replaced
+                    and path == source.name
+                    and dir_fd is not None
+                ):
+                    source.rename(archived)
+                    source.write_bytes(b"replaced-shard-output")
+                    replaced = True
+                return descriptor
+
+            with mock.patch.object(
+                PRODUCER.os,
+                "open",
+                side_effect=open_then_replace,
+            ), self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "changed",
+            ):
+                PRODUCER._copy_inside_generation(
+                    source,
+                    destination,
+                    expected_sha=expected,
+                    expected_bytes=len(original),
+                )
+            self.assertTrue(replaced)
+            self.assertFalse(destination.exists())
+
+    def test_pinned_helper_executes_the_verified_byte_snapshot(self) -> None:
+        source = inspect.getsource(PRODUCER._load_pinned_helper)
+        self.assertIn("compile(source_snapshot", source)
+        self.assertIn("exec(code, module.__dict__)", source)
+        self.assertNotIn("exec_module(module)", source)
+
     def test_inference_auxiliary_loss_bypass_is_pinned_and_scoped(self) -> None:
         required = set(PRODUCER.selector.INFERENCE_HELPERS)
         self.assertIn(

@@ -140,9 +140,13 @@ def _sha256_file(path: Path) -> str:
 
 
 def _artifact(path: Path, *, payload_sha: str | None = None) -> dict[str, str]:
+    resolved, _payload, observed, _metadata = _safe_file_snapshot(
+        path,
+        "artifact",
+    )
     result = {
-        "path": str(path.resolve(strict=True)),
-        "sha256": _sha256_file(path),
+        "path": str(resolved),
+        "sha256": observed,
     }
     if payload_sha is not None:
         result["receipt_payload_sha256"] = payload_sha
@@ -150,10 +154,14 @@ def _artifact(path: Path, *, payload_sha: str | None = None) -> dict[str, str]:
 
 
 def _output_artifact(path: Path) -> dict[str, Any]:
+    resolved, payload, observed, _metadata = _safe_file_snapshot(
+        path,
+        "output artifact",
+    )
     return {
-        "path": str(path.resolve(strict=True)),
-        "sha256": _sha256_file(path),
-        "bytes": path.stat().st_size,
+        "path": str(resolved),
+        "sha256": observed,
+        "bytes": len(payload),
     }
 
 
@@ -207,6 +215,124 @@ def _regular_file(path: Path, label: str) -> Path:
     return resolved
 
 
+_STABLE_FILE_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return tuple(
+        int(getattr(metadata, field)) for field in _STABLE_FILE_FIELDS
+    )
+
+
+def _safe_file_snapshot(
+    path: Path,
+    label: str,
+    *,
+    expected_sha: str | None = None,
+) -> tuple[Path, bytes, str, os.stat_result]:
+    """Read one immutable regular-file snapshot through one descriptor."""
+    expected = (
+        selector.require_sha256(expected_sha, f"{label} SHA")
+        if expected_sha is not None
+        else None
+    )
+    resolved = _regular_file(path, label)
+    try:
+        path_before = os.lstat(resolved)
+    except OSError as error:
+        raise ValInferenceContractError(
+            f"cannot safely inspect {label}: {resolved}"
+        ) from error
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(
+        path_before.st_mode
+    ):
+        raise ValInferenceContractError(
+            f"{label} must be a regular non-symlink file: {resolved}"
+        )
+    parts = resolved.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise ValInferenceContractError(
+            f"{label} must be below the filesystem root: {resolved}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _file_identity(path_before) != _file_identity(before)
+        ):
+            raise ValInferenceContractError(
+                f"{label} changed before it was opened: {resolved}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        if _file_identity(before) != _file_identity(after):
+            raise ValInferenceContractError(
+                f"{label} changed while it was read: {resolved}"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise ValInferenceContractError(
+                f"{label} size changed while it was read: {resolved}"
+            )
+        leaf_after = os.stat(
+            parts[-1],
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        path_after = os.lstat(resolved)
+        if (
+            _file_identity(after) != _file_identity(leaf_after)
+            or _file_identity(after) != _file_identity(path_after)
+        ):
+            raise ValInferenceContractError(
+                f"{label} path changed while it was read: {resolved}"
+            )
+        observed = _sha256_bytes(payload)
+        if expected is not None and observed != expected:
+            raise ValInferenceContractError(
+                f"{label} SHA mismatch: {observed} != {expected}"
+            )
+        return resolved, payload, observed, after
+    except ValInferenceContractError:
+        raise
+    except OSError as error:
+        raise ValInferenceContractError(
+            f"cannot safely read {label}: {resolved}"
+        ) from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def _directory(path: Path, label: str, *, create: bool = False) -> Path:
     _reject_path(path, label)
     if create and not os.path.lexists(path):
@@ -229,14 +355,11 @@ def _directory(path: Path, label: str, *, create: bool = False) -> Path:
 
 
 def _verified_bytes(path: Path, expected_sha: str, label: str) -> bytes:
-    expected = selector.require_sha256(expected_sha, f"{label} SHA")
-    resolved = _regular_file(path, label)
-    payload = resolved.read_bytes()
-    observed = _sha256_bytes(payload)
-    if observed != expected:
-        raise ValInferenceContractError(
-            f"{label} SHA mismatch: {observed} != {expected}"
-        )
+    _resolved, payload, _observed, _metadata = _safe_file_snapshot(
+        path,
+        label,
+        expected_sha=expected_sha,
+    )
     return payload
 
 
@@ -303,28 +426,43 @@ def _copy_inside_generation(
     expected_sha: str,
     expected_bytes: int,
 ) -> dict[str, Any]:
-    source = _regular_file(source, "shard output")
-    digest = hashlib.sha256()
-    copied = 0
+    source, source_payload, observed, source_stat = _safe_file_snapshot(
+        source,
+        "shard output",
+        expected_sha=expected_sha,
+    )
+    copied = len(source_payload)
+    if copied != expected_bytes:
+        raise ValInferenceContractError(
+            f"copied shard output changed: {source}"
+        )
     try:
-        with source.open("rb") as input_handle, destination.open("xb") as output:
-            for block in iter(lambda: input_handle.read(8 * 1024 * 1024), b""):
-                output.write(block)
-                digest.update(block)
-                copied += len(block)
+        with destination.open("xb") as output:
+            output.write(source_payload)
             output.flush()
             os.fsync(output.fileno())
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
-    observed = digest.hexdigest()
-    if copied != expected_bytes or observed != expected_sha:
+    try:
+        (
+            destination_resolved,
+            destination_payload,
+            destination_sha,
+            destination_stat,
+        ) = _safe_file_snapshot(
+            destination,
+            "copied shard output",
+            expected_sha=expected_sha,
+        )
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    if destination_payload != source_payload or destination_sha != observed:
         destination.unlink(missing_ok=True)
         raise ValInferenceContractError(
             f"copied shard output changed: {source}"
         )
-    source_stat = source.stat()
-    destination_stat = destination.stat()
     if (
         source_stat.st_dev == destination_stat.st_dev
         and source_stat.st_ino == destination_stat.st_ino
@@ -332,7 +470,7 @@ def _copy_inside_generation(
         destination.unlink(missing_ok=True)
         raise ValInferenceContractError("final output must not hardlink a shard")
     return {
-        "path": str(destination.resolve(strict=True)),
+        "path": str(destination_resolved),
         "sha256": observed,
         "bytes": copied,
     }
@@ -500,7 +638,7 @@ def _load_pinned_helper(
         Path(entrypoint["path"]),
         "pinned validation inference helper",
     )
-    _verified_bytes(
+    source_snapshot = _verified_bytes(
         path,
         entrypoint["sha256"],
         "pinned validation inference helper",
@@ -510,11 +648,22 @@ def _load_pinned_helper(
     ]:
         raise ValInferenceContractError("unpinned inference helper")
     name = f"_semtalk_val_helper_{entrypoint['sha256']}"
-    specification = importlib.util.spec_from_file_location(name, path)
-    if specification is None or specification.loader is None:
-        raise ValInferenceContractError(f"cannot import helper {path}")
-    module = importlib.util.module_from_spec(specification)
-    specification.loader.exec_module(module)
+    module = ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = importlib.util.spec_from_loader(
+        name,
+        loader=None,
+        origin=str(path),
+    )
+    try:
+        code = compile(source_snapshot, str(path), "exec")
+        exec(code, module.__dict__)
+    except Exception as error:
+        raise ValInferenceContractError(
+            f"cannot execute verified helper snapshot {path}"
+        ) from error
     required = set(selector.INFERENCE_HELPERS) | {
         "_validate_official_transfer_checkpoint",
         "_load_released_model_state_only",
@@ -977,8 +1126,17 @@ def _transfer_payload_expectations(
         resolved.parent / "summary.json",
         f"{stage} transfer summary",
     )
+    (
+        summary,
+        summary_snapshot,
+        summary_sha,
+        _summary_metadata,
+    ) = _safe_file_snapshot(
+        summary,
+        f"{stage} transfer summary",
+    )
     summary_payload = _strict_json_bytes(
-        summary.read_bytes(),
+        summary_snapshot,
         f"{stage} transfer summary",
     )
     if not isinstance(summary_payload, dict):
@@ -1000,7 +1158,7 @@ def _transfer_payload_expectations(
         raise ValInferenceContractError(
             f"{stage} transfer canonical receipt is missing"
         )
-    return source, canonical, summary, _sha256_file(summary)
+    return source, canonical, summary, summary_sha
 
 
 def _load_models(
@@ -1480,8 +1638,17 @@ def _validate_shard(
         root / SHARD_RECEIPT_FILENAME,
         f"shard {shard_id} receipt",
     )
+    (
+        receipt_path,
+        receipt_snapshot,
+        _receipt_sha,
+        _receipt_metadata,
+    ) = _safe_file_snapshot(
+        receipt_path,
+        f"shard {shard_id} receipt",
+    )
     receipt = _strict_json_bytes(
-        receipt_path.read_bytes(),
+        receipt_snapshot,
         f"shard {shard_id} receipt",
     )
     if not isinstance(receipt, dict):

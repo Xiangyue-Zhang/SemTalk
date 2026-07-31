@@ -14,6 +14,11 @@ if (( $# < 2 )); then
     exit 2
 fi
 
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=guarded_runner_contract.sh
+. "$launcher_dir/guarded_runner_contract.sh"
+semtalk_require_exact_guarded_runner_all_gpus
+
 python_bin=$1
 repo_root=$2
 shift 2

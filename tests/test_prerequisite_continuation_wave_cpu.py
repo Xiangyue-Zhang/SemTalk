@@ -862,9 +862,21 @@ def adapter_fixture(
 
 
 class ContinuationWaveAdapterTests(unittest.TestCase):
-    def run_adapter(self, values: dict, root: Path) -> dict:
+    def run_adapter(
+        self,
+        values: dict,
+        root: Path,
+        *,
+        artifact_stack: frozenset[Path] | None = None,
+    ) -> dict:
         decision_path = root / "decision.json"
         decision_path.write_text("{}\n")
+        candidate_loader = mock.Mock(
+            return_value=(
+                values["candidate_index"],
+                values["candidate_index_artifact"],
+            )
+        )
         with (
             mock.patch.object(
                 wave.continuation_decision,
@@ -879,10 +891,7 @@ class ContinuationWaveAdapterTests(unittest.TestCase):
             mock.patch.object(
                 wave.val_contract,
                 "load_candidate_index",
-                return_value=(
-                    values["candidate_index"],
-                    values["candidate_index_artifact"],
-                ),
+                side_effect=candidate_loader,
             ),
             mock.patch.object(
                 wave,
@@ -906,11 +915,20 @@ class ContinuationWaveAdapterTests(unittest.TestCase):
                 return_value=values["predecessor"],
             ),
         ):
-            return wave.authorize_wave_from_replayed_inputs(
+            result = wave.authorize_wave_from_replayed_inputs(
                 decision_path=decision_path,
                 expected_decision_sha256=SHA_A,
                 stage_plans=values["stage_plans"],
+                _artifact_stack=artifact_stack,
             )
+        candidate_loader.assert_called_once_with(
+            Path(values["bridge"]["candidate_index_receipt"]["path"]),
+            values["bridge"]["candidate_index_receipt"]["sha256"],
+            _artifact_stack=(
+                frozenset() if artifact_stack is None else artifact_stack
+            ),
+        )
+        return result
 
     def test_real_adapter_normalizes_decision_bridge_and_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -929,6 +947,17 @@ class ContinuationWaveAdapterTests(unittest.TestCase):
                 for stage in receipt["stages"]
             )
         )
+
+    def test_adapter_forwards_candidate_index_cycle_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            values = adapter_fixture(root)
+            artifact_stack = frozenset({root / "current-index.json"})
+            self.run_adapter(
+                values,
+                root,
+                artifact_stack=artifact_stack,
+            )
 
     def test_adapter_rejects_selected_bridge_checkpoint_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

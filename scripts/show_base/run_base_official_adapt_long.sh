@@ -9,13 +9,18 @@ fi
 
 python_bin=$1
 shift
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+script_dir=$launcher_dir
 
 if [[ ! -x "$python_bin" ]]; then
     printf 'Python executable is missing or not executable: %s\n' \
         "$python_bin" >&2
     exit 2
 fi
+
+# shellcheck source=guarded_runner_contract.sh
+. "$launcher_dir/guarded_runner_contract.sh"
+semtalk_require_exact_guarded_runner_all_gpus
 
 # PYTHONHASHSEED is read only at interpreter startup.  Bind it here, before
 # torchrun creates the eight formal rank interpreters; the trainer independently

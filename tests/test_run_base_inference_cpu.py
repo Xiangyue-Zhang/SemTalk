@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import inspect
 import io
 import ast
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -196,6 +198,108 @@ class PublicationPrimitiveTest(unittest.TestCase):
                 with self.assertRaises(MODULE.InferenceContractError):
                     with MODULE._finalize_lock(output_root):
                         pass
+
+
+class SafeFileSnapshotRaceTest(unittest.TestCase):
+    def test_checkpoint_snapshot_rejects_preopen_rename_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "checkpoint.bin"
+            archived = root / "checkpoint.before-open.bin"
+            original = b"original-checkpoint"
+            target.write_bytes(original)
+            expected = hashlib.sha256(original).hexdigest()
+            real_open = os.open
+            replaced = False
+
+            def replace_then_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if (
+                    not replaced
+                    and path == target.name
+                    and dir_fd is not None
+                ):
+                    target.rename(archived)
+                    target.write_bytes(b"replaced-checkpoint")
+                    replaced = True
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                MODULE.os,
+                "open",
+                side_effect=replace_then_open,
+            ), self.assertRaisesRegex(
+                MODULE.InferenceContractError,
+                "changed before it was opened",
+            ):
+                MODULE._read_verified_checkpoint_snapshot(
+                    target,
+                    expected,
+                    "raced checkpoint",
+                )
+            self.assertTrue(replaced)
+
+    def test_sha256_rejects_postopen_rename_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "artifact.bin"
+            archived = root / "artifact.opened.bin"
+            target.write_bytes(b"original-artifact")
+            real_open = os.open
+            replaced = False
+
+            def open_then_replace(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                descriptor = real_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+                if (
+                    not replaced
+                    and path == target.name
+                    and dir_fd is not None
+                ):
+                    target.rename(archived)
+                    target.write_bytes(b"replaced-artifact")
+                    replaced = True
+                return descriptor
+
+            with mock.patch.object(
+                MODULE.os,
+                "open",
+                side_effect=open_then_replace,
+            ), self.assertRaisesRegex(
+                MODULE.InferenceContractError,
+                "changed",
+            ):
+                MODULE.sha256_file(target)
+            self.assertTrue(replaced)
+
+    def test_released_loaders_consume_verified_snapshots(self) -> None:
+        for function in (
+            MODULE._load_released_model_state_only,
+            MODULE._load_released_base_state,
+        ):
+            with self.subTest(function=function.__name__):
+                source = inspect.getsource(function)
+                self.assertIn("_read_verified_checkpoint_snapshot(", source)
+                self.assertNotIn("read_bytes()", source)
 
 
 @unittest.skipIf(torch is None, "torch runtime is unavailable")

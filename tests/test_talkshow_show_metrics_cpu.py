@@ -1473,6 +1473,58 @@ class OfflineAdapterTest(unittest.TestCase):
                     "symlinked fixture",
                 )
 
+    def test_verified_snapshot_rejects_post_open_rename_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "artifact.json"
+            archived = root / "artifact.opened.json"
+            original = b"immutable-original"
+            replacement = b"immutable-replaced"
+            target.write_bytes(original)
+            real_open = os.open
+            replaced = False
+
+            def open_then_replace(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                descriptor = real_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+                if (
+                    not replaced
+                    and path == target.name
+                    and dir_fd is not None
+                ):
+                    target.rename(archived)
+                    target.write_bytes(replacement)
+                    replaced = True
+                return descriptor
+
+            with mock.patch.object(
+                METRICS.os,
+                "open",
+                side_effect=open_then_replace,
+            ), self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "changed",
+            ):
+                METRICS._verified_file_snapshot(
+                    target,
+                    hashlib.sha256(original).hexdigest(),
+                    "rename-raced fixture",
+                )
+            self.assertTrue(replaced)
+
     def test_git_porcelain_leading_status_column_is_preserved(self) -> None:
         completed = subprocess.CompletedProcess(
             args=["git"],

@@ -13,6 +13,11 @@ if [[ $# -lt 9 ]]; then
     exit 2
 fi
 
+launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=guarded_runner_contract.sh
+. "$launcher_dir/guarded_runner_contract.sh"
+semtalk_require_exact_guarded_runner_all_gpus
+
 repo_root=$1
 python_bin=$2
 base_candidate=$3

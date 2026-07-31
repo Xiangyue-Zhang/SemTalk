@@ -32,6 +32,12 @@ FORMAT = "semtalk_show_prerequisite_stage_bundle_v1"
 STAGES = ("face", "hands", "upper", "lower", "global")
 INCOMPLETE = ".incomplete"
 MANIFEST = "bundle_manifest.json"
+FORMAL_HOSTS = frozenset(
+    (
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0",
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0",
+    )
+)
 
 
 class BundleError(RuntimeError):
@@ -72,6 +78,12 @@ def _require_sha(value: Any, label: str) -> str:
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise BundleError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _formal_host(value: Any, label: str) -> str:
+    if not isinstance(value, str) or value not in FORMAL_HOSTS:
+        raise BundleError(f"{label} must be one of the two exact formal hosts")
     return value
 
 
@@ -239,7 +251,13 @@ def _manifest_bytes(value: Mapping[str, Any]) -> bytes:
 
 
 def pack(args: argparse.Namespace) -> dict[str, Any]:
-    if args.source_host != socket.gethostname():
+    source_host = _formal_host(args.source_host, "source hostname")
+    destination_host = _formal_host(
+        args.destination_host, "destination hostname"
+    )
+    if source_host == destination_host:
+        raise BundleError("cross-node bundle source and destination must differ")
+    if source_host != socket.gethostname():
         raise BundleError("source hostname differs from bundle authority")
     sources = _parse_stage_values(args.source_run, "source run")
     destinations = _parse_stage_values(args.destination_run, "destination run")
@@ -274,8 +292,8 @@ def pack(args: argparse.Namespace) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "format": FORMAT,
         "status": "complete",
-        "source_host": args.source_host,
-        "destination_host": args.destination_host,
+        "source_host": source_host,
+        "destination_host": destination_host,
         "stages": stages,
     }
     manifest["receipt_payload_sha256"] = _payload_sha(manifest)
@@ -329,6 +347,12 @@ def _load_manifest(
         or _payload_sha(value) != value["receipt_payload_sha256"]
     ):
         raise BundleError("bundle manifest protocol mismatch")
+    source_host = _formal_host(value["source_host"], "manifest source hostname")
+    destination_host = _formal_host(
+        value["destination_host"], "manifest destination hostname"
+    )
+    if source_host == destination_host:
+        raise BundleError("bundle manifest is not cross-node")
     root = resolved.parent
     if (root / INCOMPLETE).exists() or resolved.name != MANIFEST:
         raise BundleError("bundle is incomplete or manifest is misplaced")
@@ -368,11 +392,19 @@ def stage(args: argparse.Namespace) -> dict[str, Any]:
     )
     if args.stage not in manifest["stages"]:
         raise BundleError(f"stage {args.stage!r} is absent from bundle")
+    expected_source_host = _formal_host(
+        args.expected_source_host, "expected source hostname"
+    )
+    destination_host = _formal_host(
+        args.destination_host, "destination hostname"
+    )
     if (
-        args.destination_host != socket.gethostname()
-        or manifest["destination_host"] != args.destination_host
+        expected_source_host == destination_host
+        or manifest["source_host"] != expected_source_host
+        or destination_host != socket.gethostname()
+        or manifest["destination_host"] != destination_host
     ):
-        raise BundleError("destination hostname differs from bundle authority")
+        raise BundleError("cross-node hostname authority differs from bundle")
     value = manifest["stages"][args.stage]
     destination = _absolute(args.destination_run, "destination run")
     if str(destination) != value["destination_run"]:
@@ -393,6 +425,8 @@ def stage(args: argparse.Namespace) -> dict[str, Any]:
     _finish_reserved(reserved)
     return {
         "stage": args.stage,
+        "source_host": expected_source_host,
+        "destination_host": destination_host,
         "destination_run": str(reserved),
         "file_count": value["file_count"],
         "total_bytes": value["total_bytes"],
@@ -420,6 +454,7 @@ def _parser() -> argparse.ArgumentParser:
     stage_parser.add_argument(
         "--expected-bundle-payload-sha256", required=True
     )
+    stage_parser.add_argument("--expected-source-host", required=True)
     stage_parser.add_argument("--destination-host", required=True)
     stage_parser.add_argument("--stage", choices=STAGES, required=True)
     stage_parser.add_argument("--destination-run", type=Path, required=True)

@@ -541,12 +541,131 @@ class InferenceContractError(RuntimeError):
     """Raised when frozen inputs or generated outputs violate the contract."""
 
 
+_STABLE_FILE_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return tuple(
+        int(getattr(metadata, field)) for field in _STABLE_FILE_FIELDS
+    )
+
+
+def _safe_file_snapshot(
+    path: str | Path,
+    label: str,
+    *,
+    expected_sha256: str | None = None,
+) -> tuple[Path, bytes, str, os.stat_result]:
+    """Read and hash one stable regular file through one descriptor."""
+    expected = (
+        _require_sha256(expected_sha256, f"{label} expected SHA")
+        if expected_sha256 is not None
+        else None
+    )
+    resolved = _resolved_regular_file(path, label)
+    try:
+        path_before = os.lstat(resolved)
+    except OSError as exc:
+        raise InferenceContractError(
+            f"cannot safely inspect {label}: {resolved}"
+        ) from exc
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(
+        path_before.st_mode
+    ):
+        raise InferenceContractError(
+            f"{label} must be a regular non-symlink file: {resolved}"
+        )
+    parts = resolved.parts
+    if not parts or parts[0] != os.sep or len(parts) < 2:
+        raise InferenceContractError(
+            f"{label} must be below the filesystem root: {resolved}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    file_flags = os.O_RDONLY | nofollow
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(os.sep, directory_flags)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _file_identity(path_before) != _file_identity(before)
+        ):
+            raise InferenceContractError(
+                f"{label} changed before it was opened: {resolved}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        if _file_identity(before) != _file_identity(after):
+            raise InferenceContractError(
+                f"{label} changed while it was read: {resolved}"
+            )
+        payload = b"".join(chunks)
+        if len(payload) != after.st_size:
+            raise InferenceContractError(
+                f"{label} size changed while it was read: {resolved}"
+            )
+        leaf_after = os.stat(
+            parts[-1],
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        path_after = os.lstat(resolved)
+        if (
+            _file_identity(after) != _file_identity(leaf_after)
+            or _file_identity(after) != _file_identity(path_after)
+        ):
+            raise InferenceContractError(
+                f"{label} path changed while it was read: {resolved}"
+            )
+        observed = hashlib.sha256(payload).hexdigest()
+        if expected is not None and observed != expected:
+            raise InferenceContractError(
+                f"{label} SHA mismatch: {observed} != {expected} "
+                f"({resolved})"
+            )
+        return resolved, payload, observed, after
+    except InferenceContractError:
+        raise
+    except OSError as exc:
+        raise InferenceContractError(
+            f"cannot safely read {label}: {resolved}"
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    _resolved, _payload, observed, _metadata = _safe_file_snapshot(
+        path,
+        "file",
+    )
+    return observed
 
 
 def _require_sha256(value: str, label: str) -> str:
@@ -1398,14 +1517,11 @@ def _read_verified_checkpoint_snapshot(
     label: str,
 ) -> tuple[Path, bytes, str]:
     """Read, hash, and later deserialize one immutable byte snapshot."""
-    resolved = _resolved_regular_file(path, label)
-    expected = _require_sha256(expected, f"{label} expected SHA")
-    payload = resolved.read_bytes()
-    observed = hashlib.sha256(payload).hexdigest()
-    if observed != expected:
-        raise InferenceContractError(
-            f"{label} SHA mismatch: {observed} != {expected} ({resolved})"
-        )
+    resolved, payload, observed, _metadata = _safe_file_snapshot(
+        path,
+        label,
+        expected_sha256=expected,
+    )
     return resolved, payload, observed
 
 
@@ -2688,26 +2804,14 @@ def _load_released_model_state_only(
             f"released checkpoint filename {candidate.name!r} != "
             f"{expected_filename!r}"
         )
-    try:
-        mode = os.lstat(candidate).st_mode
-    except FileNotFoundError:
-        raise FileNotFoundError(candidate) from None
-    if candidate.is_symlink() or not stat.S_ISREG(mode):
-        raise InferenceContractError(
-            "released checkpoint must be a regular non-symlink file: "
-            f"{candidate}"
-        )
-    resolved = candidate.resolve(strict=True)
-    if resolved.name != expected_filename or not resolved.is_file():
+    resolved, snapshot, observed_sha = _read_verified_checkpoint_snapshot(
+        candidate,
+        expected_sha256,
+        "released checkpoint",
+    )
+    if resolved.name != expected_filename:
         raise InferenceContractError(
             f"unsafe released checkpoint path: {candidate}"
-        )
-    snapshot = resolved.read_bytes()
-    observed_sha = hashlib.sha256(snapshot).hexdigest()
-    if observed_sha != expected_sha256:
-        raise InferenceContractError(
-            f"{resolved}: released checkpoint SHA-256 {observed_sha} != "
-            f"{expected_sha256}"
         )
     try:
         payload = torch.load(
@@ -2754,22 +2858,14 @@ def _load_released_base_state(
             f"released Base filename {candidate.name!r} != "
             f"{expected_filename!r}"
         )
-    try:
-        mode = os.lstat(candidate).st_mode
-    except FileNotFoundError:
-        raise FileNotFoundError(candidate) from None
-    if candidate.is_symlink() or not stat.S_ISREG(mode):
+    resolved, snapshot, observed_sha = _read_verified_checkpoint_snapshot(
+        candidate,
+        expected_sha256,
+        "released Base",
+    )
+    if resolved.name != expected_filename:
         raise InferenceContractError(
-            "released Base must be a regular non-symlink file: "
-            f"{candidate}"
-        )
-    resolved = candidate.resolve(strict=True)
-    snapshot = resolved.read_bytes()
-    observed_sha = hashlib.sha256(snapshot).hexdigest()
-    if observed_sha != expected_sha256:
-        raise InferenceContractError(
-            f"{resolved}: released Base SHA-256 {observed_sha} != "
-            f"{expected_sha256}"
+            f"unsafe released Base path: {candidate}"
         )
     try:
         payload = torch.load(
@@ -3745,12 +3841,12 @@ def _verified_json_object(
     expected_sha256: str,
     label: str,
 ) -> tuple[Path, dict[str, Any], str]:
-    resolved = _resolved_regular_file(path, label)
+    resolved, payload, observed = _parse_verified_json_snapshot(
+        Path(path),
+        expected_sha256,
+        label,
+    )
     _reject_withdrawn_adapt_path(resolved, label)
-    observed = _verify_file_sha(resolved, expected_sha256, label)
-    payload = load_json(resolved)
-    if type(payload) is not dict:
-        raise InferenceContractError(f"{resolved}: {label} must be an object")
     return resolved, payload, observed
 
 

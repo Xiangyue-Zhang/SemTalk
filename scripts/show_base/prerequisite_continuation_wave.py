@@ -32,7 +32,7 @@ from scripts.show_base import prerequisite_val_contract as val_contract
 from scripts.show_base import selected_prerequisites as selected_contract
 
 
-FORMAT = "semtalk_show_prerequisite_continuation_wave_v1"
+FORMAT = val_contract.CONTINUATION_WAVE_FORMAT
 INTERVAL_EPOCHS = 20
 MINIMUM_BOUNDARY_EPOCH = 200
 EXPECTED_UPDATES_PER_EPOCH = 497
@@ -1633,6 +1633,8 @@ def authorize_wave_from_replayed_inputs(
     decision_path: Path,
     expected_decision_sha256: str,
     stage_plans: Mapping[str, Any],
+    _wave_stack: frozenset[Path] | None = None,
+    _artifact_stack: frozenset[Path] | None = None,
 ) -> dict[str, Any]:
     """Adapt real replayed decision/bridge/index evidence into one wave.
 
@@ -1643,6 +1645,10 @@ def authorize_wave_from_replayed_inputs(
     their values normalized into :func:`authorize_wave`.
     """
 
+    wave_stack = frozenset() if _wave_stack is None else _wave_stack
+    artifact_stack = (
+        frozenset() if _artifact_stack is None else _artifact_stack
+    )
     expected_decision_sha = _require_sha256(
         expected_decision_sha256,
         "continuation decision expected SHA-256",
@@ -1696,6 +1702,7 @@ def authorize_wave_from_replayed_inputs(
             val_contract.load_candidate_index(
                 Path(candidate_index_binding["path"]),
                 candidate_index_binding["sha256"],
+                _artifact_stack=artifact_stack,
             )
         )
     except (val_contract.ContractError, OSError) as error:
@@ -1776,6 +1783,8 @@ def authorize_wave_from_replayed_inputs(
             predecessor_receipt = replay_wave_file(
                 Path(predecessor_wave["path"]),
                 predecessor_wave["sha256"],
+                _wave_stack=wave_stack,
+                _artifact_stack=artifact_stack,
             )
         except ContinuationWaveError as error:
             raise ContinuationWaveError(
@@ -2054,6 +2063,9 @@ def adapter_stage_plans_from_wave(
 def replay_wave_file(
     path: Path,
     expected_sha256: str,
+    *,
+    _wave_stack: frozenset[Path] | None = None,
+    _artifact_stack: frozenset[Path] | None = None,
 ) -> dict[str, Any]:
     """Reopen a published wave and re-run decision/bridge/index authority."""
 
@@ -2066,6 +2078,7 @@ def replay_wave_file(
             path,
             expected_sha,
             "continuation wave",
+            require_path_identity=True,
         )
         receipt = val_contract.strict_json_bytes(payload, str(resolved))
     except (val_contract.ContractError, OSError) as error:
@@ -2074,11 +2087,17 @@ def replay_wave_file(
         raise ContinuationWaveError(
             "continuation wave file SHA-256 mismatch"
         )
+    wave_stack = frozenset() if _wave_stack is None else _wave_stack
+    if resolved in wave_stack:
+        raise ContinuationWaveError("continuation wave cycle detected")
+    wave_stack = wave_stack | {resolved}
     validate_wave_schema(receipt)
     expected = authorize_wave_from_replayed_inputs(
         decision_path=Path(receipt["decision"]["path"]),
         expected_decision_sha256=receipt["decision"]["sha256"],
         stage_plans=adapter_stage_plans_from_wave(receipt),
+        _wave_stack=wave_stack,
+        _artifact_stack=_artifact_stack,
     )
     if canonical_json_bytes(receipt) != canonical_json_bytes(expected):
         raise ContinuationWaveError(

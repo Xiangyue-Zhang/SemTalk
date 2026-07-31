@@ -569,6 +569,32 @@ def _safe_file_snapshot(
     label: str,
 ) -> tuple[Path, bytes]:
     candidate = _resolved_regular_file(path, label)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+
+    def identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return tuple(
+            int(getattr(metadata, field)) for field in stable_fields
+        )
+
+    try:
+        path_before = os.lstat(candidate)
+    except OSError as exc:
+        raise MetricAdapterContractError(
+            f"cannot safely inspect {label}: {candidate}"
+        ) from exc
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(
+        path_before.st_mode
+    ):
+        raise MetricAdapterContractError(
+            f"{label} must be a regular non-symlink file"
+        )
     parts = candidate.parts
     if not parts or parts[0] != os.sep or len(parts) < 2:
         raise MetricAdapterContractError(
@@ -599,6 +625,10 @@ def _safe_file_snapshot(
             raise MetricAdapterContractError(
                 f"{label} must be a regular non-symlink file"
             )
+        if identity(path_before) != identity(before):
+            raise MetricAdapterContractError(
+                f"{label} changed before it was opened"
+            )
         chunks: list[bytes] = []
         while True:
             chunk = os.read(file_fd, 1024 * 1024)
@@ -606,18 +636,7 @@ def _safe_file_snapshot(
                 break
             chunks.append(chunk)
         after = os.fstat(file_fd)
-        stable_fields = (
-            "st_dev",
-            "st_ino",
-            "st_mode",
-            "st_size",
-            "st_mtime_ns",
-            "st_ctime_ns",
-        )
-        if any(
-            getattr(before, field) != getattr(after, field)
-            for field in stable_fields
-        ):
+        if identity(before) != identity(after):
             raise MetricAdapterContractError(
                 f"{label} changed while it was read"
             )
@@ -625,6 +644,19 @@ def _safe_file_snapshot(
         if len(payload) != after.st_size:
             raise MetricAdapterContractError(
                 f"{label} size changed while it was read"
+            )
+        leaf_after = os.stat(
+            parts[-1],
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        path_after = os.lstat(candidate)
+        if (
+            identity(after) != identity(leaf_after)
+            or identity(after) != identity(path_after)
+        ):
+            raise MetricAdapterContractError(
+                f"{label} path changed while it was read"
             )
         return candidate, payload
     except MetricAdapterContractError:
@@ -1761,12 +1793,19 @@ def _import_pinned_body_feature_extractor(
                     payload,
                     package,
                 )
-                return importlib.util.spec_from_loader(
+                specification = importlib.util.spec_from_loader(
                     fullname,
                     loader,
                     origin=str(source_path),
                     is_package=package,
                 )
+                if specification is None:  # pragma: no cover - fixed loader
+                    raise ImportError(fullname)
+                # An explicit origin does not imply ``has_location`` on every
+                # supported CPython version.  Set it so the module executes
+                # with the exact attested source path in ``__file__``.
+                specification.has_location = True
+                return specification
             namespace_path = namespace_packages.get(fullname)
             if namespace_path is not None:
                 specification = importlib.machinery.ModuleSpec(

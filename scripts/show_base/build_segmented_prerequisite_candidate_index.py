@@ -73,6 +73,18 @@ def _old_read_only_proof(value: Any, *, stage: str) -> None:
         raise SegmentedIndexError(f"{stage} old-segment proof hash mismatch")
 
 
+def _read_status_snapshot(run: Path, stage: str) -> tuple[Path, bytes, Any]:
+    status_path, status_bytes = contract.read_file_snapshot(
+        run / "formal_training_status.json",
+        f"{stage} continuation status",
+    )
+    return (
+        status_path,
+        status_bytes,
+        contract.strict_json_bytes(status_bytes, str(status_path)),
+    )
+
+
 def _build_stage(
     torch: Any,
     *,
@@ -85,11 +97,7 @@ def _build_stage(
     new = wave_entry["new_segment"]
     if new["run_path"] != str(run) or new["authorized_candidate_epochs"] != [target]:
         raise SegmentedIndexError(f"{stage} run differs from wave authority")
-    status_path = contract.regular_file(
-        run / "formal_training_status.json", f"{stage} continuation status"
-    )
-    status_bytes = status_path.read_bytes()
-    status = contract.strict_json_bytes(status_bytes, str(status_path))
+    status_path, status_bytes, status = _read_status_snapshot(run, stage)
     if (
         not isinstance(status, dict)
         or status.get("status") != "complete"
