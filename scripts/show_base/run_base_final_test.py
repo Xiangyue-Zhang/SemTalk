@@ -17,10 +17,6 @@ audio shards.  This module only performs these irreversible phases:
 ``finalize``
     Rebuild exact-once closure, copy every shard artifact into a new final
     generation, and publish the generation with one directory rename.
-``distribution``
-    Bind the already validated ``final_winner`` deterministic-replication
-    gate to the physical predictions.
-
 The shell launcher then invokes the sole seven-metric DiffSHEG test
 evaluation.  This inference module has no metric-evaluation subcommand, so a
 metric report cannot be wrapped into a second authority or flow back into
@@ -1771,56 +1767,6 @@ def _load_final_rows(
     return manifest, rows, lineage
 
 
-def run_distribution(args: argparse.Namespace) -> dict[str, Any]:
-    authority = _validated_authority(args)
-    manifest, rows, lineage = _load_final_rows(authority)
-    if lineage.get("contract") != _contract(authority, args):
-        raise FinalTestContractError(
-            "final lineage differs from the fresh test authority"
-        )
-    gate_module = importlib.import_module(
-        "scripts.show_base.deterministic_replication_gate"
-    )
-    gate_artifact, _gate = gate_module.load_gate(
-        Path(args.validation_gate_json),
-        args.expected_validation_gate_sha256,
-        expected_scope="final_winner",
-    )
-    if (
-        gate_artifact["bytes"]
-        != _require_int(
-            args.expected_validation_gate_bytes,
-            "validation gate bytes",
-            minimum=1,
-        )
-        or gate_artifact["receipt_payload_sha256"]
-        != _require_sha256(
-            args.expected_validation_gate_receipt_payload_sha256,
-            "validation gate payload SHA",
-        )
-    ):
-        raise FinalTestContractError("final_winner gate external pins changed")
-    predictions = [
-        {
-            "canonical_clip_id": row["canonical_clip_id"],
-            "prediction_sha256": row["prediction"]["sha256"],
-            "prediction_bytes": row["prediction"]["bytes"],
-        }
-        for row in rows
-    ]
-    declaration = gate_module.build_distribution_receipt_from_validated_artifacts(
-        gate_artifact=gate_artifact,
-        prediction_manifest_artifact=manifest,
-        prediction_records=predictions,
-    )
-    root, _shards = _output_roots(authority)
-    destination = root / "distribution-declaration.json"
-    _write_new(destination, _canonical_json_bytes(declaration))
-    receipt = _artifact(destination)
-    print(_canonical_json_bytes(receipt).decode(), end="")
-    return receipt
-
-
 def _authority_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fresh-test-authority", type=Path, required=True)
     parser.add_argument("--expected-test-authority-sha256", required=True)
@@ -1855,19 +1801,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     finalize = subparsers.add_parser("finalize", allow_abbrev=False)
     _authority_options(finalize)
 
-    distribution = subparsers.add_parser("distribution", allow_abbrev=False)
-    _authority_options(distribution)
-    distribution.add_argument("--validation-gate-json", type=Path, required=True)
-    distribution.add_argument(
-        "--expected-validation-gate-sha256", required=True
-    )
-    distribution.add_argument(
-        "--expected-validation-gate-bytes", type=int, required=True
-    )
-    distribution.add_argument(
-        "--expected-validation-gate-receipt-payload-sha256", required=True
-    )
-
     args = parser.parse_args(argv)
     if args.seed < 0:
         parser.error("seed must be non-negative")
@@ -1894,8 +1827,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_shard(args)
     elif args.command == "finalize":
         run_finalize(args)
-    elif args.command == "distribution":
-        run_distribution(args)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     return 0

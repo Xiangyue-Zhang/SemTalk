@@ -130,6 +130,7 @@ PASPA_PROTOCOL_DOC_SHA256 = (
 )
 
 DIFFSHEG_COMMIT = "3ebf3058f48cba3da9146afb7623e9ec1ab9e9a5"
+DIFFSHEG_TREE = "b2b81733b02c04738f2fbe2ec6314480681b9cbf"
 DIFFSHEG_ORIGIN = "https://github.com/JeremyCJM/DiffSHEG.git"
 DIFFSHEG_STATS_RELATIVE = Path("data/SHOW/talkshow_mean_std.npy")
 DIFFSHEG_STATS_SHA256 = (
@@ -770,7 +771,10 @@ def _validate_assets(
     talkshow_root_value: Any,
     smplx_path_value: Any,
 ) -> dict[str, Any]:
-    diffsheg_root = _directory(diffsheg_root_value, "DiffSHEG checkout")
+    diffsheg_input = _absolute(diffsheg_root_value, "DiffSHEG checkout")
+    diffsheg_root = _directory(diffsheg_input, "DiffSHEG checkout")
+    if diffsheg_input != diffsheg_root:
+        raise FinalDiffSHEGError("DiffSHEG checkout must be canonical")
     diffsheg_head = _git_value(
         diffsheg_root,
         ["rev-parse", "HEAD^{commit}"],
@@ -792,12 +796,39 @@ def _validate_assets(
         ["rev-parse", "HEAD^{tree}"],
         "DiffSHEG",
     )
+    detached = subprocess.run(
+        ["git", "-C", str(diffsheg_root), "symbolic-ref", "-q", "HEAD"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).returncode != 0
+    local_branches = _git_value(
+        diffsheg_root,
+        ["for-each-ref", "--format=%(refname)", "refs/heads"],
+        "DiffSHEG",
+    ).splitlines()
+    dirty = _git_value(
+        diffsheg_root,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        "DiffSHEG",
+    )
+    if (
+        diffsheg_tree != DIFFSHEG_TREE
+        or not detached
+        or local_branches
+        or dirty
+    ):
+        raise FinalDiffSHEGError(
+            "DiffSHEG checkout is not the clean detached pinned bundle"
+        )
     stats = _regular_file(
         diffsheg_root / DIFFSHEG_STATS_RELATIVE,
         "DiffSHEG SHOW statistics",
     )
     if sha256_file(stats) != DIFFSHEG_STATS_SHA256:
         raise FinalDiffSHEGError("DiffSHEG SHOW statistics bytes changed")
+    _no_symlink_below(diffsheg_root, stats, "DiffSHEG SHOW statistics")
     autoencoders: dict[str, Any] = {}
     for metric, pin in DIFFSHEG_AE_PINS.items():
         path = _regular_file(
@@ -809,6 +840,11 @@ def _validate_assets(
             raise FinalDiffSHEGError(
                 f"DiffSHEG {metric} autoencoder bytes changed"
             )
+        _no_symlink_below(
+            diffsheg_root,
+            path,
+            f"DiffSHEG {metric} autoencoder",
+        )
         autoencoders[metric] = {
             "path": str(path),
             "sha256": observed,
@@ -851,6 +887,9 @@ def _validate_assets(
             "origin": diffsheg_origin,
             "commit": diffsheg_head,
             "tree": diffsheg_tree,
+            "detached": True,
+            "local_branches": [],
+            "clean": True,
             "stats": {"path": str(stats), "sha256": DIFFSHEG_STATS_SHA256},
             "autoencoders": autoencoders,
         },

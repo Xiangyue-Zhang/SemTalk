@@ -522,65 +522,13 @@ class FinalTestCpuContractTests(unittest.TestCase):
             ):
                 target._load_inputs(value)
 
-    def test_distribution_requires_final_winner_gate_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "final"
-            root.mkdir()
-            manifest_path = root / "final_manifest.jsonl"
-            manifest = artifact(manifest_path, b"{}\n")
-            value = fake_authority(root)
-            args = SimpleNamespace(
-                **vars(authority_args(Path(directory) / "authority.json")),
-                validation_gate_json=Path(directory) / "gate.json",
-                expected_validation_gate_sha256=SHA_A,
-                expected_validation_gate_bytes=1,
-                expected_validation_gate_receipt_payload_sha256=SHA_B,
-            )
-            calls = []
-
-            class Gate:
-                @staticmethod
-                def load_gate(path, sha, *, expected_scope):
-                    calls.append(expected_scope)
-                    return (
-                        {
-                            "path": str(Path(path).resolve()),
-                            "sha256": sha,
-                            "bytes": 1,
-                            "receipt_payload_sha256": SHA_B,
-                        },
-                        {},
-                    )
-
-                @staticmethod
-                def build_distribution_receipt_from_validated_artifacts(**kwargs):
-                    return {
-                        "format": "fixture",
-                        "receipt_payload_sha256": SHA_C,
-                    }
-
-            lineage = {"contract": target._contract(value, args)}
-            rows = [
-                {
-                    "canonical_clip_id": "oliver__x",
-                    "prediction": {"sha256": SHA_A, "bytes": 1},
-                }
-            ]
-            with mock.patch.object(
-                target, "_validated_authority", return_value=value
-            ), mock.patch.object(
-                target,
-                "_load_final_rows",
-                return_value=(manifest, rows, lineage),
-            ), mock.patch.object(
-                target.importlib, "import_module", return_value=Gate
-            ), redirect_stdout(io.StringIO()):
-                receipt = target.run_distribution(args)
-            self.assertEqual(calls, ["final_winner"])
-            self.assertEqual(
-                receipt["path"],
-                str((root / "distribution-declaration.json").resolve()),
-            )
+    def test_legacy_distribution_gate_is_not_exposed(self) -> None:
+        with self.assertRaises(SystemExit):
+            target.parse_args(["distribution"])
+        source = Path(target.__file__).resolve().read_text(encoding="utf-8")
+        self.assertNotIn('add_parser("distribution"', source)
+        self.assertNotIn("run_distribution", source)
+        self.assertNotIn("validation_gate_json", source)
 
     def test_metric_seal_subcommand_is_not_exposed(self) -> None:
         with self.assertRaises(SystemExit):

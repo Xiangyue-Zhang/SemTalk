@@ -50,6 +50,14 @@ class FinalDiffSHEGConstantsTests(unittest.TestCase):
             {"fmd", "fed", "fgd"},
         )
         self.assertEqual(
+            BRIDGE.DIFFSHEG_COMMIT,
+            "3ebf3058f48cba3da9146afb7623e9ec1ab9e9a5",
+        )
+        self.assertEqual(
+            BRIDGE.DIFFSHEG_TREE,
+            "b2b81733b02c04738f2fbe2ec6314480681b9cbf",
+        )
+        self.assertEqual(
             BRIDGE.PASPA_COMMIT,
             "0df27e6cab4b5ced19cc923afe352f77d547924b",
         )

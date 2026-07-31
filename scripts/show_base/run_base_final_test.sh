@@ -17,10 +17,6 @@ fresh_test_authority=
 authority_sha=
 authority_bytes=
 authority_payload_sha=
-validation_gate=
-validation_gate_sha=
-validation_gate_bytes=
-validation_gate_payload_sha=
 paspa_root=
 diffsheg_root=
 talkshow_root=
@@ -41,14 +37,6 @@ while (($#)); do
             authority_bytes=$2; shift 2 ;;
         --expected-test-authority-receipt-payload-sha256)
             authority_payload_sha=$2; shift 2 ;;
-        --validation-gate-json)
-            validation_gate=$2; shift 2 ;;
-        --expected-validation-gate-sha256)
-            validation_gate_sha=$2; shift 2 ;;
-        --expected-validation-gate-bytes)
-            validation_gate_bytes=$2; shift 2 ;;
-        --expected-validation-gate-receipt-payload-sha256)
-            validation_gate_payload_sha=$2; shift 2 ;;
         --paspa-root)
             paspa_root=$2; shift 2 ;;
         --diffsheg-root)
@@ -78,23 +66,20 @@ done
 
 for value_name in \
     python_bin fresh_test_authority authority_sha authority_bytes \
-    authority_payload_sha validation_gate validation_gate_sha \
-    validation_gate_bytes validation_gate_payload_sha paspa_root \
+    authority_payload_sha paspa_root \
     diffsheg_root talkshow_root source_audio_root smplx_path; do
     if [[ -z ${!value_name} ]]; then
         printf 'missing required option value: %s\n' "$value_name" >&2
         exit 2
     fi
 done
-for digest in \
-    "$authority_sha" "$authority_payload_sha" \
-    "$validation_gate_sha" "$validation_gate_payload_sha"; do
+for digest in "$authority_sha" "$authority_payload_sha"; do
     [[ $digest =~ ^[0-9a-f]{64}$ ]] || {
         printf 'invalid lowercase SHA-256: %s\n' "$digest" >&2
         exit 2
     }
 done
-for integer in "$authority_bytes" "$validation_gate_bytes"; do
+for integer in "$authority_bytes"; do
     [[ $integer =~ ^[1-9][0-9]*$ ]] || {
         printf 'invalid positive byte count: %s\n' "$integer" >&2
         exit 2
@@ -107,10 +92,12 @@ done
 
 adapter=$launcher_dir/run_base_final_test.py
 evaluator=$launcher_dir/evaluate_diffsheg_final_test.py
+audio_view_builder=$launcher_dir/prepare_diffsheg_audio_view.py
 for required in \
-    "$python_bin" "$fresh_test_authority" "$validation_gate" \
+    "$python_bin" "$fresh_test_authority" \
     "$paspa_root" "$diffsheg_root" "$talkshow_root" \
-    "$source_audio_root" "$smplx_path" "$adapter" "$evaluator"; do
+    "$source_audio_root" "$smplx_path" "$adapter" "$evaluator" \
+    "$audio_view_builder"; do
     [[ -e $required ]] || {
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
@@ -118,7 +105,6 @@ for required in \
 done
 
 fresh_test_authority=$(realpath -e -- "$fresh_test_authority")
-validation_gate=$(realpath -e -- "$validation_gate")
 paspa_root=$(realpath -e -- "$paspa_root")
 diffsheg_root=$(realpath -e -- "$diffsheg_root")
 talkshow_root=$(realpath -e -- "$talkshow_root")
@@ -374,29 +360,35 @@ trap - EXIT INT TERM HUP
 "$python_bin" "$adapter" finalize "${workload_authority_args[@]}" \
     >"$log_root/finalize.log" 2>&1
 
-distribution_json=$(
-    "$python_bin" "$adapter" distribution \
-        "${workload_authority_args[@]}" \
-        --validation-gate-json "$validation_gate" \
-        --expected-validation-gate-sha256 "$validation_gate_sha" \
-        --expected-validation-gate-bytes "$validation_gate_bytes" \
-        --expected-validation-gate-receipt-payload-sha256 \
-            "$validation_gate_payload_sha"
-)
-distribution_sha=$(
-    "$python_bin" -c \
-        'import json,sys; print(json.load(sys.stdin)["sha256"])' \
-        <<<"$distribution_json"
-)
-
 diffsheg_preflight=$log_root/diffsheg-preflight.json
 diffsheg_output=$output_root/diffsheg-final-metrics
+diffsheg_audio_view=$log_root/diffsheg-audio-view
+audio_view_result=$(
+    "$python_bin" "$audio_view_builder" \
+        "${workload_authority_args[@]}" \
+        --inference-final-root "$output_root" \
+        --source-audio-root "$source_audio_root" \
+        --output-root "$diffsheg_audio_view"
+)
+read -r audio_view_root audio_view_receipt_sha audio_view_source_set_sha \
+    audio_view_sealed_set_sha < <(
+    "$python_bin" -c \
+        'import json,sys; v=json.load(sys.stdin); print(v["output_root"],v["receipt_sha256"],v["source_ordered_set_sha256"],v["view_ordered_set_sha256"])' \
+        <<<"$audio_view_result"
+)
+[[ $audio_view_root == "$diffsheg_audio_view" && \
+   $audio_view_receipt_sha =~ ^[0-9a-f]{64}$ && \
+   $audio_view_source_set_sha =~ ^[0-9a-f]{64}$ && \
+   $audio_view_sealed_set_sha =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'sealed DiffSHEG audio view did not return exact pins\n' >&2
+    exit 1
+}
 diffsheg_asset_args=(
     --inference-final-root "$output_root"
     --paspa-root "$paspa_root"
     --diffsheg-root "$diffsheg_root"
     --talkshow-root "$talkshow_root"
-    --source-audio-root "$source_audio_root"
+    --source-audio-root "$diffsheg_audio_view"
     --smplx-path "$smplx_path"
     --batch-size "$diffsheg_batch_size"
 )

@@ -62,16 +62,19 @@ SOURCE_INPUT_KEYS = {
 SOURCE_DERIVED_KEYS = {
     "official_baseline_commit",
     "official_baseline_ancestor",
-    "official_remote_ref",
-    "official_remote_commit",
+    "pinned_origin",
+    "pinned_commit",
+    "pinned_tree",
+    "publication_remote_ref",
+    "publication_live_main_check_required",
     "detached",
     "local_branches_at_commit",
 }
 PRODUCER_SOURCE_DERIVED_KEYS = {
     "source_root",
-    "official_remote_ref",
-    "official_remote_commit",
-    "official_main_ancestor",
+    "pinned_inference_commit",
+    "pinned_inference_tree",
+    "inference_source_ancestor",
     "official_baseline_ancestor",
     "detached",
     "local_branches_at_commit",
@@ -412,37 +415,6 @@ def _git(root: Path, *arguments: str) -> str:
         ) from exc
 
 
-def _remote_main_oid(root: Path) -> str:
-    """Resolve the live official main tip, never a mutable local ref."""
-
-    try:
-        output = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "ls-remote",
-                "--exit-code",
-                "origin",
-                "refs/heads/main",
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise BaseFinalAuthorityError(
-            "cannot resolve live official SemTalk main"
-        ) from exc
-    fields = output.split()
-    if len(fields) != 2 or fields[1] != "refs/heads/main":
-        raise BaseFinalAuthorityError(
-            "official SemTalk main resolution is ambiguous"
-        )
-    return _git_oid(fields[0], "official SemTalk main commit")
-
-
 def _validate_source(value: Any) -> dict[str, Any]:
     if type(value) is not dict or set(value) != SOURCE_INPUT_KEYS:
         raise BaseFinalAuthorityError("inference source schema mismatch")
@@ -505,7 +477,6 @@ def _validate_source(value: Any) -> dict[str, Any]:
         _git(root, "remote", "get-url", "origin") != ORIGIN
         or _git(root, "rev-parse", "HEAD^{commit}") != commit
         or _git(root, "rev-parse", "HEAD^{tree}") != tree
-        or _remote_main_oid(root) != commit
         or _git(
             root,
             "status",
@@ -542,8 +513,11 @@ def _validate_source(value: Any) -> dict[str, Any]:
         **dict(value),
         "official_baseline_commit": OFFICIAL_BASELINE_COMMIT,
         "official_baseline_ancestor": True,
-        "official_remote_ref": "refs/heads/main",
-        "official_remote_commit": commit,
+        "pinned_origin": ORIGIN,
+        "pinned_commit": commit,
+        "pinned_tree": tree,
+        "publication_remote_ref": "refs/heads/main",
+        "publication_live_main_check_required": True,
         "detached": True,
         "local_branches_at_commit": [],
     }
@@ -986,9 +960,13 @@ def _validate_official_training_source(
         _git(entrypoint.parent, "rev-parse", "--show-toplevel")
     ).resolve()
     inference_root = Path(inference_source["source_root"]).resolve()
-    live_main = _git_oid(
-        inference_source["official_remote_commit"],
-        "live official SemTalk main",
+    inference_commit = _git_oid(
+        inference_source["commit"],
+        "pinned inference source commit",
+    )
+    inference_tree = _git_oid(
+        inference_source["tree"],
+        "pinned inference source tree",
     )
     symbolic = subprocess.run(
         ["git", "-C", str(producer_root), "symbolic-ref", "-q", "HEAD"],
@@ -1055,7 +1033,7 @@ def _validate_official_training_source(
                 "merge-base",
                 "--is-ancestor",
                 commit,
-                live_main,
+                inference_commit,
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -1066,14 +1044,14 @@ def _validate_official_training_source(
     ):
         raise BaseFinalAuthorityError(
             "Base-long producer commit/tree is not a clean reachable "
-            "official-main source"
+            "pinned inference-source ancestor"
         )
     return {
         **dict(value),
         "source_root": str(producer_root),
-        "official_remote_ref": "refs/heads/main",
-        "official_remote_commit": live_main,
-        "official_main_ancestor": True,
+        "pinned_inference_commit": inference_commit,
+        "pinned_inference_tree": inference_tree,
+        "inference_source_ancestor": True,
         "official_baseline_ancestor": True,
         "detached": True,
         "local_branches_at_commit": [],

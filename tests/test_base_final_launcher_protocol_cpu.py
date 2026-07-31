@@ -33,6 +33,23 @@ class BaseFinalLauncherProtocolTests(unittest.TestCase):
         self.assertNotIn('add_parser("seal"', consumer)
         self.assertNotIn('args.command == "seal"', consumer)
         self.assertIn("evaluate_diffsheg_final_test.py", launcher)
+        self.assertIn("prepare_diffsheg_audio_view.py", launcher)
+        self.assertLess(
+            launcher.index('"$adapter" finalize'),
+            launcher.index('"$python_bin" "$audio_view_builder"'),
+        )
+        self.assertLess(
+            launcher.index('"$python_bin" "$audio_view_builder"'),
+            launcher.index("--preflight-only"),
+        )
+        self.assertIn(
+            '--source-audio-root "$diffsheg_audio_view"',
+            launcher,
+        )
+        self.assertNotIn("validation-gate", launcher)
+        self.assertNotIn("distribution", launcher.lower())
+        self.assertNotIn("validation_gate", consumer)
+        self.assertNotIn('add_parser("distribution"', consumer)
         self.assertEqual(
             launcher.count(
                 'CUDA_VISIBLE_DEVICES=0 "$python_bin" "$evaluator"'

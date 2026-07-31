@@ -390,9 +390,9 @@ class AuthorityFixture:
                     long_trainer.read_bytes()
                 ).hexdigest(),
                 "source_root": str(self.source.resolve()),
-                "official_remote_ref": "refs/heads/main",
-                "official_remote_commit": commit,
-                "official_main_ancestor": True,
+                "pinned_inference_commit": commit,
+                "pinned_inference_tree": tree,
+                "inference_source_ancestor": True,
                 "official_baseline_ancestor": True,
                 "detached": True,
                 "local_branches_at_commit": [],
@@ -705,11 +705,6 @@ class AuthorityFixture:
                 "_replay_long_diffsheg_test_winner_claim",
                 side_effect=published,
             ),
-            mock.patch.object(
-                AUTH,
-                "_remote_main_oid",
-                return_value=self.inference_source["commit"],
-            ),
         ):
             yield (
                 continuation,
@@ -786,12 +781,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             ):
                 observed = AUTH._replay_base_long_candidate_bundle(
                     fixture.base_long_candidate_artifacts,
-                    inference_source={
-                        **fixture.inference_source,
-                        "official_remote_commit": fixture.inference_source[
-                            "commit"
-                        ],
-                    },
+                    inference_source=fixture.inference_source,
                 )
             self.assertEqual(observed, fixture.base_long_bundle)
             validator.assert_called_once_with(
@@ -826,12 +816,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             )
             source_validator.assert_called_once_with(
                 raw_source,
-                inference_source={
-                    **fixture.inference_source,
-                    "official_remote_commit": fixture.inference_source[
-                        "commit"
-                    ],
-                },
+                inference_source=fixture.inference_source,
             )
 
     def test_long_claim_replay_has_checkpoint_free_signature(self) -> None:
@@ -1454,16 +1439,11 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             source["commit"] = "f" * 40
             with self.assertRaisesRegex(
                 AUTH.BaseFinalAuthorityError,
-                "reachable official-main",
+                "reachable pinned inference-source ancestor",
             ):
                 AUTH._validate_official_training_source(
                     source,
-                    inference_source={
-                        **fixture.inference_source,
-                        "official_remote_commit": fixture.inference_source[
-                            "commit"
-                        ],
-                    },
+                    inference_source=fixture.inference_source,
                 )
 
     def test_base_training_source_receipt_cannot_hide_attached_head(
@@ -1491,16 +1471,11 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             self.assertIsNone(source["branch"])
             with self.assertRaisesRegex(
                 AUTH.BaseFinalAuthorityError,
-                "reachable official-main",
+                "reachable pinned inference-source ancestor",
             ):
                 AUTH._validate_official_training_source(
                     source,
-                    inference_source={
-                        **fixture.inference_source,
-                        "official_remote_commit": fixture.inference_source[
-                            "commit"
-                        ],
-                    },
+                    inference_source=fixture.inference_source,
                 )
 
     def test_same_path_cached_control_module_is_ignored(self) -> None:
@@ -1639,22 +1614,16 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             ):
                 AUTH.build_test_authority(**fixture.kwargs())
 
-    def test_source_must_equal_live_official_main(self) -> None:
+    def test_source_authority_defers_live_main_to_publication_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = AuthorityFixture(Path(directory))
-            with (
-                fixture.fresh_control_validators(),
-                mock.patch.object(
-                    AUTH,
-                    "_remote_main_oid",
-                    return_value="0" * 40,
-                ),
-                self.assertRaisesRegex(
-                    AUTH.BaseFinalAuthorityError,
-                    "official baseline descendant",
-                ),
-            ):
-                AUTH.build_test_authority(**fixture.kwargs())
+            with fixture.fresh_control_validators():
+                authority = AUTH.build_test_authority(**fixture.kwargs())
+            source = authority["inference_source"]
+            self.assertEqual(source["pinned_commit"], fixture.inference_source["commit"])
+            self.assertEqual(source["pinned_tree"], fixture.inference_source["tree"])
+            self.assertTrue(source["publication_live_main_check_required"])
+            self.assertNotIn("ls-remote", Path(AUTH.__file__).read_text())
 
     def test_canonical_root_external_source_pin_is_mandatory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
