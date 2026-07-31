@@ -257,7 +257,7 @@ LOCAL_WORLD_SIZE = 8
 WORLD_SIZE = 16
 LOCAL_BATCH_SIZE = 4
 GLOBAL_BATCH_SIZE = 64
-FORMAL_HOST_BY_NODE_RANK = {
+FORMAL_HOST_BY_SLOT = {
     0: (
         "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0"
     ),
@@ -265,6 +265,11 @@ FORMAL_HOST_BY_NODE_RANK = {
         "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0"
     ),
 }
+# Backward-compatible public name for callers that only describe the fixed
+# two-node topology.  Runtime code below always resolves a physical host slot
+# explicitly so single-node torch node rank zero may run on either audited
+# machine without weakening hostname evidence.
+FORMAL_HOST_BY_NODE_RANK = FORMAL_HOST_BY_SLOT
 POSE_LENGTH = 64
 PRE_FRAMES = 4
 CODEBOOK_SIZE = 256
@@ -375,6 +380,22 @@ def _activate_topology(args: argparse.Namespace) -> dict[str, Any]:
         specification["unique_samples_per_epoch"]
     )
     return {"mode": mode, **specification}
+
+
+def _active_host_slots(args: argparse.Namespace) -> tuple[int, ...]:
+    """Map torch node ranks to the exact audited physical host slots."""
+
+    topology = _activate_topology(args)
+    host_slot = getattr(args, "formal_host_slot", None)
+    if host_slot not in FORMAL_HOST_BY_SLOT:
+        raise AdaptationContractError(
+            "formal physical host slot is not in the audited host inventory"
+        )
+    if topology["node_count"] == 1:
+        return (int(host_slot),)
+    if topology["node_count"] == 2:
+        return (0, 1)
+    raise AdaptationContractError("unsupported formal physical host inventory")
 
 
 def canonical_json_sha256(payload: Any) -> str:
@@ -1444,7 +1465,17 @@ def _portable_dataset_receipt(
 
 def _global_dataset_receipt(
     node_receipts: Sequence[Mapping[str, Any]],
+    *,
+    host_slots: Sequence[int],
 ) -> dict[str, Any]:
+    if (
+        len(host_slots) != len(node_receipts)
+        or len(set(host_slots)) != len(host_slots)
+        or any(slot not in FORMAL_HOST_BY_SLOT for slot in host_slots)
+    ):
+        raise AdaptationContractError(
+            "dataset receipt host-slot inventory is invalid"
+        )
     semantic = _portable_dataset_receipt(node_receipts[0]["dataset"])
     for receipt in node_receipts[1:]:
         if _portable_dataset_receipt(receipt["dataset"]) != semantic:
@@ -1458,7 +1489,8 @@ def _global_dataset_receipt(
     global_receipt["node_lmdb_inode_bindings"] = [
         {
             "node_rank": node_rank,
-            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "host_slot": host_slots[node_rank],
+            "hostname": FORMAL_HOST_BY_SLOT[host_slots[node_rank]],
             "binding": dict(receipt["dataset"]["lmdb_inode_binding"]),
         }
         for node_rank, receipt in enumerate(node_receipts)
@@ -1468,6 +1500,8 @@ def _global_dataset_receipt(
 
 def _global_official_base_receipt(
     rank_receipts: Sequence[Mapping[str, Any]],
+    *,
+    host_slots: Sequence[int],
 ) -> dict[str, Any]:
     """Bind equal checkpoint content plus ordered node-local open identities."""
 
@@ -1488,6 +1522,14 @@ def _global_official_base_receipt(
         raise AdaptationContractError(
             "ranks disagree on official Base checkpoint semantics"
         )
+    if (
+        len(host_slots) != NODE_COUNT
+        or len(set(host_slots)) != len(host_slots)
+        or any(slot not in FORMAL_HOST_BY_SLOT for slot in host_slots)
+    ):
+        raise AdaptationContractError(
+            "official Base receipt host-slot inventory is invalid"
+        )
     result = dict(semantic_receipts[0])
     result["file_binding_scope"] = (
         "ordered_node_local_open_identity_with_global_content_sha256"
@@ -1495,7 +1537,8 @@ def _global_official_base_receipt(
     result["node_local_files"] = [
         {
             "node_rank": node_rank,
-            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "host_slot": host_slots[node_rank],
+            "hostname": FORMAL_HOST_BY_SLOT[host_slots[node_rank]],
             "path": rank_receipts[node_rank * LOCAL_WORLD_SIZE]["path"],
             "file_identity": dict(
                 rank_receipts[node_rank * LOCAL_WORLD_SIZE]["file_identity"]
@@ -1854,6 +1897,7 @@ def protocol_receipt(
         raise AdaptationContractError(
             "published official Base trainer semantics changed"
         )
+    host_slots = _active_host_slots(args)
     return {
         "format": PROTOCOL_FORMAT,
         "scope": "SemTalk Base only",
@@ -1889,7 +1933,8 @@ def protocol_receipt(
             "nodes": [
                 {
                     "node_rank": rank,
-                    "hostname": FORMAL_HOST_BY_NODE_RANK[rank],
+                    "host_slot": host_slots[rank],
+                    "hostname": FORMAL_HOST_BY_SLOT[host_slots[rank]],
                     "rank_range": list(
                         range(
                             rank * LOCAL_WORLD_SIZE,
@@ -3401,6 +3446,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topology-selection-report")
     parser.add_argument("--expected-topology-selection-sha256")
     parser.add_argument("--formal-node-rank", type=int, required=True)
+    parser.add_argument(
+        "--formal-host-slot", type=int, choices=tuple(FORMAL_HOST_BY_SLOT),
+        required=True,
+    )
     parser.add_argument("--formal-master-addr", required=True)
     parser.add_argument("--formal-master-port", type=int, required=True)
     parser.add_argument("--formal-run-id", required=True)
@@ -3418,6 +3467,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     topology = _activate_topology(args)
+    host_slots = _active_host_slots(args)
     reject_forbidden_source_labels(
         args.run_name,
         args.output_root,
@@ -3474,8 +3524,13 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if (
         args.formal_node_rank not in range(topology["node_count"])
-        or os.uname().nodename
-        != FORMAL_HOST_BY_NODE_RANK[args.formal_node_rank]
+        or args.formal_host_slot not in FORMAL_HOST_BY_SLOT
+        or host_slots[args.formal_node_rank] != args.formal_host_slot
+        or (
+            topology["node_count"] == 2
+            and args.formal_host_slot != args.formal_node_rank
+        )
+        or os.uname().nodename != FORMAL_HOST_BY_SLOT[args.formal_host_slot]
         or not re.fullmatch(r"[A-Za-z0-9.-]+", args.formal_master_addr)
         or not (1024 <= args.formal_master_port <= 65535)
         or re.fullmatch(r"[A-Za-z0-9._-]{8,128}", args.formal_run_id)
@@ -3642,8 +3697,7 @@ def _distributed_context(
         or not (0 <= local_rank < LOCAL_WORLD_SIZE)
         or os.environ.get("MASTER_ADDR") != args.formal_master_addr
         or master_port != args.formal_master_port
-        or os.uname().nodename
-        != FORMAL_HOST_BY_NODE_RANK[args.formal_node_rank]
+        or os.uname().nodename != FORMAL_HOST_BY_SLOT[args.formal_host_slot]
     ):
         raise AdaptationContractError(
             "official adaptation requires the exact selected rank/node/host topology"
@@ -3663,6 +3717,7 @@ def _distributed_topology_receipt(
         "rank": rank,
         "local_rank": local_rank,
         "node_rank": args.formal_node_rank,
+        "host_slot": args.formal_host_slot,
         "hostname": os.uname().nodename,
         "master_addr": os.environ["MASTER_ADDR"],
         "master_port": int(os.environ["MASTER_PORT"]),
@@ -3670,12 +3725,14 @@ def _distributed_topology_receipt(
     }
     gathered: list[Any] = [None for _ in range(WORLD_SIZE)]
     dist.all_gather_object(gathered, local)
+    host_slots = _active_host_slots(args)
     expected = [
         {
             "rank": node_rank * LOCAL_WORLD_SIZE + local_rank_value,
             "local_rank": local_rank_value,
             "node_rank": node_rank,
-            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "host_slot": host_slots[node_rank],
+            "hostname": FORMAL_HOST_BY_SLOT[host_slots[node_rank]],
             "master_addr": args.formal_master_addr,
             "master_port": args.formal_master_port,
             "formal_run_id": args.formal_run_id,
@@ -4799,13 +4856,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         local_dataset_receipt = node_receipts[
             args.formal_node_rank
         ]["dataset"]
-        dataset_receipt = _global_dataset_receipt(node_receipts)
+        host_slots = _active_host_slots(args)
+        dataset_receipt = _global_dataset_receipt(
+            node_receipts, host_slots=host_slots
+        )
         current_source = {
             **source_semantics[0],
             "node_local_clones": [
                 {
                     "node_rank": node_rank,
-                    "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+                    "host_slot": host_slots[node_rank],
+                    "hostname": FORMAL_HOST_BY_SLOT[host_slots[node_rank]],
                     "entrypoint": receipt["source"]["entrypoint"],
                     "branch": receipt["source"]["branch"],
                 }
@@ -4824,7 +4885,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             gathered_official_receipts, local_official_receipt
         )
         official_receipt = _global_official_base_receipt(
-            gathered_official_receipts
+            gathered_official_receipts,
+            host_slots=host_slots,
         )
         model = semtalk_base(_model_args())
         speaker_initialization = strict_load_and_initialize_show_speakers(

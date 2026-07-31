@@ -175,6 +175,29 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
             },
         )
 
+    def test_base_launcher_separates_torch_rank_from_physical_host_slot(self) -> None:
+        launcher = (
+            REPOSITORY
+            / "scripts"
+            / "show_base"
+            / "run_base_official_adapt_long.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0)",
+            launcher,
+        )
+        self.assertIn(
+            "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0)",
+            launcher,
+        )
+        self.assertIn("host_slot=0", launcher)
+        self.assertIn("host_slot=1", launcher)
+        self.assertIn(
+            '( "$nnodes" -eq 2 && "$node_rank" -ne "$host_slot" )',
+            launcher,
+        )
+        self.assertIn('--formal-host-slot "$host_slot"', launcher)
+
 
 if __name__ == "__main__":
     unittest.main()

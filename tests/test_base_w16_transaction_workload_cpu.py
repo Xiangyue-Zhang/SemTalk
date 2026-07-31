@@ -392,8 +392,31 @@ class BaseW16TransactionWorkloadTests(unittest.TestCase):
             formal_run_id="formal-w16-run-001",
         )
         self.assertEqual(args.formal_node_rank, "1")
+        self.assertEqual(args.formal_host_slot, "1")
+        self.assertEqual(
+            tokens[tokens.index("--formal-host-slot") + 1],
+            "1",
+        )
         self.assertIn("--local-batch-size", tokens)
         self.assertIn("32", tokens)
+        with self.assertRaisesRegex(
+            SHIM.W16ShimError,
+            "shim owns trainer option",
+        ):
+            SHIM.prepare_trainer_launch(
+                trainer=trainer,
+                trainer_tokens=[
+                    "--mode", "train", "--epochs", "400",
+                    "--formal-host-slot", "0",
+                ],
+                topology_mode=(
+                    "validation_gated_w16_l32_g512_empirical_acceleration"
+                ),
+                node_rank=0,
+                master_addr=SHIM.EXPECTED_HOST_BY_RANK[0],
+                master_port=29601,
+                formal_run_id="formal-w16-run-001",
+            )
         with self.assertRaisesRegex(SHIM.W16ShimError, "Speaker2"):
             SHIM.prepare_trainer_launch(
                 trainer=trainer,

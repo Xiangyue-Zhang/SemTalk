@@ -76,6 +76,7 @@ IDENTITY_KEYS = {
 }
 RESERVED_TRAINER_OPTIONS = {
     "--formal-node-rank",
+    "--formal-host-slot",
     "--formal-master-addr",
     "--formal-master-port",
     "--formal-run-id",
@@ -594,6 +595,8 @@ def prepare_trainer_launch(
     topology = W16_TOPOLOGIES[topology_mode]
     derived = [
         "--formal-node-rank",
+        str(node_rank),
+        "--formal-host-slot",
         str(node_rank),
         "--formal-master-addr",
         master_addr,

@@ -209,6 +209,7 @@ def _base_cli() -> list[str]:
         "--output-root", "/runs/base",
         "--run-name", "selected_all_show",
         "--formal-node-rank", "0",
+        "--formal-host-slot", "0",
         "--formal-master-addr", "master.example",
         "--formal-master-port", "29601",
         "--formal-run-id", "formal-run-001",
@@ -616,6 +617,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             loader_workers=4,
             seed=43,
             topology_mode=ADAPT.W16_GLOBAL64_MODE,
+            formal_host_slot=0,
             formal_master_addr="master.example",
             formal_master_port=29601,
             formal_run_id="formal-run-001",
@@ -662,6 +664,23 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             ":4096:8",
         )
         self.assertEqual(protocol["determinism"]["python_hash_seed"], "43")
+        self.assertEqual(
+            protocol["distributed_topology"]["nodes"],
+            [
+                {
+                    "node_rank": 0,
+                    "host_slot": 0,
+                    "hostname": ADAPT.FORMAL_HOST_BY_SLOT[0],
+                    "rank_range": list(range(0, 8)),
+                },
+                {
+                    "node_rank": 1,
+                    "host_slot": 1,
+                    "hostname": ADAPT.FORMAL_HOST_BY_SLOT[1],
+                    "rank_range": list(range(8, 16)),
+                },
+            ],
+        )
         self.assertTrue(
             protocol["determinism"][
                 "python_hash_seed_required_at_interpreter_start"
@@ -879,6 +898,83 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         args.epochs = 200
         with self.assertRaises(ADAPT.AdaptationContractError):
             ADAPT.validate_args(args)
+
+    def test_single_node_worker_host_slot_is_audited_and_allowed(self) -> None:
+        parser = ADAPT.build_parser()
+        args = parser.parse_args(_base_cli())
+        args.formal_host_slot = 1
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_SLOT[1]
+            ),
+        ):
+            ADAPT.validate_args(args)
+            protocol = ADAPT.protocol_receipt(
+                args,
+                contract_receipts={
+                    "trajectory_anchor": {
+                        "mode": ADAPT.FRESH_TRAJECTORY_MODE,
+                        "path": "/frozen/fresh-lineage.json",
+                        "sha256": "f" * 64,
+                    }
+                },
+                topology_gate_spec={
+                    "path": str(TOPOLOGY_GATE_SPEC),
+                    "sha256": _sha(TOPOLOGY_GATE_SPEC),
+                },
+            )
+        self.assertEqual(
+            protocol["distributed_topology"]["nodes"],
+            [
+                {
+                    "node_rank": 0,
+                    "host_slot": 1,
+                    "hostname": ADAPT.FORMAL_HOST_BY_SLOT[1],
+                    "rank_range": list(range(0, 8)),
+                }
+            ],
+        )
+
+    def test_host_slot_and_hostname_mismatch_is_rejected(self) -> None:
+        parser = ADAPT.build_parser()
+        args = parser.parse_args(_base_cli())
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_SLOT[1]
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "node/host",
+            ):
+                ADAPT.validate_args(args)
+
+    def test_w16_node_rank_must_equal_physical_host_slot(self) -> None:
+        parser = ADAPT.build_parser()
+        args = parser.parse_args(_base_cli())
+        specification = ADAPT.TOPOLOGY_SPECS[ADAPT.W16_GLOBAL512_MODE]
+        args.topology_mode = ADAPT.W16_GLOBAL512_MODE
+        args.local_batch_size = specification["local_batch_size"]
+        args.learning_rate = specification["learning_rate"]
+        args.precision = specification["precision"]
+        args.formal_node_rank = 1
+        args.formal_host_slot = 0
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_SLOT[0]
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "node/host",
+            ):
+                ADAPT.validate_args(args)
 
     def test_short_quality_requires_gate_not_topology_selection_w8_w16(
         self,
@@ -1276,7 +1372,19 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                     }
                 }
             )
-        receipt = ADAPT._global_dataset_receipt(nodes)
+        receipt = ADAPT._global_dataset_receipt(
+            nodes, host_slots=(0, 1)
+        )
+        self.assertEqual(
+            [
+                (item["host_slot"], item["hostname"])
+                for item in receipt["node_lmdb_inode_bindings"]
+            ],
+            [
+                (0, ADAPT.FORMAL_HOST_BY_SLOT[0]),
+                (1, ADAPT.FORMAL_HOST_BY_SLOT[1]),
+            ],
+        )
         self.assertEqual(
             [
                 item["binding"]["directory_identity"]["device"]
@@ -1286,7 +1394,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         nodes[1]["dataset"]["data_mdb_sha256"] = "9" * 64
         with self.assertRaises(ADAPT.AdaptationContractError):
-            ADAPT._global_dataset_receipt(nodes)
+            ADAPT._global_dataset_receipt(nodes, host_slots=(0, 1))
 
 
 class OfficialBaseAdaptReceiptContracts(unittest.TestCase):

@@ -66,22 +66,27 @@ case "$topology_mode" in
         ;;
 esac
 
+case "$(hostname)" in
+    iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0)
+        host_slot=0
+        ;;
+    iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0)
+        host_slot=1
+        ;;
+    *)
+        printf 'host is not in the exact formal Base inventory\n' >&2
+        exit 2
+        ;;
+esac
 case "$node_rank" in
-    0)
-        expected_host=
-        expected_host+=iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0
-        ;;
-    1)
-        expected_host=
-        expected_host+=iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0
-        ;;
+    0|1) ;;
     *)
         printf 'NODE_RANK must be exactly 0 or 1\n' >&2
         exit 2
         ;;
 esac
 if [[ "$node_rank" -ge "$nnodes" || \
-      "$(hostname)" != "$expected_host" || \
+      ( "$nnodes" -eq 2 && "$node_rank" -ne "$host_slot" ) || \
       ! "$master_addr" =~ ^[A-Za-z0-9.-]+$ || \
       ! "$master_port" =~ ^[0-9]+$ || \
       "$master_port" -lt 1024 || "$master_port" -gt 65535 || \
@@ -108,6 +113,7 @@ exec "$python_bin" -m torch.distributed.run \
     --master_port="$master_port" \
     "$script_dir/train_base_official_adapt_long.py" \
     --formal-node-rank "$node_rank" \
+    --formal-host-slot "$host_slot" \
     --formal-master-addr "$master_addr" \
     --formal-master-port "$master_port" \
     --formal-run-id "$formal_run_id" \
