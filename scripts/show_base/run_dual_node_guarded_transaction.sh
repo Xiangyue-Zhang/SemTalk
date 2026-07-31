@@ -26,7 +26,13 @@ helper="$launcher_dir/dual_node_guarded_transaction.py"
 . "$launcher_dir/guarded_runner_contract.sh"
 semtalk_require_exact_guarded_runner_all_gpus
 
-if [[ ! "$python_bin" = /* || ! -x "$python_bin" || -L "$python_bin" ]]; then
+python_dir=$(CDPATH= cd -- "$(dirname -- "$python_bin")" 2>/dev/null && pwd -P) || {
+    printf '%s\n' 'Python parent directory is unavailable' >&2
+    exit 2
+}
+python_canonical="$python_dir/${python_bin##*/}"
+if [[ ! "$python_bin" = /* || "$python_canonical" != "$python_bin" || \
+      ! -f "$python_bin" || ! -x "$python_bin" || -L "$python_bin" ]]; then
     printf '%s\n' 'Python must be an absolute executable non-symlink file' >&2
     exit 2
 fi

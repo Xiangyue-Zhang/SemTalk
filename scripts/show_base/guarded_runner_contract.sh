@@ -10,7 +10,6 @@
 _semtalk_guarded_runner_argv_is_exact() {
     local python_name
     local runner_path_count=0
-    local delimiter_count=0
     local delimiter_index=-1
     local gpu_option_count=0
     local exact_gpu_count=0
@@ -19,19 +18,22 @@ _semtalk_guarded_runner_argv_is_exact() {
 
     # The runner is a Python script.  Whether invoked through its shebang or
     # an explicit interpreter, Linux presents the interpreter as argv[0] and
-    # the actual script as argv[1].  Tokens in workload argv after the unique
-    # `--` separator are deliberately not runner authority.
+    # the actual script as argv[1].  Tokens in workload argv after the first
+    # runner `--` separator are deliberately not runner authority.
     (( ${#argv[@]} >= 5 )) || return 1
     python_name=${argv[0]##*/}
     [[ "$python_name" =~ ^python([0-9]+([.][0-9]+)*)?$ && \
        ${argv[1]} == /tmp/globaldiff_guarded_runner.py ]] || return 1
+    # Only the first separator belongs to the guarded runner.  The workload
+    # argv after it is inert authority and may contain any number of its own
+    # ``--`` separators.
     for ((index = 2; index < ${#argv[@]}; index++)); do
         if [[ ${argv[$index]} == -- ]]; then
-            ((delimiter_count += 1))
             delimiter_index=$index
+            break
         fi
     done
-    [[ "$delimiter_count" -eq 1 && "$delimiter_index" -gt 2 && \
+    [[ "$delimiter_index" -gt 2 && \
        "$delimiter_index" -lt $((${#argv[@]} - 1)) ]] || return 1
 
     for ((index = 2; index < delimiter_index; index++)); do

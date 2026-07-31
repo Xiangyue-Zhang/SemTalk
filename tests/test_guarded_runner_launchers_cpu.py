@@ -52,6 +52,8 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
                 "/formal/launcher.sh",
                 "--gpus",
                 "workload-value-is-inert",
+                "--",
+                "/absolute/nested-workload",
             )
         )
 
