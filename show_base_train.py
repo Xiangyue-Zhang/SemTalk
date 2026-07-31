@@ -17,6 +17,7 @@ from numbers import Real
 import os
 from pathlib import Path
 import random
+import socket
 import stat
 import statistics
 import subprocess
@@ -54,6 +55,8 @@ from utils.smplx_training import (
     clip_aligned_spans,
     parse_smplx_helper_devices,
 )
+from scripts.show_base import prerequisite_continuation_runtime
+from scripts.show_base import prerequisite_continuation_wave
 
 
 FORMAL_SMPLX_FILENAME = "SMPLX_NEUTRAL_2020.npz"
@@ -566,6 +569,12 @@ def _formal_smplx_asset_receipt(args: Any) -> dict[str, Any] | None:
         raise RuntimeError(
             f"formal SMPL-X asset SHA mismatch: {observed} != {expected}"
         )
+    if asset_stat.st_size != prerequisite_continuation_wave.FORMAL_SMPLX_BYTES:
+        raise RuntimeError(
+            "formal SMPL-X asset byte count mismatch: "
+            f"{asset_stat.st_size} != "
+            f"{prerequisite_continuation_wave.FORMAL_SMPLX_BYTES}"
+        )
     return {
         "format": "semtalk_show_smplx_asset_v1",
         "filename": FORMAL_SMPLX_FILENAME,
@@ -768,11 +777,7 @@ def _verify_lower_target_backend_resume_receipt(
 
 
 def _config_fingerprint(args: Any) -> str:
-    snapshot = {
-        key: value
-        for key, value in vars(args).items()
-        if key not in {"resume_state", "local_rank"}
-    }
+    snapshot = _config_snapshot(args)
     encoded = json.dumps(
         snapshot,
         sort_keys=True,
@@ -780,6 +785,50 @@ def _config_fingerprint(args: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _config_snapshot(args: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key
+        not in {
+            "resume_state",
+            "resume_wave_receipt",
+            "expected_resume_wave_sha256",
+            "print_formal_config_receipt",
+            "local_rank",
+        }
+    }
+
+
+def _continuation_wave_overlay(trainer: Any) -> dict[str, Any]:
+    binding = getattr(trainer, "continuation_wave_receipt", None)
+    if binding is None:
+        return {}
+    if (
+        not isinstance(binding, dict)
+        or set(binding)
+        != prerequisite_continuation_wave.DECISION_BINDING_KEYS
+    ):
+        raise RuntimeError("invalid continuation wave binding")
+    for key in ("sha256", "receipt_payload_sha256"):
+        _require_lowercase_sha256(
+            binding.get(key),
+            f"continuation wave {key}",
+        )
+    path = Path(str(binding.get("path", "")))
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or not path.is_file()
+    ):
+        raise RuntimeError(
+            "continuation wave binding path is unavailable"
+        )
+    return {
+        "continuation_wave_receipt": copy.deepcopy(binding)
+    }
 
 
 def _require_lowercase_sha256(value: Any, label: str) -> str:
@@ -3841,6 +3890,28 @@ def _rvq_ema_invariant_errors(model: torch.nn.Module) -> list[str]:
 
 def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
     representation_stage = args.formal_stage in REPRESENTATION_STAGES
+    wave_receipt = bool(
+        getattr(args, "resume_wave_receipt", "")
+    )
+    wave_sha = bool(
+        getattr(args, "expected_resume_wave_sha256", "")
+    )
+    config_preflight = bool(
+        getattr(args, "print_formal_config_receipt", False)
+    )
+    if wave_receipt != wave_sha:
+        raise RuntimeError(
+            "resume wave receipt and expected SHA-256 must be "
+            "provided together"
+        )
+    if wave_receipt and not getattr(args, "resume_state", ""):
+        raise RuntimeError(
+            "resume wave requires the exact old --resume_state"
+        )
+    if (wave_receipt or config_preflight) and not representation_stage:
+        raise RuntimeError(
+            "formal continuation is restricted to representation stages"
+        )
     global_batch_size = 256 if representation_stage else 64
     local_batch_size = (
         global_batch_size // world_size
@@ -4029,6 +4100,29 @@ def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
         raise RuntimeError(
             f"--formal_stage must be one of {sorted(stages)}, got {args.formal_stage!r}"
         )
+    if wave_receipt or config_preflight:
+        target_epoch = _require_exact_audit_int(
+            args.epochs,
+            "formal continuation target epoch",
+        )
+        if (
+            target_epoch <= 200
+            or target_epoch
+            % prerequisite_continuation_wave.INTERVAL_EPOCHS
+        ):
+            raise RuntimeError(
+                "formal continuation target must be a >200 multiple of 20"
+            )
+        expected_final = f"show_ft_{args.formal_stage}_{target_epoch}.bin"
+        if args.final_ckpt_name != expected_final:
+            raise RuntimeError(
+                "formal continuation final checkpoint name mismatch"
+            )
+        stages[args.formal_stage] = {
+            **stages[args.formal_stage],
+            "epochs": target_epoch,
+            "final_ckpt_name": expected_final,
+        }
     expected = {**common, **stages[args.formal_stage]}
     mismatches = []
     for name, value in expected.items():
@@ -4049,6 +4143,33 @@ def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
         raise RuntimeError("formal Base-only training forbids a discriminator")
 
 
+def _formal_config_receipt(
+    args: Any,
+    *,
+    world_size: int,
+    source_receipt: dict[str, str],
+) -> dict[str, Any]:
+    snapshot = _config_snapshot(args)
+    payload = {
+        "format": prerequisite_continuation_runtime.CONFIG_RECEIPT_FORMAT,
+        "formal_stage": args.formal_stage,
+        "hostname": socket.gethostname(),
+        "world_size": world_size,
+        "smplx_asset": _formal_smplx_asset_receipt(args),
+        "config_snapshot": snapshot,
+        "config_sha256": _config_fingerprint(args),
+        "config_semantic_sha256": (
+            prerequisite_continuation_runtime.config_semantic_sha256(
+                snapshot
+            )
+        ),
+        "source_receipt": source_receipt,
+        "source_receipt_sha256": _payload_sha256(source_receipt),
+    }
+    payload["receipt_payload_sha256"] = _payload_sha256(payload)
+    return payload
+
+
 def _load_resume(
     trainer: Any,
     resume_path: Path,
@@ -4062,6 +4183,7 @@ def _load_resume(
     source_receipt: dict[str, str],
     source_receipt_sha256: str,
     candidate_manifest_path: Path,
+    continuation_runtime: dict[str, Any] | None = None,
 ) -> tuple[
     int,
     dict[str, dict[str, float | int]],
@@ -4070,7 +4192,23 @@ def _load_resume(
     int,
     dict[str, Any] | None,
 ]:
-    payload = torch.load(resume_path, map_location="cpu", weights_only=False)
+    resume_snapshot = resume_path.read_bytes()
+    if continuation_runtime is not None:
+        expected_resume_sha = continuation_runtime["boundary_resume"][
+            "sha256"
+        ]
+        if (
+            hashlib.sha256(resume_snapshot).hexdigest()
+            != expected_resume_sha
+        ):
+            raise RuntimeError(
+                "continuation resume bytes changed before state restore"
+            )
+    payload = torch.load(
+        io.BytesIO(resume_snapshot),
+        map_location="cpu",
+        weights_only=False,
+    )
     if payload.get("format") != "semtalk_show_train_resume_v5":
         raise RuntimeError("unsupported or unsafe resume checkpoint format")
     completed_epochs = _require_exact_audit_int(
@@ -4081,6 +4219,13 @@ def _load_resume(
         payload.get("optimizer_updates"),
         "resume optimizer_updates",
     )
+    if continuation_runtime is not None and (
+        completed_epochs != continuation_runtime["boundary_epoch"]
+        or trainer.args.epochs != continuation_runtime["target_epoch"]
+    ):
+        raise RuntimeError(
+            "resume boundary/target differs from continuation wave"
+        )
     if (
         _require_exact_audit_int(
             payload.get("world_size"),
@@ -4125,7 +4270,27 @@ def _load_resume(
         updates_per_epoch=trainer.train_length,
         seed=int(trainer.args.random_seed),
     )
-    if payload["config_sha256"] != config_sha256:
+    expected_resume_config_sha = config_sha256
+    expected_resume_source_sha = source_receipt_sha256
+    if continuation_runtime is not None:
+        expected_resume_config_sha = continuation_runtime[
+            "old_config_sha256"
+        ]
+        expected_resume_source_sha = continuation_runtime[
+            "old_source_audit_sha256"
+        ]
+        if (
+            continuation_runtime["new_config_sha256"]
+            != config_sha256
+            or continuation_runtime["new_config_semantic_sha256"]
+            != prerequisite_continuation_runtime.config_semantic_sha256(
+                _config_snapshot(trainer.args)
+            )
+        ):
+            raise RuntimeError(
+                "continuation current config binding mismatch"
+            )
+    if payload["config_sha256"] != expected_resume_config_sha:
         raise RuntimeError("resume training config fingerprint does not match")
     if payload.get("lineage_manifest_sha256") != lineage_sha256:
         raise RuntimeError("resume lineage manifest fingerprint does not match")
@@ -4133,11 +4298,33 @@ def _load_resume(
         raise RuntimeError("resume dataset summary fingerprint does not match")
     if payload.get("data_mdb_sha256") != data_mdb_sha256:
         raise RuntimeError("resume LMDB fingerprint does not match")
-    if payload.get("dataset_receipt_sha256") != _payload_sha256(dataset_receipt):
+    expected_resume_dataset_receipt_sha = _payload_sha256(dataset_receipt)
+    if continuation_runtime is not None:
+        expected_resume_dataset_receipt_sha = continuation_runtime[
+            "old_dataset_receipt_sha256"
+        ]
+        observed_dataset_semantic_sha = (
+            prerequisite_continuation_runtime.dataset_semantic_sha256(
+                dataset_receipt
+            )
+        )
+        if (
+            observed_dataset_semantic_sha
+            != continuation_runtime[
+                "new_dataset_semantic_sha256"
+            ]
+        ):
+            raise RuntimeError(
+                "continuation changed a non-source dataset field"
+            )
+    if (
+        payload.get("dataset_receipt_sha256")
+        != expected_resume_dataset_receipt_sha
+    ):
         raise RuntimeError("resume dataset receipt fingerprint does not match")
     if payload.get("smplx_asset_receipt") != dataset_receipt.get("smplx_asset"):
         raise RuntimeError("resume SMPL-X asset receipt does not match")
-    if payload.get("source_receipt_sha256") != source_receipt_sha256:
+    if payload.get("source_receipt_sha256") != expected_resume_source_sha:
         raise RuntimeError("resume source checkout fingerprint does not match")
     if payload.get("initialization_receipt") != getattr(
         trainer,
@@ -4151,11 +4338,19 @@ def _load_resume(
         None,
     ):
         raise RuntimeError("resume RVQ EMA-prior receipt mismatch")
+    latest_candidate_receipt = payload.get(
+        "latest_representation_candidate"
+    )
     trainer.latest_representation_candidate = (
         _validate_representation_candidate_receipt(
             trainer,
-            payload.get("latest_representation_candidate"),
+            latest_candidate_receipt,
             completed_epochs=completed_epochs,
+            external_boundary_candidate=(
+                continuation_runtime["resume_boundary_candidate"]
+                if continuation_runtime is not None
+                else None
+            ),
         )
     )
     verify_lower_target_cache_resume_receipt(
@@ -4173,10 +4368,36 @@ def _load_resume(
             SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
         ),
     )
-    _verify_lower_target_backend_resume_receipt(
-        payload,
-        dataset_receipt.get(LOWER_TARGET_BACKEND_RECEIPT_KEY),
-    )
+    if continuation_runtime is None:
+        _verify_lower_target_backend_resume_receipt(
+            payload,
+            dataset_receipt.get(LOWER_TARGET_BACKEND_RECEIPT_KEY),
+        )
+    else:
+        old_has_backend = LOWER_TARGET_BACKEND_RECEIPT_KEY in payload
+        new_has_backend = LOWER_TARGET_BACKEND_RECEIPT_KEY in dataset_receipt
+        if old_has_backend != new_has_backend:
+            raise RuntimeError(
+                "old/new lower target backend presence differs"
+            )
+        if old_has_backend:
+            old_backend_projection = copy.deepcopy(dataset_receipt)
+            old_backend_projection[LOWER_TARGET_BACKEND_RECEIPT_KEY] = (
+                copy.deepcopy(
+                    payload[LOWER_TARGET_BACKEND_RECEIPT_KEY]
+                )
+            )
+            if (
+                prerequisite_continuation_runtime.dataset_semantic_sha256(
+                    old_backend_projection
+                )
+                != continuation_runtime[
+                    "new_dataset_semantic_sha256"
+                ]
+            ):
+                raise RuntimeError(
+                    "old/new lower target backend semantics differ"
+                )
     expected_optimizer_updates = completed_epochs * trainer.train_length
     if optimizer_updates != expected_optimizer_updates:
         raise RuntimeError(
@@ -4467,6 +4688,7 @@ def _save_resume(
         "latest_representation_candidate": copy.deepcopy(
             getattr(trainer, "latest_representation_candidate", None)
         ),
+        **_continuation_wave_overlay(trainer),
         "config_sha256": config_sha256,
         "lineage_manifest_sha256": lineage_sha256,
         "dataset_summary_sha256": dataset_summary_sha256,
@@ -4574,6 +4796,7 @@ def _model_payload(
         "latest_representation_candidate": copy.deepcopy(
             getattr(trainer, "latest_representation_candidate", None)
         ),
+        **_continuation_wave_overlay(trainer),
         "base_candidate_manifest": candidate_manifest_receipt,
         SMPLX_TRAINING_POOL_RUNTIME_EVIDENCE_KEY: runtime_evidence,
     }
@@ -5899,6 +6122,7 @@ def _save_representation_candidate(
         "distributed_training_receipt": distributed_training_receipt,
         "rvq_rank_state_receipt": rvq_rank_state_receipt,
         "selection_status": "offline_validation_pending",
+        **_continuation_wave_overlay(trainer),
     }
     checkpoint_sha256 = _verify_or_write_final(
         path,
@@ -5921,6 +6145,7 @@ def _validate_representation_candidate_receipt(
     receipt: Any,
     *,
     completed_epochs: int,
+    external_boundary_candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if trainer.args.formal_stage not in REPRESENTATION_STAGES:
         if receipt is not None:
@@ -5942,14 +6167,38 @@ def _validate_representation_candidate_receipt(
             "resume is missing its latest representation candidate receipt"
         )
     expected_updates = expected_epoch * trainer.train_length
-    expected_path = (
-        Path(trainer.checkpoint_path)
-        / "representation_candidates"
-        / (
-            f"{trainer.args.formal_stage}_epoch_{expected_epoch:04d}"
-            f"_step_{expected_updates:09d}.bin"
+    if external_boundary_candidate is None:
+        expected_path = (
+            Path(trainer.checkpoint_path)
+            / "representation_candidates"
+            / (
+                f"{trainer.args.formal_stage}_epoch_{expected_epoch:04d}"
+                f"_step_{expected_updates:09d}.bin"
+            )
         )
-    )
+        expected_sha256 = None
+        expected_bytes = None
+    else:
+        try:
+            normalized = (
+                prerequisite_continuation_wave._validate_candidate(
+                    external_boundary_candidate,
+                    stage=trainer.args.formal_stage,
+                    label="external resume boundary candidate",
+                )
+            )
+        except prerequisite_continuation_wave.ContinuationWaveError as error:
+            raise RuntimeError(str(error)) from error
+        if (
+            normalized["epoch"] != expected_epoch
+            or normalized["optimizer_updates"] != expected_updates
+        ):
+            raise RuntimeError(
+                "external resume candidate is not the latest boundary"
+            )
+        expected_path = Path(normalized["checkpoint"]["path"])
+        expected_sha256 = normalized["checkpoint"]["sha256"]
+        expected_bytes = normalized["checkpoint"]["bytes"]
     if (
         set(receipt)
         != {
@@ -5978,7 +6227,17 @@ def _validate_representation_candidate_receipt(
             "latest representation candidate checkpoint is unavailable"
         )
     observed_sha256 = _sha256(expected_path)
-    if receipt["sha256"] != observed_sha256:
+    if (
+        receipt["sha256"] != observed_sha256
+        or (
+            expected_sha256 is not None
+            and observed_sha256 != expected_sha256
+        )
+        or (
+            expected_bytes is not None
+            and expected_path.stat().st_size != expected_bytes
+        )
+    ):
         raise RuntimeError(
             "latest representation candidate checkpoint SHA-256 mismatch"
         )
@@ -6042,12 +6301,13 @@ def main() -> None:
         BASE_CANDIDATE_STAGING_FILENAME,
     }:
         raise RuntimeError("--final_ckpt_name collides with a reserved artifact")
-    _validate_smplx_training_pool_device_matrix(
-        args,
-        world_size=world_size,
-        cuda_available=torch.cuda.is_available(),
-        visible_device_count=torch.cuda.device_count(),
-    )
+    if not args.print_formal_config_receipt:
+        _validate_smplx_training_pool_device_matrix(
+            args,
+            world_size=world_size,
+            cuda_available=torch.cuda.is_available(),
+            visible_device_count=torch.cuda.device_count(),
+        )
 
     stage_key = (args.model, args.g_name, args.trainer, bool(args.train_rvq))
     allowed_stages = {
@@ -6078,6 +6338,20 @@ def main() -> None:
         raise RuntimeError(
             "PYTHONHASHSEED must be exported before launch and match random_seed"
         )
+    if args.print_formal_config_receipt:
+        print(
+            json.dumps(
+                _formal_config_receipt(
+                    args,
+                    world_size=world_size,
+                    source_receipt=_source_receipt(),
+                ),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+        return
 
     source_receipt = _source_receipt()
     source_receipt_sha = _payload_sha256(source_receipt)
@@ -6099,8 +6373,85 @@ def main() -> None:
     initial_pool_gate_receipt = initial_dataset_receipt.get(
         SMPLX_TRAINING_POOL_GATE_RECEIPT_KEY
     )
+    lineage_sha = None
+    if args.lineage_manifest:
+        lineage_path = Path(args.lineage_manifest)
+        if not lineage_path.is_file():
+            raise FileNotFoundError(lineage_path)
+        lineage_sha = _sha256(lineage_path)
+    config_sha = _config_fingerprint(args)
+    expected_checkpoint_dir = Path(
+        args.out_path + "custom/" + args.name + args.notes + "/"
+    )
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", init_method="env://")
+    continuation_runtime: dict[str, Any] | None = None
+    continuation_old_read_only_proof: dict[str, Any] | None = None
+    if args.resume_wave_receipt:
+        runtime_message: list[dict[str, Any] | None] = [None]
+        if rank == 0:
+            try:
+                runtime_message[0] = {
+                    "ok": True,
+                    "receipt": (
+                        prerequisite_continuation_runtime
+                        .verify_runtime_wave_stage(
+                            wave_path=Path(args.resume_wave_receipt),
+                            expected_wave_sha256=(
+                                args.expected_resume_wave_sha256
+                            ),
+                            stage=args.formal_stage,
+                            target_epoch=args.epochs,
+                            current_new_run=expected_checkpoint_dir,
+                            resume_path=Path(args.resume_state),
+                            current_source={
+                                "commit": source_receipt["commit"],
+                                "tree": source_receipt["tree"],
+                                "source_receipt_sha256": (
+                                    source_receipt_sha
+                                ),
+                            },
+                            current_host=socket.gethostname(),
+                            current_smplx_asset=(
+                                initial_smplx_asset_receipt
+                            ),
+                            current_config_sha256=config_sha,
+                            current_config_semantic_sha256=(
+                                prerequisite_continuation_runtime
+                                .config_semantic_sha256(
+                                    _config_snapshot(args)
+                                )
+                            ),
+                            current_dataset_semantic_sha256=(
+                                prerequisite_continuation_runtime
+                                .dataset_semantic_sha256(
+                                    initial_dataset_receipt
+                                )
+                            ),
+                            world_size=world_size,
+                        )
+                    ),
+                }
+            except Exception as runtime_error:
+                runtime_message[0] = {
+                    "ok": False,
+                    "error_type": type(runtime_error).__name__,
+                    "error": str(runtime_error),
+                }
+        dist.broadcast_object_list(runtime_message, src=0)
+        runtime_result = runtime_message[0]
+        if (
+            not isinstance(runtime_result, dict)
+            or runtime_result.get("ok") is not True
+            or not isinstance(runtime_result.get("receipt"), dict)
+        ):
+            raise RuntimeError(
+                "continuation runtime preflight failed: "
+                f"{runtime_result!r}"
+            )
+        continuation_runtime = copy.deepcopy(
+            runtime_result["receipt"]
+        )
     logger_tools.set_args_and_logger(args, rank)
     other_tools.set_random_seed(args)
     if world_size > 1:
@@ -6149,6 +6500,15 @@ def main() -> None:
         rvq_ema_prior_receipt
     )
     trainer.latest_representation_candidate = None
+    if Path(trainer.checkpoint_path) != expected_checkpoint_dir:
+        raise RuntimeError(
+            "trainer checkpoint path differs from continuation preflight"
+        )
+    trainer.continuation_wave_receipt = (
+        copy.deepcopy(continuation_runtime["wave"])
+        if continuation_runtime is not None
+        else None
+    )
     _validate_smplx_training_pool_trainer_runtime(
         args,
         trainer,
@@ -6254,13 +6614,10 @@ def main() -> None:
     resume_path = checkpoint_dir / "latest_resume.pt"
     final_path = checkpoint_dir / args.final_ckpt_name
     candidate_manifest_path = checkpoint_dir / "base_candidate_manifest.json"
-    lineage_sha = None
-    if args.lineage_manifest:
-        lineage_path = Path(args.lineage_manifest)
-        if not lineage_path.is_file():
-            raise FileNotFoundError(lineage_path)
-        lineage_sha = _sha256(lineage_path)
-    config_sha = _config_fingerprint(args)
+    if checkpoint_dir != expected_checkpoint_dir:
+        raise RuntimeError(
+            "trainer checkpoint path changed after continuation preflight"
+        )
 
     start_epoch = 0
     started_at = time.time()
@@ -6292,6 +6649,7 @@ def main() -> None:
                 source_receipt=source_receipt,
                 source_receipt_sha256=source_receipt_sha,
                 candidate_manifest_path=candidate_manifest_path,
+                continuation_runtime=continuation_runtime,
         )
     else:
         active_candidate_transaction = _inspect_base_candidate_transaction(
@@ -6380,6 +6738,7 @@ def main() -> None:
             status_path,
             {
                 "status": "running",
+                "hostname": socket.gethostname(),
                 "run_name": args.run_name,
                 "model": args.g_name,
                 "trainer": args.trainer,
@@ -6401,6 +6760,7 @@ def main() -> None:
                 "latest_representation_candidate": (
                     trainer.latest_representation_candidate
                 ),
+                **_continuation_wave_overlay(trainer),
                 "lineage_manifest_sha256": lineage_sha,
                 "dataset_receipt": dataset_receipt,
                 "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),
@@ -6727,6 +7087,7 @@ def main() -> None:
                         status_path,
                         {
                             "status": "running",
+                            "hostname": socket.gethostname(),
                             "run_name": args.run_name,
                             "model": args.g_name,
                             "trainer": args.trainer,
@@ -6755,6 +7116,7 @@ def main() -> None:
                             "latest_representation_candidate": (
                                 trainer.latest_representation_candidate
                             ),
+                            **_continuation_wave_overlay(trainer),
                             "optimizer_updates": trainer.formal_optimizer_updates,
                             "lineage_manifest_sha256": lineage_sha,
                             "dataset_receipt": dataset_receipt,
@@ -6803,6 +7165,13 @@ def main() -> None:
             if bad:
                 raise FloatingPointError(
                     "non-finite final model state: " + ", ".join(bad[:20])
+                )
+            if continuation_runtime is not None:
+                continuation_old_read_only_proof = (
+                    prerequisite_continuation_runtime
+                    .verify_old_segment_unchanged(
+                        continuation_runtime
+                    )
                 )
             final_source_receipt = _source_receipt()
             if final_source_receipt != source_receipt:
@@ -6884,6 +7253,7 @@ def main() -> None:
                 status_path,
                 {
                     "status": "complete",
+                    "hostname": socket.gethostname(),
                     "run_name": args.run_name,
                     "model": args.g_name,
                     "trainer": args.trainer,
@@ -6905,6 +7275,16 @@ def main() -> None:
                     "rvq_ema_prior_receipt": rvq_ema_prior_receipt,
                     "latest_representation_candidate": (
                         trainer.latest_representation_candidate
+                    ),
+                    **_continuation_wave_overlay(trainer),
+                    **(
+                        {
+                            "continuation_old_segment_read_only": (
+                                continuation_old_read_only_proof
+                            )
+                        }
+                        if continuation_old_read_only_proof is not None
+                        else {}
                     ),
                     "optimizer_updates": trainer.formal_optimizer_updates,
                     "lineage_manifest_sha256": lineage_sha,
@@ -6950,6 +7330,7 @@ def main() -> None:
                 status_path,
                 {
                     "status": "failed",
+                    "hostname": socket.gethostname(),
                     "run_name": args.run_name,
                     "model": args.g_name,
                     "trainer": args.trainer,
@@ -6972,6 +7353,7 @@ def main() -> None:
                     "latest_representation_candidate": (
                         trainer.latest_representation_candidate
                     ),
+                    **_continuation_wave_overlay(trainer),
                     "lineage_manifest_sha256": lineage_sha,
                     "dataset_receipt": dataset_receipt,
                     "smplx_asset_receipt": dataset_receipt.get("smplx_asset"),

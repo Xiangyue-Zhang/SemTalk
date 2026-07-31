@@ -55,6 +55,26 @@ def parse_args():
     parser.add("--resume", type=str, default="")
     parser.add("--resume_state", type=str, default="")
     parser.add(
+        "--resume-wave-receipt",
+        "--resume_wave_receipt",
+        dest="resume_wave_receipt",
+        type=str,
+        default="",
+    )
+    parser.add(
+        "--expected-resume-wave-sha256",
+        "--expected_resume_wave_sha256",
+        dest="expected_resume_wave_sha256",
+        type=str,
+        default="",
+    )
+    parser.add(
+        "--print-formal-config-receipt",
+        "--print_formal_config_receipt",
+        dest="print_formal_config_receipt",
+        action="store_true",
+    )
+    parser.add(
         "--initial-model-checkpoint",
         "--initial_model_checkpoint",
         dest="initial_model_checkpoint",

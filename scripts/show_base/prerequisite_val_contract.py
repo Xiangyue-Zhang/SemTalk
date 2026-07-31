@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
+OFFICIAL_BASELINE_COMMIT = "806b008c97bf51fce203e54109e4c22325253618"
 EXPECTED_VAL_CLIPS = 1_715
 EXPECTED_SHOW_SPLIT_COUNTS = {"train": 13_687, "val": 1_715, "test": 1_708}
 EXPECTED_VAL_GLOBAL_INDEX_START = EXPECTED_SHOW_SPLIT_COUNTS["train"]
@@ -158,6 +159,7 @@ REPRESENTATION_CANDIDATE_AUDIT_KEYS = (
     "rvq_rank_state_receipt",
     "selection_status",
 )
+CONTINUATION_WAVE_BINDING_KEY = "continuation_wave_receipt"
 
 SELECTION_METRICS = {
     "face": "face_geometry_expression_objective_v1",
@@ -513,6 +515,20 @@ def freeze_training_audit_source(
         ).splitlines()
         if line
     ]
+    baseline_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_root),
+            "merge-base",
+            "--is-ancestor",
+            OFFICIAL_BASELINE_COMMIT,
+            commit,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     if (
         origin != training_audit["origin"]
         or commit != training_audit["commit"]
@@ -520,6 +536,7 @@ def freeze_training_audit_source(
         or dirty
         or symbolic
         or local_heads
+        or baseline_result.returncode != 0
     ):
         raise ContractError(
             f"{label} checkout is not exact, clean, detached, branch-free"
@@ -539,6 +556,8 @@ def freeze_training_audit_source(
             "clean": True,
             "detached": True,
             "local_branch_count": 0,
+            "official_baseline_commit": OFFICIAL_BASELINE_COMMIT,
+            "official_baseline_is_ancestor": True,
         }
     )
 
@@ -560,6 +579,8 @@ def validate_frozen_training_source(
             "clean",
             "detached",
             "local_branch_count",
+            "official_baseline_commit",
+            "official_baseline_is_ancestor",
             "receipt_payload_sha256",
         ),
         label,
@@ -583,6 +604,8 @@ def validate_frozen_training_source(
         or value["clean"] is not True
         or value["detached"] is not True
         or value["local_branch_count"] != 0
+        or value["official_baseline_commit"] != OFFICIAL_BASELINE_COMMIT
+        or value["official_baseline_is_ancestor"] is not True
     ):
         raise ContractError(f"{label} freeze binding mismatch")
     root = Path(value["source_root"])
@@ -877,7 +900,37 @@ def validate_representation_candidate_audit(
     label: str,
     reprove_paths: bool,
 ) -> dict[str, Any]:
-    value = exact_keys(value, REPRESENTATION_CANDIDATE_AUDIT_KEYS, label)
+    if not isinstance(value, dict):
+        raise ContractError(f"{label} must be an object")
+    expected_keys = set(REPRESENTATION_CANDIDATE_AUDIT_KEYS)
+    if frozenset(value) not in {
+        frozenset(expected_keys),
+        frozenset(expected_keys | {CONTINUATION_WAVE_BINDING_KEY}),
+    }:
+        raise ContractError(f"{label} schema mismatch")
+    continuation_wave = value.get(CONTINUATION_WAVE_BINDING_KEY)
+    if continuation_wave is not None:
+        continuation_wave = exact_keys(
+            continuation_wave,
+            ("path", "sha256", "receipt_payload_sha256"),
+            f"{label}.continuation_wave_receipt",
+        )
+        wave_path = continuation_wave["path"]
+        if (
+            not isinstance(wave_path, str)
+            or not Path(wave_path).is_absolute()
+        ):
+            raise ContractError(
+                f"{label} continuation wave path must be absolute"
+            )
+        require_sha256(
+            continuation_wave["sha256"],
+            f"{label} continuation wave SHA-256",
+        )
+        require_sha256(
+            continuation_wave["receipt_payload_sha256"],
+            f"{label} continuation wave payload SHA-256",
+        )
     updates = epoch * EXPECTED_UPDATES_PER_EPOCH
     if (
         stage not in STAGES

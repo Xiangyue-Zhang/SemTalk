@@ -38,6 +38,45 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
         # real candidate-index bindings before invoking merge/select.
         candidate_index = cls.fixture["candidate_index"]
         for stage in producer_contract.STAGES:
+            summary_path = cls.root / f"{stage}_representation_summary.json"
+            summary_sha = selector_fixture.write_json(
+                summary_path,
+                {
+                    "status": "complete",
+                    "protocol": {
+                        "split": "train",
+                        "speaker_map": dict(
+                            consumer.EXPECTED_SPEAKER_MAP
+                        ),
+                    },
+                    "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                    "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                    "speaker_clip_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_CLIPS
+                    ),
+                    "speaker_window_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_WINDOWS
+                    ),
+                },
+            )
+            frozen_source = candidate_index["source_receipts"][stage]
+            dataset_receipt = {
+                "summary": str(summary_path),
+                "summary_sha256": summary_sha,
+                "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                "split_label": "SHOW available frozen subset",
+                "source_binding": {
+                    key: frozen_source["portable_identity"][key]
+                    for key in ("origin", "commit", "tree")
+                },
+            }
+            candidate_index["dataset_receipt_sha256"][stage] = (
+                producer_contract.canonical_payload_sha256(
+                    dataset_receipt
+                )
+            )
+            final_row = candidate_index["stages"][stage][-1]
             status_path = Path(
                 candidate_index["formal_training_status"][stage]["path"]
             )
@@ -54,6 +93,28 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                         200 * producer_contract.EXPECTED_UPDATES_PER_EPOCH
                     ),
                     "all_training_state_finite": True,
+                    "config_sha256": candidate_index["config_sha256"][
+                        stage
+                    ],
+                    "source_receipt": frozen_source["training_audit"],
+                    "source_receipt_sha256": (
+                        producer_contract.canonical_payload_sha256(
+                            frozen_source["training_audit"]
+                        )
+                    ),
+                    "dataset_receipt": dataset_receipt,
+                    "latest_representation_candidate": {
+                        "path": final_row["checkpoint"],
+                        "sha256": final_row["checkpoint_sha256"],
+                        "completed_epochs": 200,
+                        "optimizer_updates": (
+                            200
+                            * producer_contract.EXPECTED_UPDATES_PER_EPOCH
+                        ),
+                        "selection_status": (
+                            "offline_validation_pending"
+                        ),
+                    },
                 },
             )
             candidate_index["formal_training_status"][stage]["sha256"] = (
@@ -134,6 +195,61 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
         self.assertTrue(result["global_verified_not_consumed"])
         self.assertFalse(result["test_visible"])
         consumer.revalidate_selected_prerequisites(result)
+
+    def test_show_all_training_dataset_rejects_missing_speaker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            summary_path = root / "summary.json"
+            speaker_map = dict(consumer.EXPECTED_SPEAKER_MAP)
+            speaker_map.pop("conan")
+            summary_sha = selector_fixture.write_json(
+                summary_path,
+                {
+                    "status": "complete",
+                    "protocol": {
+                        "split": "train",
+                        "speaker_map": speaker_map,
+                    },
+                    "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                    "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                    "speaker_clip_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_CLIPS
+                    ),
+                    "speaker_window_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_WINDOWS
+                    ),
+                },
+            )
+            source = self.fixture["candidate_index"][
+                "source_receipts"
+            ]["face"]
+            dataset = {
+                "summary": str(summary_path),
+                "summary_sha256": summary_sha,
+                "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                "split_label": "SHOW available frozen subset",
+                "source_binding": {
+                    key: source["portable_identity"][key]
+                    for key in ("origin", "commit", "tree")
+                },
+            }
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "speakers 0/1/2/3",
+            ):
+                consumer._validate_show_all_training_dataset(
+                    dataset,
+                    source=source,
+                    expected_sha256=(
+                        producer_contract.canonical_payload_sha256(
+                            dataset
+                        )
+                    ),
+                    label="attacked",
+                )
 
     def test_missing_global_fails_closed(self) -> None:
         def mutate(value: dict[str, object]) -> None:

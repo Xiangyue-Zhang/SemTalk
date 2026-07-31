@@ -43,6 +43,27 @@ EXPECTED_UPDATES_PER_EPOCH = 497
 EXPECTED_VAL_CLIPS = 1_715
 EXPECTED_SHARDS = 8
 EXPECTED_SPEAKER_SCOPE = "all_speakers_0_1_2_3"
+EXPECTED_TRAINING_SPEAKERS = [0, 1, 2, 3]
+EXPECTED_SPEAKER_MAP = {
+    "oliver": 0,
+    "chemistry": 1,
+    "seth": 2,
+    "conan": 3,
+}
+EXPECTED_TRAIN_SPEAKER_CLIPS = {
+    "oliver": 5_246,
+    "chemistry": 1_949,
+    "seth": 1_984,
+    "conan": 4_508,
+}
+EXPECTED_TRAIN_SPEAKER_WINDOWS = {
+    "oliver": 50_285,
+    "chemistry": 14_374,
+    "seth": 19_310,
+    "conan": 43_317,
+}
+EXPECTED_TRAIN_CLIPS = 13_687
+EXPECTED_TRAIN_WINDOWS = 127_286
 WINDOW_LENGTH = 64
 WINDOW_STRIDE = 20
 EXPECTED_METRICS = {
@@ -451,6 +472,73 @@ def _validate_frozen_training_source(
     return source
 
 
+def _validate_show_all_training_dataset(
+    value: Any,
+    *,
+    source: Mapping[str, Any],
+    expected_sha256: str,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise SelectedPrerequisiteError(
+            f"{label} dataset receipt is unavailable"
+        )
+    if (
+        canonical_json_sha256(value)
+        != require_sha256(
+            expected_sha256,
+            f"{label} dataset receipt SHA-256",
+        )
+        or value.get("train_clips") != EXPECTED_TRAIN_CLIPS
+        or value.get("entries") != EXPECTED_TRAIN_WINDOWS
+        or value.get("split_label") != "SHOW available frozen subset"
+        or value.get("source_binding")
+        != {
+            key: source["portable_identity"][key]
+            for key in ("origin", "commit", "tree")
+        }
+    ):
+        raise SelectedPrerequisiteError(
+            f"{label} dataset receipt is not frozen SHOW All-speakers"
+        )
+    summary_path = regular_file(
+        value.get("summary"),
+        f"{label} representation summary",
+        val_only=False,
+    )
+    if (
+        sha256_file(summary_path)
+        != require_sha256(
+            value.get("summary_sha256"),
+            f"{label} representation summary SHA-256",
+        )
+    ):
+        raise SelectedPrerequisiteError(
+            f"{label} representation summary changed"
+        )
+    summary = strict_json_bytes(
+        summary_path.read_bytes(),
+        str(summary_path),
+    )
+    protocol = summary.get("protocol")
+    if (
+        summary.get("status") != "complete"
+        or summary.get("train_clips") != EXPECTED_TRAIN_CLIPS
+        or summary.get("entries") != EXPECTED_TRAIN_WINDOWS
+        or summary.get("speaker_clip_counts")
+        != EXPECTED_TRAIN_SPEAKER_CLIPS
+        or summary.get("speaker_window_counts")
+        != EXPECTED_TRAIN_SPEAKER_WINDOWS
+        or not isinstance(protocol, dict)
+        or protocol.get("split") != "train"
+        or protocol.get("speaker_map") != EXPECTED_SPEAKER_MAP
+    ):
+        raise SelectedPrerequisiteError(
+            f"{label} representation summary is not SHOW speakers 0/1/2/3"
+        )
+    return dict(value)
+
+
 def _validate_producer_source(value: Any, label: str) -> dict[str, Any]:
     source = exact_keys(value, PRODUCER_SOURCE_KEYS, label)
     _validate_training_source(source, label)
@@ -686,7 +774,7 @@ def _validate_candidate_index(
                 f"candidate index {mapping_name} stage coverage mismatch"
             )
     for stage in STAGES:
-        _validate_frozen_training_source(
+        frozen_source = _validate_frozen_training_source(
             index["source_receipts"][stage],
             f"candidate index {stage} training source",
         )
@@ -704,6 +792,25 @@ def _validate_candidate_index(
             label=f"{stage} formal training status",
         )
         assert status is not None
+        stage_rows = index["stages"][stage]
+        if not isinstance(stage_rows, list) or not stage_rows:
+            raise SelectedPrerequisiteError(
+                f"{stage} candidate index has no final row"
+            )
+        final_row = stage_rows[-1]
+        if not isinstance(final_row, dict):
+            raise SelectedPrerequisiteError(
+                f"{stage} candidate index final row is invalid"
+            )
+        expected_latest = {
+            "path": final_row["checkpoint"],
+            "sha256": final_row["checkpoint_sha256"],
+            "completed_epochs": final_epoch,
+            "optimizer_updates": (
+                final_epoch * EXPECTED_UPDATES_PER_EPOCH
+            ),
+            "selection_status": "offline_validation_pending",
+        }
         if (
             status.get("status") != "complete"
             or status.get("formal_stage") != stage
@@ -712,10 +819,26 @@ def _validate_candidate_index(
             or status.get("optimizer_updates")
             != final_epoch * EXPECTED_UPDATES_PER_EPOCH
             or status.get("all_training_state_finite", True) is not True
+            or status.get("config_sha256")
+            != index["config_sha256"][stage]
+            or status.get("source_receipt")
+            != frozen_source["training_audit"]
+            or status.get("source_receipt_sha256")
+            != raw_contract.canonical_payload_sha256(
+                frozen_source["training_audit"]
+            )
+            or status.get("latest_representation_candidate")
+            != expected_latest
         ):
             raise SelectedPrerequisiteError(
                 f"{stage} formal training status is incomplete"
             )
+        _validate_show_all_training_dataset(
+            status.get("dataset_receipt"),
+            source=frozen_source,
+            expected_sha256=index["dataset_receipt_sha256"][stage],
+            label=f"{stage} formal training",
+        )
 
     normalized: dict[str, dict[int, dict[str, Any]]] = {}
     observed_paths: set[Path] = set()

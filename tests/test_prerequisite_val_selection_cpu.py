@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 from scripts.show_base import merge_prerequisite_val_shards as merger
@@ -103,6 +104,10 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "clean": True,
                 "detached": True,
                 "local_branch_count": 0,
+                "official_baseline_commit": (
+                    contract.OFFICIAL_BASELINE_COMMIT
+                ),
+                "official_baseline_is_ancestor": True,
             }
         )
 
@@ -1553,29 +1558,69 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     entrypoint.read_bytes()
                 ).hexdigest(),
             }
-            frozen = contract.freeze_training_audit_source(raw, "fixture")
-            self.assertTrue(frozen["clean"])
-            self.assertTrue(frozen["detached"])
-            self.assertEqual(frozen["local_branch_count"], 0)
-            self.assertEqual(set(frozen["training_audit"]), set(raw))
-            self.assertEqual(
-                set(frozen["portable_identity"]),
-                {
-                    "origin",
-                    "commit",
-                    "tree",
-                    "script_relative",
-                    "script_sha256",
-                },
+            with mock.patch.object(
+                contract,
+                "OFFICIAL_BASELINE_COMMIT",
+                commit,
+            ):
+                frozen = contract.freeze_training_audit_source(
+                    raw,
+                    "fixture",
+                )
+                self.assertTrue(frozen["clean"])
+                self.assertTrue(frozen["detached"])
+                self.assertEqual(frozen["local_branch_count"], 0)
+                self.assertEqual(
+                    frozen["official_baseline_commit"],
+                    commit,
+                )
+                self.assertTrue(
+                    frozen["official_baseline_is_ancestor"]
+                )
+                self.assertEqual(set(frozen["training_audit"]), set(raw))
+                self.assertEqual(
+                    set(frozen["portable_identity"]),
+                    {
+                        "origin",
+                        "commit",
+                        "tree",
+                        "script_relative",
+                        "script_sha256",
+                    },
+                )
+                contract.validate_frozen_training_source(
+                    frozen,
+                    "fixture",
+                    reprove_checkout=True,
+                )
+                entrypoint.write_text("# dirty\n", encoding="utf-8")
+                with self.assertRaises(contract.ContractError):
+                    contract.freeze_training_audit_source(
+                        raw,
+                        "fixture",
+                    )
+
+    def test_frozen_training_source_rejects_wrong_official_baseline(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            frozen = self.training_source_receipt(
+                root,
+                "show_base_train.py",
             )
-            contract.validate_frozen_training_source(
-                frozen,
-                "fixture",
-                reprove_checkout=True,
-            )
-            entrypoint.write_text("# dirty\n", encoding="utf-8")
-            with self.assertRaises(contract.ContractError):
-                contract.freeze_training_audit_source(raw, "fixture")
+            frozen["official_baseline_commit"] = "9" * 40
+            frozen.pop("receipt_payload_sha256")
+            frozen = contract.receipt_payload(frozen)
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "freeze binding mismatch",
+            ):
+                contract.validate_frozen_training_source(
+                    frozen,
+                    "attacked",
+                    reprove_checkout=False,
+                )
 
     def test_launcher_has_disjoint_two_host_partition_contract(self) -> None:
         launcher = (
