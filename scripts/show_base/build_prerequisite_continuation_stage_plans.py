@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build deterministic five-stage plans for one prerequisite +20 wave.
+"""Build deterministic active-stage plans for one prerequisite +20 wave.
 
 The operator first asks ``show_base_train.py`` to print the formal config
 receipt for both the immutable old run (first wave only) and each proposed new
@@ -212,7 +212,8 @@ def _first_wave_old(
     frozen = index["source_receipts"][stage]
     old_source = _source_from_frozen(frozen, stage)
     if (
-        old_config["config_sha256"] != index["config_sha256"][stage]
+        old_config["config_snapshot"].get("epochs") != boundary
+        or old_config["config_sha256"] != index["config_sha256"][stage]
         or old_config["source_receipt"] != frozen.get("training_audit")
         or {
             "commit": old_config["source_receipt"].get("commit"),
@@ -274,8 +275,18 @@ def _later_wave_old(
     predecessor: Mapping[str, Any],
     predecessor_binding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    matches = [entry for entry in predecessor["stages"] if entry["stage"] == stage]
-    if len(matches) != 1 or predecessor["target_epoch"] != boundary:
+    matches = [
+        entry
+        for entry in predecessor["stages"]
+        if entry["stage"] == stage
+    ]
+    previous_target = (
+        matches[0].get("target_epoch")
+        if len(matches) == 1
+        and predecessor.get("format") == wave.PER_STAGE_FORMAT
+        else predecessor.get("target_epoch")
+    )
+    if len(matches) != 1 or previous_target != boundary:
         raise StagePlanBuildError(f"{stage} predecessor boundary mismatch")
     previous = matches[0]
     old = previous["old_segment"]
@@ -311,13 +322,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     old_config_shas = _parse_stage_shas(
         args.expected_old_config_receipt_sha256 or [], "old config receipt SHA-256"
     )
-    required = set(wave.STAGES)
-    if set(new_runs) != required or set(new_configs) != required or set(new_config_shas) != required:
-        raise StagePlanBuildError("new run/config inputs must cover exactly five stages")
     decision, _bridge, index = _decision_index(
         args.decision_json, args.expected_decision_sha256
     )
-    boundary, _triggers, _stages = wave._validate_decision(decision)
+    active, _decision_payload_sha = wave._validate_per_stage_decision(
+        decision
+    )
+    required = set(active)
+    if (
+        set(new_runs) != required
+        or set(new_configs) != required
+        or set(new_config_shas) != required
+    ):
+        raise StagePlanBuildError(
+            "new run/config inputs must cover exactly active stages"
+        )
 
     predecessor = None
     predecessor_binding = None
@@ -335,13 +354,26 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         if old_configs or old_config_shas:
             raise StagePlanBuildError("later waves derive old config from predecessor")
     elif set(old_configs) != required or set(old_config_shas) != required:
-        raise StagePlanBuildError("first wave requires five old config receipts")
+        raise StagePlanBuildError(
+            "first wave requires old config receipts for exactly active stages"
+        )
 
     plans: dict[str, Any] = {}
     for stage in wave.STAGES:
+        if stage not in active:
+            continue
+        boundary = active[stage]["boundary_epoch"]
         new_config = _load_config(
-            new_configs[stage], new_config_shas[stage], stage=stage, label=f"{stage} new config"
+            new_configs[stage],
+            new_config_shas[stage],
+            stage=stage,
+            label=f"{stage} new config",
         )
+        target = active[stage]["target_epoch"]
+        if new_config["config_snapshot"].get("epochs") != target:
+            raise StagePlanBuildError(
+                f"{stage} new config epochs differ from authorized target"
+            )
         old = (
             _later_wave_old(
                 stage=stage,

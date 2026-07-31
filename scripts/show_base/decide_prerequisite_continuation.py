@@ -21,10 +21,18 @@ from scripts.show_base import prerequisite_val_contract as contract
 from scripts.show_base import selected_prerequisites as selected_contract
 
 
-FORMAT = "semtalk_show_prerequisite_continuation_decision_v1"
+FORMAT = "semtalk_show_prerequisite_continuation_decision_v2"
 RECENT_CANDIDATES = 3
 MIN_RELATIVE_IMPROVEMENT = 0.005
 SCORE_DIRECTION = "lower_is_better"
+INTERVAL_EPOCHS = 20
+STAGE_CAP_EPOCHS = {
+    "face": 600,
+    "hands": 500,
+    "upper": 500,
+    "lower": 600,
+    "global": 1700,
+}
 DECISION_KEYS = {
     "format",
     "status",
@@ -41,7 +49,10 @@ PROTOCOL_KEYS = {
     "recent_candidates",
     "relative_improvement_reference",
     "minimum_relative_improvement",
+    "interval_epochs",
+    "stage_cap_epochs",
     "continue_rule",
+    "terminal_rule",
 }
 INPUT_KEYS = {"selection", "measurement_index", "stage_measurements"}
 BINDING_KEYS = {"path", "sha256", "receipt_payload_sha256"}
@@ -56,6 +67,10 @@ STAGE_DECISION_KEYS = {
     "relative_improvement",
     "latest_is_winner",
     "meets_relative_improvement_threshold",
+    "cap_epoch",
+    "action",
+    "target_epoch",
+    "frozen_winner_epoch",
     "requests_continuation",
 }
 
@@ -120,16 +135,22 @@ def _exact_keys(
 
 def _decision_protocol() -> dict[str, Any]:
     return {
-        "name": "fresh_replayed_recent_val_improvement_v1",
+        "name": "fresh_replayed_independent_stage_val_improvement_v2",
         "score_direction": SCORE_DIRECTION,
         "recent_candidates": RECENT_CANDIDATES,
         "relative_improvement_reference": (
             "best_of_preceding_two_recent_candidates"
         ),
         "minimum_relative_improvement": MIN_RELATIVE_IMPROVEMENT,
+        "interval_epochs": INTERVAL_EPOCHS,
+        "stage_cap_epochs": dict(STAGE_CAP_EPOCHS),
         "continue_rule": (
-            "any_stage_latest_boundary_is_winner_and_relative_"
-            "improvement_gte_threshold"
+            "each_stage_latest_boundary_is_global_val_winner_and_relative_"
+            "improvement_gte_threshold_and_below_stage_cap"
+        ),
+        "terminal_rule": (
+            "otherwise_freeze_global_val_winner;at_cap_mark_capped;"
+            "terminal_stages_never_reenter"
         ),
     }
 
@@ -244,6 +265,14 @@ def _validate_decision_schema(value: Any) -> dict[str, Any]:
             stage["latest_epoch"],
             f"continuation decision {expected_stage} latest epoch",
         )
+        cap_epoch = _require_int(
+            stage["cap_epoch"],
+            f"continuation decision {expected_stage} cap epoch",
+        )
+        if cap_epoch != STAGE_CAP_EPOCHS[expected_stage]:
+            raise ContinuationDecisionError(
+                f"continuation decision {expected_stage} cap changed"
+            )
         _require_score(
             stage["previous_best_score"],
             f"continuation decision {expected_stage} previous best score",
@@ -264,6 +293,48 @@ def _validate_decision_schema(value: Any) -> dict[str, Any]:
             _require_bool(
                 stage[key],
                 f"continuation decision {expected_stage} {key}",
+            )
+        action = stage["action"]
+        if action not in {"continue", "freeze", "capped"}:
+            raise ContinuationDecisionError(
+                f"continuation decision {expected_stage} action changed"
+            )
+        target_epoch = stage["target_epoch"]
+        if target_epoch is not None:
+            target_epoch = _require_int(
+                target_epoch,
+                f"continuation decision {expected_stage} target epoch",
+            )
+        frozen_winner_epoch = _require_int(
+            stage["frozen_winner_epoch"],
+            (
+                f"continuation decision {expected_stage} frozen winner "
+                "epoch"
+            ),
+        )
+        latest_epoch = stage["latest_epoch"]
+        expected_request = action == "continue"
+        if (
+            stage["requests_continuation"] is not expected_request
+            or frozen_winner_epoch != stage["winner_epoch"]
+            or latest_epoch > cap_epoch
+            or (
+                action == "continue"
+                and (
+                    target_epoch != latest_epoch + INTERVAL_EPOCHS
+                    or target_epoch > cap_epoch
+                    or not stage["latest_is_winner"]
+                    or not stage[
+                        "meets_relative_improvement_threshold"
+                    ]
+                )
+            )
+            or (action != "continue" and target_epoch is not None)
+            or (action == "capped" and latest_epoch != cap_epoch)
+            or (action == "freeze" and latest_epoch >= cap_epoch)
+        ):
+            raise ContinuationDecisionError(
+                f"continuation decision {expected_stage} action mismatch"
             )
     _require_sha256(
         receipt["receipt_payload_sha256"],
@@ -430,7 +501,26 @@ def _stage_decision(
     meets_threshold = (
         relative_improvement >= MIN_RELATIVE_IMPROVEMENT
     )
-    requests_continuation = latest_is_winner and meets_threshold
+    cap_epoch = STAGE_CAP_EPOCHS[stage]
+    latest_epoch = latest["epoch"]
+    if latest_epoch > cap_epoch:
+        raise ContinuationDecisionError(
+            f"{stage} latest boundary exceeds the formal cap"
+        )
+    if latest_epoch == cap_epoch:
+        action = "capped"
+        target_epoch = None
+    elif latest_is_winner and meets_threshold:
+        action = "continue"
+        target_epoch = latest_epoch + INTERVAL_EPOCHS
+        if target_epoch > cap_epoch:
+            raise ContinuationDecisionError(
+                f"{stage} continuation target exceeds the formal cap"
+            )
+    else:
+        action = "freeze"
+        target_epoch = None
+    requests_continuation = action == "continue"
     return {
         "stage": stage,
         "recent_candidate_epochs": [
@@ -446,6 +536,10 @@ def _stage_decision(
         "relative_improvement": relative_improvement,
         "latest_is_winner": latest_is_winner,
         "meets_relative_improvement_threshold": meets_threshold,
+        "cap_epoch": cap_epoch,
+        "action": action,
+        "target_epoch": target_epoch,
+        "frozen_winner_epoch": winner_epoch,
         "requests_continuation": requests_continuation,
     }
 
@@ -506,8 +600,24 @@ def decide(
         raise ContinuationDecisionError(
             "measurement index protocol is missing"
         )
-    candidate_epochs = protocol.get("candidate_epochs")
-    if not isinstance(candidate_epochs, list):
+    common_candidate_epochs = protocol.get("candidate_epochs")
+    candidate_epochs_by_stage = protocol.get(
+        "candidate_epochs_by_stage"
+    )
+    if common_candidate_epochs is not None and not isinstance(
+        common_candidate_epochs, list
+    ):
+        raise ContinuationDecisionError(
+            "measurement candidate epoch inventory is invalid"
+        )
+    if candidate_epochs_by_stage is not None and (
+        not isinstance(candidate_epochs_by_stage, dict)
+        or set(candidate_epochs_by_stage) != set(selected_contract.STAGES)
+    ):
+        raise ContinuationDecisionError(
+            "measurement per-stage candidate inventory is invalid"
+        )
+    if common_candidate_epochs is None and candidate_epochs_by_stage is None:
         raise ContinuationDecisionError(
             "measurement candidate epoch inventory is missing"
         )
@@ -555,14 +665,23 @@ def decide(
             raise ContinuationDecisionError(
                 f"{stage} measurement binding differs from fresh replay"
             )
+        stage_protocol = stage_measurement.get("protocol")
+        if not isinstance(stage_protocol, dict):
+            raise ContinuationDecisionError(
+                f"{stage} measurement protocol is missing"
+            )
+        stage_candidate_epochs = stage_protocol.get("candidate_epochs")
+        indexed_candidate_epochs = (
+            candidate_epochs_by_stage[stage]
+            if candidate_epochs_by_stage is not None
+            else common_candidate_epochs
+        )
         if (
             stage_measurement.get("stage") != stage
             or stage_measurement.get("split") != "val"
             or stage_measurement.get("test_visible") is not False
-            or stage_measurement.get("protocol", {}).get(
-                "candidate_epochs"
-            )
-            != candidate_epochs
+            or not isinstance(stage_candidate_epochs, list)
+            or stage_candidate_epochs != indexed_candidate_epochs
         ):
             raise ContinuationDecisionError(
                 f"{stage} measurement protocol changed"
@@ -573,7 +692,7 @@ def decide(
                 stage=stage,
                 candidates_value=stage_measurement.get("candidates"),
                 selected_stage=selected_stages[stage],
-                expected_candidate_epochs=candidate_epochs,
+                expected_candidate_epochs=stage_candidate_epochs,
             )
         )
 
@@ -699,6 +818,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "status": result["status"],
                 "decision": result["decision"],
+                "stage_actions": {
+                    stage["stage"]: {
+                        "action": stage["action"],
+                        "winner_epoch": stage["winner_epoch"],
+                        "latest_epoch": stage["latest_epoch"],
+                        "target_epoch": stage["target_epoch"],
+                        "cap_epoch": stage["cap_epoch"],
+                    }
+                    for stage in result["stages"]
+                },
                 "receipt_payload_sha256": result[
                     "receipt_payload_sha256"
                 ],

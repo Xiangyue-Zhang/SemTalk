@@ -11,7 +11,11 @@ from scripts.show_base import build_prerequisite_continuation_stage_plans as bui
 from scripts.show_base import prerequisite_continuation_runtime as runtime
 from scripts.show_base import prerequisite_continuation_wave as wave
 from scripts.show_base import prerequisite_val_contract as contract
-from tests.test_prerequisite_continuation_wave_cpu import authorize, fixture
+from tests.test_prerequisite_continuation_wave_cpu import (
+    authorize,
+    fixture,
+    per_stage_fixture,
+)
 
 
 class ContinuationStagePlanBuilderTests(unittest.TestCase):
@@ -41,6 +45,35 @@ class ContinuationStagePlanBuilderTests(unittest.TestCase):
                 predecessor=previous,
                 predecessor_binding=binding,
             )
+
+    def test_recursive_old_plan_uses_stage_local_mixed_boundary(self) -> None:
+        previous = wave.authorize_per_stage_wave(
+            **per_stage_fixture({"face": 200, "global": 400})
+        )
+        binding = {
+            "path": "/formal/waves/mixed.json",
+            "sha256": "a" * 64,
+            "receipt_payload_sha256": previous[
+                "receipt_payload_sha256"
+            ],
+        }
+        face = builder._later_wave_old(
+            stage="face",
+            boundary=220,
+            predecessor=previous,
+            predecessor_binding=binding,
+        )
+        global_stage = builder._later_wave_old(
+            stage="global",
+            boundary=420,
+            predecessor=previous,
+            predecessor_binding=binding,
+        )
+        self.assertEqual(face["old_run_path"], "/formal/new/e220/face")
+        self.assertEqual(
+            global_stage["old_run_path"],
+            "/formal/new/e420/global",
+        )
 
     def test_printed_config_receipt_is_recomputed_not_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

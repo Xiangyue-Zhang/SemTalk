@@ -321,6 +321,187 @@ def resign(receipt: dict) -> dict:
     return receipt
 
 
+def per_stage_fixture(
+    active_boundaries: dict[str, int],
+    *,
+    capped: tuple[str, ...] = (),
+) -> dict:
+    decision_stages = []
+    selected = {}
+    catalogs = {}
+    plans = {}
+    for stage in wave.STAGES:
+        boundary = active_boundaries.get(stage, 200)
+        cap = wave.continuation_decision.STAGE_CAP_EPOCHS[stage]
+        if stage in capped:
+            boundary = cap
+            action = "capped"
+        elif stage in active_boundaries:
+            action = "continue"
+        else:
+            action = "freeze"
+        target = boundary + 20 if action == "continue" else None
+        winner_epoch = boundary if action == "continue" else 120
+        decision_stages.append(
+            {
+                "stage": stage,
+                "recent_candidate_epochs": [
+                    boundary - 40,
+                    boundary - 20,
+                    boundary,
+                ],
+                "recent_selection_scores": [1.0, 0.9, 0.8],
+                "winner_epoch": winner_epoch,
+                "latest_epoch": boundary,
+                "previous_best_score": 0.9,
+                "latest_score": 0.8,
+                "relative_improvement": (0.9 - 0.8) / 0.9,
+                "latest_is_winner": action == "continue",
+                "meets_relative_improvement_threshold": True,
+                "cap_epoch": cap,
+                "action": action,
+                "target_epoch": target,
+                "frozen_winner_epoch": winner_epoch,
+                "requests_continuation": action == "continue",
+            }
+        )
+        if action != "continue":
+            continue
+        source = fixture(triggers=(stage,), boundary=boundary)
+        selected[stage] = source["selected_by_stage"][stage]
+        catalogs[stage] = source["candidate_catalog_by_stage"][stage]
+        plans[stage] = source["stage_plans"][stage]
+    decision_receipt = {
+        "format": wave.continuation_decision.FORMAT,
+        "status": "complete",
+        "decision": "continue",
+        "test_visible": False,
+        "protocol": wave.continuation_decision._decision_protocol(),
+        "inputs": {
+            "selection": {
+                "path": "/formal/receipts/selection.json",
+                "sha256": SHA_A,
+                "receipt_payload_sha256": SHA_B,
+            },
+            "measurement_index": {
+                "path": "/formal/receipts/measurement-index.json",
+                "sha256": SHA_C,
+                "receipt_payload_sha256": SHA_D,
+            },
+            "stage_measurements": {
+                stage: {
+                    "path": f"/formal/receipts/{stage}-measurement.json",
+                    "sha256": SHA_A,
+                    "receipt_payload_sha256": SHA_B,
+                }
+                for stage in wave.STAGES
+            },
+        },
+        "stages": decision_stages,
+    }
+    decision_receipt["receipt_payload_sha256"] = (
+        wave.canonical_json_sha256(decision_receipt)
+    )
+    return {
+        "decision_receipt": decision_receipt,
+        "decision_binding": {
+            "path": "/formal/receipts/per-stage-decision.json",
+            "sha256": SHA_A,
+            "receipt_payload_sha256": decision_receipt[
+                "receipt_payload_sha256"
+            ],
+        },
+        "selected_by_stage": selected,
+        "candidate_catalog_by_stage": catalogs,
+        "stage_plans": plans,
+    }
+
+
+class PerStageContinuationWaveTests(unittest.TestCase):
+    def test_only_continue_actions_enter_wave(self) -> None:
+        data = per_stage_fixture({"face": 200})
+        receipt = wave.authorize_per_stage_wave(**data)
+        self.assertEqual(receipt["format"], wave.PER_STAGE_FORMAT)
+        self.assertEqual(receipt["trigger_stages"], ["face"])
+        self.assertEqual(
+            [entry["stage"] for entry in receipt["stages"]],
+            ["face"],
+        )
+        self.assertEqual(receipt["stages"][0]["boundary_epoch"], 200)
+        self.assertEqual(receipt["stages"][0]["target_epoch"], 220)
+        self.assertEqual(receipt["stages"][0]["cap_epoch"], 600)
+        self.assertEqual(
+            wave.validate_any_wave_schema(receipt),
+            receipt,
+        )
+
+    def test_mixed_stage_boundaries_are_independent(self) -> None:
+        data = per_stage_fixture({"face": 200, "global": 400})
+        receipt = wave.authorize_per_stage_wave(**data)
+        observed = {
+            entry["stage"]: (
+                entry["boundary_epoch"],
+                entry["target_epoch"],
+            )
+            for entry in receipt["stages"]
+        }
+        self.assertEqual(
+            observed,
+            {"face": (200, 220), "global": (400, 420)},
+        )
+
+    def test_capped_and_frozen_stage_cannot_reenter_plan(self) -> None:
+        data = per_stage_fixture({"hands": 200}, capped=("face",))
+        receipt = wave.authorize_per_stage_wave(**data)
+        self.assertEqual(receipt["trigger_stages"], ["hands"])
+        attacked = copy.deepcopy(data)
+        extra = fixture(boundary=600)
+        attacked["stage_plans"]["face"] = extra["stage_plans"]["face"]
+        attacked["selected_by_stage"]["face"] = extra[
+            "selected_by_stage"
+        ]["face"]
+        attacked["candidate_catalog_by_stage"]["face"] = extra[
+            "candidate_catalog_by_stage"
+        ]["face"]
+        with self.assertRaisesRegex(
+            wave.ContinuationWaveError,
+            "exactly cover active stages",
+        ):
+            wave.authorize_per_stage_wave(**attacked)
+
+    def test_test_visibility_cap_and_payload_attacks_fail_closed(self) -> None:
+        data = per_stage_fixture({"upper": 480})
+        receipt = wave.authorize_per_stage_wave(**data)
+        self.assertEqual(receipt["stages"][0]["target_epoch"], 500)
+
+        attacked = copy.deepcopy(receipt)
+        attacked["test_visible"] = True
+        resign(attacked)
+        with self.assertRaisesRegex(
+            wave.ContinuationWaveError,
+            "protocol mismatch",
+        ):
+            wave.validate_per_stage_wave_schema(attacked)
+
+        attacked = copy.deepcopy(receipt)
+        attacked["stages"][0]["target_epoch"] = 520
+        attacked["stages"][0]["new_segment"]["target_epoch"] = 520
+        resign(attacked)
+        with self.assertRaisesRegex(
+            wave.ContinuationWaveError,
+            "binding mismatch",
+        ):
+            wave.validate_per_stage_wave_schema(attacked)
+
+        attacked = copy.deepcopy(receipt)
+        attacked["receipt_payload_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            wave.ContinuationWaveError,
+            "payload SHA-256 mismatch",
+        ):
+            wave.validate_per_stage_wave_schema(attacked)
+
+
 class ContinuationWaveTests(unittest.TestCase):
     def test_one_trigger_authorizes_all_five(self) -> None:
         data = fixture(triggers=("face",))

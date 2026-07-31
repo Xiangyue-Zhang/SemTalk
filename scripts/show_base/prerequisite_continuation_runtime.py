@@ -21,7 +21,7 @@ from scripts.show_base import prerequisite_continuation_wave as wave
 from scripts.show_base import prerequisite_val_contract as val_contract
 
 
-FORMAT = "semtalk_show_prerequisite_continuation_runtime_v1"
+FORMAT = "semtalk_show_prerequisite_continuation_runtime_v2"
 OLD_SNAPSHOT_FORMAT = "semtalk_show_old_segment_snapshot_v1"
 OLD_BEFORE_AFTER_FORMAT = (
     "semtalk_show_old_segment_read_only_before_after_v1"
@@ -33,6 +33,7 @@ RUNTIME_KEYS = {
     "stage",
     "boundary_epoch",
     "target_epoch",
+    "cap_epoch",
     "wave",
     "old_run_path",
     "new_run_path",
@@ -596,7 +597,13 @@ def verify_runtime_wave_stage(
     entry = matches[0]
     old = entry["old_segment"]
     new = entry["new_segment"]
-    boundary = receipt["boundary_epoch"]
+    boundary = entry.get("boundary_epoch", receipt.get("boundary_epoch"))
+    boundary = _require_int(boundary, "boundary epoch")
+    cap = entry.get(
+        "cap_epoch",
+        wave.continuation_decision.STAGE_CAP_EPOCHS[stage],
+    )
+    cap = _require_int(cap, "cap epoch")
     target = _require_int(target_epoch, "target epoch")
     world = _require_int(world_size, "world size")
     new_run = _absolute_path(
@@ -617,8 +624,10 @@ def verify_runtime_wave_stage(
         host=host,
     )
     if (
-        target != receipt["target_epoch"]
+        target != entry.get("target_epoch", receipt.get("target_epoch"))
         or new["target_epoch"] != target
+        or target > cap
+        or cap != wave.continuation_decision.STAGE_CAP_EPOCHS[stage]
         or new["authorized_candidate_epochs"] != [target]
         or new_run != Path(new["run_path"])
         or resume != Path(old["boundary_resume"]["path"])
@@ -682,6 +691,7 @@ def verify_runtime_wave_stage(
         "stage": stage,
         "boundary_epoch": boundary,
         "target_epoch": target,
+        "cap_epoch": cap,
         "wave": {
             "path": str(wave_resolved),
             "sha256": expected_wave_sha,
@@ -734,11 +744,15 @@ def validate_runtime_receipt(value: Any) -> dict[str, Any]:
         )
     boundary = _require_int(value["boundary_epoch"], "boundary epoch")
     target = _require_int(value["target_epoch"], "target epoch")
+    cap = _require_int(value["cap_epoch"], "cap epoch")
     world = _require_int(value["world_size"], "world size")
     if (
         boundary < 200
         or boundary % wave.INTERVAL_EPOCHS
         or target != boundary + wave.INTERVAL_EPOCHS
+        or target > cap
+        or cap
+        != wave.continuation_decision.STAGE_CAP_EPOCHS[value["stage"]]
         or world != (4 if value["stage"] in wave.RVQ_STAGES else 1)
     ):
         raise ContinuationRuntimeError(

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Pure authorization contract for one synchronized prerequisite wave.
+"""Pure authorization contracts for SHOW prerequisite continuation waves.
 
-This module deliberately does not move checkpoints or launch training.  It
-turns one freshly replayed continuation decision into a single authorization
-covering all five SHOW prerequisite stages.  If any stage requests
-continuation, every stage is authorized for exactly one additional 20-epoch
-boundary.
+This module deliberately does not move checkpoints or launch training.  The
+legacy v1 pure schema helpers remain isolated for compatibility tests.  The v2
+producer authorizes exactly the independently active stages, each for one
+additional 20-epoch boundary, while frozen or capped stages are absent from
+plans and runtime authority.
 
 The independently selected validation winner and the latest resume boundary
 are separate bindings.  A winner may therefore be older than the boundary.
@@ -33,6 +33,7 @@ from scripts.show_base import selected_prerequisites as selected_contract
 
 
 FORMAT = val_contract.CONTINUATION_WAVE_FORMAT
+PER_STAGE_FORMAT = "semtalk_show_prerequisite_continuation_wave_v2"
 INTERVAL_EPOCHS = 20
 MINIMUM_BOUNDARY_EPOCH = 200
 EXPECTED_UPDATES_PER_EPOCH = 497
@@ -74,6 +75,25 @@ PROTOCOL = {
     "interval_epochs": INTERVAL_EPOCHS,
 }
 
+PER_STAGE_PROTOCOL = {
+    "authorization": (
+        "fresh_replayed_decision_authorizes_only_continue_action_stages"
+    ),
+    "wave_scope": "independent_stage_exact_plus_20",
+    "selection": (
+        "independent_global_validation_winner_may_precede_resume_boundary"
+    ),
+    "resume": "each_stage_latest_boundary_candidate_only",
+    "storage": (
+        "immutable_segments_new_segment_contains_target_candidate_only"
+    ),
+    "terminal_stages": "freeze_or_capped_never_reenter",
+    "interval_epochs": INTERVAL_EPOCHS,
+    "stage_cap_epochs": dict(
+        continuation_decision.STAGE_CAP_EPOCHS
+    ),
+}
+
 TOP_KEYS = {
     "format",
     "status",
@@ -94,6 +114,28 @@ DECISION_BINDING_KEYS = {
 STAGE_KEYS = {
     "stage",
     "triggered",
+    "selection_metric",
+    "training_topology",
+    "independent_selected_candidate",
+    "resume_boundary_candidate",
+    "old_segment",
+    "new_segment",
+}
+PER_STAGE_TOP_KEYS = {
+    "format",
+    "status",
+    "test_visible",
+    "protocol",
+    "decision",
+    "trigger_stages",
+    "stages",
+    "receipt_payload_sha256",
+}
+PER_STAGE_STAGE_KEYS = {
+    "stage",
+    "boundary_epoch",
+    "target_epoch",
+    "cap_epoch",
     "selection_metric",
     "training_topology",
     "independent_selected_candidate",
@@ -226,7 +268,7 @@ ADAPTER_STAGE_PLAN_KEYS = (
 
 
 class ContinuationWaveError(RuntimeError):
-    """Raised when a synchronized continuation wave is not exact."""
+    """Raised when a continuation wave is not exact."""
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -844,6 +886,126 @@ def _validate_decision(
     return boundary, tuple(triggers), claimed_payload_sha
 
 
+def _validate_per_stage_decision(
+    value: Any,
+) -> tuple[dict[str, dict[str, int]], str]:
+    """Return only independently authorized stages from a v2 decision."""
+
+    if not isinstance(value, dict):
+        raise ContinuationWaveError("continuation decision must be an object")
+    try:
+        continuation_decision._validate_decision_schema(value)
+    except continuation_decision.ContinuationDecisionError as error:
+        raise ContinuationWaveError(
+            f"continuation decision schema mismatch: {error}"
+        ) from error
+    claimed_payload_sha = _require_sha256(
+        value.get("receipt_payload_sha256"),
+        "continuation decision payload SHA-256",
+    )
+    unsigned = dict(value)
+    unsigned.pop("receipt_payload_sha256")
+    if canonical_json_sha256(unsigned) != claimed_payload_sha:
+        raise ContinuationWaveError(
+            "continuation decision payload SHA-256 mismatch"
+        )
+    if (
+        value.get("format") != continuation_decision.FORMAT
+        or value.get("status") != "complete"
+        or value.get("decision") != "continue"
+        or value.get("test_visible") is not False
+        or value.get("protocol")
+        != continuation_decision._decision_protocol()
+    ):
+        raise ContinuationWaveError(
+            "continuation decision does not authorize a per-stage wave"
+        )
+    stages = value.get("stages")
+    if not isinstance(stages, list) or len(stages) != len(STAGES):
+        raise ContinuationWaveError(
+            "continuation decision must cover ordered five stages"
+        )
+    active: dict[str, dict[str, int]] = {}
+    for expected_stage, stage_value in zip(STAGES, stages):
+        stage = _exact_keys(
+            stage_value,
+            continuation_decision.STAGE_DECISION_KEYS,
+            f"continuation decision {expected_stage} stage",
+        )
+        if stage["stage"] != expected_stage:
+            raise ContinuationWaveError(
+                "continuation decision stage order changed"
+            )
+        boundary = _require_int(
+            stage["latest_epoch"],
+            f"continuation decision {expected_stage} latest epoch",
+        )
+        cap = _require_int(
+            stage["cap_epoch"],
+            f"continuation decision {expected_stage} cap epoch",
+        )
+        action = stage["action"]
+        requested = _require_bool(
+            stage["requests_continuation"],
+            f"continuation decision {expected_stage} request",
+        )
+        expected_cap = continuation_decision.STAGE_CAP_EPOCHS[
+            expected_stage
+        ]
+        if (
+            boundary < MINIMUM_BOUNDARY_EPOCH
+            or boundary % INTERVAL_EPOCHS
+            or boundary > cap
+            or cap != expected_cap
+            or action not in {"continue", "freeze", "capped"}
+            or requested != (action == "continue")
+            or stage["frozen_winner_epoch"] != stage["winner_epoch"]
+            or (action == "capped" and boundary != cap)
+            or (action == "freeze" and boundary >= cap)
+        ):
+            raise ContinuationWaveError(
+                f"continuation decision {expected_stage} action mismatch"
+            )
+        target_value = stage["target_epoch"]
+        if action == "continue":
+            target = _require_int(
+                target_value,
+                f"continuation decision {expected_stage} target epoch",
+            )
+            if (
+                target != boundary + INTERVAL_EPOCHS
+                or target > cap
+                or stage["latest_is_winner"] is not True
+                or stage[
+                    "meets_relative_improvement_threshold"
+                ]
+                is not True
+            ):
+                raise ContinuationWaveError(
+                    f"continuation decision {expected_stage} target mismatch"
+                )
+            active[expected_stage] = {
+                "boundary_epoch": boundary,
+                "target_epoch": target,
+                "cap_epoch": cap,
+            }
+        elif target_value is not None:
+            raise ContinuationWaveError(
+                f"terminal stage {expected_stage} has a target"
+            )
+    if not active:
+        raise ContinuationWaveError(
+            "continue decision has no active stage"
+        )
+    if value["decision"] != (
+        "continue" if active else "stop"
+    ):
+        raise ContinuationWaveError(
+            "continuation decision disagrees with stage actions"
+        )
+    return active, claimed_payload_sha
+
+
 def _require_disjoint_run_paths(
     old_runs: set[str],
     new_runs: set[str],
@@ -1319,6 +1481,169 @@ def authorize_wave(
     return receipt
 
 
+def authorize_per_stage_wave(
+    *,
+    decision_receipt: Mapping[str, Any],
+    decision_binding: Mapping[str, Any],
+    selected_by_stage: Mapping[str, Any],
+    candidate_catalog_by_stage: Mapping[str, Any],
+    stage_plans: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authorize one +20 segment only for independently active stages."""
+
+    active, decision_payload_sha = _validate_per_stage_decision(
+        decision_receipt
+    )
+    binding = _validate_payload_binding(
+        decision_binding,
+        "continuation decision binding",
+    )
+    if binding["receipt_payload_sha256"] != decision_payload_sha:
+        raise ContinuationWaveError(
+            "continuation decision binding payload mismatch"
+        )
+    required = set(active)
+    if (
+        not isinstance(selected_by_stage, Mapping)
+        or set(selected_by_stage) != required
+        or not isinstance(candidate_catalog_by_stage, Mapping)
+        or set(candidate_catalog_by_stage) != required
+        or not isinstance(stage_plans, Mapping)
+        or set(stage_plans) != required
+    ):
+        raise ContinuationWaveError(
+            "per-stage wave inputs must exactly cover active stages"
+        )
+
+    stage_entries: list[dict[str, Any]] = []
+    old_runs: set[str] = set()
+    new_runs: set[str] = set()
+    new_source_identities: set[tuple[str, str]] = set()
+    for stage in STAGES:
+        if stage not in active:
+            continue
+        spec = active[stage]
+        boundary = spec["boundary_epoch"]
+        target = spec["target_epoch"]
+        cap = spec["cap_epoch"]
+        plan = _normalize_plan(
+            stage_plans[stage],
+            stage=stage,
+            boundary=boundary,
+        )
+        if (
+            plan["boundary_state"]["boundary_epoch"] != boundary
+            or plan["boundary_state"]["world_size"]
+            != _topology(stage)["world_size"]
+        ):
+            raise ContinuationWaveError(
+                f"{stage} boundary state differs from decision/topology"
+            )
+        new_source_identities.add(
+            (
+                plan["new_source"]["commit"],
+                plan["new_source"]["tree"],
+            )
+        )
+        if plan["old_run_path"] in old_runs:
+            raise ContinuationWaveError("old stage runs must be unique")
+        if plan["new_run_path"] in new_runs:
+            raise ContinuationWaveError("new stage runs must be unique")
+        old_runs.add(plan["old_run_path"])
+        new_runs.add(plan["new_run_path"])
+
+        catalog = _normalize_catalog(
+            candidate_catalog_by_stage[stage],
+            stage=stage,
+        )
+        if catalog[-1]["epoch"] != boundary:
+            raise ContinuationWaveError(
+                f"{stage} catalog boundary differs from decision"
+            )
+        selected = _validate_candidate(
+            selected_by_stage[stage],
+            stage=stage,
+            label=f"{stage} independently selected candidate",
+        )
+        expected_selected = _candidate_at(
+            catalog,
+            selected["epoch"],
+            stage=stage,
+            label="selected",
+        )
+        if selected != expected_selected:
+            raise ContinuationWaveError(
+                f"{stage} selected candidate differs from catalog"
+            )
+        boundary_candidate = _candidate_at(
+            catalog,
+            boundary,
+            stage=stage,
+            label="resume boundary",
+        )
+        for candidate in catalog:
+            candidate_segment = _segment_for_epoch(
+                plan["candidate_segment_chain"],
+                candidate["epoch"],
+                stage=stage,
+            )
+            if not _is_within(
+                candidate["checkpoint"]["path"],
+                str(
+                    Path(candidate_segment["run_path"])
+                    / "representation_candidates"
+                ),
+            ):
+                raise ContinuationWaveError(
+                    f"{stage} checkpoint is outside its immutable segment"
+                )
+
+        old_segment = _old_segment(
+            plan=plan,
+            boundary=boundary,
+            catalog=catalog,
+        )
+        new_segment = _new_segment(
+            plan=plan,
+            target=target,
+            predecessor_segment_id=plan["candidate_segment_chain"][-1][
+                "segment_id"
+            ],
+        )
+        stage_entries.append(
+            {
+                "stage": stage,
+                "boundary_epoch": boundary,
+                "target_epoch": target,
+                "cap_epoch": cap,
+                "selection_metric": val_contract.SELECTION_METRICS[stage],
+                "training_topology": _topology(stage),
+                "independent_selected_candidate": selected,
+                "resume_boundary_candidate": boundary_candidate,
+                "old_segment": old_segment,
+                "new_segment": new_segment,
+            }
+        )
+    _require_disjoint_run_paths(old_runs, new_runs)
+    if len(new_source_identities) != 1:
+        raise ContinuationWaveError(
+            "active stages must use one new source commit/tree"
+        )
+
+    receipt: dict[str, Any] = {
+        "format": PER_STAGE_FORMAT,
+        "status": "authorized",
+        "test_visible": False,
+        "protocol": dict(PER_STAGE_PROTOCOL),
+        "decision": binding,
+        "trigger_stages": list(active),
+        "stages": stage_entries,
+    }
+    receipt["receipt_payload_sha256"] = canonical_json_sha256(receipt)
+    validate_per_stage_wave_schema(receipt)
+    return receipt
+
+
 def _catalog_candidate_from_index(
     value: Any,
     *,
@@ -1739,6 +2064,15 @@ def authorize_wave_from_replayed_inputs(
     formal_training_status = candidate_index.get(
         "formal_training_status"
     )
+    per_stage = replayed_decision.get("format") == continuation_decision.FORMAT
+    if per_stage:
+        active_specs, _ = _validate_per_stage_decision(replayed_decision)
+        stage_order = tuple(stage for stage in STAGES if stage in active_specs)
+        common_boundary: int | None = None
+    else:
+        common_boundary, _, _ = _validate_decision(replayed_decision)
+        active_specs = {}
+        stage_order = STAGES
     if (
         not isinstance(selected_value, dict)
         or set(selected_value) != set(STAGES)
@@ -1753,24 +2087,24 @@ def authorize_wave_from_replayed_inputs(
         or not isinstance(formal_training_status, dict)
         or set(formal_training_status) != set(STAGES)
         or not isinstance(stage_plans, Mapping)
-        or set(stage_plans) != set(STAGES)
+        or set(stage_plans) != set(stage_order)
     ):
         raise ContinuationWaveError(
-            "replayed wave inputs do not exactly cover five stages"
+            "replayed wave plans do not exactly cover authorized stages"
         )
 
     predecessor_values = [
         stage_plans[stage].get("predecessor_wave")
         if isinstance(stage_plans[stage], Mapping)
         else object()
-        for stage in STAGES
+        for stage in stage_order
     ]
     predecessor_wave: dict[str, Any] | None = None
     predecessor_receipt: dict[str, Any] | None = None
     if any(value is not None for value in predecessor_values):
         if any(value is None for value in predecessor_values):
             raise ContinuationWaveError(
-                "all five stages must bind the same predecessor wave"
+                "authorized stages must bind the same predecessor wave"
             )
         predecessor_wave = _validate_payload_binding(
             predecessor_values[0],
@@ -1785,7 +2119,7 @@ def authorize_wave_from_replayed_inputs(
             for value in predecessor_values[1:]
         ):
             raise ContinuationWaveError(
-                "all five stages must bind the same predecessor wave"
+                "authorized stages must bind the same predecessor wave"
             )
         try:
             predecessor_receipt = replay_wave_file(
@@ -1809,8 +2143,14 @@ def authorize_wave_from_replayed_inputs(
     selected_by_stage: dict[str, Any] = {}
     candidate_catalog_by_stage: dict[str, Any] = {}
     normalized_plans: dict[str, Any] = {}
-    boundary, _, _ = _validate_decision(replayed_decision)
-    for stage in STAGES:
+    for stage in stage_order:
+        boundary = (
+            active_specs[stage]["boundary_epoch"]
+            if per_stage
+            else common_boundary
+        )
+        if boundary is None:
+            raise ContinuationWaveError("continuation boundary is missing")
         entries = indexed_stages[stage]
         if not isinstance(entries, list):
             raise ContinuationWaveError(
@@ -1840,10 +2180,6 @@ def authorize_wave_from_replayed_inputs(
                     f"{stage} unexpected predecessor wave"
                 )
         else:
-            if predecessor_receipt["target_epoch"] != boundary:
-                raise ContinuationWaveError(
-                    "predecessor wave target differs from decision boundary"
-                )
             previous_matches = [
                 entry
                 for entry in predecessor_receipt["stages"]
@@ -1854,6 +2190,15 @@ def authorize_wave_from_replayed_inputs(
                     f"{stage} predecessor wave stage is not exact-once"
                 )
             previous_entry = previous_matches[0]
+            previous_target = (
+                previous_entry.get("target_epoch")
+                if predecessor_receipt.get("format") == PER_STAGE_FORMAT
+                else predecessor_receipt.get("target_epoch")
+            )
+            if previous_target != boundary:
+                raise ContinuationWaveError(
+                    f"{stage} predecessor target differs from decision boundary"
+                )
             previous_new = previous_entry["new_segment"]
             appended = _make_chain_segment(
                 run_path=previous_new["run_path"],
@@ -2011,7 +2356,8 @@ def authorize_wave_from_replayed_inputs(
             "receipt_payload_sha256"
         ],
     }
-    return authorize_wave(
+    authorizer = authorize_per_stage_wave if per_stage else authorize_wave
+    return authorizer(
         decision_receipt=replayed_decision,
         decision_binding=decision_binding,
         selected_by_stage=selected_by_stage,
@@ -2025,7 +2371,7 @@ def adapter_stage_plans_from_wave(
 ) -> dict[str, dict[str, Any]]:
     """Recover the exact semantic plan needed for a fresh adapter replay."""
 
-    validate_wave_schema(receipt)
+    validate_any_wave_schema(receipt)
     result: dict[str, dict[str, Any]] = {}
     for stage_entry in receipt["stages"]:
         stage = stage_entry["stage"]
@@ -2099,7 +2445,7 @@ def replay_wave_file(
     if resolved in wave_stack:
         raise ContinuationWaveError("continuation wave cycle detected")
     wave_stack = wave_stack | {resolved}
-    validate_wave_schema(receipt)
+    validate_any_wave_schema(receipt)
     expected = authorize_wave_from_replayed_inputs(
         decision_path=Path(receipt["decision"]["path"]),
         expected_decision_sha256=receipt["decision"]["sha256"],
@@ -2342,6 +2688,179 @@ def _validate_new_segment(
     }
 
 
+def validate_per_stage_wave_schema(value: Any) -> dict[str, Any]:
+    """Validate the v2 mixed-stage wave and its stage-local bounds."""
+
+    receipt = _exact_keys(
+        value,
+        PER_STAGE_TOP_KEYS,
+        "per-stage continuation wave",
+    )
+    if (
+        receipt["format"] != PER_STAGE_FORMAT
+        or receipt["status"] != "authorized"
+        or receipt["test_visible"] is not False
+        or receipt["protocol"] != PER_STAGE_PROTOCOL
+    ):
+        raise ContinuationWaveError(
+            "per-stage continuation wave protocol mismatch"
+        )
+    _validate_payload_binding(
+        receipt["decision"],
+        "per-stage continuation wave decision",
+    )
+    triggers = receipt["trigger_stages"]
+    if (
+        not isinstance(triggers, list)
+        or not triggers
+        or len(triggers) != len(set(triggers))
+        or triggers != [stage for stage in STAGES if stage in set(triggers)]
+    ):
+        raise ContinuationWaveError(
+            "per-stage continuation wave active inventory mismatch"
+        )
+    stage_values = receipt["stages"]
+    if (
+        not isinstance(stage_values, list)
+        or len(stage_values) != len(triggers)
+    ):
+        raise ContinuationWaveError(
+            "per-stage continuation wave stage inventory mismatch"
+        )
+
+    old_runs: set[str] = set()
+    new_runs: set[str] = set()
+    new_source_identities: set[tuple[str, str]] = set()
+    for expected_stage, stage_value in zip(triggers, stage_values):
+        stage = _exact_keys(
+            stage_value,
+            PER_STAGE_STAGE_KEYS,
+            f"{expected_stage} per-stage continuation wave stage",
+        )
+        boundary = _require_int(
+            stage["boundary_epoch"],
+            f"{expected_stage} boundary epoch",
+        )
+        target = _require_int(
+            stage["target_epoch"],
+            f"{expected_stage} target epoch",
+        )
+        cap = _require_int(
+            stage["cap_epoch"],
+            f"{expected_stage} cap epoch",
+        )
+        if (
+            stage["stage"] != expected_stage
+            or stage["selection_metric"]
+            != val_contract.SELECTION_METRICS[expected_stage]
+            or boundary < MINIMUM_BOUNDARY_EPOCH
+            or boundary % INTERVAL_EPOCHS
+            or target != boundary + INTERVAL_EPOCHS
+            or target > cap
+            or cap
+            != continuation_decision.STAGE_CAP_EPOCHS[expected_stage]
+        ):
+            raise ContinuationWaveError(
+                f"{expected_stage} per-stage continuation binding mismatch"
+            )
+        _validate_topology(
+            stage["training_topology"],
+            stage=expected_stage,
+            label=f"{expected_stage} training topology",
+        )
+        selected = _validate_candidate(
+            stage["independent_selected_candidate"],
+            stage=expected_stage,
+            label=f"{expected_stage} selected candidate",
+        )
+        resume = _validate_candidate(
+            stage["resume_boundary_candidate"],
+            stage=expected_stage,
+            label=f"{expected_stage} resume candidate",
+        )
+        if selected["epoch"] > boundary or resume["epoch"] != boundary:
+            raise ContinuationWaveError(
+                f"{expected_stage} selected/resume boundary mismatch"
+            )
+        old = _validate_old_segment(
+            stage["old_segment"],
+            stage=expected_stage,
+            boundary=boundary,
+        )
+        new = _validate_new_segment(
+            stage["new_segment"],
+            stage=expected_stage,
+            target=target,
+            predecessor_segment_id=old["candidate_segment_chain"][-1][
+                "segment_id"
+            ],
+            predecessor_source=old["source"],
+        )
+        if (
+            old["config_semantic_sha256"]
+            != new["config_semantic_sha256"]
+            or old["dataset_semantic_sha256"]
+            != new["dataset_semantic_sha256"]
+        ):
+            raise ContinuationWaveError(
+                f"{expected_stage} training semantics changed"
+            )
+        new_source_identities.add(
+            (new["source"]["commit"], new["source"]["tree"])
+        )
+        if (
+            old["run_path"] == new["run_path"]
+            or _is_within(old["run_path"], new["run_path"])
+            or _is_within(new["run_path"], old["run_path"])
+            or old["run_path"] in old_runs
+            or new["run_path"] in new_runs
+        ):
+            raise ContinuationWaveError(
+                f"{expected_stage} segment path reuse detected"
+            )
+        old_runs.add(old["run_path"])
+        new_runs.add(new["run_path"])
+        for label, candidate in (("selected", selected), ("resume", resume)):
+            candidate_segment = _segment_for_epoch(
+                old["candidate_segment_chain"],
+                candidate["epoch"],
+                stage=expected_stage,
+            )
+            expected_parent = (
+                Path(candidate_segment["run_path"])
+                / "representation_candidates"
+            )
+            if not _is_within(
+                candidate["checkpoint"]["path"],
+                str(expected_parent),
+            ):
+                raise ContinuationWaveError(
+                    f"{expected_stage} {label} checkpoint escaped old segment"
+                )
+    _require_disjoint_run_paths(old_runs, new_runs)
+    if len(new_source_identities) != 1:
+        raise ContinuationWaveError(
+            "active stages must use one new source commit/tree"
+        )
+    payload_sha = _require_sha256(
+        receipt["receipt_payload_sha256"],
+        "per-stage continuation wave payload SHA-256",
+    )
+    unsigned = dict(receipt)
+    unsigned.pop("receipt_payload_sha256")
+    if canonical_json_sha256(unsigned) != payload_sha:
+        raise ContinuationWaveError(
+            "per-stage continuation wave payload SHA-256 mismatch"
+        )
+    return receipt
+
+
+def validate_any_wave_schema(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and value.get("format") == PER_STAGE_FORMAT:
+        return validate_per_stage_wave_schema(value)
+    return validate_wave_schema(value)
+
+
 def validate_wave_schema(value: Any) -> dict[str, Any]:
     """Validate the closed wave schema and all internal invariants."""
 
@@ -2546,8 +3065,13 @@ def replay_wave_receipt(
 ) -> dict[str, Any]:
     """Fail closed unless a receipt equals a fresh deterministic rebuild."""
 
-    validate_wave_schema(receipt)
-    expected = authorize_wave(
+    validate_any_wave_schema(receipt)
+    authorizer = (
+        authorize_per_stage_wave
+        if receipt.get("format") == PER_STAGE_FORMAT
+        else authorize_wave
+    )
+    expected = authorizer(
         decision_receipt=decision_receipt,
         decision_binding=decision_binding,
         selected_by_stage=selected_by_stage,

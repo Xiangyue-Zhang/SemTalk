@@ -657,12 +657,18 @@ class ContinuationWaveFileReplayE2ETest(unittest.TestCase):
                 replayed = wave.replay_wave_file(second_path, second_sha)
 
             self.assertEqual(
-                (first_receipt["boundary_epoch"], first_receipt["target_epoch"]),
-                (200, 220),
+                {
+                    (entry["boundary_epoch"], entry["target_epoch"])
+                    for entry in first_receipt["stages"]
+                },
+                {(200, 220)},
             )
             self.assertEqual(
-                (replayed["boundary_epoch"], replayed["target_epoch"]),
-                (220, 240),
+                {
+                    (entry["boundary_epoch"], entry["target_epoch"])
+                    for entry in replayed["stages"]
+                },
+                {(220, 240)},
             )
             self.assertTrue(
                 all(

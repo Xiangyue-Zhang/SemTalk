@@ -53,7 +53,7 @@ def wave_receipt() -> dict:
 
 
 class PublishContinuationWaveTests(unittest.TestCase):
-    def test_load_requires_exact_five_stage_plans(self) -> None:
+    def test_load_accepts_only_nonempty_known_active_stage_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             path = root / "plans.json"
@@ -61,11 +61,19 @@ class PublishContinuationWaveTests(unittest.TestCase):
                 path,
                 stages=["face", "hands", "upper", "lower"],
             )
+            plans, _ = publish._load_stage_plans(path, digest)
+            self.assertEqual(
+                list(plans),
+                ["face", "hands", "upper", "lower"],
+            )
+
+            bad_path = root / "bad-plans.json"
+            bad_digest = write_plans(bad_path, stages=["face", "unknown"])
             with self.assertRaisesRegex(
                 publish.PublishContinuationWaveError,
-                "exactly five stages",
+                "inventory is invalid",
             ):
-                publish._load_stage_plans(path, digest)
+                publish._load_stage_plans(bad_path, bad_digest)
 
     def test_load_rejects_file_and_payload_hash_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

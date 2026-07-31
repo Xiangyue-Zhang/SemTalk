@@ -116,6 +116,60 @@ class PrerequisiteContinuationDecisionTests(unittest.TestCase):
                 selected_stage=self._selected(180, 0.9),
                 expected_candidate_epochs=[160, 180, 200],
             )
+
+    def test_stage_actions_obey_independent_caps_and_freeze_rule(self) -> None:
+        continued = decision._stage_decision(
+            stage="upper",
+            candidates_value=self._candidates(
+                [1.0, 0.9, 0.8],
+                epochs=[440, 460, 480],
+            ),
+            selected_stage=self._selected(480, 0.8),
+            expected_candidate_epochs=[440, 460, 480],
+        )
+        self.assertEqual(continued["action"], "continue")
+        self.assertEqual(continued["target_epoch"], 500)
+        self.assertEqual(continued["cap_epoch"], 500)
+
+        capped = decision._stage_decision(
+            stage="upper",
+            candidates_value=self._candidates(
+                [1.0, 0.9, 0.8],
+                epochs=[460, 480, 500],
+            ),
+            selected_stage=self._selected(500, 0.8),
+            expected_candidate_epochs=[460, 480, 500],
+        )
+        self.assertEqual(capped["action"], "capped")
+        self.assertIsNone(capped["target_epoch"])
+        self.assertFalse(capped["requests_continuation"])
+
+        frozen = decision._stage_decision(
+            stage="global",
+            candidates_value=self._candidates(
+                [0.8, 0.7, 0.9],
+                epochs=[200, 220, 240],
+            ),
+            selected_stage=self._selected(220, 0.7),
+            expected_candidate_epochs=[200, 220, 240],
+        )
+        self.assertEqual(frozen["action"], "freeze")
+        self.assertEqual(frozen["frozen_winner_epoch"], 220)
+        self.assertIsNone(frozen["target_epoch"])
+
+        with self.assertRaisesRegex(
+            decision.ContinuationDecisionError,
+            "exceeds the formal cap",
+        ):
+            decision._stage_decision(
+                stage="hands",
+                candidates_value=self._candidates(
+                    [1.0, 0.9, 0.8],
+                    epochs=[480, 500, 520],
+                ),
+                selected_stage=self._selected(520, 0.8),
+                expected_candidate_epochs=[480, 500, 520],
+            )
         with self.assertRaisesRegex(
             decision.ContinuationDecisionError,
             "finite",

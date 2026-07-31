@@ -120,6 +120,37 @@ def build_runtime_fixture(root: Path, stage: str = "hands") -> dict:
     }
 
 
+def make_per_stage_runtime_fixture(root: Path) -> dict:
+    values = build_runtime_fixture(root, stage="hands")
+    entry = copy.deepcopy(values["entry"])
+    entry.pop("triggered")
+    entry.update(
+        {
+            "boundary_epoch": 200,
+            "target_epoch": 220,
+            "cap_epoch": runtime.wave.continuation_decision.STAGE_CAP_EPOCHS[
+                "hands"
+            ],
+        }
+    )
+    receipt = {
+        "format": wave.PER_STAGE_FORMAT,
+        "status": "authorized",
+        "test_visible": False,
+        "protocol": copy.deepcopy(wave.PER_STAGE_PROTOCOL),
+        "decision": copy.deepcopy(values["receipt"]["decision"]),
+        "trigger_stages": ["hands"],
+        "stages": [entry],
+    }
+    receipt["receipt_payload_sha256"] = wave.canonical_json_sha256(
+        receipt
+    )
+    wave.validate_per_stage_wave_schema(receipt)
+    values["receipt"] = receipt
+    values["entry"] = entry
+    return values
+
+
 class ContinuationRuntimeTests(unittest.TestCase):
     def verify(self, values: dict) -> dict:
         kwargs = {
@@ -184,6 +215,25 @@ class ContinuationRuntimeTests(unittest.TestCase):
                     / "representation_candidates"
                 ).exists()
             )
+
+    def test_per_stage_runtime_uses_local_boundary_cap_and_excludes_frozen(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            values = make_per_stage_runtime_fixture(
+                Path(temporary).resolve()
+            )
+            receipt = self.verify(values)
+            self.assertEqual(receipt["boundary_epoch"], 200)
+            self.assertEqual(receipt["target_epoch"], 220)
+            self.assertEqual(receipt["cap_epoch"], 500)
+
+            values["stage"] = "face"
+            with self.assertRaisesRegex(
+                runtime.ContinuationRuntimeError,
+                "not exact-once",
+            ):
+                self.verify(values)
 
     def test_old_segment_pre_post_sha_is_exact_and_mutation_fails(
         self,

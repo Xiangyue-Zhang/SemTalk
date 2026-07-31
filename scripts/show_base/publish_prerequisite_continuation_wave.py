@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one immutable five-stage prerequisite continuation authority.
+"""Publish one immutable independent-stage continuation authority.
 
 The heavy validation remains in :mod:`prerequisite_continuation_wave`.  This
 small CLI gives the formal operator an atomic, hash-bound publication path so
@@ -18,7 +18,7 @@ from scripts.show_base import prerequisite_continuation_wave as wave
 from scripts.show_base import prerequisite_val_contract as contract
 
 
-FORMAT = "semtalk_show_prerequisite_continuation_stage_plans_v1"
+FORMAT = "semtalk_show_prerequisite_continuation_stage_plans_v2"
 TOP_KEYS = {
     "format",
     "status",
@@ -63,13 +63,17 @@ def _load_stage_plans(
             "continuation stage-plan protocol mismatch"
         )
     stages = value["stages"]
+    if not isinstance(stages, dict) or not stages:
+        raise PublishContinuationWaveError(
+            "continuation stage plans must cover active stages"
+        )
+    ordered = [stage for stage in wave.STAGES if stage in stages]
     if (
-        not isinstance(stages, dict)
-        or set(stages) != set(wave.STAGES)
-        or any(not isinstance(stages[stage], dict) for stage in wave.STAGES)
+        len(ordered) != len(stages)
+        or any(not isinstance(stages[stage], dict) for stage in ordered)
     ):
         raise PublishContinuationWaveError(
-            "continuation stage plans must cover exactly five stages"
+            "continuation active-stage inventory is invalid"
         )
     claimed_payload_sha = value["receipt_payload_sha256"]
     try:
@@ -87,7 +91,7 @@ def _load_stage_plans(
             "continuation stage-plan payload SHA-256 mismatch"
         )
     return (
-        {stage: dict(stages[stage]) for stage in wave.STAGES},
+        {stage: dict(stages[stage]) for stage in ordered},
         {
             "path": str(resolved),
             "sha256": observed_sha,
@@ -151,7 +155,7 @@ def publish_wave(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Publish one synchronized SHOW prerequisite +20 wave",
+        description="Publish one independent SHOW prerequisite +20 wave",
         allow_abbrev=False,
     )
     parser.add_argument("--decision-json", type=Path, required=True)
@@ -175,8 +179,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "status": receipt["status"],
-                "boundary_epoch": receipt["boundary_epoch"],
-                "target_epoch": receipt["target_epoch"],
+                "stage_targets": {
+                    stage["stage"]: stage["target_epoch"]
+                    for stage in receipt["stages"]
+                },
                 "file_sha256": file_sha,
                 "receipt_payload_sha256": receipt[
                     "receipt_payload_sha256"
