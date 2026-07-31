@@ -119,6 +119,11 @@ STAGE_KEYS = {
 CHECKPOINT_KEYS = {"path", "sha256", "bytes"}
 PAYLOAD_ARTIFACT_KEYS = {"path", "sha256", "receipt_payload_sha256"}
 ARTIFACT_KEYS = {"path", "sha256"}
+FINITE_STATUS_ARTIFACT_KEYS = {
+    "path",
+    "sha256",
+    "finite_evidence",
+}
 COVERAGE_KEYS = {
     "split",
     "test_visible",
@@ -749,6 +754,166 @@ def _validate_canonical_view(
     return public, raw_rows
 
 
+def _validate_formal_status_finite_evidence(
+    value: Any,
+    *,
+    status: Mapping[str, Any],
+    status_path: Path,
+    stage: str,
+) -> None:
+    evidence = exact_keys(
+        value,
+        {
+            "final_checkpoint",
+            "latest_resume",
+            "last_metrics",
+            "all_candidate_model_tensors_finite",
+        },
+        f"{stage} formal finite evidence",
+    )
+    if evidence["all_candidate_model_tensors_finite"] is not True:
+        raise SelectedPrerequisiteError(
+            f"{stage} candidate tensor finiteness is not proven"
+        )
+    metrics = evidence["last_metrics"]
+    if (
+        metrics != status.get("last_metrics")
+        or not isinstance(metrics, dict)
+        or not metrics
+    ):
+        raise SelectedPrerequisiteError(
+            f"{stage} formal finite metrics differ from status"
+        )
+    for name, metric in metrics.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(metric, dict)
+            or set(metric) != {"avg", "count"}
+            or isinstance(metric["avg"], bool)
+            or type(metric["avg"]) not in {int, float}
+            or not math.isfinite(float(metric["avg"]))
+            or isinstance(metric["count"], bool)
+            or not isinstance(metric["count"], int)
+            or metric["count"] <= 0
+        ):
+            raise SelectedPrerequisiteError(
+                f"{stage} formal finite metric {name!r} is invalid"
+            )
+
+    final = exact_keys(
+        evidence["final_checkpoint"],
+        {
+            "path",
+            "sha256",
+            "bytes",
+            "tensor_count",
+            "element_count",
+            "all_model_tensors_finite",
+        },
+        f"{stage} formal finite final checkpoint",
+    )
+    final_path, final_payload = _safe_file_snapshot(
+        final["path"],
+        f"{stage} formal finite final checkpoint",
+        val_only=False,
+    )
+    final_sha = require_sha256(
+        final["sha256"],
+        f"{stage} formal finite final checkpoint SHA-256",
+    )
+    final_bytes = require_exact_int(
+        final["bytes"],
+        f"{stage} formal finite final checkpoint bytes",
+    )
+    tensor_count = require_exact_int(
+        final["tensor_count"],
+        f"{stage} formal finite final checkpoint tensor count",
+    )
+    element_count = require_exact_int(
+        final["element_count"],
+        f"{stage} formal finite final checkpoint element count",
+    )
+    status_final = regular_file(
+        status.get("final_checkpoint"),
+        f"{stage} status final checkpoint",
+        val_only=False,
+    )
+    if (
+        final_path != status_final
+        or final_path.parent != status_path.parent
+        or final_sha
+        != require_sha256(
+            status.get("final_checkpoint_sha256"),
+            f"{stage} status final checkpoint SHA-256",
+        )
+        or hashlib.sha256(final_payload).hexdigest() != final_sha
+        or len(final_payload) != final_bytes
+        or final_bytes <= 0
+        or tensor_count <= 0
+        or element_count <= 0
+        or final["all_model_tensors_finite"] is not True
+    ):
+        raise SelectedPrerequisiteError(
+            f"{stage} formal finite final checkpoint changed"
+        )
+
+    resume = exact_keys(
+        evidence["latest_resume"],
+        {"path", "sha256", "bytes"},
+        f"{stage} formal finite resume",
+    )
+    resume_path, resume_payload = _safe_file_snapshot(
+        resume["path"],
+        f"{stage} formal finite resume",
+        val_only=False,
+    )
+    expected_resume = regular_file(
+        status_path.parent / "latest_resume.pt",
+        f"{stage} status resume",
+        val_only=False,
+    )
+    resume_sha = require_sha256(
+        resume["sha256"],
+        f"{stage} formal finite resume SHA-256",
+    )
+    resume_bytes = require_exact_int(
+        resume["bytes"],
+        f"{stage} formal finite resume bytes",
+    )
+    if (
+        resume_path != expected_resume
+        or resume_sha
+        != require_sha256(
+            status.get("latest_resume_sha256"),
+            f"{stage} status resume SHA-256",
+        )
+        or hashlib.sha256(resume_payload).hexdigest() != resume_sha
+        or len(resume_payload) != resume_bytes
+        or resume_bytes <= 0
+    ):
+        raise SelectedPrerequisiteError(
+            f"{stage} formal finite resume changed"
+        )
+
+
+def _validate_status_finite_proof(
+    status: Mapping[str, Any],
+    status_binding: Mapping[str, Any],
+    *,
+    stage: str,
+) -> None:
+    if "all_training_state_finite" in status:
+        if status["all_training_state_finite"] is not True:
+            raise SelectedPrerequisiteError(
+                f"{stage} formal training state is not finite"
+            )
+    elif "finite_evidence" not in status_binding:
+        raise SelectedPrerequisiteError(
+            f"{stage} formal training status has no finite proof"
+        )
+
+
 def _validate_candidate_index(
     artifact: Any,
 ) -> tuple[
@@ -836,12 +1001,37 @@ def _validate_candidate_index(
             index["dataset_receipt_sha256"][stage],
             f"candidate index {stage} dataset receipt SHA-256",
         )
-        _, _, status, _ = _read_artifact(
-            index["formal_training_status"][stage],
-            keys=ARTIFACT_KEYS,
+        status_artifact = index["formal_training_status"][stage]
+        status_keys = (
+            frozenset(status_artifact)
+            if isinstance(status_artifact, dict)
+            else frozenset()
+        )
+        if status_keys not in {
+            frozenset(ARTIFACT_KEYS),
+            frozenset(FINITE_STATUS_ARTIFACT_KEYS),
+        }:
+            raise SelectedPrerequisiteError(
+                f"{stage} formal training status artifact schema mismatch"
+            )
+        status_path, _, status, status_binding = _read_artifact(
+            status_artifact,
+            keys=status_keys,
             label=f"{stage} formal training status",
         )
         assert status is not None
+        _validate_status_finite_proof(
+            status,
+            status_binding,
+            stage=stage,
+        )
+        if "finite_evidence" in status_binding:
+            _validate_formal_status_finite_evidence(
+                status_binding["finite_evidence"],
+                status=status,
+                status_path=status_path,
+                stage=stage,
+            )
         stage_rows = index["stages"][stage]
         if not isinstance(stage_rows, list) or not stage_rows:
             raise SelectedPrerequisiteError(
@@ -868,7 +1058,6 @@ def _validate_candidate_index(
             or status.get("updates_per_epoch") != updates_per_epoch(stage)
             or status.get("optimizer_updates")
             != final_epoch * updates_per_epoch(stage)
-            or status.get("all_training_state_finite", True) is not True
             or status.get("config_sha256")
             != index["config_sha256"][stage]
             or status.get("source_receipt")

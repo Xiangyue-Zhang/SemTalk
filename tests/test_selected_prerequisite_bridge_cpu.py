@@ -81,46 +81,77 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
             status_path = Path(
                 candidate_index["formal_training_status"][stage]["path"]
             )
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            final_path = status_path.parent / f"show_ft_{stage}_200.bin"
+            final_payload = f"fixture-finite-final-{stage}".encode()
+            final_path.write_bytes(final_payload)
+            final_sha = hashlib.sha256(final_payload).hexdigest()
+            resume_path = status_path.parent / "latest_resume.pt"
+            resume_payload = b"fixture-finite-resume-state"
+            resume_path.write_bytes(resume_payload)
+            resume_sha = hashlib.sha256(resume_payload).hexdigest()
+            last_metrics = {"rec": {"avg": 0.25, "count": 1}}
+            status_value = {
+                "status": "complete",
+                "formal_stage": stage,
+                "completed_epochs": 200,
+                "updates_per_epoch": (
+                    producer_contract.updates_per_epoch(stage)
+                ),
+                "optimizer_updates": (
+                    200 * producer_contract.updates_per_epoch(stage)
+                ),
+                "config_sha256": candidate_index["config_sha256"][stage],
+                "source_receipt": frozen_source["training_audit"],
+                "source_receipt_sha256": (
+                    producer_contract.canonical_payload_sha256(
+                        frozen_source["training_audit"]
+                    )
+                ),
+                "dataset_receipt": dataset_receipt,
+                "last_metrics": last_metrics,
+                "final_checkpoint": str(final_path),
+                "final_checkpoint_sha256": final_sha,
+                "latest_resume_sha256": resume_sha,
+                "latest_representation_candidate": {
+                    "path": final_row["checkpoint"],
+                    "sha256": final_row["checkpoint_sha256"],
+                    "completed_epochs": 200,
+                    "optimizer_updates": (
+                        200
+                        * producer_contract.updates_per_epoch(stage)
+                    ),
+                    "selection_status": "offline_validation_pending",
+                },
+            }
+            if stage != "face":
+                status_value["all_training_state_finite"] = True
             status_sha = selector_fixture.write_json(
                 status_path,
-                {
-                    "status": "complete",
-                    "formal_stage": stage,
-                    "completed_epochs": 200,
-                    "updates_per_epoch": (
-                        producer_contract.updates_per_epoch(stage)
-                    ),
-                    "optimizer_updates": (
-                        200 * producer_contract.updates_per_epoch(stage)
-                    ),
-                    "all_training_state_finite": True,
-                    "config_sha256": candidate_index["config_sha256"][
-                        stage
-                    ],
-                    "source_receipt": frozen_source["training_audit"],
-                    "source_receipt_sha256": (
-                        producer_contract.canonical_payload_sha256(
-                            frozen_source["training_audit"]
-                        )
-                    ),
-                    "dataset_receipt": dataset_receipt,
-                    "latest_representation_candidate": {
-                        "path": final_row["checkpoint"],
-                        "sha256": final_row["checkpoint_sha256"],
-                        "completed_epochs": 200,
-                        "optimizer_updates": (
-                            200
-                            * producer_contract.updates_per_epoch(stage)
-                        ),
-                        "selection_status": (
-                            "offline_validation_pending"
-                        ),
-                    },
-                },
+                status_value,
             )
             candidate_index["formal_training_status"][stage]["sha256"] = (
                 status_sha
             )
+            candidate_index["formal_training_status"][stage][
+                "finite_evidence"
+            ] = {
+                "final_checkpoint": {
+                    "path": str(final_path),
+                    "sha256": final_sha,
+                    "bytes": len(final_payload),
+                    "tensor_count": 1,
+                    "element_count": 1,
+                    "all_model_tensors_finite": True,
+                },
+                "latest_resume": {
+                    "path": str(resume_path),
+                    "sha256": resume_sha,
+                    "bytes": len(resume_payload),
+                },
+                "last_metrics": last_metrics,
+                "all_candidate_model_tensors_finite": True,
+            }
         unsigned_index = dict(candidate_index)
         unsigned_index.pop("receipt_payload_sha256")
         candidate_index = producer_contract.receipt_payload(unsigned_index)
@@ -178,6 +209,243 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
         path = self.root / name
         selector_fixture.write_json(path, value)
         return path
+
+    def test_finite_status_binding_replays_live_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            final_path = root / "show_ft_face_200.bin"
+            final_payload = b"finite-final-checkpoint"
+            final_path.write_bytes(final_payload)
+            final_sha = hashlib.sha256(final_payload).hexdigest()
+            resume_path = root / "latest_resume.pt"
+            resume_payload = b"finite-resume-state"
+            resume_path.write_bytes(resume_payload)
+            resume_sha = hashlib.sha256(resume_payload).hexdigest()
+            metrics = {"rec": {"avg": 0.25, "count": 7}}
+            status = {
+                "last_metrics": metrics,
+                "final_checkpoint": str(final_path),
+                "final_checkpoint_sha256": final_sha,
+                "latest_resume_sha256": resume_sha,
+            }
+            evidence = {
+                "final_checkpoint": {
+                    "path": str(final_path),
+                    "sha256": final_sha,
+                    "bytes": len(final_payload),
+                    "tensor_count": 2,
+                    "element_count": 3,
+                    "all_model_tensors_finite": True,
+                },
+                "latest_resume": {
+                    "path": str(resume_path),
+                    "sha256": resume_sha,
+                    "bytes": len(resume_payload),
+                },
+                "last_metrics": metrics,
+                "all_candidate_model_tensors_finite": True,
+            }
+            consumer._validate_formal_status_finite_evidence(
+                evidence,
+                status=status,
+                status_path=root / "formal_training_status.json",
+                stage="face",
+            )
+
+            forged_metrics = json.loads(json.dumps(evidence))
+            forged_metrics["last_metrics"]["rec"]["avg"] = 0.5
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "finite metrics differ",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    forged_metrics,
+                    status=status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+            forged_finite = json.loads(json.dumps(evidence))
+            forged_finite["final_checkpoint"][
+                "all_model_tensors_finite"
+            ] = False
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "final checkpoint changed",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    forged_finite,
+                    status=status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+            forged_count = json.loads(json.dumps(evidence))
+            forged_count["last_metrics"]["rec"]["count"] = 0
+            forged_count_status = dict(status)
+            forged_count_status["last_metrics"] = forged_count[
+                "last_metrics"
+            ]
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "finite metric .* invalid",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    forged_count,
+                    status=forged_count_status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+            forged_bytes = json.loads(json.dumps(evidence))
+            forged_bytes["final_checkpoint"]["bytes"] += 1
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "final checkpoint changed",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    forged_bytes,
+                    status=status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "final checkpoint changed",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    evidence,
+                    status=status,
+                    status_path=root / "other" / "formal_training_status.json",
+                    stage="face",
+                )
+
+            forged_schema = json.loads(json.dumps(evidence))
+            forged_schema["unexpected"] = True
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "finite evidence schema mismatch",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    forged_schema,
+                    status=status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+            resume_path.write_bytes(b"replaced-resume-state")
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "resume changed",
+            ):
+                consumer._validate_formal_status_finite_evidence(
+                    evidence,
+                    status=status,
+                    status_path=root / "formal_training_status.json",
+                    stage="face",
+                )
+
+    def test_legacy_status_requires_explicit_finite_proof(self) -> None:
+        with self.assertRaisesRegex(
+            consumer.SelectedPrerequisiteError,
+            "has no finite proof",
+        ):
+            consumer._validate_status_finite_proof(
+                {},
+                {"path": "/tmp/status.json", "sha256": "0" * 64},
+                stage="face",
+            )
+        consumer._validate_status_finite_proof(
+            {},
+            {
+                "path": "/tmp/status.json",
+                "sha256": "0" * 64,
+                "finite_evidence": {},
+            },
+            stage="face",
+        )
+        with self.assertRaisesRegex(
+            consumer.SelectedPrerequisiteError,
+            "is not finite",
+        ):
+            consumer._validate_status_finite_proof(
+                {"all_training_state_finite": False},
+                {
+                    "path": "/tmp/status.json",
+                    "sha256": "0" * 64,
+                    "finite_evidence": {},
+                },
+                stage="face",
+            )
+
+    def test_candidate_index_rejects_extra_finite_binding_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidate = json.loads(
+                self.fixture["candidate_path"].read_text(encoding="utf-8")
+            )
+            candidate["formal_training_status"]["face"][
+                "unexpected"
+            ] = True
+            candidate.pop("receipt_payload_sha256")
+            candidate = producer_contract.receipt_payload(candidate)
+            candidate_path = root / "candidate-extra-key.json"
+            candidate_sha = selector_fixture.write_json(
+                candidate_path,
+                candidate,
+            )
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "artifact schema mismatch",
+            ):
+                consumer._validate_candidate_index(
+                    {
+                        "path": str(candidate_path),
+                        "sha256": candidate_sha,
+                        "receipt_payload_sha256": candidate[
+                            "receipt_payload_sha256"
+                        ],
+                    }
+                )
+
+    def test_candidate_index_legacy_binding_needs_finite_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidate = json.loads(
+                self.fixture["candidate_path"].read_text(encoding="utf-8")
+            )
+            original_status = Path(
+                candidate["formal_training_status"]["face"]["path"]
+            )
+            status = json.loads(original_status.read_text(encoding="utf-8"))
+            status.pop("all_training_state_finite", None)
+            status_path = root / "formal_training_status.json"
+            status_sha = selector_fixture.write_json(status_path, status)
+            candidate["formal_training_status"]["face"] = {
+                "path": str(status_path),
+                "sha256": status_sha,
+            }
+            candidate.pop("receipt_payload_sha256")
+            candidate = producer_contract.receipt_payload(candidate)
+            candidate_path = root / "candidate-legacy-no-proof.json"
+            candidate_sha = selector_fixture.write_json(
+                candidate_path,
+                candidate,
+            )
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "has no finite proof",
+            ):
+                consumer._validate_candidate_index(
+                    {
+                        "path": str(candidate_path),
+                        "sha256": candidate_sha,
+                        "receipt_payload_sha256": candidate[
+                            "receipt_payload_sha256"
+                        ],
+                    }
+                )
 
     def test_accepts_real_selector_five_stage_val_selection(self) -> None:
         result = consumer.load_selected_prerequisites(
