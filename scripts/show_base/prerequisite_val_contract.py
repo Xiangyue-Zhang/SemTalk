@@ -36,7 +36,11 @@ REQUIRED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
 # so a later formal run can append e220, e240, ... without weakening the
 # required e20..e200 prefix.
 EXPECTED_CANDIDATE_EPOCHS = REQUIRED_CANDIDATE_EPOCHS
-EXPECTED_UPDATES_PER_EPOCH = 497
+RVQ_UPDATES_PER_EPOCH = 497
+GLOBAL_UPDATES_PER_EPOCH = 1_988
+# Compatibility alias for RVQ-only callers.  Five-stage consumers must call
+# ``updates_per_epoch(stage)`` and must never apply this value to Global.
+EXPECTED_UPDATES_PER_EPOCH = RVQ_UPDATES_PER_EPOCH
 TARGET_SPEAKER_SCOPE = "all_speakers_0_1_2_3"
 FPS = 30
 WINDOW_LENGTH = 64
@@ -45,6 +49,18 @@ RVQ_LEVELS = 6
 CODEBOOK_SIZE = 256
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = ("face", "hands", "upper", "lower")
+
+
+def updates_per_epoch(stage: str) -> int:
+    if stage in RVQ_STAGES:
+        return RVQ_UPDATES_PER_EPOCH
+    if stage == "global":
+        return GLOBAL_UPDATES_PER_EPOCH
+    raise ContractError(f"unknown prerequisite stage {stage!r}")
+
+
+def updates_per_epoch_map(stages: Iterable[str]) -> dict[str, int]:
+    return {stage: updates_per_epoch(stage) for stage in stages}
 
 
 def validate_candidate_epochs(value: Any) -> tuple[int, ...]:
@@ -97,9 +113,9 @@ VAL_CANONICAL_SUMMARY_FORMAT = (
 VAL_CANONICAL_LINEAGE_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_lineage_v1"
 )
-CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v1"
+CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v2"
 PARTIAL_CANDIDATE_INDEX_FORMAT = (
-    "semtalk_show_prerequisite_nonglobal_candidate_index_v1"
+    "semtalk_show_prerequisite_nonglobal_candidate_index_v2"
 )
 SEGMENTED_UNION_FORMAT = (
     "semtalk_show_prerequisite_segmented_candidate_union_v1"
@@ -112,6 +128,7 @@ STAGE_MEASUREMENT_FORMAT = (
 MEASUREMENT_FORMAT = "semtalk_show_prerequisite_val_measurement_index_v1"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
 TRAINING_SOURCE_FREEZE_FORMAT = "semtalk_show_training_source_freeze_v2"
+SOURCE_POLICY_FORMAT = "semtalk_show_prerequisite_source_policy_v1"
 
 SHOW_SPEAKERS = {"oliver": 0, "chemistry": 1, "seth": 2, "conan": 3}
 OFFICIAL_INITIALIZATION = {
@@ -164,6 +181,7 @@ REPRESENTATION_CANDIDATE_AUDIT_KEYS = (
     "selection_status",
 )
 CONTINUATION_WAVE_BINDING_KEY = "continuation_wave_receipt"
+OPTIMIZER_RUNTIME_BINDING_KEY = "optimizer_runtime_receipt"
 
 SELECTION_METRICS = {
     "face": "face_geometry_expression_objective_v1",
@@ -813,6 +831,89 @@ def verify_receipt_payload(payload: Any, label: str) -> dict[str, Any]:
     return payload
 
 
+def build_source_policy(
+    source_receipts: Mapping[str, Any],
+    *,
+    stages: Sequence[str],
+    reprove_ancestry: bool,
+) -> dict[str, Any]:
+    expected_stages = tuple(stages)
+    if (
+        not expected_stages
+        or any(stage not in STAGES for stage in expected_stages)
+        or len(set(expected_stages)) != len(expected_stages)
+        or not isinstance(source_receipts, Mapping)
+        or set(source_receipts) != set(expected_stages)
+    ):
+        raise ContractError("source policy stage coverage mismatch")
+    portable = {
+        stage: portable_training_source_identity(
+            source_receipts[stage]["portable_identity"],
+            f"{stage} source policy identity",
+        )
+        for stage in expected_stages
+    }
+    rvq_stages = [stage for stage in expected_stages if stage in RVQ_STAGES]
+    rvq_identity_hashes = {
+        canonical_payload_sha256(portable[stage]) for stage in rvq_stages
+    }
+    if len(rvq_identity_hashes) != 1:
+        raise ContractError("source policy RVQ identities differ")
+    rvq_identity = portable[rvq_stages[0]]
+    global_identity = portable.get("global")
+    descendant: bool | None = None
+    if global_identity is not None:
+        if global_identity["origin"] != rvq_identity["origin"]:
+            raise ContractError("source policy origins differ")
+        if reprove_ancestry:
+            global_root = Path(source_receipts["global"]["source_root"])
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(global_root),
+                    "merge-base",
+                    "--is-ancestor",
+                    rvq_identity["commit"],
+                    global_identity["commit"],
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise ContractError(
+                    "Global training source is not an RVQ-source descendant"
+                )
+        descendant = True
+    policy = {
+        "format": SOURCE_POLICY_FORMAT,
+        "mode": "rvq_common_global_descendant_v1",
+        "stages": list(expected_stages),
+        "origin": rvq_identity["origin"],
+        "rvq_portable_identity_sha256": canonical_payload_sha256(
+            rvq_identity
+        ),
+        "rvq_commit": rvq_identity["commit"],
+        "rvq_tree": rvq_identity["tree"],
+        "global_portable_identity_sha256": (
+            canonical_payload_sha256(global_identity)
+            if global_identity is not None
+            else None
+        ),
+        "global_commit": (
+            global_identity["commit"] if global_identity is not None else None
+        ),
+        "global_tree": (
+            global_identity["tree"] if global_identity is not None else None
+        ),
+        "same_origin": True if global_identity is not None else None,
+        "global_descends_from_rvq": descendant,
+    }
+    policy["receipt_payload_sha256"] = canonical_payload_sha256(policy)
+    return policy
+
+
 def verify_named_compact_hash(
     value: Any,
     *,
@@ -956,15 +1057,19 @@ def validate_distributed_training_receipt(
             "set_epoch": None,
         }
         expected_ema = {"enabled": False}
-        valid_parallelism = world_size == 1 and local_batch == 256
+        valid_parallelism = world_size == 1 and local_batch == 64
+    stage_global_batch = 256 if stage in RVQ_STAGES else 64
+    stage_updates = updates_per_epoch(stage)
     integer_expectations = {
-        "global_batch_size": 256,
+        "global_batch_size": stage_global_batch,
         "train_samples": 127_286,
         "available_train_samples": 127_286,
-        "consumed_samples_per_epoch": 127_232,
-        "dropped_samples_per_epoch": 54,
+        "consumed_samples_per_epoch": stage_updates * stage_global_batch,
+        "dropped_samples_per_epoch": (
+            127_286 - stage_updates * stage_global_batch
+        ),
         "padding_or_duplicate_samples_per_epoch": 0,
-        "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+        "updates_per_epoch": stage_updates,
     }
     if (
         value["format"] != "semtalk_show_representation_ddp_v1"
@@ -978,6 +1083,64 @@ def validate_distributed_training_receipt(
     for key, expected in integer_expectations.items():
         if require_exact_int(value[key], f"{label}.{key}") != expected:
             raise ContractError(f"{label}.{key} mismatch")
+    return dict(value)
+
+
+def validate_optimizer_runtime_receipt(
+    value: Any,
+    *,
+    stage: str,
+    label: str,
+    required: bool = False,
+) -> dict[str, Any] | None:
+    if value is None:
+        if required:
+            raise ContractError(f"{label} is required")
+        return None
+    value = exact_keys(
+        verify_named_compact_hash(
+            value,
+            hash_key="receipt_sha256",
+            label=label,
+        ),
+        (
+            "format",
+            "formal_stage",
+            "class",
+            "base_learning_rate",
+            "betas",
+            "weight_decay",
+            "eps",
+            "amsgrad",
+            "parameter_groups",
+            "trained_parameter_tensors",
+            "receipt_sha256",
+        ),
+        label,
+    )
+    expected_base_lr = 6e-4 if stage in RVQ_STAGES else (
+        1.5e-4 if stage == "global" else 5e-5
+    )
+    groups = require_exact_int(
+        value["parameter_groups"], f"{label}.parameter_groups"
+    )
+    trained = require_exact_int(
+        value["trained_parameter_tensors"],
+        f"{label}.trained_parameter_tensors",
+    )
+    if (
+        value["format"] != "semtalk_show_optimizer_runtime_v1"
+        or value["formal_stage"] != stage
+        or value["class"] != "torch.optim.Adam"
+        or value["base_learning_rate"] != expected_base_lr
+        or value["betas"] != [0.5, 0.999]
+        or value["weight_decay"] != 0.0
+        or value["eps"] != 1e-8
+        or value["amsgrad"] is not False
+        or groups <= 0
+        or trained <= 0
+    ):
+        raise ContractError(f"{label} optimizer protocol mismatch")
     return dict(value)
 
 
@@ -1066,11 +1229,19 @@ def validate_representation_candidate_audit(
     if not isinstance(value, dict):
         raise ContractError(f"{label} must be an object")
     expected_keys = set(REPRESENTATION_CANDIDATE_AUDIT_KEYS)
-    if frozenset(value) not in {
-        frozenset(expected_keys),
-        frozenset(expected_keys | {CONTINUATION_WAVE_BINDING_KEY}),
-    }:
+    optional_keys = {
+        CONTINUATION_WAVE_BINDING_KEY,
+        OPTIMIZER_RUNTIME_BINDING_KEY,
+    }
+    if not expected_keys.issubset(value) or (
+        set(value) - expected_keys
+    ) - optional_keys:
         raise ContractError(f"{label} schema mismatch")
+    if (
+        stage == "global"
+        and OPTIMIZER_RUNTIME_BINDING_KEY not in value
+    ):
+        raise ContractError(f"{label} lacks Global optimizer binding")
     continuation_wave = value.get(CONTINUATION_WAVE_BINDING_KEY)
     if continuation_wave is not None:
         continuation_wave = exact_keys(
@@ -1094,7 +1265,7 @@ def validate_representation_candidate_audit(
             continuation_wave["receipt_payload_sha256"],
             f"{label} continuation wave payload SHA-256",
         )
-    updates = epoch * EXPECTED_UPDATES_PER_EPOCH
+    updates = epoch * updates_per_epoch(stage)
     if (
         stage not in STAGES
         or not is_candidate_epoch(epoch)
@@ -1142,6 +1313,12 @@ def validate_representation_candidate_audit(
         value["distributed_training_receipt"],
         stage=stage,
         label=f"{label}.distributed_training_receipt",
+    )
+    validate_optimizer_runtime_receipt(
+        value.get(OPTIMIZER_RUNTIME_BINDING_KEY),
+        stage=stage,
+        label=f"{label}.optimizer_runtime_receipt",
+        required=stage == "global",
     )
     validate_rvq_ema_prior_receipt(
         value["rvq_ema_prior_receipt"],
@@ -1522,6 +1699,7 @@ def validate_candidate_index(
     *,
     path: Path | None = None,
     allow_partial: bool = False,
+    reprove_source_ancestry: bool = False,
     _artifact_stack: frozenset[Path] | None = None,
 ) -> dict[str, Any]:
     artifact_stack = frozenset() if _artifact_stack is None else _artifact_stack
@@ -1542,7 +1720,8 @@ def validate_candidate_index(
         or payload.get("target_speaker_scope") != TARGET_SPEAKER_SCOPE
         or payload.get("selection_split") != "val"
         or payload.get("test_visible") is not False
-        or payload.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
+        or payload.get("updates_per_epoch")
+        != updates_per_epoch_map(expected_stages)
     ):
         raise ContractError("candidate index protocol mismatch")
     schedule = validate_candidate_epochs(payload.get("candidate_epochs"))
@@ -1560,7 +1739,14 @@ def validate_candidate_index(
             f"{stage} frozen training source",
             reprove_checkout=False,
         )
-    portable_sources = {
+    expected_source_policy = build_source_policy(
+        source_receipts,
+        stages=expected_stages,
+        reprove_ancestry=reprove_source_ancestry,
+    )
+    if payload.get("source_policy") != expected_source_policy:
+        raise ContractError("candidate index source policy mismatch")
+    rvq_portable_sources = {
         canonical_payload_sha256(
             portable_training_source_identity(
                 source_receipts[stage]["portable_identity"],
@@ -1568,9 +1754,15 @@ def validate_candidate_index(
             )
         )
         for stage in expected_stages
+        if stage in RVQ_STAGES
     }
-    if len(portable_sources) != 1:
-        raise ContractError("candidate index portable training sources differ")
+    # The four RVQs are one synchronized DDP production group and must be
+    # byte-identical in source.  Global is an independent VAEConvZero model;
+    # it may use a separately frozen official descendant source so a
+    # Global-only contract correction never forces scientifically unrelated
+    # RVQs to be retrained or relabelled.
+    if len(rvq_portable_sources) != 1:
+        raise ContractError("candidate index RVQ training sources differ")
     observed_paths: set[Path] = set()
     for stage in expected_stages:
         entries = stages[stage]
@@ -1593,7 +1785,7 @@ def validate_candidate_index(
             )
             if (
                 epoch != expected_epoch
-                or updates != epoch * EXPECTED_UPDATES_PER_EPOCH
+                or updates != epoch * updates_per_epoch(stage)
             ):
                 raise ContractError(f"{stage} candidate schedule mismatch")
             checkpoint, checkpoint_payload = read_file_snapshot(
@@ -1939,7 +2131,7 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
             or epoch not in epochs
             or result["candidate_index"] != epochs.index(epoch)
             or result["optimizer_updates"]
-            != epoch * EXPECTED_UPDATES_PER_EPOCH
+            != epoch * updates_per_epoch(stage)
         ):
             raise ContractError(f"{stage} selection result mismatch")
         require_finite(

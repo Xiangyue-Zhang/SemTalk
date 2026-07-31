@@ -288,7 +288,7 @@ with path.open("x", encoding="utf-8", newline="\n") as handle:
     handle.write("\n".join(lines) + "\n")
 PY
 
-candidate_index_format=$(
+mapfile -t candidate_index_formats < <(
     "$python_bin" - "$candidate_index" "$candidate_index_sha256" <<'PY'
 from pathlib import Path
 import sys
@@ -297,10 +297,17 @@ value, _ = contract.load_candidate_index(
     Path(sys.argv[1]), sys.argv[2], allow_partial=True
 )
 print(value["format"])
+print(contract.PARTIAL_CANDIDATE_INDEX_FORMAT)
 PY
 )
+if [[ ${#candidate_index_formats[@]} -ne 2 ]]; then
+    printf 'candidate index format preflight returned incomplete fields\n' >&2
+    exit 1
+fi
+candidate_index_format=${candidate_index_formats[0]}
+partial_candidate_index_format=${candidate_index_formats[1]}
 if [[ "$candidate_index_format" == \
-      semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+      "$partial_candidate_index_format" ]]; then
     case "$partition" in
         nonglobal|gate) ;;
         *)
@@ -325,7 +332,7 @@ mapfile -t candidate_plan <"$plan_path"
 minimum_plan_jobs=50
 plan_stage_modulus=5
 if [[ "$candidate_index_format" == \
-      semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+      "$partial_candidate_index_format" ]]; then
     minimum_plan_jobs=40
     plan_stage_modulus=4
 fi
@@ -360,7 +367,7 @@ for ((plan_index = 0; plan_index < ${#candidate_plan[@]}; plan_index++)); do
         gate)
             gate_stage=face
             if [[ "$candidate_index_format" != \
-                  semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+                  "$partial_candidate_index_format" ]]; then
                 gate_stage=global
             fi
             # Four deterministic same-stage candidates prove byte-exact

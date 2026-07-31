@@ -351,7 +351,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--epoch is outside the frozen schedule")
     if (
         args.optimizer_updates
-        != args.epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+        != args.epoch * contract.updates_per_epoch(args.stage)
     ):
         raise ValueError("--optimizer-updates is inconsistent")
     if (

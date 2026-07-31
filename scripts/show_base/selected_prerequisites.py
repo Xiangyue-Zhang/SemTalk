@@ -27,7 +27,7 @@ from scripts.show_base import prerequisite_val_contract as raw_contract
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
-CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v1"
+CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v2"
 MEASUREMENT_INDEX_FORMAT = (
     "semtalk_show_prerequisite_val_measurement_index_v1"
 )
@@ -39,7 +39,6 @@ TRAINING_SOURCE_FREEZE_FORMAT = raw_contract.TRAINING_SOURCE_FREEZE_FORMAT
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = ("face", "hands", "upper", "lower")
 REQUIRED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
-EXPECTED_UPDATES_PER_EPOCH = 497
 EXPECTED_VAL_CLIPS = 1_715
 EXPECTED_SHARDS = 8
 EXPECTED_SPEAKER_SCOPE = "all_speakers_0_1_2_3"
@@ -73,6 +72,13 @@ EXPECTED_METRICS = {
     "lower": "lower_rotation_contact_objective_v1",
     "global": "global_root_contact_objective_v1",
 }
+
+
+def updates_per_epoch(stage: str) -> int:
+    try:
+        return raw_contract.updates_per_epoch(stage)
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(str(error)) from error
 
 TOP_KEYS = {
     "format",
@@ -123,6 +129,7 @@ CANDIDATE_INDEX_KEYS = {
     "test_visible",
     "candidate_epochs",
     "updates_per_epoch",
+    "source_policy",
     "source_receipts",
     "config_sha256",
     "dataset_receipt_sha256",
@@ -766,7 +773,8 @@ def _validate_candidate_index(
         or index["target_speaker_scope"] != EXPECTED_SPEAKER_SCOPE
         or index["selection_split"] != "val"
         or index["test_visible"] is not False
-        or index["updates_per_epoch"] != EXPECTED_UPDATES_PER_EPOCH
+        or index["updates_per_epoch"]
+        != raw_contract.updates_per_epoch_map(STAGES)
     ):
         raise SelectedPrerequisiteError(
             "prerequisite candidate index protocol mismatch"
@@ -826,7 +834,7 @@ def _validate_candidate_index(
             "sha256": final_row["checkpoint_sha256"],
             "completed_epochs": final_epoch,
             "optimizer_updates": (
-                final_epoch * EXPECTED_UPDATES_PER_EPOCH
+                final_epoch * updates_per_epoch(stage)
             ),
             "selection_status": "offline_validation_pending",
         }
@@ -834,9 +842,9 @@ def _validate_candidate_index(
             status.get("status") != "complete"
             or status.get("formal_stage") != stage
             or status.get("completed_epochs") != final_epoch
-            or status.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
+            or status.get("updates_per_epoch") != updates_per_epoch(stage)
             or status.get("optimizer_updates")
-            != final_epoch * EXPECTED_UPDATES_PER_EPOCH
+            != final_epoch * updates_per_epoch(stage)
             or status.get("all_training_state_finite", True) is not True
             or status.get("config_sha256")
             != index["config_sha256"][stage]
@@ -906,7 +914,7 @@ def _validate_candidate_index(
             )
             if (
                 epoch != expected_epoch
-                or updates != epoch * EXPECTED_UPDATES_PER_EPOCH
+                or updates != epoch * updates_per_epoch(stage)
                 or checkpoint in observed_paths
                 or checkpoint.stat().st_size != checkpoint_bytes
                 or sha256_file(checkpoint) != checkpoint_sha
@@ -1684,6 +1692,7 @@ def load_selected_prerequisites(
             "stage": stage,
             "selection_metric": row["selection_metric"],
             "epoch": epoch,
+            "updates_per_epoch": updates_per_epoch(stage),
             "optimizer_updates": updates,
             "candidate_index": candidate_index_number,
             "selection_score": score,

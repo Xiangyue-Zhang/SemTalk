@@ -38,6 +38,13 @@ MINIMUM_BOUNDARY_EPOCH = 200
 EXPECTED_UPDATES_PER_EPOCH = 497
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = frozenset(("face", "hands", "upper", "lower"))
+
+
+def updates_per_epoch(stage: str) -> int:
+    try:
+        return val_contract.updates_per_epoch(stage)
+    except val_contract.ContractError as error:
+        raise ContinuationWaveError(str(error)) from error
 FORMAL_HOSTS = frozenset(
     (
         "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0",
@@ -342,7 +349,7 @@ def _validate_candidate(
     if (
         epoch <= 0
         or epoch % INTERVAL_EPOCHS != 0
-        or updates != epoch * EXPECTED_UPDATES_PER_EPOCH
+        or updates != epoch * updates_per_epoch(stage)
     ):
         raise ContinuationWaveError(f"{label} epoch/update mismatch")
     checkpoint = _validate_checkpoint(
@@ -609,14 +616,14 @@ def _topology(stage: str) -> dict[str, int]:
             "world_size": 4,
             "local_batch_size": 64,
             "global_batch_size": 256,
-            "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "updates_per_epoch": updates_per_epoch(stage),
         }
     if stage == "global":
         return {
             "world_size": 1,
-            "local_batch_size": 256,
-            "global_batch_size": 256,
-            "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "local_batch_size": 64,
+            "global_batch_size": 64,
+            "updates_per_epoch": updates_per_epoch(stage),
         }
     raise ContinuationWaveError(f"unknown prerequisite stage {stage!r}")
 
@@ -1437,7 +1444,8 @@ def _load_old_runtime_evidence(
         )
     except val_contract.ContractError as error:
         raise ContinuationWaveError(str(error)) from error
-    expected_updates = boundary * EXPECTED_UPDATES_PER_EPOCH
+    stage_updates = updates_per_epoch(stage)
+    expected_updates = boundary * stage_updates
     expected_world = _topology(stage)["world_size"]
     if (
         not isinstance(status, dict)
@@ -1445,7 +1453,7 @@ def _load_old_runtime_evidence(
         or status.get("formal_stage") != stage
         or status.get("completed_epochs") != boundary
         or status.get("epochs") not in (None, boundary)
-        or status.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
+        or status.get("updates_per_epoch") != stage_updates
         or status.get("optimizer_updates") != expected_updates
         or status.get("world_size") not in (None, expected_world)
         or status.get("config_sha256") != old_config_sha256

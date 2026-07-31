@@ -285,6 +285,9 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         source: dict[str, object],
     ) -> tuple[Path, str, dict[str, object]]:
         stages: dict[str, list[dict[str, object]]] = {}
+        source_receipts = {
+            stage: dict(source) for stage in contract.STAGES
+        }
         for stage in contract.STAGES:
             entries = []
             for epoch in contract.EXPECTED_CANDIDATE_EPOCHS:
@@ -300,7 +303,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     {
                         "epoch": epoch,
                         "optimizer_updates": (
-                            epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+                            epoch * contract.updates_per_epoch(stage)
                         ),
                         "checkpoint": str(path.resolve()),
                         "checkpoint_sha256": hashlib.sha256(
@@ -324,10 +327,15 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "candidate_epochs": list(
                     contract.EXPECTED_CANDIDATE_EPOCHS
                 ),
-                "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
-                "source_receipts": {
-                    stage: dict(source) for stage in contract.STAGES
-                },
+                "updates_per_epoch": contract.updates_per_epoch_map(
+                    contract.STAGES
+                ),
+                "source_policy": contract.build_source_policy(
+                    source_receipts,
+                    stages=contract.STAGES,
+                    reprove_ancestry=False,
+                ),
+                "source_receipts": source_receipts,
                 "config_sha256": {
                     stage: hashlib.sha256(stage.encode()).hexdigest()
                     for stage in contract.STAGES
@@ -989,6 +997,12 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "stages",
             ):
                 partial[key].pop("global")
+            partial["updates_per_epoch"].pop("global")
+            partial["source_policy"] = contract.build_source_policy(
+                partial["source_receipts"],
+                stages=contract.STAGES[:-1],
+                reprove_ancestry=False,
+            )
             partial = contract.receipt_payload(partial)
             contract.validate_candidate_index(
                 partial,
@@ -1074,18 +1088,24 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     "exact SHA-256 agreement at save/resume/finalize"
                 ),
             }
+            stage_updates = contract.updates_per_epoch(stage)
+            stage_batch = 256 if stage in contract.RVQ_STAGES else 64
             distributed_unsigned = {
                 "format": "semtalk_show_representation_ddp_v1",
                 "formal_stage": stage,
-                "world_size": 2,
-                "local_batch_size": 128,
-                "global_batch_size": 256,
+                "world_size": 2 if stage in contract.RVQ_STAGES else 1,
+                "local_batch_size": (
+                    128 if stage in contract.RVQ_STAGES else 64
+                ),
+                "global_batch_size": stage_batch,
                 "train_samples": 127_286,
                 "available_train_samples": 127_286,
-                "consumed_samples_per_epoch": 127_232,
-                "dropped_samples_per_epoch": 54,
+                "consumed_samples_per_epoch": stage_updates * stage_batch,
+                "dropped_samples_per_epoch": (
+                    127_286 - stage_updates * stage_batch
+                ),
                 "padding_or_duplicate_samples_per_epoch": 0,
-                "updates_per_epoch": 497,
+                "updates_per_epoch": stage_updates,
                 "loader_drop_last": True,
                 "sampler": sampler,
                 "rvq_ema": rvq_ema,
@@ -1648,6 +1668,163 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             self.assertIn(token, source)
         self.assertNotIn("git push", source)
         self.assertNotIn("git checkout -b", source)
+        self.assertNotIn(
+            "semtalk_show_prerequisite_nonglobal_candidate_index_v1",
+            source,
+        )
+        self.assertIn(
+            "partial_candidate_index_format=${candidate_index_formats[1]}",
+            source,
+        )
+
+    def test_source_policy_accepts_only_global_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve() / "source"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "fixture@example.invalid",
+                ],
+                check=True,
+            )
+            entrypoint = repo / "show_base_train.py"
+            entrypoint.write_text("# rvq\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "show_base_train.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "rvq"], check=True)
+            rvq_commit = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            rvq_tree = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], text=True
+            ).strip()
+            entrypoint.write_text("# global fix\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "show_base_train.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "global"], check=True)
+            global_commit = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            global_tree = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], text=True
+            ).strip()
+
+            def frozen(commit: str, tree: str) -> dict[str, object]:
+                identity = {
+                    "origin": contract.EXPECTED_ORIGIN,
+                    "commit": commit,
+                    "tree": tree,
+                    "script_relative": "show_base_train.py",
+                    "script_sha256": "1" * 64,
+                }
+                return {
+                    "source_root": str(repo),
+                    "portable_identity": identity,
+                }
+
+            sources = {
+                stage: frozen(rvq_commit, rvq_tree)
+                for stage in contract.RVQ_STAGES
+            }
+            sources["global"] = frozen(global_commit, global_tree)
+            policy = contract.build_source_policy(
+                sources,
+                stages=contract.STAGES,
+                reprove_ancestry=True,
+            )
+            self.assertTrue(policy["global_descends_from_rvq"])
+
+            reverse = {
+                stage: frozen(global_commit, global_tree)
+                for stage in contract.RVQ_STAGES
+            }
+            reverse["global"] = frozen(rvq_commit, rvq_tree)
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "not an RVQ-source descendant",
+            ):
+                contract.build_source_policy(
+                    reverse,
+                    stages=contract.STAGES,
+                    reprove_ancestry=True,
+                )
+
+            mixed = copy.deepcopy(sources)
+            mixed["hands"] = frozen(global_commit, global_tree)
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "RVQ identities differ",
+            ):
+                contract.build_source_policy(
+                    mixed,
+                    stages=contract.STAGES,
+                    reprove_ancestry=False,
+                )
+
+    def test_optimizer_runtime_receipt_is_stage_specific(self) -> None:
+        payload = {
+            "format": "semtalk_show_optimizer_runtime_v1",
+            "formal_stage": "global",
+            "class": "torch.optim.Adam",
+            "base_learning_rate": 1.5e-4,
+            "betas": [0.5, 0.999],
+            "weight_decay": 0.0,
+            "eps": 1e-8,
+            "amsgrad": False,
+            "parameter_groups": 1,
+            "trained_parameter_tensors": 12,
+        }
+        payload["receipt_sha256"] = contract.canonical_payload_sha256(
+            payload
+        )
+        self.assertEqual(
+            contract.validate_optimizer_runtime_receipt(
+                payload,
+                stage="global",
+                label="global optimizer",
+                required=True,
+            ),
+            payload,
+        )
+        wrong_lr = dict(payload)
+        wrong_lr["base_learning_rate"] = 6e-4
+        wrong_lr.pop("receipt_sha256")
+        wrong_lr["receipt_sha256"] = contract.canonical_payload_sha256(
+            wrong_lr
+        )
+        with self.assertRaisesRegex(
+            contract.ContractError,
+            "optimizer protocol mismatch",
+        ):
+            contract.validate_optimizer_runtime_receipt(
+                wrong_lr,
+                stage="global",
+                label="global optimizer",
+                required=True,
+            )
+        with self.assertRaisesRegex(contract.ContractError, "is required"):
+            contract.validate_optimizer_runtime_receipt(
+                None,
+                stage="global",
+                label="global optimizer",
+                required=True,
+            )
+        self.assertIsNone(
+            contract.validate_optimizer_runtime_receipt(
+                None,
+                stage="face",
+                label="legacy RVQ optimizer",
+                required=False,
+            )
+        )
 
 
 if __name__ == "__main__":

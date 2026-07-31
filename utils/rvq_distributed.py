@@ -75,9 +75,9 @@ def representation_ddp_receipt(
             "rank_state": "exact SHA-256 agreement at save/resume/finalize",
         }
     elif formal_stage == "global":
-        if world_size != 1 or local_batch_size != 256:
+        if world_size != 1 or local_batch_size != 64:
             raise RuntimeError(
-                "formal Global keeps world_size 1 and batch size 256"
+                "formal Global keeps the official world_size 1 and batch 64"
             )
         sampler = {
             "class": "RandomSampler",
@@ -101,12 +101,8 @@ def representation_ddp_receipt(
         }
         ema = {"enabled": False}
 
-    expected_updates = (
-        497 if formal_stage in REPRESENTATION_STAGES else 1_988
-    )
-    expected_global_batch = (
-        256 if formal_stage in REPRESENTATION_STAGES else 64
-    )
+    expected_updates = 497 if formal_stage in RVQ_STAGES else 1_988
+    expected_global_batch = 256 if formal_stage in RVQ_STAGES else 64
     consumed_samples = updates_per_epoch * expected_global_batch
     if (
         train_samples != 127_286

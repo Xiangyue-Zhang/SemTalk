@@ -73,7 +73,7 @@ def checkpoint(stage: str, epoch: int) -> dict:
 def candidate(stage: str, epoch: int) -> dict:
     return {
         "epoch": epoch,
-        "optimizer_updates": epoch * wave.EXPECTED_UPDATES_PER_EPOCH,
+        "optimizer_updates": epoch * wave.updates_per_epoch(stage),
         "checkpoint": checkpoint(stage, epoch),
         "checkpoint_audit_sha256": hashlib.sha256(
             f"audit:{stage}:{epoch}".encode()
@@ -98,7 +98,7 @@ def boundary_state_proof(stage: str, boundary: int) -> dict:
         "stage": stage,
         "boundary_epoch": boundary,
         "optimizer_updates": (
-            boundary * wave.EXPECTED_UPDATES_PER_EPOCH
+            boundary * wave.updates_per_epoch(stage)
         ),
         "world_size": world,
         "model_state_sha256": SHA_A,
@@ -110,7 +110,7 @@ def boundary_state_proof(stage: str, boundary: int) -> dict:
         ).hexdigest(),
         "trained_parameter_count": 17,
         "adam_state_count": 17,
-        "adam_step": boundary * wave.EXPECTED_UPDATES_PER_EPOCH,
+        "adam_step": boundary * wave.updates_per_epoch(stage),
         "scheduler_epoch": boundary - 1,
         "scheduler_lrs": [0.000123],
         "rvq_ema_layers": 6 if stage in wave.RVQ_STAGES else 0,

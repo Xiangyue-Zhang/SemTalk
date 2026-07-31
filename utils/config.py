@@ -75,6 +75,17 @@ def parse_args():
         action="store_true",
     )
     parser.add(
+        "--global-one-epoch-gate",
+        "--global_one_epoch_gate",
+        dest="global_one_epoch_gate",
+        action="store_true",
+        help=(
+            "Run the audited fresh one-full-epoch SHOW Global gate. "
+            "This mode is restricted to formal_stage=global and cannot "
+            "be resumed or used as a prerequisite candidate source."
+        ),
+    )
+    parser.add(
         "--initial-model-checkpoint",
         "--initial_model_checkpoint",
         dest="initial_model_checkpoint",

@@ -88,10 +88,10 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                     "formal_stage": stage,
                     "completed_epochs": 200,
                     "updates_per_epoch": (
-                        producer_contract.EXPECTED_UPDATES_PER_EPOCH
+                        producer_contract.updates_per_epoch(stage)
                     ),
                     "optimizer_updates": (
-                        200 * producer_contract.EXPECTED_UPDATES_PER_EPOCH
+                        200 * producer_contract.updates_per_epoch(stage)
                     ),
                     "all_training_state_finite": True,
                     "config_sha256": candidate_index["config_sha256"][
@@ -110,7 +110,7 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                         "completed_epochs": 200,
                         "optimizer_updates": (
                             200
-                            * producer_contract.EXPECTED_UPDATES_PER_EPOCH
+                            * producer_contract.updates_per_epoch(stage)
                         ),
                         "selection_status": (
                             "offline_validation_pending"
@@ -188,6 +188,19 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
         self.assertEqual(
             [result["selected"][stage]["epoch"] for stage in consumer.STAGES],
             [40, 80, 100, 120, 140],
+        )
+        self.assertEqual(
+            {
+                stage: result["selected"][stage]["updates_per_epoch"]
+                for stage in consumer.STAGES
+            },
+            {
+                "face": 497,
+                "hands": 497,
+                "upper": 497,
+                "lower": 497,
+                "global": 1_988,
+            },
         )
         self.assertEqual(
             set(result["producer_sources"]),

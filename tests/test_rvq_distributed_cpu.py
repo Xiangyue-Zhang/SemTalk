@@ -253,7 +253,7 @@ class RVQDistributedCPUTest(unittest.TestCase):
             consumed_by_epoch.append(flattened)
         self.assertNotEqual(consumed_by_epoch[0], consumed_by_epoch[1])
 
-    def test_receipt_locks_w2_w4_and_global_batch_256(self) -> None:
+    def test_receipt_locks_rvq_256_and_official_global_64(self) -> None:
         from utils.rvq_distributed import (
             representation_ddp_receipt,
             validate_representation_ddp_receipt,
@@ -293,6 +293,26 @@ class RVQDistributedCPUTest(unittest.TestCase):
                 updates_per_epoch=497,
                 seed=2021,
             )
+        global_receipt = representation_ddp_receipt(
+            formal_stage="global",
+            world_size=1,
+            local_batch_size=64,
+            train_samples=127_286,
+            updates_per_epoch=1_988,
+            seed=2021,
+        )
+        validate_representation_ddp_receipt(
+            global_receipt,
+            formal_stage="global",
+            world_size=1,
+            local_batch_size=64,
+            train_samples=127_286,
+            updates_per_epoch=1_988,
+            seed=2021,
+        )
+        self.assertEqual(global_receipt["global_batch_size"], 64)
+        self.assertEqual(global_receipt["consumed_samples_per_epoch"], 127_232)
+        self.assertEqual(global_receipt["dropped_samples_per_epoch"], 54)
     def test_optimizer_lr_uses_global_batch(self) -> None:
         from types import SimpleNamespace
         from optimizers.optim_factory import optimizer_kwargs
@@ -311,6 +331,11 @@ class RVQDistributedCPUTest(unittest.TestCase):
         self.assertEqual(
             optimizer_kwargs(args, 1)["learning_rate"],
             3e-4 * 256 / 128,
+        )
+        args.global_batch_size = 64
+        self.assertEqual(
+            optimizer_kwargs(args, 1)["learning_rate"],
+            1.5e-4,
         )
 
     def test_official_codebook_prior_prevents_first_update_reset(self) -> None:

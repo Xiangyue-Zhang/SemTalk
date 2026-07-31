@@ -419,7 +419,7 @@ def _read_shard(
         or payload["test_visible"] is not False
         or payload["epoch"] != epoch
         or payload["optimizer_updates"]
-        != epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+        != epoch * contract.updates_per_epoch(stage)
         or payload["finite"] is not True
         or payload["exact_once_within_shard"] is not True
     ):

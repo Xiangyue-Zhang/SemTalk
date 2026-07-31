@@ -49,7 +49,7 @@ class ContinuationStagePlanBuilderTests(unittest.TestCase):
                 "epochs": 220,
                 "run_name": "continuation_global",
                 "final_ckpt_name": "show_ft_global_220.bin",
-                "batch_size": 256,
+                "batch_size": 64,
             }
             source = {"origin": contract.EXPECTED_ORIGIN, "marker": "source"}
             value = {

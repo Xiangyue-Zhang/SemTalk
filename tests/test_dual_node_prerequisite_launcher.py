@@ -64,16 +64,43 @@ class DualNodePrerequisiteLauncherTest(unittest.TestCase):
             self.source,
         )
         self.assertIn(
-            '--batch_size "$((256 / ${#stage_gpus[@]}))"',
+            '--batch_size "$stage_local_batch_size"',
             self.source,
         )
-        self.assertIn("--global_batch_size 256", self.source)
-        self.assertIn("updates = entries // 256", self.source)
+        self.assertIn(
+            '--global_batch_size "$stage_global_batch_size"',
+            self.source,
+        )
+        self.assertIn("rvq_updates = entries // 256", self.source)
+        self.assertIn("global_updates = entries // 64", self.source)
+        self.assertIn("stage_global_batch_size=64", self.source)
+        self.assertIn("stage_local_batch_size=64", self.source)
         self.assertIn('global "$global_gpu" 29615', self.source)
         self.assertIn('global_gpu=0', self.source)
         self.assertIn('global_gpu=4', self.source)
         self.assertIn('"$name" == face || "$name" == hands', self.source)
         self.assertIn('global_launched=false', self.source)
+
+    def test_fresh_global_only_and_one_epoch_gate_are_fail_closed(self) -> None:
+        self.assertIn("--fresh-global-only", self.source)
+        self.assertIn("--fresh-global-gate-e1", self.source)
+        self.assertIn("active_stages=(global)", self.source)
+        self.assertIn(
+            "fresh Global-only modes are restricted to master",
+            self.source,
+        )
+        self.assertIn("show_ft_global_gate_1.bin", self.source)
+        self.assertIn("--global-one-epoch-gate", self.source)
+        self.assertIn('global 0 29615', self.source)
+        self.assertIn('"$fresh_global_only" == false', self.source)
+        self.assertIn(
+            "the one-full-epoch Global gate must be a fresh training run",
+            self.training_source,
+        )
+        self.assertIn(
+            "the one-full-epoch gate is restricted to W1 Global",
+            self.training_source,
+        )
 
     def test_ddp_jobs_forbid_detached_pool_helpers(self) -> None:
         self.assertNotIn("POOL_GATE_REPORT", self.source)

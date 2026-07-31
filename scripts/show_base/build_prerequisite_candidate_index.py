@@ -139,7 +139,7 @@ def _audit_final_checkpoint(
         or audit.get("format") != "semtalk_show_model_v2"
         or audit.get("formal_stage") != stage
         or audit.get("optimizer_updates")
-        != final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+        != final_epoch * contract.updates_per_epoch(stage)
     ):
         raise RuntimeError(f"{stage} final checkpoint audit mismatch")
     source = contract.validate_training_audit_source(
@@ -176,6 +176,12 @@ def _audit_final_checkpoint(
         audit.get("distributed_training_receipt"),
         stage=stage,
         label=f"{stage} final distributed training receipt",
+    )
+    contract.validate_optimizer_runtime_receipt(
+        audit.get("optimizer_runtime_receipt"),
+        stage=stage,
+        label=f"{stage} final optimizer runtime receipt",
+        required=stage == "global",
     )
     contract.validate_rvq_ema_prior_receipt(
         audit.get("rvq_ema_prior_receipt"),
@@ -271,7 +277,7 @@ def _validate_latest_candidate_receipt(
         "sha256": candidate["checkpoint_sha256"],
         "completed_epochs": final_epoch,
         "optimizer_updates": (
-            final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+            final_epoch * contract.updates_per_epoch(stage)
         ),
         "selection_status": "offline_validation_pending",
     }:
@@ -325,9 +331,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             or status.get("formal_stage") != stage
             or status.get("completed_epochs") != final_epoch
             or status.get("updates_per_epoch")
-            != contract.EXPECTED_UPDATES_PER_EPOCH
+            != contract.updates_per_epoch(stage)
             or status.get("optimizer_updates")
-            != final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+            != final_epoch * contract.updates_per_epoch(stage)
         ):
             raise RuntimeError(f"{stage} formal training is not complete")
         status_source = contract.validate_training_audit_source(
@@ -392,6 +398,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 label=f"{stage} status distributed training receipt",
             )
         )
+        status_optimizer_runtime = (
+            contract.validate_optimizer_runtime_receipt(
+                status.get("optimizer_runtime_receipt"),
+                stage=stage,
+                label=f"{stage} status optimizer runtime receipt",
+                required=stage == "global",
+            )
+        )
         status_rvq_prior = contract.validate_rvq_ema_prior_receipt(
             status.get("rvq_ema_prior_receipt"),
             stage=stage,
@@ -431,6 +445,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "initialization_receipt": status_initialization,
             "rvq_ema_prior_receipt": status_rvq_prior,
             "distributed_training_receipt": status_distributed,
+            "optimizer_runtime_receipt": status_optimizer_runtime,
         }
         _require_common_audit_binding(
             final_audit,
@@ -483,7 +498,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             candidate_dir
             / (
                 f"{stage}_epoch_{epoch:04d}_step_"
-                f"{epoch * contract.EXPECTED_UPDATES_PER_EPOCH:09d}.bin"
+                f"{epoch * contract.updates_per_epoch(stage):09d}.bin"
             )
             for epoch in schedule
         ]
@@ -536,6 +551,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     "initialization_receipt",
                     "rvq_ema_prior_receipt",
                     "distributed_training_receipt",
+                    "optimizer_runtime_receipt",
                 ):
                     if audit.get(key) != stage_audit.get(key):
                         raise RuntimeError(
@@ -545,7 +561,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 {
                     "epoch": epoch,
                     "optimizer_updates": (
-                        epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+                        epoch * contract.updates_per_epoch(stage)
                     ),
                     "checkpoint": str(resolved),
                     "checkpoint_sha256": digest,
@@ -605,17 +621,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             f"{stage} dataset receipt SHA-256",
         )
         stages[stage] = entries
-    source_core = {
+    rvq_source_core = {
         contract.canonical_payload_sha256(
             contract.portable_training_source_identity(
                 value["portable_identity"],
                 "portable training source",
             )
         )
-        for value in source_receipts.values()
+        for stage, value in source_receipts.items()
+        if stage in contract.RVQ_STAGES
     }
-    if len(source_core) != 1:
-        raise RuntimeError("prerequisite candidate sources differ")
+    if len(rvq_source_core) != 1:
+        raise RuntimeError("prerequisite RVQ candidate sources differ")
     payload = contract.receipt_payload(
         {
             "format": (
@@ -629,7 +646,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "selection_split": "val",
             "test_visible": False,
             "candidate_epochs": list(schedule),
-            "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
+            "updates_per_epoch": contract.updates_per_epoch_map(
+                expected_stages
+            ),
+            "source_policy": contract.build_source_policy(
+                source_receipts,
+                stages=expected_stages,
+                reprove_ancestry=True,
+            ),
             "source_receipts": source_receipts,
             "config_sha256": config_sha256,
             "dataset_receipt_sha256": dataset_receipt_sha256,
@@ -640,6 +664,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     contract.validate_candidate_index(
         payload,
         allow_partial=scope == "nonglobal",
+        reprove_source_ancestry=True,
     )
     contract.atomic_json_new(args.output_json, payload)
     return payload

@@ -3890,6 +3890,9 @@ def _rvq_ema_invariant_errors(model: torch.nn.Module) -> list[str]:
 
 def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
     representation_stage = args.formal_stage in REPRESENTATION_STAGES
+    global_one_epoch_gate = bool(
+        getattr(args, "global_one_epoch_gate", False)
+    )
     wave_receipt = bool(
         getattr(args, "resume_wave_receipt", "")
     )
@@ -3912,12 +3915,36 @@ def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
         raise RuntimeError(
             "formal continuation is restricted to representation stages"
         )
-    global_batch_size = 256 if representation_stage else 64
-    local_batch_size = (
-        global_batch_size // world_size
-        if args.formal_stage in RVQ_STAGES
-        else global_batch_size
-    )
+    if global_one_epoch_gate:
+        if args.formal_stage != "global" or world_size != 1:
+            raise RuntimeError(
+                "the one-full-epoch gate is restricted to W1 Global"
+            )
+        if wave_receipt or config_preflight or getattr(args, "resume_state", ""):
+            raise RuntimeError(
+                "the one-full-epoch Global gate must be a fresh training run"
+            )
+        if not str(args.run_name).endswith("_global_gate_e1_global"):
+            raise RuntimeError(
+                "the one-full-epoch Global gate stage run name must end "
+                "with _global_gate_e1_global"
+            )
+    if args.formal_stage in RVQ_STAGES:
+        global_batch_size = 256
+        local_batch_size = global_batch_size // world_size
+        log_period = 497
+    elif args.formal_stage == "global":
+        # Preserve the official VAEConvZero optimizer exposure exactly.
+        # The stock config is a single-process batch of 64, which makes the
+        # repository optimizer use 3e-4 * 64 / 128 == 1.5e-4.  Treating this
+        # stage like the four DDP RVQ stages silently quadruples its LR.
+        global_batch_size = 64
+        local_batch_size = 64
+        log_period = 1_988
+    else:
+        global_batch_size = 64
+        local_batch_size = 64
+        log_period = 1_988
     common = {
         "dataset": "show_base",
         "training_speakers": [0, 1, 2, 3],
@@ -3963,7 +3990,7 @@ def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
         "deterministic": True,
         "benchmark": True,
         "cudnn_enabled": True,
-        "log_period": 497 if representation_stage else 1_988,
+        "log_period": log_period,
         "save_every": 5,
         "use_lower_target_joints_cache": False,
     }
@@ -4100,6 +4127,13 @@ def _validate_formal_stage(args: Any, *, world_size: int = 1) -> None:
         raise RuntimeError(
             f"--formal_stage must be one of {sorted(stages)}, got {args.formal_stage!r}"
         )
+    if global_one_epoch_gate:
+        stages["global"] = {
+            **stages["global"],
+            "epochs": 1,
+            "save_every": 1,
+            "final_ckpt_name": "show_ft_global_gate_1.bin",
+        }
     if wave_receipt or config_preflight:
         target_epoch = _require_exact_audit_int(
             args.epochs,
@@ -4269,6 +4303,33 @@ def _load_resume(
         train_samples=len(trainer.train_data),
         updates_per_epoch=trainer.train_length,
         seed=int(trainer.args.random_seed),
+    )
+    embedded_optimizer_receipt = payload.get("optimizer_runtime_receipt")
+    if (
+        trainer.args.formal_stage == "global"
+        and embedded_optimizer_receipt is None
+    ):
+        raise RuntimeError(
+            "Global resume lacks its optimizer runtime receipt"
+        )
+    if embedded_optimizer_receipt is not None and (
+        not isinstance(embedded_optimizer_receipt, dict)
+        or embedded_optimizer_receipt.get("format")
+        != "semtalk_show_optimizer_runtime_v1"
+        or embedded_optimizer_receipt.get("formal_stage")
+        != trainer.args.formal_stage
+        or embedded_optimizer_receipt.get("receipt_sha256")
+        != _payload_sha256(
+            {
+                key: value
+                for key, value in embedded_optimizer_receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
+    ):
+        raise RuntimeError("resume optimizer runtime receipt is invalid")
+    trainer.loaded_optimizer_runtime_receipt = copy.deepcopy(
+        embedded_optimizer_receipt
     )
     expected_resume_config_sha = config_sha256
     expected_resume_source_sha = source_receipt_sha256
@@ -4678,6 +4739,9 @@ def _save_resume(
         "updates_per_epoch": updates_per_epoch,
         "batch_size": batch_size,
         "distributed_training_receipt": distributed_training_receipt,
+        "optimizer_runtime_receipt": copy.deepcopy(
+            trainer.optimizer_runtime_receipt
+        ),
         "rvq_rank_state_receipt": rvq_rank_state_receipt,
         "initialization_receipt": copy.deepcopy(
             getattr(trainer, "initialization_receipt", None)
@@ -4786,6 +4850,9 @@ def _model_payload(
         "source_receipt_sha256": _payload_sha256(source_receipt),
         "optimizer_updates": optimizer_updates,
         "distributed_training_receipt": distributed_training_receipt,
+        "optimizer_runtime_receipt": copy.deepcopy(
+            trainer.optimizer_runtime_receipt
+        ),
         "rvq_rank_state_receipt": rvq_rank_state_receipt,
         "initialization_receipt": copy.deepcopy(
             getattr(trainer, "initialization_receipt", None)
@@ -6120,6 +6187,9 @@ def _save_representation_candidate(
             trainer.rvq_ema_prior_receipt
         ),
         "distributed_training_receipt": distributed_training_receipt,
+        "optimizer_runtime_receipt": copy.deepcopy(
+            trainer.optimizer_runtime_receipt
+        ),
         "rvq_rank_state_receipt": rvq_rank_state_receipt,
         "selection_status": "offline_validation_pending",
         **_continuation_wave_overlay(trainer),
@@ -6244,6 +6314,100 @@ def _validate_representation_candidate_receipt(
     return copy.deepcopy(receipt)
 
 
+def _validate_formal_optimizer_runtime(
+    trainer: Any,
+    *,
+    formal_stage: str,
+    completed_epochs: int = 0,
+) -> dict[str, Any]:
+    """Bind the instantiated optimizer to the stage's real batch semantics."""
+
+    optimizer = getattr(trainer, "opt", None)
+    if not isinstance(optimizer, torch.optim.Adam):
+        raise RuntimeError("formal SHOW training requires torch.optim.Adam")
+    expected_base_lr = 6e-4 if formal_stage in RVQ_STAGES else (
+        1.5e-4 if formal_stage == "global" else 5e-5
+    )
+    if type(completed_epochs) is not int or completed_epochs < 0:
+        raise RuntimeError("formal optimizer completed_epochs is invalid")
+    scheduler = getattr(trainer, "opt_s", None)
+    base_lrs = getattr(scheduler, "base_values", None)
+    if (
+        not isinstance(base_lrs, list)
+        or not base_lrs
+        or any(
+            abs(float(lr) - expected_base_lr) > 1e-15
+            for lr in base_lrs
+        )
+        or not hasattr(scheduler, "get_epoch_values")
+    ):
+        raise RuntimeError("formal optimizer scheduler base LR mismatch")
+    current_lrs = [group.get("lr") for group in optimizer.param_groups]
+    expected_current = (
+        list(base_lrs)
+        if completed_epochs == 0
+        else list(scheduler.get_epoch_values(completed_epochs - 1))
+    )
+    if (
+        len(current_lrs) != len(base_lrs)
+        or len(expected_current) != len(base_lrs)
+    ):
+        raise RuntimeError("formal optimizer scheduler base LR mismatch")
+    groups = getattr(optimizer, "param_groups", None)
+    if not isinstance(groups, list) or not groups:
+        raise RuntimeError("formal optimizer has no parameter groups")
+    if len(groups) != len(current_lrs):
+        raise RuntimeError("formal optimizer/scheduler group count mismatch")
+    for index, group in enumerate(groups):
+        lr = group.get("lr")
+        betas = group.get("betas")
+        weight_decay = group.get("weight_decay")
+        eps = group.get("eps")
+        amsgrad = group.get("amsgrad")
+        if (
+            type(lr) is not float
+            or abs(lr - float(expected_current[index])) > 1e-15
+            or betas != (0.5, 0.999)
+            or type(weight_decay) not in {int, float}
+            or float(weight_decay) != 0.0
+            or eps != 1e-8
+            or amsgrad is not False
+        ):
+            raise RuntimeError(
+                "formal optimizer runtime differs from the locked "
+                f"{formal_stage} contract at param group {index}"
+            )
+    trainable = {
+        id(parameter)
+        for parameter in trainer.model.parameters()
+        if parameter.requires_grad
+    }
+    optimized = [
+        id(parameter)
+        for group in groups
+        for parameter in group.get("params", ())
+    ]
+    if len(optimized) != len(set(optimized)) or set(optimized) != trainable:
+        raise RuntimeError(
+            "formal optimizer parameters do not exactly cover the trainable "
+            "model parameters"
+        )
+    receipt = {
+        "format": "semtalk_show_optimizer_runtime_v1",
+        "formal_stage": formal_stage,
+        "class": "torch.optim.Adam",
+        "base_learning_rate": expected_base_lr,
+        "betas": [0.5, 0.999],
+        "weight_decay": 0.0,
+        "eps": 1e-8,
+        "amsgrad": False,
+        "parameter_groups": len(groups),
+        "trained_parameter_tensors": len(trainable),
+    }
+    receipt["receipt_sha256"] = _payload_sha256(receipt)
+    return receipt
+
+
 def main() -> None:
     args = config.parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -6254,10 +6418,10 @@ def main() -> None:
     args.gpus = list(range(world_size)) if args.ddp else [0]
     args.skip_test_init = True
     expected_global_batch_size = (
-        256 if args.formal_stage in REPRESENTATION_STAGES else 64
+        256 if args.formal_stage in RVQ_STAGES else 64
     )
     expected_updates_per_epoch = (
-        497 if args.formal_stage in REPRESENTATION_STAGES else 1_988
+        497 if args.formal_stage in RVQ_STAGES else 1_988
     )
     if args.global_batch_size not in {0, expected_global_batch_size}:
         raise RuntimeError(
@@ -6464,6 +6628,10 @@ def main() -> None:
     trainer = __import__(
         f"{args.trainer}_trainer", fromlist=["something"]
     ).CustomTrainer(args)
+    trainer.optimizer_runtime_receipt = _validate_formal_optimizer_runtime(
+        trainer,
+        formal_stage=args.formal_stage,
+    )
     initialization_receipt = None
     rvq_ema_prior_receipt = None
     if args.formal_stage in REPRESENTATION_STAGES:
@@ -6651,6 +6819,20 @@ def main() -> None:
                 candidate_manifest_path=candidate_manifest_path,
                 continuation_runtime=continuation_runtime,
         )
+        restored_optimizer_receipt = _validate_formal_optimizer_runtime(
+            trainer,
+            formal_stage=args.formal_stage,
+            completed_epochs=start_epoch,
+        )
+        if (
+            args.formal_stage == "global"
+            and restored_optimizer_receipt
+            != getattr(trainer, "loaded_optimizer_runtime_receipt", None)
+        ):
+            raise RuntimeError(
+                "restored Global optimizer runtime differs from resume"
+            )
+        trainer.optimizer_runtime_receipt = restored_optimizer_receipt
     else:
         active_candidate_transaction = _inspect_base_candidate_transaction(
             candidate_manifest_path,
@@ -6753,6 +6935,9 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "distributed_training_receipt": (
                     distributed_training_receipt
+                ),
+                "optimizer_runtime_receipt": copy.deepcopy(
+                    trainer.optimizer_runtime_receipt
                 ),
                 "rvq_rank_state_receipt": rvq_rank_state_receipt,
                 "initialization_receipt": initialization_receipt,
@@ -7104,6 +7289,9 @@ def main() -> None:
                             "distributed_training_receipt": (
                                 distributed_training_receipt
                             ),
+                            "optimizer_runtime_receipt": copy.deepcopy(
+                                trainer.optimizer_runtime_receipt
+                            ),
                             "rvq_rank_state_receipt": (
                                 rvq_rank_state_receipt
                             ),
@@ -7270,6 +7458,9 @@ def main() -> None:
                     "distributed_training_receipt": (
                         distributed_training_receipt
                     ),
+                    "optimizer_runtime_receipt": copy.deepcopy(
+                        trainer.optimizer_runtime_receipt
+                    ),
                     "rvq_rank_state_receipt": rvq_rank_state_receipt,
                     "initialization_receipt": initialization_receipt,
                     "rvq_ema_prior_receipt": rvq_ema_prior_receipt,
@@ -7346,6 +7537,9 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "distributed_training_receipt": (
                         distributed_training_receipt
+                    ),
+                    "optimizer_runtime_receipt": copy.deepcopy(
+                        trainer.optimizer_runtime_receipt
                     ),
                     "rvq_rank_state_receipt": rvq_rank_state_receipt,
                     "initialization_receipt": initialization_receipt,

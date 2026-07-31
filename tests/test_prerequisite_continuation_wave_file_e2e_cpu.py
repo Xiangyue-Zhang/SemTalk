@@ -80,6 +80,9 @@ class ImprovingFixture:
 
     def candidate_fixture(self, root: Path, source: dict[str, object]):
         stages: dict[str, list[dict[str, object]]] = {}
+        source_receipts = {
+            stage: copy.deepcopy(source) for stage in contract.STAGES
+        }
         for stage in contract.STAGES:
             entries = []
             for epoch in self.schedule:
@@ -96,7 +99,7 @@ class ImprovingFixture:
                     {
                         "epoch": epoch,
                         "optimizer_updates": (
-                            epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+                            epoch * contract.updates_per_epoch(stage)
                         ),
                         "checkpoint": str(path.resolve()),
                         "checkpoint_sha256": hashlib.sha256(payload).hexdigest(),
@@ -116,10 +119,15 @@ class ImprovingFixture:
                 "selection_split": "val",
                 "test_visible": False,
                 "candidate_epochs": list(self.schedule),
-                "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
-                "source_receipts": {
-                    stage: copy.deepcopy(source) for stage in contract.STAGES
-                },
+                "updates_per_epoch": contract.updates_per_epoch_map(
+                    contract.STAGES
+                ),
+                "source_policy": contract.build_source_policy(
+                    source_receipts,
+                    stages=contract.STAGES,
+                    reprove_ancestry=False,
+                ),
+                "source_receipts": source_receipts,
                 "config_sha256": {
                     stage: hashlib.sha256(stage.encode()).hexdigest()
                     for stage in contract.STAGES
@@ -210,7 +218,8 @@ def _smplx(stage: str, host: str) -> dict[str, object] | None:
 
 def _resume(stage: str, boundary: int) -> dict[str, object]:
     world = 4 if stage in wave.RVQ_STAGES else 1
-    updates = boundary * contract.EXPECTED_UPDATES_PER_EPOCH
+    stage_updates = contract.updates_per_epoch(stage)
+    updates = boundary * stage_updates
     rvq = (
         {
             f"layer_{index}": {
@@ -227,7 +236,7 @@ def _resume(stage: str, boundary: int) -> dict[str, object]:
         "format": "semtalk_show_train_resume_v5",
         "completed_epochs": boundary,
         "optimizer_updates": updates,
-        "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
+        "updates_per_epoch": stage_updates,
         "world_size": world,
         "model_state": {"weight": FakeTensor(1.0)},
         "optimizer_state": {
@@ -319,9 +328,9 @@ def _write_runtime_statuses(
             "status": "complete",
             "formal_stage": stage,
             "completed_epochs": boundary,
-            "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
+            "updates_per_epoch": contract.updates_per_epoch(stage),
             "optimizer_updates": (
-                boundary * contract.EXPECTED_UPDATES_PER_EPOCH
+                boundary * contract.updates_per_epoch(stage)
             ),
             "world_size": 4 if stage in wave.RVQ_STAGES else 1,
             "hostname": hosts[stage],
@@ -337,7 +346,7 @@ def _write_runtime_statuses(
                 "sha256": latest["checkpoint_sha256"],
                 "completed_epochs": boundary,
                 "optimizer_updates": (
-                    boundary * contract.EXPECTED_UPDATES_PER_EPOCH
+                    boundary * contract.updates_per_epoch(stage)
                 ),
                 "selection_status": "offline_validation_pending",
             },

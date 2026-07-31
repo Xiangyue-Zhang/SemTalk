@@ -104,8 +104,9 @@ def _build_stage(
         or status.get("formal_stage") != stage
         or status.get("completed_epochs") != target
         or status.get("optimizer_updates")
-        != target * contract.EXPECTED_UPDATES_PER_EPOCH
-        or status.get("updates_per_epoch") != contract.EXPECTED_UPDATES_PER_EPOCH
+        != target * contract.updates_per_epoch(stage)
+        or status.get("updates_per_epoch")
+        != contract.updates_per_epoch(stage)
         or status.get("continuation_wave_receipt") != wave_binding
         or status.get("hostname") != new["host"]
         or status.get("config_sha256") != new["config_sha256"]
@@ -150,6 +151,12 @@ def _build_stage(
         stage=stage,
         label=f"{stage} continuation distributed receipt",
     )
+    optimizer_runtime = contract.validate_optimizer_runtime_receipt(
+        status.get("optimizer_runtime_receipt"),
+        stage=stage,
+        label=f"{stage} continuation optimizer runtime receipt",
+        required=stage == "global",
+    )
     prior = contract.validate_rvq_ema_prior_receipt(
         status.get("rvq_ema_prior_receipt"),
         stage=stage,
@@ -173,6 +180,7 @@ def _build_stage(
         "initialization_receipt": initialization,
         "rvq_ema_prior_receipt": prior,
         "distributed_training_receipt": distributed,
+        "optimizer_runtime_receipt": optimizer_runtime,
     }
     final_evidence, final_audit, final_state = initial._audit_final_checkpoint(
         torch, status=status, run=run, stage=stage, final_epoch=target
@@ -188,7 +196,7 @@ def _build_stage(
     candidate_dir = run / "representation_candidates"
     expected_path = candidate_dir / (
         f"{stage}_epoch_{target:04d}_step_"
-        f"{target * contract.EXPECTED_UPDATES_PER_EPOCH:09d}.bin"
+        f"{target * contract.updates_per_epoch(stage):09d}.bin"
     )
     if (
         candidate_dir.is_symlink()
@@ -212,7 +220,7 @@ def _build_stage(
         raise SegmentedIndexError(f"{stage} candidate wave binding mismatch")
     entry = {
         "epoch": target,
-        "optimizer_updates": target * contract.EXPECTED_UPDATES_PER_EPOCH,
+        "optimizer_updates": target * contract.updates_per_epoch(stage),
         "checkpoint": str(candidate_path),
         "checkpoint_sha256": checkpoint_sha,
         "checkpoint_bytes": candidate_path.stat().st_size,
@@ -384,7 +392,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "selection_split": "val",
             "test_visible": False,
             "candidate_epochs": [*prior["candidate_epochs"], target],
-            "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
+            "updates_per_epoch": contract.updates_per_epoch_map(stages),
+            "source_policy": contract.build_source_policy(
+                sources,
+                stages=stages,
+                reprove_ancestry=True,
+            ),
             "source_receipts": sources,
             "config_sha256": configs,
             "dataset_receipt_sha256": datasets,

@@ -19,6 +19,7 @@ FORMAT = "semtalk_show_prerequisite_boundary_state_v1"
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = frozenset(("face", "hands", "upper", "lower"))
 UPDATES_PER_EPOCH = 497
+GLOBAL_UPDATES_PER_EPOCH = 1_988
 RNG_KEYS = {"python", "numpy", "torch_cpu", "torch_cuda"}
 PROOF_KEYS = {
     "format",
@@ -44,6 +45,14 @@ PROOF_KEYS = {
 
 class BoundaryStateError(RuntimeError):
     """Raised when resume state is empty, reset, or structurally ambiguous."""
+
+
+def updates_per_epoch(stage: str) -> int:
+    if stage in RVQ_STAGES:
+        return UPDATES_PER_EPOCH
+    if stage == "global":
+        return GLOBAL_UPDATES_PER_EPOCH
+    raise BoundaryStateError(f"unknown stage {stage!r}")
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -596,12 +605,13 @@ def build_boundary_state_proof(
     if boundary < 200 or boundary % 20 or world <= 0:
         raise BoundaryStateError("boundary/world protocol mismatch")
     expected_world = 4 if stage in RVQ_STAGES else 1
-    expected_updates = boundary * UPDATES_PER_EPOCH
+    stage_updates = updates_per_epoch(stage)
+    expected_updates = boundary * stage_updates
     if (
         resume.get("format") != "semtalk_show_train_resume_v5"
         or resume.get("completed_epochs") != boundary
         or resume.get("optimizer_updates") != expected_updates
-        or resume.get("updates_per_epoch") != UPDATES_PER_EPOCH
+        or resume.get("updates_per_epoch") != stage_updates
         or resume.get("world_size") != world
         or world != expected_world
     ):
@@ -664,7 +674,7 @@ def validate_boundary_state_proof(value: Any) -> dict[str, Any]:
     if (
         boundary < 200
         or boundary % 20
-        or updates != boundary * UPDATES_PER_EPOCH
+        or updates != boundary * updates_per_epoch(value["stage"])
         or world != expected_world
         or value["adam_step"] != updates
         or value["scheduler_epoch"] != boundary - 1

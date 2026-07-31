@@ -11,13 +11,14 @@ export PYTHONDONTWRITEBYTECODE=1
 #
 # Every RVQ is one single-node W4 DDP job with local batch 64 and locked global
 # batch 256, matching the proven All-Speakers prerequisite exposure topology.
-# Global retains its exact W1 fastpath with batch 256 and overlaps the slower
-# master RVQ after the first four-GPU group is released. No NCCL process group
-# crosses the master/worker node boundary.
+# Global preserves the official W1 local/global batch 64 topology and its exact
+# 1,988 updates per epoch. It overlaps the slower master RVQ only after the
+# first four-GPU group is released. No NCCL process group crosses the
+# master/worker node boundary.
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 [--resume | --continuation-wave WAVE_JSON WAVE_SHA256]"
+        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 [--resume | --fresh-global-only | --fresh-global-gate-e1 | --continuation-wave WAVE_JSON WAVE_SHA256]"
 }
 
 if [[ $# -ne 10 && $# -ne 11 && $# -ne 13 ]]; then
@@ -42,16 +43,29 @@ parity_bundle=$9
 parity_sha256=${10}
 resume_mode=false
 continuation_mode=false
+fresh_global_only=false
+global_one_epoch_gate=false
 continuation_wave=
 continuation_wave_sha256=
 formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
 official_vq_root=${SEMTALK_OFFICIAL_VQ_ROOT:-/local-ssd/xiangyuezhang/semtalk_all_speakers_full_vq_20260730/pretrained_vq}
 if [[ $# -eq 11 ]]; then
-    if [[ ${11} != "--resume" ]]; then
-        usage
-        exit 2
-    fi
-    resume_mode=true
+    case ${11} in
+        --resume)
+            resume_mode=true
+            ;;
+        --fresh-global-only)
+            fresh_global_only=true
+            ;;
+        --fresh-global-gate-e1)
+            fresh_global_only=true
+            global_one_epoch_gate=true
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
 elif [[ $# -eq 13 ]]; then
     if [[ ${11} != "--continuation-wave" ]]; then
         usage
@@ -65,9 +79,18 @@ fi
 formal_partition=${SEMTALK_FORMAL_PARTITION:-}
 case "$formal_partition" in
     master)
-        active_stages=(face hands global)
+        if [[ "$fresh_global_only" == true ]]; then
+            active_stages=(global)
+        else
+            active_stages=(face hands global)
+        fi
         ;;
     worker)
+        if [[ "$fresh_global_only" == true ]]; then
+            printf '%s\n' \
+                "fresh Global-only modes are restricted to master" >&2
+            exit 2
+        fi
         active_stages=(upper lower)
         ;;
     *)
@@ -130,8 +153,16 @@ if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf 'unsafe run id: %s\n' "$run_id" >&2
     exit 1
 fi
+if [[ "$global_one_epoch_gate" == true && \
+      "$run_id" != *_global_gate_e1 ]]; then
+    printf '%s\n' \
+        "one-full-epoch Global gate RUN_ID must end with _global_gate_e1" \
+        >&2
+    exit 1
+fi
 
-read -r train_samples updates_per_epoch global_foot_fastpath < <(
+read -r train_samples rvq_updates_per_epoch \
+    global_updates_per_epoch global_foot_fastpath < <(
     "$python_bin" - "$rep_summary" "$rep_lmdb" "$lineage" \
         "$parity_bundle" "$parity_sha256" "$asset_root" <<'PY'
 import hashlib
@@ -266,12 +297,18 @@ digest = digest_state.hexdigest()
 if digest != summary["data_mdb_sha256"]:
     raise SystemExit("representation data.mdb SHA mismatch")
 entries = require_exact_int(summary.get("entries"), "representation entries")
-updates = entries // 256
-if entries != 127_286 or updates != 497:
+rvq_updates = entries // 256
+global_updates = entries // 64
+if (
+    entries != 127_286
+    or rvq_updates != 497
+    or global_updates != 1_988
+):
     raise SystemExit(
-        f"formal representation accounting mismatch: {entries=} {updates=}"
+        "formal representation accounting mismatch: "
+        f"{entries=} {rvq_updates=} {global_updates=}"
     )
-print(entries, updates, fastpath)
+print(entries, rvq_updates, global_updates, fastpath)
 PY
 )
 
@@ -615,7 +652,12 @@ launch_stage() {
     local parity_args=()
     local smplx_args=()
     local lower_backend_args=()
+    local stage_mode_args=()
     local -a stage_gpus=()
+    local stage_updates_per_epoch=$rvq_updates_per_epoch
+    local stage_global_batch_size=256
+    local stage_local_batch_size=0
+    local stage_save_every=5
     local log_path="$output_root/logs/$run_id/$stage.log"
     mkdir -p "$stage_out"
 
@@ -625,6 +667,24 @@ launch_stage() {
     fi
 
     IFS=, read -r -a stage_gpus <<<"$physical_gpus"
+    stage_local_batch_size=$((stage_global_batch_size / ${#stage_gpus[@]}))
+    if [[ "$stage" == global ]]; then
+        stage_updates_per_epoch=$global_updates_per_epoch
+        stage_global_batch_size=64
+        stage_local_batch_size=64
+        if [[ "$global_one_epoch_gate" == true ]]; then
+            if [[ "$epochs" -ne 1 || \
+                  "$final_name" != show_ft_global_gate_1.bin ]]; then
+                printf 'invalid one-full-epoch Global gate arguments\n' >&2
+                return 1
+            fi
+            stage_save_every=1
+            stage_mode_args=(--global-one-epoch-gate)
+        fi
+    elif [[ "$global_one_epoch_gate" == true ]]; then
+        printf 'the one-full-epoch gate cannot launch %s\n' "$stage" >&2
+        return 1
+    fi
     if [[ "$pool_mode" == disabled ]]; then
         local expected_world_size=4
         if [[ "$stage" == global ]]; then
@@ -718,15 +778,15 @@ launch_stage() {
             --lineage_manifest "$lineage" \
             --dataset_summary "$rep_summary" \
             --expected_train_samples "$train_samples" \
-            --expected_updates_per_epoch "$updates_per_epoch" \
-            --batch_size "$((256 / ${#stage_gpus[@]}))" \
-            --global_batch_size 256 \
+            --expected_updates_per_epoch "$stage_updates_per_epoch" \
+            --batch_size "$stage_local_batch_size" \
+            --global_batch_size "$stage_global_batch_size" \
             --initial-model-checkpoint \
                 "$official_vq_root/${official_filename[$stage]}" \
             --strict_finite true \
             --rvq_check_finite_every_step false \
-            --save_every 5 \
-            --log_period "$updates_per_epoch" \
+            --save_every "$stage_save_every" \
+            --log_period "$stage_updates_per_epoch" \
             --loader_workers "${SEMTALK_LOADER_WORKERS:-4}" \
             --random_seed 2021 \
             --pretrain false \
@@ -747,6 +807,7 @@ launch_stage() {
             "${smplx_args[@]}" \
             "${parity_args[@]}" \
             "${lower_backend_args[@]}" \
+            "${stage_mode_args[@]}" \
             "${resume_args[@]}"
     ) >"$log_path" 2>&1 &
     local child_pid=$!
@@ -772,7 +833,17 @@ launch_stage() {
     pending_pid=
 }
 
-if [[ "$formal_partition" == master ]]; then
+if [[ "$fresh_global_only" == true ]]; then
+    global_epochs=200
+    global_final_name=show_ft_global_200.bin
+    if [[ "$global_one_epoch_gate" == true ]]; then
+        global_epochs=1
+        global_final_name=show_ft_global_gate_1.bin
+    fi
+    launch_stage \
+        global 0 29615 configs/cnn_vqvae_lower_foot_30.yaml \
+        "$global_final_name" "$global_epochs" disabled
+elif [[ "$formal_partition" == master ]]; then
     launch_stage \
         face 0,1,2,3 29611 configs/cnn_vqvae_face_30.yaml \
         show_ft_face_200.bin 200 disabled
@@ -820,6 +891,7 @@ while ((${#active_pids[@]} > 0)); do
     fi
     printf 'stage complete: %s pid=%s\n' "$name" "$finished_pid"
     if [[ "$formal_partition" == master && \
+          "$fresh_global_only" == false && \
           "$global_launched" == false && \
           ( "$name" == face || "$name" == hands ) ]]; then
         global_gpu=0

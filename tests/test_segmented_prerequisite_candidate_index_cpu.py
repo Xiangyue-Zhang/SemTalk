@@ -78,7 +78,9 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
                 entries.append(
                     {
                         "epoch": epoch,
-                        "optimizer_updates": epoch * contract.EXPECTED_UPDATES_PER_EPOCH,
+                        "optimizer_updates": (
+                            epoch * contract.updates_per_epoch(stage)
+                        ),
                         "checkpoint": str(checkpoint),
                         "checkpoint_sha256": contract.sha256_file(checkpoint),
                         "checkpoint_bytes": checkpoint.stat().st_size,
@@ -107,6 +109,17 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
             "candidate_segment_chain": chains,
         }
         segmented["receipt_payload_sha256"] = contract.canonical_payload_sha256(segmented)
+        portable_identity = {
+            "origin": contract.EXPECTED_ORIGIN,
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "script_relative": "show_base_train.py",
+            "script_sha256": "3" * 64,
+        }
+        source_receipts = {
+            stage: {"portable_identity": dict(portable_identity)}
+            for stage in contract.STAGES
+        }
         payload = {
             "format": contract.CANDIDATE_INDEX_FORMAT,
             "status": "complete",
@@ -115,11 +128,15 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
             "selection_split": "val",
             "test_visible": False,
             "candidate_epochs": epochs,
-            "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
-            "source_receipts": {
-                stage: {"portable_identity": {"stage": stage}}
-                for stage in contract.STAGES
-            },
+            "updates_per_epoch": contract.updates_per_epoch_map(
+                contract.STAGES
+            ),
+            "source_policy": contract.build_source_policy(
+                source_receipts,
+                stages=contract.STAGES,
+                reprove_ancestry=False,
+            ),
+            "source_receipts": source_receipts,
             "config_sha256": {stage: "c" * 64 for stage in contract.STAGES},
             "dataset_receipt_sha256": {stage: "d" * 64 for stage in contract.STAGES},
             "formal_training_status": {stage: {} for stage in contract.STAGES},
@@ -134,10 +151,6 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
             contract,
             "validate_frozen_training_source",
             side_effect=lambda value, *_args, **_kwargs: value,
-        ), mock.patch.object(
-            contract,
-            "portable_training_source_identity",
-            return_value={"same": True},
         ), mock.patch.object(
             contract,
             "_validate_bound_prior_candidate_index",

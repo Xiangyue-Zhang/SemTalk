@@ -81,7 +81,8 @@ def rng_state(seed: int) -> dict:
 
 
 def resume_fixture(stage_name: str = "face", boundary: int = 200) -> dict:
-    updates = boundary * state.UPDATES_PER_EPOCH
+    stage_updates = state.updates_per_epoch(stage_name)
+    updates = boundary * stage_updates
     scheduler = step_state()
     current_lr = state._step_epoch_values(scheduler, boundary - 1)[0]
     optimizer = {
@@ -123,7 +124,7 @@ def resume_fixture(stage_name: str = "face", boundary: int = 200) -> dict:
         "format": "semtalk_show_train_resume_v5",
         "completed_epochs": boundary,
         "optimizer_updates": updates,
-        "updates_per_epoch": state.UPDATES_PER_EPOCH,
+        "updates_per_epoch": stage_updates,
         "world_size": world_size,
         "model_state": {
             "weight": Tensor([0.5, -0.25]),
