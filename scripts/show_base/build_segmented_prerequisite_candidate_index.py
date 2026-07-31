@@ -282,11 +282,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         allow_partial=False,
     )
     expected_format = (
-        contract.CANDIDATE_INDEX_FORMAT
+        contract.SEGMENTED_CANDIDATE_INDEX_FORMAT
         if scope == "full"
-        else contract.PARTIAL_CANDIDATE_INDEX_FORMAT
+        else contract.SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT
     )
-    if prior["format"] != contract.CANDIDATE_INDEX_FORMAT:
+    if prior["format"] not in {
+        contract.CANDIDATE_INDEX_FORMAT,
+        contract.SEGMENTED_CANDIDATE_INDEX_FORMAT,
+    }:
         raise SegmentedIndexError(
             "the wave-bound full prior index is required for either output scope"
         )
@@ -298,27 +301,87 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     receipt = wave.replay_wave_file(
         args.continuation_wave, args.expected_continuation_wave_sha256
     )
+    if receipt.get("format") != wave.PER_STAGE_FORMAT:
+        raise SegmentedIndexError(
+            "segmented publishing requires the per-stage continuation v2 path"
+        )
     wave_artifact = _artifact(
         args.continuation_wave,
         args.expected_continuation_wave_sha256,
         receipt["receipt_payload_sha256"],
     )
-    target = receipt["target_epoch"]
-    if tuple(prior["candidate_epochs"]) != tuple(range(20, target, 20)):
-        raise SegmentedIndexError("prior index does not end at wave boundary")
-    runs = _parse_runs(args.stage_run, stages)
+    all_active_entries = {
+        entry["stage"]: entry for entry in receipt["stages"]
+    }
+    if (
+        list(all_active_entries) != receipt["trigger_stages"]
+        or not all_active_entries
+    ):
+        raise SegmentedIndexError(
+            "continuation active stage inventory changed"
+        )
+    active_entries = {
+        stage: entry
+        for stage, entry in all_active_entries.items()
+        if stage in stages
+    }
+    if not active_entries:
+        raise SegmentedIndexError(
+            "continuation wave has no active stage inside output scope"
+        )
+    runs = _parse_runs(args.stage_run, tuple(active_entries))
+    prior_schedules = contract.candidate_epochs_by_stage(prior)
     wave_binding = {
         key: wave_artifact[key]
         for key in ("path", "sha256", "receipt_payload_sha256")
     }
     new_entries: dict[str, dict[str, Any]] = {}
-    sources: dict[str, Any] = {}
-    configs: dict[str, str] = {}
-    datasets: dict[str, str] = {}
-    statuses: dict[str, Any] = {}
-    chains: dict[str, Any] = {}
-    for stage in stages:
-        wave_entry = _wave_entry(receipt, stage)
+    sources = {stage: prior["source_receipts"][stage] for stage in stages}
+    configs = {stage: prior["config_sha256"][stage] for stage in stages}
+    datasets = {
+        stage: prior["dataset_receipt_sha256"][stage] for stage in stages
+    }
+    statuses = {
+        stage: prior["formal_training_status"][stage] for stage in stages
+    }
+    stage_rows = {stage: list(prior["stages"][stage]) for stage in stages}
+    schedules = {stage: list(prior_schedules[stage]) for stage in stages}
+
+    def initial_chain(stage: str) -> list[dict[str, Any]]:
+        parents = {
+            str(Path(entry["checkpoint"]).parent.parent)
+            for entry in prior["stages"][stage]
+        }
+        if len(parents) != 1:
+            raise SegmentedIndexError(
+                f"{stage} initial candidates do not share one immutable run"
+            )
+        values = prior_schedules[stage]
+        return [
+            wave._make_chain_segment(
+                run_path=next(iter(parents)),
+                start_epoch=values[0],
+                end_epoch=values[-1],
+                predecessor_segment_id=None,
+            )
+        ]
+
+    prior_chains = prior.get("segmented_union", {}).get(
+        "candidate_segment_chain", {}
+    )
+    chains = {
+        stage: list(prior_chains[stage])
+        if stage in prior_chains
+        else initial_chain(stage)
+        for stage in stages
+    }
+    for stage, wave_entry in active_entries.items():
+        boundary = wave_entry["boundary_epoch"]
+        target = wave_entry["target_epoch"]
+        if prior_schedules[stage][-1] != boundary:
+            raise SegmentedIndexError(
+                f"{stage} prior index does not end at its wave boundary"
+            )
         old = wave_entry["old_segment"]
         catalog = old["candidate_catalog_receipt"]
         if (
@@ -358,16 +421,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         datasets[stage] = dataset_sha
         statuses[stage] = status
         chains[stage] = chain
-    portable = {
-        contract.canonical_payload_sha256(
-            contract.portable_training_source_identity(
-                source["portable_identity"], "terminal portable source"
-            )
-        )
-        for source in sources.values()
-    }
-    if len(portable) != 1:
-        raise SegmentedIndexError("terminal continuation sources differ")
+        stage_rows[stage].append(entry)
+        schedules[stage].append(target)
     prior_waves = (
         list(prior["segmented_union"]["continuation_waves"])
         if "segmented_union" in prior
@@ -391,21 +446,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "target_speaker_scope": contract.TARGET_SPEAKER_SCOPE,
             "selection_split": "val",
             "test_visible": False,
-            "candidate_epochs": [*prior["candidate_epochs"], target],
+            "candidate_epochs": sorted(
+                {epoch for values in schedules.values() for epoch in values}
+            ),
+            "candidate_epochs_by_stage": schedules,
             "updates_per_epoch": contract.updates_per_epoch_map(stages),
             "source_policy": contract.build_source_policy(
                 sources,
                 stages=stages,
                 reprove_ancestry=True,
+                independent_stage_sources=True,
             ),
             "source_receipts": sources,
             "config_sha256": configs,
             "dataset_receipt_sha256": datasets,
             "formal_training_status": statuses,
-            "stages": {
-                stage: [*prior["stages"][stage], new_entries[stage]]
-                for stage in stages
-            },
+            "stages": stage_rows,
             "segmented_union": segmented,
         }
     )
@@ -439,7 +495,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "status": result["status"],
-                "terminal_epoch": result["candidate_epochs"][-1],
+                "terminal_epochs": {
+                    stage: epochs[-1]
+                    for stage, epochs in result[
+                        "candidate_epochs_by_stage"
+                    ].items()
+                },
                 "stages": list(result["stages"]),
                 "receipt_payload_sha256": result["receipt_payload_sha256"],
             },

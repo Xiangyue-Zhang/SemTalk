@@ -118,6 +118,97 @@ if [[ "$continuation_mode" == true ]]; then
         exit 1
     fi
 fi
+if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'unsafe run id: %s\n' "$run_id" >&2
+    exit 1
+fi
+declare -A continuation_boundary_epoch=()
+declare -A continuation_target_epoch=()
+declare -A continuation_cap_epoch=()
+declare -A continuation_resume_path=()
+declare -A continuation_new_run_path=()
+if [[ "$continuation_mode" == true ]]; then
+    mapfile -d '' -t continuation_fields < <(
+        "$python_bin" - "$repo_root" "$continuation_wave" \
+            "$continuation_wave_sha256" "$formal_partition" \
+            "$output_root" "$run_id" <<'PY'
+from pathlib import Path
+import socket
+import sys
+
+repo = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(repo))
+from scripts.show_base import prerequisite_continuation_wave as wave
+
+receipt = wave.replay_wave_file(Path(sys.argv[2]), sys.argv[3])
+if receipt.get("format") != wave.PER_STAGE_FORMAT:
+    raise SystemExit("continuation launcher requires per-stage wave v2")
+partition = sys.argv[4]
+output_root = Path(sys.argv[5])
+run_id = sys.argv[6]
+owned = {
+    "master": ("face", "hands", "global"),
+    "worker": ("upper", "lower"),
+}[partition]
+entries = {entry["stage"]: entry for entry in receipt["stages"]}
+if list(entries) != receipt["trigger_stages"]:
+    raise SystemExit("continuation active inventory changed")
+hostname = socket.gethostname()
+fields = []
+for stage in owned:
+    if stage not in entries:
+        continue
+    entry = entries[stage]
+    old = entry["old_segment"]
+    new = entry["new_segment"]
+    expected_run = output_root / stage / "custom" / f"{run_id}_{stage}"
+    if (
+        new["host"] != hostname
+        or new["run_path"] != str(expected_run)
+        or old["boundary_resume"]["path"]
+        != str(Path(old["run_path"]) / "latest_resume.pt")
+        or entry["target_epoch"] != entry["boundary_epoch"] + 20
+        or entry["target_epoch"] > entry["cap_epoch"]
+    ):
+        raise SystemExit(
+            f"{stage} continuation host/run/resume/boundary mismatch"
+        )
+    fields.extend(
+        (
+            stage,
+            str(entry["boundary_epoch"]),
+            str(entry["target_epoch"]),
+            str(entry["cap_epoch"]),
+            old["boundary_resume"]["path"],
+            new["run_path"],
+        )
+    )
+if fields:
+    sys.stdout.buffer.write(b"\0".join(item.encode() for item in fields) + b"\0")
+PY
+    )
+    if (( ${#continuation_fields[@]} % 6 != 0 )); then
+        printf 'continuation wave preflight returned incomplete fields\n' >&2
+        exit 1
+    fi
+    active_stages=()
+    field_index=0
+    while ((field_index < ${#continuation_fields[@]})); do
+        stage=${continuation_fields[$field_index]}
+        active_stages+=("$stage")
+        continuation_boundary_epoch[$stage]=${continuation_fields[$((field_index + 1))]}
+        continuation_target_epoch[$stage]=${continuation_fields[$((field_index + 2))]}
+        continuation_cap_epoch[$stage]=${continuation_fields[$((field_index + 3))]}
+        continuation_resume_path[$stage]=${continuation_fields[$((field_index + 4))]}
+        continuation_new_run_path[$stage]=${continuation_fields[$((field_index + 5))]}
+        field_index=$((field_index + 6))
+    done
+    if ((${#active_stages[@]} == 0)); then
+        printf 'continuation partition has no authorized active stages: %s\n' \
+            "$formal_partition"
+        exit 0
+    fi
+fi
 if [[ ! -d "$rep_lmdb" ]]; then
     printf 'missing representation LMDB: %s\n' "$rep_lmdb" >&2
     exit 1
@@ -311,85 +402,6 @@ if (
 print(entries, rvq_updates, global_updates, fastpath)
 PY
 )
-
-declare -A continuation_resume_path=()
-declare -A continuation_new_run_path=()
-continuation_boundary_epoch=0
-continuation_target_epoch=200
-if [[ "$continuation_mode" == true ]]; then
-    mapfile -d '' -t continuation_fields < <(
-        "$python_bin" - "$repo_root" "$continuation_wave" \
-            "$continuation_wave_sha256" "$formal_partition" \
-            "$output_root" "$run_id" <<'PY'
-from pathlib import Path
-import socket
-import sys
-
-repo = Path(sys.argv[1]).resolve(strict=True)
-sys.path.insert(0, str(repo))
-from scripts.show_base import prerequisite_continuation_wave as wave
-
-wave_path = Path(sys.argv[2])
-wave_sha = sys.argv[3]
-partition = sys.argv[4]
-output_root = Path(sys.argv[5])
-run_id = sys.argv[6]
-receipt = wave.replay_wave_file(wave_path, wave_sha)
-expected = {
-    "master": ("face", "hands", "global"),
-    "worker": ("upper", "lower"),
-}[partition]
-entries = {entry["stage"]: entry for entry in receipt["stages"]}
-if set(entries) != set(wave.STAGES):
-    raise SystemExit("continuation wave does not cover exact five stages")
-hostname = socket.gethostname()
-fields = [
-    str(receipt["boundary_epoch"]),
-    str(receipt["target_epoch"]),
-]
-for stage in expected:
-    entry = entries[stage]
-    old = entry["old_segment"]
-    new = entry["new_segment"]
-    expected_run = output_root / stage / "custom" / f"{run_id}_{stage}"
-    if (
-        new["host"] != hostname
-        or new["run_path"] != str(expected_run)
-        or old["boundary_resume"]["path"]
-        != str(Path(old["run_path"]) / "latest_resume.pt")
-    ):
-        raise SystemExit(
-            f"{stage} continuation host/run/resume binding mismatch"
-        )
-    fields.extend(
-        (
-            stage,
-            old["boundary_resume"]["path"],
-            new["run_path"],
-        )
-    )
-sys.stdout.buffer.write(b"\0".join(item.encode() for item in fields) + b"\0")
-PY
-    )
-    expected_field_count=$((2 + 3 * ${#active_stages[@]}))
-    if [[ ${#continuation_fields[@]} -ne $expected_field_count ]]; then
-        printf 'continuation wave preflight returned incomplete fields\n' >&2
-        exit 1
-    fi
-    continuation_boundary_epoch=${continuation_fields[0]}
-    continuation_target_epoch=${continuation_fields[1]}
-    if ((continuation_target_epoch != continuation_boundary_epoch + 20)); then
-        printf 'continuation wave is not exact +20\n' >&2
-        exit 1
-    fi
-    field_index=2
-    while ((field_index < ${#continuation_fields[@]})); do
-        stage=${continuation_fields[$field_index]}
-        continuation_resume_path[$stage]=${continuation_fields[$((field_index + 1))]}
-        continuation_new_run_path[$stage]=${continuation_fields[$((field_index + 2))]}
-        field_index=$((field_index + 3))
-    done
-fi
 
 mkdir -p "$output_root/logs/$run_id"
 for stage in "${active_stages[@]}"; do
@@ -662,8 +674,16 @@ launch_stage() {
     mkdir -p "$stage_out"
 
     if [[ "$continuation_mode" == true ]]; then
-        epochs=$continuation_target_epoch
-        final_name="show_ft_${stage}_${continuation_target_epoch}.bin"
+        local stage_boundary=${continuation_boundary_epoch[$stage]:-0}
+        local stage_target=${continuation_target_epoch[$stage]:-0}
+        local stage_cap=${continuation_cap_epoch[$stage]:-0}
+        if ((stage_target != stage_boundary + 20 || stage_target > stage_cap)); then
+            printf 'invalid stage-local continuation bounds: %s\n' \
+                "$stage" >&2
+            return 1
+        fi
+        epochs=$stage_target
+        final_name="show_ft_${stage}_${stage_target}.bin"
     fi
 
     IFS=, read -r -a stage_gpus <<<"$physical_gpus"
@@ -717,7 +737,7 @@ launch_stage() {
             --resume_wave_receipt "$continuation_wave"
             --expected_resume_wave_sha256 "$continuation_wave_sha256"
         )
-        log_path="$output_root/logs/$run_id/$stage.continuation.e${continuation_target_epoch}.$$.log"
+        log_path="$output_root/logs/$run_id/$stage.continuation.e${continuation_target_epoch[$stage]}.$$.log"
     elif [[ "$resume_mode" == true ]]; then
         if [[ ! -f "$stage_dir/latest_resume.pt" ]]; then
             printf 'resume checkpoint is missing: %s\n' \
@@ -833,6 +853,18 @@ launch_stage() {
     pending_pid=
 }
 
+stage_is_active() {
+    local wanted=$1
+    local current
+    for current in "${active_stages[@]}"; do
+        if [[ "$current" == "$wanted" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+global_launched=false
 if [[ "$fresh_global_only" == true ]]; then
     global_epochs=200
     global_final_name=show_ft_global_200.bin
@@ -844,23 +876,43 @@ if [[ "$fresh_global_only" == true ]]; then
         global 0 29615 configs/cnn_vqvae_lower_foot_30.yaml \
         "$global_final_name" "$global_epochs" disabled
 elif [[ "$formal_partition" == master ]]; then
-    launch_stage \
-        face 0,1,2,3 29611 configs/cnn_vqvae_face_30.yaml \
-        show_ft_face_200.bin 200 disabled
-    launch_stage \
-        hands 4,5,6,7 29612 configs/cnn_vqvae_hands_30.yaml \
-        show_ft_hands_200.bin 200 disabled
+    if stage_is_active face; then
+        launch_stage \
+            face 0,1,2,3 29611 configs/cnn_vqvae_face_30.yaml \
+            show_ft_face_200.bin 200 disabled
+    fi
+    if stage_is_active hands; then
+        launch_stage \
+            hands 4,5,6,7 29612 configs/cnn_vqvae_hands_30.yaml \
+            show_ft_hands_200.bin 200 disabled
+    fi
+    if stage_is_active global; then
+        if ! stage_is_active face; then
+            launch_stage \
+                global 0 29615 configs/cnn_vqvae_lower_foot_30.yaml \
+                show_ft_global_200.bin 200 disabled
+            global_launched=true
+        elif ! stage_is_active hands; then
+            launch_stage \
+                global 4 29615 configs/cnn_vqvae_lower_foot_30.yaml \
+                show_ft_global_200.bin 200 disabled
+            global_launched=true
+        fi
+    fi
 else
-    launch_stage \
-        upper 0,1,2,3 29613 configs/cnn_vqvae_upper_30.yaml \
-        show_ft_upper_200.bin 200 disabled
-    launch_stage \
-        lower 4,5,6,7 29614 configs/cnn_vqvae_lower_30.yaml \
-        show_ft_lower_200.bin 200 disabled
+    if stage_is_active upper; then
+        launch_stage \
+            upper 0,1,2,3 29613 configs/cnn_vqvae_upper_30.yaml \
+            show_ft_upper_200.bin 200 disabled
+    fi
+    if stage_is_active lower; then
+        launch_stage \
+            lower 4,5,6,7 29614 configs/cnn_vqvae_lower_30.yaml \
+            show_ft_lower_200.bin 200 disabled
+    fi
 fi
 
 overall_rc=0
-global_launched=false
 wait_for_active() {
 while ((${#active_pids[@]} > 0)); do
     finished_pid=
@@ -893,7 +945,8 @@ while ((${#active_pids[@]} > 0)); do
     if [[ "$formal_partition" == master && \
           "$fresh_global_only" == false && \
           "$global_launched" == false && \
-          ( "$name" == face || "$name" == hands ) ]]; then
+          ( "$name" == face || "$name" == hands ) ]] && \
+          stage_is_active global; then
         global_gpu=0
         if [[ "$name" == hands ]]; then
             global_gpu=4

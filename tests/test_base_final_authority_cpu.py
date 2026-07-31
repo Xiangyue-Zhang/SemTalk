@@ -42,7 +42,7 @@ def write_wave(
     predecessor: dict[str, object] | None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     unsigned: dict[str, object] = {
-        "format": "semtalk_show_prerequisite_continuation_wave_v1",
+        "format": "semtalk_show_prerequisite_continuation_wave_v2",
         "status": "authorized",
         "test_visible": False,
         "decision": {
@@ -54,12 +54,19 @@ def write_wave(
                 f"continue-payload-{boundary}".encode()
             ).hexdigest(),
         },
-        "trigger_stages": ["face"],
-        "boundary_epoch": boundary,
-        "target_epoch": boundary + 20,
+        "trigger_stages": list(AUTH.REPRESENTATION_STAGES),
         "stages": [
             {
                 "stage": stage,
+                "boundary_epoch": boundary,
+                "target_epoch": boundary + 20,
+                "cap_epoch": {
+                    "face": 600,
+                    "hands": 500,
+                    "upper": 500,
+                    "lower": 600,
+                    "global": 1700,
+                }[stage],
                 "old_segment": {
                     "predecessor_wave": copy.deepcopy(predecessor)
                 },
@@ -399,13 +406,19 @@ class AuthorityFixture:
                 f"{stage}-measurement".encode()
             )
         prerequisite_unsigned = {
-            "format": "semtalk_show_prerequisite_val_selection_v1",
+            "format": "semtalk_show_prerequisite_val_selection_v2",
             "status": "selected",
             "split": "val",
             "test_visible": False,
             "protocol": {
                 "candidate_epochs": list(range(20, 201, 20)),
-                "candidates_per_stage": 10,
+                "candidate_epochs_by_stage": {
+                    stage: list(range(20, 201, 20))
+                    for stage in AUTH.REPRESENTATION_STAGES
+                },
+                "candidates_per_stage": {
+                    stage: 10 for stage in AUTH.REPRESENTATION_STAGES
+                },
             },
             "stages": [
                 {
@@ -479,12 +492,30 @@ class AuthorityFixture:
             self.winner_selection_payload,
         )
         self.continuation_payload = {
-            "format": "semtalk_show_prerequisite_continuation_decision_v1",
+            "format": "semtalk_show_prerequisite_continuation_decision_v2",
             "status": "complete",
             "decision": "stop",
             "test_visible": False,
             "inputs": {"selection": prerequisite_binding},
-            "stages": [],
+            "stages": [
+                {
+                    "stage": stage,
+                    "winner_epoch": 200,
+                    "latest_epoch": 200,
+                    "frozen_winner_epoch": 200,
+                    "cap_epoch": {
+                        "face": 600,
+                        "hands": 500,
+                        "upper": 500,
+                        "lower": 600,
+                        "global": 1700,
+                    }[stage],
+                    "action": "freeze",
+                    "target_epoch": None,
+                    "requests_continuation": False,
+                }
+                for stage in AUTH.REPRESENTATION_STAGES
+            ],
             "receipt_payload_sha256": hashlib.sha256(
                 b"continuation-payload"
             ).hexdigest(),
@@ -904,21 +935,30 @@ class BaseFinalAuthorityTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = AuthorityFixture(Path(directory))
+            extended = [*range(20, 201, 20), 220]
             fixture.prerequisite_selection_payload["protocol"] = {
-                "candidate_epochs": [
-                    *range(20, 201, 20),
-                    220,
-                ],
-                "candidates_per_stage": 11,
+                "candidate_epochs": extended,
+                "candidate_epochs_by_stage": {
+                    stage: list(extended)
+                    for stage in AUTH.REPRESENTATION_STAGES
+                },
+                "candidates_per_stage": {
+                    stage: 11 for stage in AUTH.REPRESENTATION_STAGES
+                },
             }
             face = fixture.prerequisite_selection_payload["stages"][0]
             face["epoch"] = 220
             face["optimizer_updates"] = 220 * 497
+            for terminal in fixture.continuation_payload["stages"]:
+                terminal["latest_epoch"] = 220
+                if terminal["stage"] == "face":
+                    terminal["winner_epoch"] = 220
+                    terminal["frozen_winner_epoch"] = 220
             with (
                 fixture.fresh_control_validators(),
                 self.assertRaisesRegex(
                     AUTH.BaseFinalAuthorityError,
-                    "does not cover every appended",
+                    "stage-local appended boundary|stage-local",
                 ),
             ):
                 AUTH.build_test_authority(**fixture.kwargs())
@@ -937,7 +977,10 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             ):
                 normalized_waves = AUTH._replay_continuation_waves(
                     [wave],
-                    candidate_epochs=[*range(20, 201, 20), 220],
+                    candidate_epochs_by_stage={
+                        stage: extended
+                        for stage in AUTH.REPRESENTATION_STAGES
+                    },
                 )
             fixture.continuation_waves.append(wave)
             fixture.published_validation["continuation_waves"] = [wave]
@@ -1016,38 +1059,48 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             ):
                 observed = AUTH._replay_continuation_waves(
                     [first, second],
-                    candidate_epochs=[*range(20, 201, 20), 220, 240],
+                    candidate_epochs_by_stage={
+                        stage: [*range(20, 201, 20), 220, 240]
+                        for stage in AUTH.REPRESENTATION_STAGES
+                    },
                 )
                 self.assertEqual(
-                    [(row["boundary_epoch"], row["target_epoch"]) for row in observed],
-                    [(200, 220), (220, 240)],
+                    [
+                        [
+                            (item["boundary_epoch"], item["target_epoch"])
+                            for item in row["stage_transitions"]
+                        ]
+                        for row in observed
+                    ],
+                    [
+                        [(200, 220)] * len(AUTH.REPRESENTATION_STAGES),
+                        [(220, 240)] * len(AUTH.REPRESENTATION_STAGES),
+                    ],
                 )
                 with self.assertRaisesRegex(
                     AUTH.BaseFinalAuthorityError,
-                    "does not cover every appended",
+                    "stage-local appended boundary|stage-local",
                 ):
                     AUTH._replay_continuation_waves(
                         [first],
-                        candidate_epochs=[
-                            *range(20, 201, 20),
-                            220,
-                            240,
-                        ],
+                        candidate_epochs_by_stage={
+                            stage: [*range(20, 201, 20), 220, 240]
+                            for stage in AUTH.REPRESENTATION_STAGES
+                        },
                     )
                 receipts[second["path"]]["stages"][0]["old_segment"][
                     "predecessor_wave"
                 ] = None
                 with self.assertRaisesRegex(
                     AUTH.BaseFinalAuthorityError,
-                    "predecessor chain mismatch",
+                    "stage chain mismatch",
                 ):
                     AUTH._replay_continuation_waves(
                         [first, second],
-                        candidate_epochs=[
-                            *range(20, 201, 20),
-                            220,
-                            240,
-                        ],
+                        candidate_epochs_by_stage={
+                            stage: [*range(20, 201, 20), 220, 240]
+                            for stage in AUTH.REPRESENTATION_STAGES
+                        },
                     )
 
     def test_all_twenty_two_published_rows_bind_long_training_bundle(

@@ -64,7 +64,7 @@ def _write_wave(
     predecessor: dict[str, object] | None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     receipt: dict[str, object] = {
-        "format": "semtalk_show_prerequisite_continuation_wave_v1",
+        "format": "semtalk_show_prerequisite_continuation_wave_v2",
         "status": "authorized",
         "test_visible": False,
         "decision": {
@@ -76,12 +76,19 @@ def _write_wave(
                 f"continue-payload-{boundary}".encode()
             ).hexdigest(),
         },
-        "trigger_stages": ["face"],
-        "boundary_epoch": boundary,
-        "target_epoch": boundary + 20,
+        "trigger_stages": list(CLAIM.STAGES),
         "stages": [
             {
                 "stage": stage,
+                "boundary_epoch": boundary,
+                "target_epoch": boundary + 20,
+                "cap_epoch": {
+                    "face": 600,
+                    "hands": 500,
+                    "upper": 500,
+                    "lower": 600,
+                    "global": 1700,
+                }[stage],
                 "old_segment": {
                     "predecessor_wave": copy.deepcopy(predecessor)
                 },
@@ -144,7 +151,8 @@ class ClaimFixture:
                     "selection_metric": CLAIM.STAGE_SELECTION_METRICS[stage],
                     "epoch": epoch,
                     "optimizer_updates": (
-                        epoch * CLAIM.PREREQUISITE_UPDATES_PER_EPOCH
+                        epoch
+                        * PREREQUISITE_CONTRACT.updates_per_epoch(stage)
                     ),
                     "candidate_index": index,
                     "selection_score": 1.0 + index,
@@ -168,13 +176,18 @@ class ClaimFixture:
             "split": "val",
             "test_visible": False,
             "protocol": {
-                "name": "five_independent_show_prerequisite_validation_v1",
+                "name": "five_independent_show_prerequisite_validation_v2",
                 "candidate_epochs": list(
                     CLAIM.PREREQUISITE_CANDIDATE_EPOCHS
                 ),
-                "candidates_per_stage": len(
-                    CLAIM.PREREQUISITE_CANDIDATE_EPOCHS
-                ),
+                "candidate_epochs_by_stage": {
+                    stage: list(CLAIM.PREREQUISITE_CANDIDATE_EPOCHS)
+                    for stage in CLAIM.STAGES
+                },
+                "candidates_per_stage": {
+                    stage: len(CLAIM.PREREQUISITE_CANDIDATE_EPOCHS)
+                    for stage in CLAIM.STAGES
+                },
                 "clips_per_candidate": CLAIM.EXPECTED_VAL_CLIPS,
                 "shards_per_candidate": CLAIM.EXPECTED_SHARDS,
                 "window_length": 64,
@@ -249,6 +262,16 @@ class ClaimFixture:
                     "relative_improvement": 0.5,
                     "latest_is_winner": False,
                     "meets_relative_improvement_threshold": True,
+                    "cap_epoch": {
+                        "face": 600,
+                        "hands": 500,
+                        "upper": 500,
+                        "lower": 600,
+                        "global": 1700,
+                    }[stage],
+                    "action": "freeze",
+                    "target_epoch": None,
+                    "frozen_winner_epoch": selected["epoch"],
                     "requests_continuation": decision == "continue",
                 }
             )
@@ -258,16 +281,28 @@ class ClaimFixture:
             "decision": decision,
             "test_visible": False,
             "protocol": {
-                "name": "fresh_replayed_recent_val_improvement_v1",
+                "name": "fresh_replayed_independent_stage_val_improvement_v2",
                 "score_direction": "lower_is_better",
                 "recent_candidates": 3,
                 "relative_improvement_reference": (
                     "best_of_preceding_two_recent_candidates"
                 ),
                 "minimum_relative_improvement": 0.005,
+                "interval_epochs": 20,
+                "stage_cap_epochs": {
+                    "face": 600,
+                    "hands": 500,
+                    "upper": 500,
+                    "lower": 600,
+                    "global": 1700,
+                },
                 "continue_rule": (
-                    "any_stage_latest_boundary_is_winner_and_relative_"
-                    "improvement_gte_threshold"
+                    "each_stage_latest_boundary_is_global_val_winner_and_"
+                    "relative_improvement_gte_threshold_and_below_stage_cap"
+                ),
+                "terminal_rule": (
+                    "otherwise_freeze_global_val_winner;at_cap_mark_capped;"
+                    "terminal_stages_never_reenter"
                 ),
             },
             "inputs": {
@@ -744,7 +779,13 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         fixture.prerequisite_payload["protocol"]["candidate_epochs"].append(
             220
         )
-        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = 11
+        fixture.prerequisite_payload["protocol"]["candidate_epochs_by_stage"] = {
+            stage: [*CLAIM.PREREQUISITE_CANDIDATE_EPOCHS, 220]
+            for stage in CLAIM.STAGES
+        }
+        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = {
+            stage: 11 for stage in CLAIM.STAGES
+        }
         fixture.prerequisite_artifact = _write_receipt(
             Path(fixture.prerequisite_artifact["path"]),
             fixture.prerequisite_payload,
@@ -780,7 +821,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             CLAIM.PublishedWinnerClaimError,
-            "do not cover every appended boundary",
+            "stage-local boundary",
         ):
             CLAIM._validate_continuation_waves(
                 [],
@@ -811,7 +852,13 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         fixture.prerequisite_payload["protocol"]["candidate_epochs"].append(
             220
         )
-        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = 11
+        fixture.prerequisite_payload["protocol"]["candidate_epochs_by_stage"] = {
+            stage: [*CLAIM.PREREQUISITE_CANDIDATE_EPOCHS, 220]
+            for stage in CLAIM.STAGES
+        }
+        fixture.prerequisite_payload["protocol"]["candidates_per_stage"] = {
+            stage: 11 for stage in CLAIM.STAGES
+        }
         face = fixture.prerequisite_payload["stages"][0]
         face["epoch"] = 220
         face["optimizer_updates"] = (
@@ -857,7 +904,11 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                     *range(20, 201, 20),
                     220,
                     240,
-                ]
+                ],
+                "candidate_epochs_by_stage": {
+                    stage: [*range(20, 201, 20), 220, 240]
+                    for stage in CLAIM.STAGES
+                },
             }
         }
         with (

@@ -30,10 +30,10 @@ WINNER_SELECTION_FORMAT = (
     "semtalk_show_base_talkshow_released2_fgd_selection_v1"
 )
 PREREQUISITE_SELECTION_FORMAT = (
-    "semtalk_show_prerequisite_val_selection_v1"
+    "semtalk_show_prerequisite_val_selection_v2"
 )
 CONTINUATION_DECISION_FORMAT = (
-    "semtalk_show_prerequisite_continuation_decision_v1"
+    "semtalk_show_prerequisite_continuation_decision_v2"
 )
 VAL_LINEAGE_FORMAT = "semtalk_show_base_val_inference_lineage_v2"
 METRIC_REPORT_FORMAT = "semtalk_show_talkshow_metrics_v1"
@@ -630,6 +630,9 @@ def _validate_prerequisite_selection(
                 None,
             )
         )
+        or not callable(
+            getattr(prerequisite_contract, "updates_per_epoch", None)
+        )
     ):
         raise PublishedWinnerClaimError(
             "prerequisite schedule validator ABI mismatch"
@@ -638,14 +641,40 @@ def _validate_prerequisite_selection(
         candidate_epochs = prerequisite_contract.validate_candidate_epochs(
             protocol.get("candidate_epochs")
         )
+        raw_schedules = protocol.get("candidate_epochs_by_stage")
+        if not isinstance(raw_schedules, dict) or set(raw_schedules) != set(STAGES):
+            raise ValueError("per-stage schedule coverage mismatch")
+        candidate_epochs_by_stage = {
+            stage: prerequisite_contract.validate_candidate_epochs(
+                raw_schedules[stage]
+            )
+            for stage in STAGES
+        }
+        if tuple(
+            sorted(
+                {
+                    epoch
+                    for values in candidate_epochs_by_stage.values()
+                    for epoch in values
+                }
+            )
+        ) != candidate_epochs:
+            raise ValueError("per-stage schedule union mismatch")
     except Exception as error:
         raise PublishedWinnerClaimError(
             f"prerequisite candidate schedule is invalid: {error}"
         ) from error
     if protocol != {
-        "name": "five_independent_show_prerequisite_validation_v1",
+        "name": "five_independent_show_prerequisite_validation_v2",
         "candidate_epochs": list(candidate_epochs),
-        "candidates_per_stage": len(candidate_epochs),
+        "candidate_epochs_by_stage": {
+            stage: list(candidate_epochs_by_stage[stage])
+            for stage in STAGES
+        },
+        "candidates_per_stage": {
+            stage: len(candidate_epochs_by_stage[stage])
+            for stage in STAGES
+        },
         "clips_per_candidate": EXPECTED_VAL_CLIPS,
         "shards_per_candidate": EXPECTED_SHARDS,
         "window_length": 64,
@@ -701,12 +730,15 @@ def _validate_prerequisite_selection(
             stage["stage"] != expected_stage
             or stage["selection_metric"]
             != STAGE_SELECTION_METRICS[expected_stage]
-            or epoch not in candidate_epochs
+            or epoch not in candidate_epochs_by_stage[expected_stage]
             or stage["optimizer_updates"]
-            != epoch * PREREQUISITE_UPDATES_PER_EPOCH
+            != epoch * prerequisite_contract.updates_per_epoch(
+                expected_stage
+            )
             or not isinstance(stage["candidate_index"], int)
             or isinstance(stage["candidate_index"], bool)
-            or stage["candidate_index"] != candidate_epochs.index(epoch)
+            or stage["candidate_index"]
+            != candidate_epochs_by_stage[expected_stage].index(epoch)
             or _require_number(
                 stage["selection_score"],
                 f"prerequisite {expected_stage} selection score",
@@ -769,16 +801,28 @@ def _validate_continuation_decision(
             "prerequisite continuation is not a final stop decision"
         )
     if decision["protocol"] != {
-        "name": "fresh_replayed_recent_val_improvement_v1",
+        "name": "fresh_replayed_independent_stage_val_improvement_v2",
         "score_direction": "lower_is_better",
         "recent_candidates": 3,
         "relative_improvement_reference": (
             "best_of_preceding_two_recent_candidates"
         ),
         "minimum_relative_improvement": 0.005,
+        "interval_epochs": 20,
+        "stage_cap_epochs": {
+            "face": 600,
+            "hands": 500,
+            "upper": 500,
+            "lower": 600,
+            "global": 1700,
+        },
         "continue_rule": (
-            "any_stage_latest_boundary_is_winner_and_relative_"
-            "improvement_gte_threshold"
+            "each_stage_latest_boundary_is_global_val_winner_and_relative_"
+            "improvement_gte_threshold_and_below_stage_cap"
+        ),
+        "terminal_rule": (
+            "otherwise_freeze_global_val_winner;at_cap_mark_capped;"
+            "terminal_stages_never_reenter"
         ),
     }:
         raise PublishedWinnerClaimError(
@@ -801,9 +845,15 @@ def _validate_continuation_decision(
         "prerequisite_val_contract"
     )
     try:
-        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
-            prerequisite_selection["protocol"]["candidate_epochs"]
-        )
+        raw_schedules = prerequisite_selection["protocol"][
+            "candidate_epochs_by_stage"
+        ]
+        candidate_epochs_by_stage = {
+            stage: prerequisite_contract.validate_candidate_epochs(
+                raw_schedules[stage]
+            )
+            for stage in STAGES
+        }
     except Exception as error:
         raise PublishedWinnerClaimError(
             f"continuation prerequisite schedule is invalid: {error}"
@@ -832,15 +882,33 @@ def _validate_continuation_decision(
                 "relative_improvement",
                 "latest_is_winner",
                 "meets_relative_improvement_threshold",
+                "cap_epoch",
+                "action",
+                "target_epoch",
+                "frozen_winner_epoch",
                 "requests_continuation",
             },
             f"continuation {expected_stage}",
         )
+        candidate_epochs = candidate_epochs_by_stage[expected_stage]
+        cap = decision["protocol"]["stage_cap_epochs"][expected_stage]
         if (
             stage["stage"] != expected_stage
             or stage["winner_epoch"] != selected["epoch"]
             or stage["latest_epoch"] != candidate_epochs[-1]
+            or stage["frozen_winner_epoch"] != selected["epoch"]
+            or stage["cap_epoch"] != cap
+            or stage["action"] not in {"freeze", "capped"}
+            or stage["target_epoch"] is not None
             or stage["requests_continuation"] is not False
+            or (
+                stage["action"] == "capped"
+                and stage["latest_epoch"] != cap
+            )
+            or (
+                stage["action"] == "freeze"
+                and stage["latest_epoch"] >= cap
+            )
         ):
             raise PublishedWinnerClaimError(
                 f"continuation {expected_stage} contradicts selection"
@@ -921,8 +989,8 @@ def _validate_continuation_waves(
     prerequisite_selection: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     protocol = prerequisite_selection.get("protocol")
-    raw_epochs = (
-        protocol.get("candidate_epochs")
+    raw_schedules = (
+        protocol.get("candidate_epochs_by_stage")
         if isinstance(protocol, dict)
         else None
     )
@@ -930,9 +998,14 @@ def _validate_continuation_waves(
         "prerequisite_val_contract"
     )
     try:
-        candidate_epochs = prerequisite_contract.validate_candidate_epochs(
-            raw_epochs
-        )
+        if not isinstance(raw_schedules, dict) or set(raw_schedules) != set(STAGES):
+            raise ValueError("per-stage schedule coverage mismatch")
+        schedules = {
+            stage: prerequisite_contract.validate_candidate_epochs(
+                raw_schedules[stage]
+            )
+            for stage in STAGES
+        }
     except Exception as error:
         raise PublishedWinnerClaimError(
             f"continuation wave candidate schedule is invalid: {error}"
@@ -941,15 +1014,14 @@ def _validate_continuation_waves(
         raise PublishedWinnerClaimError(
             "continuation waves must be a JSON list"
         )
-    expected_count = len(candidate_epochs) - len(
-        PREREQUISITE_CANDIDATE_EPOCHS
-    )
-    if len(values) != expected_count:
-        raise PublishedWinnerClaimError(
-            "continuation waves do not cover every appended boundary"
-        )
     result: list[dict[str, Any]] = []
-    predecessor: dict[str, Any] | None = None
+    positions = {
+        stage: len(PREREQUISITE_CANDIDATE_EPOCHS) for stage in STAGES
+    }
+    predecessors: dict[str, dict[str, Any] | None] = {
+        stage: None for stage in STAGES
+    }
+    eligible = set(STAGES)
     for index, raw_artifact in enumerate(values):
         artifact, _payload = _normalize_artifact(
             raw_artifact,
@@ -957,46 +1029,62 @@ def _validate_continuation_waves(
             with_payload=True,
         )
         receipt = _replay_continuation_wave_file(artifact)
-        boundary = PREREQUISITE_CANDIDATE_EPOCHS[-1] + index * 20
-        target = boundary + 20
         if (
             receipt.get("format")
-            != "semtalk_show_prerequisite_continuation_wave_v1"
+            != "semtalk_show_prerequisite_continuation_wave_v2"
             or receipt.get("status") != "authorized"
             or receipt.get("test_visible") is not False
-            or receipt.get("boundary_epoch") != boundary
-            or receipt.get("target_epoch") != target
             or receipt.get("receipt_payload_sha256")
             != artifact["receipt_payload_sha256"]
             or not isinstance(receipt.get("trigger_stages"), list)
             or not receipt["trigger_stages"]
             or not isinstance(receipt.get("stages"), list)
-            or len(receipt["stages"]) != len(STAGES)
+            or len(receipt["stages"]) != len(receipt["trigger_stages"])
         ):
             raise PublishedWinnerClaimError(
                 f"continuation wave {index} identity/boundary mismatch"
             )
-        for expected_stage, stage in zip(STAGES, receipt["stages"]):
+        triggers = list(receipt["trigger_stages"])
+        if (
+            triggers != [stage for stage in STAGES if stage in set(triggers)]
+            or not set(triggers).issubset(eligible)
+        ):
+            raise PublishedWinnerClaimError(
+                f"continuation wave {index} reactivates a frozen stage"
+            )
+        eligible = set(triggers)
+        binding = {
+            key: artifact[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+        for expected_stage, stage in zip(triggers, receipt["stages"]):
             old = stage.get("old_segment") if isinstance(stage, dict) else None
+            position = positions[expected_stage]
+            if position >= len(schedules[expected_stage]):
+                raise PublishedWinnerClaimError(
+                    f"continuation wave {index} exceeds {expected_stage} schedule"
+                )
+            boundary = schedules[expected_stage][position - 1]
+            target = schedules[expected_stage][position]
             if (
                 not isinstance(stage, dict)
                 or stage.get("stage") != expected_stage
+                or stage.get("boundary_epoch") != boundary
+                or stage.get("target_epoch") != target
+                or target != boundary + 20
                 or not isinstance(old, dict)
-                or old.get("predecessor_wave") != predecessor
+                or old.get("predecessor_wave")
+                != predecessors[expected_stage]
             ):
                 raise PublishedWinnerClaimError(
                     f"continuation wave {index} predecessor chain mismatch"
                 )
-        predecessor = {
-            key: artifact[key]
-            for key in ("path", "sha256", "receipt_payload_sha256")
-        }
+            positions[expected_stage] += 1
+            predecessors[expected_stage] = binding
         result.append(artifact)
-    if result and candidate_epochs[-1] != (
-        PREREQUISITE_CANDIDATE_EPOCHS[-1] + len(result) * 20
-    ):
+    if any(positions[stage] != len(schedules[stage]) for stage in STAGES):
         raise PublishedWinnerClaimError(
-            "continuation wave tail differs from prerequisite schedule"
+            "continuation waves do not cover every stage-local boundary"
         )
     return result
 

@@ -28,7 +28,7 @@ def _expected_jobs(index: dict[str, Any], stages: Sequence[str]) -> list[dict[st
             "checkpoint_sha256": candidate["checkpoint_sha256"],
         }
         for stage in stages
-        for epoch in contract.candidate_epochs(index)
+        for epoch in contract.candidate_epochs_for_stage(index, stage)
         for candidate in [contract.candidate_lookup(index, stage, epoch)]
     ]
 
@@ -39,14 +39,26 @@ def validate_partial_full_authority(
 ) -> None:
     if (
         nonglobal_candidate_index["format"]
-        != contract.PARTIAL_CANDIDATE_INDEX_FORMAT
-        or candidate_index["format"] != contract.CANDIDATE_INDEX_FORMAT
-        or nonglobal_candidate_index["candidate_epochs"]
-        != candidate_index["candidate_epochs"]
+        not in {
+            contract.PARTIAL_CANDIDATE_INDEX_FORMAT,
+            contract.SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT,
+        }
+        or candidate_index["format"]
+        not in {
+            contract.CANDIDATE_INDEX_FORMAT,
+            contract.SEGMENTED_CANDIDATE_INDEX_FORMAT,
+        }
     ):
         raise contract.ContractError(
             "partial/full candidate schedules differ"
         )
+    for stage in contract.STAGES[:-1]:
+        if contract.candidate_epochs_for_stage(
+            nonglobal_candidate_index, stage
+        ) != contract.candidate_epochs_for_stage(candidate_index, stage):
+            raise contract.ContractError(
+                "partial/full candidate schedules differ"
+            )
     for key in (
         "source_receipts",
         "config_sha256",
@@ -241,7 +253,10 @@ def _validate_partition_union(
         combined != expected_all
         or len(identities) != len(set(identities))
         or len(combined)
-        != len(contract.STAGES) * len(contract.candidate_epochs(candidate_index))
+        != sum(
+            len(contract.candidate_epochs_for_stage(candidate_index, stage))
+            for stage in contract.STAGES
+        )
     ):
         raise contract.ContractError("formal partition jobs are not an exact disjoint union")
     return resolved

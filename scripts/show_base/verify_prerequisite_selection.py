@@ -41,6 +41,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "candidate_epochs": result["protocol"][
                     "candidate_epochs"
                 ],
+                "candidate_epochs_by_stage": result["protocol"].get(
+                    "candidate_epochs_by_stage",
+                    {
+                        item["stage"]: result["protocol"]["candidate_epochs"]
+                        for item in result["stages"]
+                    },
+                ),
                 "selected": {
                     item["stage"]: {
                         "epoch": item["epoch"],

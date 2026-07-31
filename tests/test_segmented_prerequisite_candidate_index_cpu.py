@@ -32,7 +32,7 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
         self._write_receipt(
             self.wave,
             {
-                "format": contract.CONTINUATION_WAVE_FORMAT,
+                "format": contract.PER_STAGE_CONTINUATION_WAVE_FORMAT,
                 "kind": "wave",
             },
         )
@@ -121,13 +121,16 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
             for stage in contract.STAGES
         }
         payload = {
-            "format": contract.CANDIDATE_INDEX_FORMAT,
+            "format": contract.SEGMENTED_CANDIDATE_INDEX_FORMAT,
             "status": "complete",
             "target_dataset": "SHOW",
             "target_speaker_scope": contract.TARGET_SPEAKER_SCOPE,
             "selection_split": "val",
             "test_visible": False,
             "candidate_epochs": epochs,
+            "candidate_epochs_by_stage": {
+                stage: list(epochs) for stage in contract.STAGES
+            },
             "updates_per_epoch": contract.updates_per_epoch_map(
                 contract.STAGES
             ),
@@ -135,6 +138,7 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
                 source_receipts,
                 stages=contract.STAGES,
                 reprove_ancestry=False,
+                independent_stage_sources=True,
             ),
             "source_receipts": source_receipts,
             "config_sha256": {stage: "c" * 64 for stage in contract.STAGES},
@@ -179,6 +183,37 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
 
     def test_exact_segmented_union_is_accepted(self) -> None:
         self._validate(self._payload())
+
+    def test_heterogeneous_stage_schedules_preserve_frozen_rows(self) -> None:
+        payload = self._payload()
+        frozen = ("hands", "upper", "lower")
+        for stage in frozen:
+            payload["candidate_epochs_by_stage"][stage] = list(
+                range(20, 201, 20)
+            )
+            payload["stages"][stage] = payload["stages"][stage][:-1]
+            payload["segmented_union"]["candidate_segment_chain"][stage] = [
+                payload["segmented_union"]["candidate_segment_chain"][stage][0]
+            ]
+            payload["source_receipts"][stage]["portable_identity"][
+                "commit"
+            ] = ("4" if stage == "hands" else "5") * 40
+        payload["source_policy"] = contract.build_source_policy(
+            payload["source_receipts"],
+            stages=contract.STAGES,
+            reprove_ancestry=False,
+            independent_stage_sources=True,
+        )
+        self._resign(payload)
+        self._validate(payload)
+        self.assertEqual(
+            contract.candidate_epochs_for_stage(payload, "hands")[-1],
+            200,
+        )
+        self.assertEqual(
+            contract.candidate_epochs_for_stage(payload, "face")[-1],
+            220,
+        )
 
     def test_candidate_cannot_escape_its_segment(self) -> None:
         payload = self._payload()
@@ -256,7 +291,7 @@ class SegmentedCandidateIndexContractTests(unittest.TestCase):
         self._write_receipt(
             self.wave,
             {
-                "format": contract.CONTINUATION_WAVE_FORMAT,
+                "format": contract.PER_STAGE_CONTINUATION_WAVE_FORMAT,
                 "kind": "wave",
             },
         )

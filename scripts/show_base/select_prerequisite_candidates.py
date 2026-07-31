@@ -282,7 +282,9 @@ def _validate_stage_measurement(
     measurement_index: Mapping[str, Any],
     candidate_index: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    candidate_epochs = contract.candidate_epochs(candidate_index)
+    candidate_epochs = contract.candidate_epochs_for_stage(
+        candidate_index, stage
+    )
     if set(payload) != STAGE_MEASUREMENT_KEYS:
         raise contract.ContractError(f"{stage} measurement schema mismatch")
     if (
@@ -463,6 +465,12 @@ def select(
         candidate_index_sha256,
     )
     candidate_epochs = contract.candidate_epochs(candidate_index)
+    candidate_epochs_by_stage = contract.candidate_epochs_by_stage(
+        candidate_index
+    )
+    is_per_stage = candidate_index["format"] == (
+        contract.SEGMENTED_CANDIDATE_INDEX_FORMAT
+    )
     measurement_path, measurement_index, measurement_sha = (
         _load_receipt_json(
             measurement_index_path,
@@ -479,7 +487,11 @@ def select(
         ],
     }
     if (
-        measurement_index["format"] != contract.MEASUREMENT_FORMAT
+        measurement_index["format"] != (
+            contract.PER_STAGE_MEASUREMENT_FORMAT
+            if is_per_stage
+            else contract.MEASUREMENT_FORMAT
+        )
         or measurement_index["status"] != "complete"
         or measurement_index["target_dataset"] != "SHOW"
         or measurement_index["target_speaker_scope"]
@@ -494,26 +506,42 @@ def select(
         != candidate_index["config_sha256"]
     ):
         raise contract.ContractError("measurement index binding mismatch")
+    protocol_keys = [
+        "per_stage_independent",
+        "candidate_epochs",
+        "candidates_per_stage",
+        "shards_per_candidate",
+        "full_base_fgd_used",
+        "test_feedback_into_selection",
+    ]
+    if is_per_stage:
+        protocol_keys.insert(2, "candidate_epochs_by_stage")
     index_protocol = contract.exact_keys(
         measurement_index["protocol"],
-        (
-            "per_stage_independent",
-            "candidate_epochs",
-            "candidates_per_stage",
-            "shards_per_candidate",
-            "full_base_fgd_used",
-            "test_feedback_into_selection",
-        ),
+        protocol_keys,
         "measurement index protocol",
     )
-    if index_protocol != {
+    expected_index_protocol = {
         "per_stage_independent": True,
         "candidate_epochs": list(candidate_epochs),
-        "candidates_per_stage": len(candidate_epochs),
+        "candidates_per_stage": (
+            {
+                stage: len(candidate_epochs_by_stage[stage])
+                for stage in contract.STAGES
+            }
+            if is_per_stage
+            else len(candidate_epochs)
+        ),
         "shards_per_candidate": contract.EXPECTED_SHARDS,
         "full_base_fgd_used": False,
         "test_feedback_into_selection": False,
-    }:
+    }
+    if is_per_stage:
+        expected_index_protocol["candidate_epochs_by_stage"] = {
+            stage: list(candidate_epochs_by_stage[stage])
+            for stage in contract.STAGES
+        }
+    if index_protocol != expected_index_protocol:
         raise contract.ContractError("measurement index protocol changed")
     canonical = contract.exact_keys(
         measurement_index["canonical_view"],
@@ -563,10 +591,19 @@ def select(
     )
     if index_coverage != {
         "stages": len(contract.STAGES),
-        "candidates_per_stage": len(candidate_epochs),
+        "candidates_per_stage": (
+            {
+                stage: len(candidate_epochs_by_stage[stage])
+                for stage in contract.STAGES
+            }
+            if is_per_stage
+            else len(candidate_epochs)
+        ),
         "shards_per_candidate": contract.EXPECTED_SHARDS,
-        "total_shard_jobs": len(contract.STAGES)
-        * len(candidate_epochs)
+        "total_shard_jobs": sum(
+            len(candidate_epochs_by_stage[stage])
+            for stage in contract.STAGES
+        )
         * contract.EXPECTED_SHARDS,
         "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
         "windows_per_candidate": expected_windows,
@@ -677,22 +714,46 @@ def select(
     }
     result = contract.receipt_payload(
         {
-            "format": contract.SELECTION_FORMAT,
+            "format": (
+                contract.PER_STAGE_SELECTION_FORMAT
+                if is_per_stage
+                else contract.SELECTION_FORMAT
+            ),
             "status": "selected",
             "target_dataset": "SHOW",
             "target_speaker_scope": contract.TARGET_SPEAKER_SCOPE,
             "split": "val",
             "test_visible": False,
-            "protocol": {
-                "name": "five_independent_show_prerequisite_validation_v1",
-                "candidate_epochs": list(candidate_epochs),
-                "candidates_per_stage": len(candidate_epochs),
-                "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
-                "shards_per_candidate": contract.EXPECTED_SHARDS,
-                "window_length": contract.WINDOW_LENGTH,
-                "window_stride": contract.WINDOW_STRIDE,
-                "full_base_fgd_used": False,
-            },
+            "protocol": (
+                {
+                    "name": "five_independent_show_prerequisite_validation_v2",
+                    "candidate_epochs": list(candidate_epochs),
+                    "candidate_epochs_by_stage": {
+                        stage: list(candidate_epochs_by_stage[stage])
+                        for stage in contract.STAGES
+                    },
+                    "candidates_per_stage": {
+                        stage: len(candidate_epochs_by_stage[stage])
+                        for stage in contract.STAGES
+                    },
+                    "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
+                    "shards_per_candidate": contract.EXPECTED_SHARDS,
+                    "window_length": contract.WINDOW_LENGTH,
+                    "window_stride": contract.WINDOW_STRIDE,
+                    "full_base_fgd_used": False,
+                }
+                if is_per_stage
+                else {
+                    "name": "five_independent_show_prerequisite_validation_v1",
+                    "candidate_epochs": list(candidate_epochs),
+                    "candidates_per_stage": len(candidate_epochs),
+                    "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
+                    "shards_per_candidate": contract.EXPECTED_SHARDS,
+                    "window_length": contract.WINDOW_LENGTH,
+                    "window_stride": contract.WINDOW_STRIDE,
+                    "full_base_fgd_used": False,
+                }
+            ),
             "selection_policy": {
                 "per_stage_independent": True,
                 "ordering": [

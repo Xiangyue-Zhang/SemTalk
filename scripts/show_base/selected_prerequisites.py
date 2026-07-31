@@ -27,9 +27,16 @@ from scripts.show_base import prerequisite_val_contract as raw_contract
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
+PER_STAGE_SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v2"
 CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v2"
+SEGMENTED_CANDIDATE_INDEX_FORMAT = (
+    "semtalk_show_prerequisite_candidate_index_v3"
+)
 MEASUREMENT_INDEX_FORMAT = (
     "semtalk_show_prerequisite_val_measurement_index_v1"
+)
+PER_STAGE_MEASUREMENT_INDEX_FORMAT = (
+    "semtalk_show_prerequisite_val_measurement_index_v2"
 )
 STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
@@ -755,7 +762,13 @@ def _validate_candidate_index(
         label="prerequisite candidate index",
     )
     assert index is not None
-    exact_keys(index, CANDIDATE_INDEX_KEYS, "candidate index")
+    candidate_keys = set(CANDIDATE_INDEX_KEYS)
+    is_per_stage = index.get("format") == SEGMENTED_CANDIDATE_INDEX_FORMAT
+    if is_per_stage:
+        candidate_keys.update(
+            {"candidate_epochs_by_stage", "segmented_union"}
+        )
+    exact_keys(index, candidate_keys, "candidate index")
     try:
         replayed_index = raw_contract.validate_candidate_index(index)
     except raw_contract.ContractError as error:
@@ -767,7 +780,8 @@ def _validate_candidate_index(
             "candidate index contract replay changed its payload"
         )
     if (
-        index["format"] != CANDIDATE_INDEX_FORMAT
+        index["format"]
+        not in {CANDIDATE_INDEX_FORMAT, SEGMENTED_CANDIDATE_INDEX_FORMAT}
         or index["status"] != "complete"
         or index["target_dataset"] != "SHOW"
         or index["target_speaker_scope"] != EXPECTED_SPEAKER_SCOPE
@@ -787,7 +801,14 @@ def _validate_candidate_index(
         raise SelectedPrerequisiteError(
             f"candidate index schedule replay failed: {error}"
         ) from error
-    final_epoch = candidate_epochs[-1]
+    try:
+        candidate_epochs_by_stage = raw_contract.candidate_epochs_by_stage(
+            index
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(
+            f"candidate per-stage schedule replay failed: {error}"
+        ) from error
     for mapping_name in (
         "source_receipts",
         "config_sha256",
@@ -801,6 +822,8 @@ def _validate_candidate_index(
                 f"candidate index {mapping_name} stage coverage mismatch"
             )
     for stage in STAGES:
+        stage_epochs = candidate_epochs_by_stage[stage]
+        final_epoch = stage_epochs[-1]
         frozen_source = _validate_frozen_training_source(
             index["source_receipts"][stage],
             f"candidate index {stage} training source",
@@ -870,15 +893,16 @@ def _validate_candidate_index(
     normalized: dict[str, dict[int, dict[str, Any]]] = {}
     observed_paths: set[Path] = set()
     for stage in STAGES:
+        stage_epochs = candidate_epochs_by_stage[stage]
         rows = index["stages"][stage]
         if not isinstance(rows, list) or len(rows) != len(
-            candidate_epochs
+            stage_epochs
         ):
             raise SelectedPrerequisiteError(
                 f"{stage} candidate index coverage mismatch"
             )
         normalized[stage] = {}
-        for expected_epoch, row in zip(candidate_epochs, rows):
+        for expected_epoch, row in zip(stage_epochs, rows):
             row = exact_keys(
                 row,
                 {
@@ -1156,8 +1180,8 @@ def _validate_stage_measurement(
     replay_state: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     try:
-        candidate_epochs = raw_contract.validate_candidate_epochs(
-            candidate_index["candidate_epochs"]
+        candidate_epochs = raw_contract.candidate_epochs_for_stage(
+            candidate_index, stage
         )
     except raw_contract.ContractError as error:
         raise SelectedPrerequisiteError(
@@ -1369,7 +1393,10 @@ def load_selected_prerequisites(
     exact_keys(selection, TOP_KEYS, "prerequisite selection")
     claimed_payload_sha = selection["receipt_payload_sha256"]
     if (
-        selection["format"] != SELECTION_FORMAT
+        selection["format"] not in {
+            SELECTION_FORMAT,
+            PER_STAGE_SELECTION_FORMAT,
+        }
         or selection["status"] != "selected"
         or selection["target_dataset"] != "SHOW"
         or selection["target_speaker_scope"] != EXPECTED_SPEAKER_SCOPE
@@ -1380,18 +1407,21 @@ def load_selected_prerequisites(
             "prerequisite selection protocol mismatch"
         )
     reject_absolute_paths_in_tree(selection, "prerequisite selection")
+    is_per_stage = selection["format"] == PER_STAGE_SELECTION_FORMAT
+    protocol_keys = {
+        "name",
+        "candidate_epochs",
+        "candidates_per_stage",
+        "clips_per_candidate",
+        "shards_per_candidate",
+        "window_length",
+        "window_stride",
+        "full_base_fgd_used",
+    }
+    if is_per_stage:
+        protocol_keys.add("candidate_epochs_by_stage")
     protocol = exact_keys(
-        selection["protocol"],
-        {
-            "name",
-            "candidate_epochs",
-            "candidates_per_stage",
-            "clips_per_candidate",
-            "shards_per_candidate",
-            "window_length",
-            "window_stride",
-            "full_base_fgd_used",
-        },
+        selection["protocol"], protocol_keys,
         "prerequisite selection protocol",
     )
     try:
@@ -1402,16 +1432,50 @@ def load_selected_prerequisites(
         raise SelectedPrerequisiteError(
             f"prerequisite selection candidate schedule invalid: {exc}"
         ) from exc
-    if protocol != {
-        "name": "five_independent_show_prerequisite_validation_v1",
-        "candidate_epochs": list(candidate_epochs),
-        "candidates_per_stage": len(candidate_epochs),
-        "clips_per_candidate": EXPECTED_VAL_CLIPS,
-        "shards_per_candidate": EXPECTED_SHARDS,
-        "window_length": WINDOW_LENGTH,
-        "window_stride": WINDOW_STRIDE,
-        "full_base_fgd_used": False,
-    }:
+    if is_per_stage:
+        raw_stage_epochs = protocol["candidate_epochs_by_stage"]
+        if not isinstance(raw_stage_epochs, dict) or set(raw_stage_epochs) != set(STAGES):
+            raise SelectedPrerequisiteError(
+                "prerequisite selection per-stage schedule coverage changed"
+            )
+        candidate_epochs_by_stage = {
+            stage: raw_contract.validate_candidate_epochs(
+                raw_stage_epochs[stage]
+            )
+            for stage in STAGES
+        }
+        expected_protocol = {
+            "name": "five_independent_show_prerequisite_validation_v2",
+            "candidate_epochs": list(candidate_epochs),
+            "candidate_epochs_by_stage": {
+                stage: list(candidate_epochs_by_stage[stage])
+                for stage in STAGES
+            },
+            "candidates_per_stage": {
+                stage: len(candidate_epochs_by_stage[stage])
+                for stage in STAGES
+            },
+            "clips_per_candidate": EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": EXPECTED_SHARDS,
+            "window_length": WINDOW_LENGTH,
+            "window_stride": WINDOW_STRIDE,
+            "full_base_fgd_used": False,
+        }
+    else:
+        candidate_epochs_by_stage = {
+            stage: candidate_epochs for stage in STAGES
+        }
+        expected_protocol = {
+            "name": "five_independent_show_prerequisite_validation_v1",
+            "candidate_epochs": list(candidate_epochs),
+            "candidates_per_stage": len(candidate_epochs),
+            "clips_per_candidate": EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": EXPECTED_SHARDS,
+            "window_length": WINDOW_LENGTH,
+            "window_stride": WINDOW_STRIDE,
+            "full_base_fgd_used": False,
+        }
+    if protocol != expected_protocol:
         raise SelectedPrerequisiteError(
             "prerequisite selection protocol changed"
         )
@@ -1432,7 +1496,11 @@ def load_selected_prerequisites(
     candidate_index, candidate_receipt, candidates = (
         _validate_candidate_index(selection["candidate_index_receipt"])
     )
-    if candidate_index["candidate_epochs"] != list(candidate_epochs):
+    if (
+        candidate_index["candidate_epochs"] != list(candidate_epochs)
+        or raw_contract.candidate_epochs_by_stage(candidate_index)
+        != candidate_epochs_by_stage
+    ):
         raise SelectedPrerequisiteError(
             "selection/candidate-index candidate schedule mismatch"
         )
@@ -1448,7 +1516,11 @@ def load_selected_prerequisites(
         "prerequisite measurement index",
     )
     if (
-        measurement_index["format"] != MEASUREMENT_INDEX_FORMAT
+        measurement_index["format"] != (
+            PER_STAGE_MEASUREMENT_INDEX_FORMAT
+            if is_per_stage
+            else MEASUREMENT_INDEX_FORMAT
+        )
         or measurement_index["status"] != "complete"
         or measurement_index["target_dataset"] != "SHOW"
         or measurement_index["target_speaker_scope"]
@@ -1464,14 +1536,27 @@ def load_selected_prerequisites(
         raise SelectedPrerequisiteError(
             "prerequisite measurement index binding mismatch"
         )
-    if measurement_index["protocol"] != {
+    expected_measurement_protocol = {
         "per_stage_independent": True,
         "candidate_epochs": list(candidate_epochs),
-        "candidates_per_stage": len(candidate_epochs),
+        "candidates_per_stage": (
+            {
+                stage: len(candidate_epochs_by_stage[stage])
+                for stage in STAGES
+            }
+            if is_per_stage
+            else len(candidate_epochs)
+        ),
         "shards_per_candidate": EXPECTED_SHARDS,
         "full_base_fgd_used": False,
         "test_feedback_into_selection": False,
-    }:
+    }
+    if is_per_stage:
+        expected_measurement_protocol["candidate_epochs_by_stage"] = {
+            stage: list(candidate_epochs_by_stage[stage])
+            for stage in STAGES
+        }
+    if measurement_index["protocol"] != expected_measurement_protocol:
         raise SelectedPrerequisiteError(
             "prerequisite measurement index protocol changed"
         )
@@ -1495,10 +1580,18 @@ def load_selected_prerequisites(
     )
     if index_coverage != {
         "stages": len(STAGES),
-        "candidates_per_stage": len(candidate_epochs),
+        "candidates_per_stage": (
+            {
+                stage: len(candidate_epochs_by_stage[stage])
+                for stage in STAGES
+            }
+            if is_per_stage
+            else len(candidate_epochs)
+        ),
         "shards_per_candidate": EXPECTED_SHARDS,
         "total_shard_jobs": (
-            len(STAGES) * len(candidate_epochs) * EXPECTED_SHARDS
+            sum(len(candidate_epochs_by_stage[stage]) for stage in STAGES)
+            * EXPECTED_SHARDS
         ),
         "clips_per_candidate": EXPECTED_VAL_CLIPS,
         "windows_per_candidate": windows_per_candidate,
@@ -1664,7 +1757,7 @@ def load_selected_prerequisites(
             or expected_candidate is None
             or updates != expected_candidate["optimizer_updates"]
             or candidate_index_number
-            != candidate_epochs.index(epoch)
+            != candidate_epochs_by_stage[stage].index(epoch)
             or checkpoint_binding
             != {
                 key: expected_candidate[key]

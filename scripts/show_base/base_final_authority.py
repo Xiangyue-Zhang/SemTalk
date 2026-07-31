@@ -1383,42 +1383,43 @@ def _replay_continuation(
 def _replay_continuation_waves(
     values: Any,
     *,
-    candidate_epochs: Sequence[int],
+    candidate_epochs_by_stage: Mapping[str, Sequence[int]],
 ) -> list[dict[str, Any]]:
-    """Fresh-replay every synchronized +20 prerequisite authorization.
-
-    e20..e200 needs no wave.  Every appended e220/e240/... boundary needs one
-    exact predecessor-linked wave proving the preceding boundary made a fresh
-    ``continue`` decision.  The final separately pinned decision remains the
-    fresh ``stop`` at the tail.
-    """
+    """Fresh-replay the monotone active subsets of mixed-stage v2 waves."""
 
     mandatory = tuple(range(20, 201, 20))
-    schedule = tuple(candidate_epochs)
-    if (
-        len(schedule) < len(mandatory)
-        or schedule[: len(mandatory)] != mandatory
-        or any(
-            epoch != schedule[index - 1] + 20
-            for index, epoch in enumerate(schedule)
-            if index
-        )
-    ):
+    if type(candidate_epochs_by_stage) is not dict or set(
+        candidate_epochs_by_stage
+    ) != set(REPRESENTATION_STAGES):
         raise BaseFinalAuthorityError(
-            "prerequisite candidate schedule is not the exact +20 chain"
+            "prerequisite per-stage candidate schedules are incomplete"
         )
+    schedules: dict[str, tuple[int, ...]] = {}
+    for stage in REPRESENTATION_STAGES:
+        schedule = tuple(candidate_epochs_by_stage[stage])
+        if (
+            len(schedule) < len(mandatory)
+            or schedule[: len(mandatory)] != mandatory
+            or any(
+                epoch != schedule[index - 1] + 20
+                for index, epoch in enumerate(schedule)
+                if index
+            )
+        ):
+            raise BaseFinalAuthorityError(
+                f"{stage} prerequisite schedule is not the exact +20 chain"
+            )
+        schedules[stage] = schedule
     if type(values) is not list:
         raise BaseFinalAuthorityError(
             "continuation wave inventory must be a JSON list"
         )
-    expected_count = len(schedule) - len(mandatory)
-    if len(values) != expected_count:
-        raise BaseFinalAuthorityError(
-            "continuation wave inventory does not cover every appended "
-            "prerequisite boundary"
-        )
     normalized: list[dict[str, Any]] = []
-    previous_binding: dict[str, Any] | None = None
+    positions = {stage: len(mandatory) for stage in REPRESENTATION_STAGES}
+    previous_bindings: dict[str, dict[str, Any] | None] = {
+        stage: None for stage in REPRESENTATION_STAGES
+    }
+    eligible = set(REPRESENTATION_STAGES)
     for index, raw_value in enumerate(values):
         artifact = _payload_artifact_from_binding(
             raw_value,
@@ -1439,68 +1440,86 @@ def _replay_continuation_waves(
             raise BaseFinalAuthorityError(
                 f"continuation wave {index} fresh replay failed: {exc}"
             ) from exc
-        boundary = mandatory[-1] + index * 20
-        target = boundary + 20
         if (
             type(receipt) is not dict
             or receipt.get("format")
-            != "semtalk_show_prerequisite_continuation_wave_v1"
+            != "semtalk_show_prerequisite_continuation_wave_v2"
             or receipt.get("status") != "authorized"
             or receipt.get("test_visible") is not False
-            or receipt.get("boundary_epoch") != boundary
-            or receipt.get("target_epoch") != target
             or receipt.get("receipt_payload_sha256")
             != artifact["receipt_payload_sha256"]
             or type(receipt.get("trigger_stages")) is not list
             or not receipt["trigger_stages"]
             or type(receipt.get("stages")) is not list
-            or len(receipt["stages"]) != len(REPRESENTATION_STAGES)
+            or len(receipt["stages"]) != len(receipt["trigger_stages"])
         ):
             raise BaseFinalAuthorityError(
                 f"continuation wave {index} identity/boundary mismatch"
             )
-        stage_predecessors: list[Any] = []
-        for expected_stage, stage in zip(
-            REPRESENTATION_STAGES,
-            receipt["stages"],
+        triggers = list(receipt["trigger_stages"])
+        if (
+            triggers
+            != [stage for stage in REPRESENTATION_STAGES if stage in set(triggers)]
+            or not set(triggers).issubset(eligible)
         ):
+            raise BaseFinalAuthorityError(
+                f"continuation wave {index} reactivates a frozen stage"
+            )
+        eligible = set(triggers)
+        transitions = []
+        current_binding = {
+            key: artifact[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+        for expected_stage, stage in zip(triggers, receipt["stages"]):
             old_segment = stage.get("old_segment") if type(stage) is dict else None
+            position = positions[expected_stage]
+            if position >= len(schedules[expected_stage]):
+                raise BaseFinalAuthorityError(
+                    f"continuation wave {index} exceeds {expected_stage} schedule"
+                )
+            boundary = schedules[expected_stage][position - 1]
+            target = schedules[expected_stage][position]
             if (
                 type(stage) is not dict
                 or stage.get("stage") != expected_stage
+                or stage.get("boundary_epoch") != boundary
+                or stage.get("target_epoch") != target
+                or target != boundary + 20
                 or type(old_segment) is not dict
-                or "predecessor_wave" not in old_segment
+                or old_segment.get("predecessor_wave")
+                != previous_bindings[expected_stage]
             ):
                 raise BaseFinalAuthorityError(
                     f"continuation wave {index} stage chain mismatch"
                 )
-            stage_predecessors.append(old_segment["predecessor_wave"])
-        if any(
-            predecessor != previous_binding
-            for predecessor in stage_predecessors
-        ):
-            raise BaseFinalAuthorityError(
-                f"continuation wave {index} predecessor chain mismatch"
+            positions[expected_stage] += 1
+            previous_bindings[expected_stage] = current_binding
+            transitions.append(
+                {
+                    "stage": expected_stage,
+                    "boundary_epoch": boundary,
+                    "target_epoch": target,
+                    "cap_epoch": stage.get("cap_epoch"),
+                }
             )
-        previous_binding = {
-            key: artifact[key]
-            for key in ("path", "sha256", "receipt_payload_sha256")
-        }
         normalized.append(
             {
                 **artifact,
                 "canonical_payload_sha256": canonical_json_sha256(
                     receipt
                 ),
-                "boundary_epoch": boundary,
-                "target_epoch": target,
                 "decision": dict(receipt["decision"]),
-                "trigger_stages": list(receipt["trigger_stages"]),
+                "trigger_stages": triggers,
+                "stage_transitions": transitions,
             }
         )
-    if normalized and normalized[-1]["target_epoch"] != schedule[-1]:
+    if any(
+        positions[stage] != len(schedules[stage])
+        for stage in REPRESENTATION_STAGES
+    ):
         raise BaseFinalAuthorityError(
-            "continuation wave tail differs from prerequisite schedule"
+            "continuation waves do not cover every stage-local appended boundary"
         )
     return normalized
 
@@ -1631,7 +1650,7 @@ def _control_authority(
     )
     if (
         replayed_continuation.get("format")
-        != "semtalk_show_prerequisite_continuation_decision_v1"
+        != "semtalk_show_prerequisite_continuation_decision_v2"
         or replayed_continuation.get("status") != "complete"
         or replayed_continuation.get("decision") != "stop"
         or replayed_continuation.get("test_visible") is not False
@@ -1647,7 +1666,7 @@ def _control_authority(
     stages = prerequisite_selection.get("stages")
     if (
         prerequisite_selection.get("format")
-        != "semtalk_show_prerequisite_val_selection_v1"
+        != "semtalk_show_prerequisite_val_selection_v2"
         or prerequisite_selection.get("status") != "selected"
         or prerequisite_selection.get("split") != "val"
         or prerequisite_selection.get("test_visible") is not False
@@ -1691,18 +1710,63 @@ def _control_authority(
             "selected-five replay stage coverage mismatch"
         )
     protocol = prerequisite_selection.get("protocol")
-    candidate_epochs = (
-        protocol.get("candidate_epochs")
+    candidate_epochs_by_stage = (
+        protocol.get("candidate_epochs_by_stage")
         if type(protocol) is dict
         else None
     )
-    if type(candidate_epochs) is not list:
+    if (
+        type(candidate_epochs_by_stage) is not dict
+        or set(candidate_epochs_by_stage) != set(REPRESENTATION_STAGES)
+    ):
         raise BaseFinalAuthorityError(
-            "selected-five prerequisite schedule is missing"
+            "selected-five per-stage prerequisite schedules are missing"
         )
+    decision_stages = replayed_continuation.get("stages")
+    caps = {
+        "face": 600,
+        "hands": 500,
+        "upper": 500,
+        "lower": 600,
+        "global": 1700,
+    }
+    if (
+        type(decision_stages) is not list
+        or len(decision_stages) != len(REPRESENTATION_STAGES)
+    ):
+        raise BaseFinalAuthorityError(
+            "final continuation-stop decision stage coverage mismatch"
+        )
+    for stage, terminal in zip(REPRESENTATION_STAGES, decision_stages):
+        selected_stage = explicit_stages[stage]
+        schedule = candidate_epochs_by_stage[stage]
+        if (
+            type(terminal) is not dict
+            or terminal.get("stage") != stage
+            or type(schedule) is not list
+            or not schedule
+            or terminal.get("latest_epoch") != schedule[-1]
+            or terminal.get("winner_epoch") != selected_stage["epoch"]
+            or terminal.get("frozen_winner_epoch") != selected_stage["epoch"]
+            or terminal.get("cap_epoch") != caps[stage]
+            or terminal.get("action") not in {"freeze", "capped"}
+            or terminal.get("target_epoch") is not None
+            or terminal.get("requests_continuation") is not False
+            or (
+                terminal.get("action") == "capped"
+                and terminal.get("latest_epoch") != caps[stage]
+            )
+            or (
+                terminal.get("action") == "freeze"
+                and terminal.get("latest_epoch") >= caps[stage]
+            )
+        ):
+            raise BaseFinalAuthorityError(
+                f"final {stage} continuation action is not frozen/capped"
+            )
     replayed_waves = _replay_continuation_waves(
         list(continuation_waves),
-        candidate_epochs=candidate_epochs,
+        candidate_epochs_by_stage=candidate_epochs_by_stage,
     )
     pinned_continuation_waves = [
         {

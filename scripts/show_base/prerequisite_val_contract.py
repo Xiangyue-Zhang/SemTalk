@@ -100,6 +100,41 @@ def candidate_epochs(candidate_index: Mapping[str, Any]) -> tuple[int, ...]:
     return validate_candidate_epochs(candidate_index.get("candidate_epochs"))
 
 
+def candidate_epochs_by_stage(
+    candidate_index: Mapping[str, Any],
+) -> dict[str, tuple[int, ...]]:
+    """Return the exact append-only validation inventory for every stage.
+
+    Initial e20..e200 indexes intentionally keep the v2 common-schedule
+    schema.  A segmented v3 index carries one independent schedule per stage
+    so a frozen winner is never fabricated at a later boundary merely because
+    another prerequisite still needs continuation.
+    """
+
+    stages = candidate_index.get("stages")
+    if not isinstance(stages, Mapping):
+        raise ContractError("candidate index stage coverage is missing")
+    raw = candidate_index.get("candidate_epochs_by_stage")
+    if raw is None:
+        common = candidate_epochs(candidate_index)
+        return {stage: common for stage in stages}
+    if not isinstance(raw, dict) or set(raw) != set(stages):
+        raise ContractError("per-stage candidate schedule coverage mismatch")
+    return {
+        stage: validate_candidate_epochs(raw[stage])
+        for stage in stages
+    }
+
+
+def candidate_epochs_for_stage(
+    candidate_index: Mapping[str, Any], stage: str
+) -> tuple[int, ...]:
+    schedules = candidate_epochs_by_stage(candidate_index)
+    if stage not in schedules:
+        raise ContractError(f"unknown candidate stage {stage!r}")
+    return schedules[stage]
+
+
 def is_candidate_epoch(epoch: Any) -> bool:
     return (
         type(epoch) is int
@@ -117,18 +152,34 @@ CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v2"
 PARTIAL_CANDIDATE_INDEX_FORMAT = (
     "semtalk_show_prerequisite_nonglobal_candidate_index_v2"
 )
+SEGMENTED_CANDIDATE_INDEX_FORMAT = (
+    "semtalk_show_prerequisite_candidate_index_v3"
+)
+SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT = (
+    "semtalk_show_prerequisite_nonglobal_candidate_index_v3"
+)
 SEGMENTED_UNION_FORMAT = (
-    "semtalk_show_prerequisite_segmented_candidate_union_v1"
+    "semtalk_show_prerequisite_segmented_candidate_union_v2"
 )
 CONTINUATION_WAVE_FORMAT = "semtalk_show_prerequisite_continuation_wave_v1"
+PER_STAGE_CONTINUATION_WAVE_FORMAT = (
+    "semtalk_show_prerequisite_continuation_wave_v2"
+)
 SHARD_FORMAT = "semtalk_show_prerequisite_val_shard_v1"
 STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
 )
 MEASUREMENT_FORMAT = "semtalk_show_prerequisite_val_measurement_index_v1"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
+PER_STAGE_MEASUREMENT_FORMAT = (
+    "semtalk_show_prerequisite_val_measurement_index_v2"
+)
+PER_STAGE_SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v2"
 TRAINING_SOURCE_FREEZE_FORMAT = "semtalk_show_training_source_freeze_v2"
 SOURCE_POLICY_FORMAT = "semtalk_show_prerequisite_source_policy_v1"
+PER_STAGE_SOURCE_POLICY_FORMAT = (
+    "semtalk_show_prerequisite_source_policy_v2"
+)
 
 SHOW_SPEAKERS = {"oliver": 0, "chemistry": 1, "seth": 2, "conan": 3}
 OFFICIAL_INITIALIZATION = {
@@ -836,6 +887,7 @@ def build_source_policy(
     *,
     stages: Sequence[str],
     reprove_ancestry: bool,
+    independent_stage_sources: bool = False,
 ) -> dict[str, Any]:
     expected_stages = tuple(stages)
     if (
@@ -853,6 +905,33 @@ def build_source_policy(
         )
         for stage in expected_stages
     }
+    if independent_stage_sources:
+        # A per-stage continuation wave proves old -> new ancestry for every
+        # active stage independently.  Frozen stages intentionally retain
+        # their prior immutable source receipt, so requiring all four RVQs to
+        # finish on one commit would make a heterogeneous continuation
+        # impossible to publish.  The v2 policy records every terminal source
+        # explicitly; the segmented-union replay supplies the ancestry proof.
+        policy = {
+            "format": PER_STAGE_SOURCE_POLICY_FORMAT,
+            "mode": "independent_stage_source_ancestry_v2",
+            "stages": list(expected_stages),
+            "origin": EXPECTED_ORIGIN,
+            "portable_identity_sha256_by_stage": {
+                stage: canonical_payload_sha256(portable[stage])
+                for stage in expected_stages
+            },
+            "commit_by_stage": {
+                stage: portable[stage]["commit"] for stage in expected_stages
+            },
+            "tree_by_stage": {
+                stage: portable[stage]["tree"] for stage in expected_stages
+            },
+            "same_origin": True,
+            "ancestry_authority": PER_STAGE_CONTINUATION_WAVE_FORMAT,
+        }
+        policy["receipt_payload_sha256"] = canonical_payload_sha256(policy)
+        return policy
     rvq_stages = [stage for stage in expected_stages if stage in RVQ_STAGES]
     rvq_identity_hashes = {
         canonical_payload_sha256(portable[stage]) for stage in rvq_stages
@@ -1709,11 +1788,24 @@ def validate_candidate_index(
             raise ContractError("segmented candidate index cycle detected")
         artifact_stack = artifact_stack | {candidate_path}
     payload = verify_receipt_payload(value, "candidate index")
-    is_partial = payload.get("format") == PARTIAL_CANDIDATE_INDEX_FORMAT
+    candidate_format = payload.get("format")
+    is_segmented = candidate_format in {
+        SEGMENTED_CANDIDATE_INDEX_FORMAT,
+        SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT,
+    }
+    is_partial = candidate_format in {
+        PARTIAL_CANDIDATE_INDEX_FORMAT,
+        SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT,
+    }
     expected_stages = STAGES[:-1] if is_partial else STAGES
     if (
-        payload.get("format")
-        not in {CANDIDATE_INDEX_FORMAT, PARTIAL_CANDIDATE_INDEX_FORMAT}
+        candidate_format
+        not in {
+            CANDIDATE_INDEX_FORMAT,
+            PARTIAL_CANDIDATE_INDEX_FORMAT,
+            SEGMENTED_CANDIDATE_INDEX_FORMAT,
+            SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT,
+        }
         or (is_partial and not allow_partial)
         or payload.get("status") != "complete"
         or payload.get("target_dataset") != "SHOW"
@@ -1728,6 +1820,15 @@ def validate_candidate_index(
     stages = payload.get("stages")
     if not isinstance(stages, dict) or set(stages) != set(expected_stages):
         raise ContractError("candidate index stage coverage mismatch")
+    if is_segmented:
+        schedules = candidate_epochs_by_stage(payload)
+        union = sorted({epoch for values in schedules.values() for epoch in values})
+        if list(schedule) != union or payload.get("segmented_union") is None:
+            raise ContractError("segmented candidate schedule union mismatch")
+    else:
+        if "candidate_epochs_by_stage" in payload or "segmented_union" in payload:
+            raise ContractError("initial candidate index cannot bypass v3")
+        schedules = {stage: schedule for stage in expected_stages}
     source_receipts = payload.get("source_receipts")
     if not isinstance(source_receipts, dict) or set(source_receipts) != set(
         expected_stages
@@ -1743,6 +1844,7 @@ def validate_candidate_index(
         source_receipts,
         stages=expected_stages,
         reprove_ancestry=reprove_source_ancestry,
+        independent_stage_sources=is_segmented,
     )
     if payload.get("source_policy") != expected_source_policy:
         raise ContractError("candidate index source policy mismatch")
@@ -1761,14 +1863,15 @@ def validate_candidate_index(
     # it may use a separately frozen official descendant source so a
     # Global-only contract correction never forces scientifically unrelated
     # RVQs to be retrained or relabelled.
-    if len(rvq_portable_sources) != 1:
+    if not is_segmented and len(rvq_portable_sources) != 1:
         raise ContractError("candidate index RVQ training sources differ")
     observed_paths: set[Path] = set()
     for stage in expected_stages:
         entries = stages[stage]
-        if not isinstance(entries, list) or len(entries) != len(schedule):
+        stage_schedule = schedules[stage]
+        if not isinstance(entries, list) or len(entries) != len(stage_schedule):
             raise ContractError(f"{stage} candidate coverage mismatch")
-        for expected_epoch, entry in zip(schedule, entries):
+        for expected_epoch, entry in zip(stage_schedule, entries):
             if not isinstance(entry, dict) or set(entry) != {
                 "epoch",
                 "optimizer_updates",
@@ -1845,7 +1948,7 @@ def validate_candidate_index(
             value: Any,
             label: str,
             *,
-            expected_format: str,
+            expected_format: str | tuple[str, ...],
         ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
             binding = exact_keys(
                 value,
@@ -1872,7 +1975,12 @@ def validate_candidate_index(
                 artifact_payload, str(artifact_path)
             )
             artifact_value = verify_receipt_payload(artifact_value, label)
-            if artifact_value.get("format") != expected_format:
+            expected_formats = (
+                (expected_format,)
+                if isinstance(expected_format, str)
+                else expected_format
+            )
+            if artifact_value.get("format") not in expected_formats:
                 raise ContractError(f"{label} format mismatch")
             if (
                 artifact_value["receipt_payload_sha256"]
@@ -1884,7 +1992,10 @@ def validate_candidate_index(
         prior, prior_path, prior_value = validate_binding(
             segmented["prior_candidate_index"],
             "prior candidate index",
-            expected_format=CANDIDATE_INDEX_FORMAT,
+            expected_format=(
+                CANDIDATE_INDEX_FORMAT,
+                SEGMENTED_CANDIDATE_INDEX_FORMAT,
+            ),
         )
         if path is not None and prior["path"] == str(path):
             raise ContractError("segmented candidate index is self-referential")
@@ -1901,7 +2012,7 @@ def validate_candidate_index(
             binding, wave_path, wave_value = validate_binding(
                 value,
                 f"continuation wave {index}",
-                expected_format=CONTINUATION_WAVE_FORMAT,
+                expected_format=PER_STAGE_CONTINUATION_WAVE_FORMAT,
             )
             _replay_bound_continuation_wave(
                 wave_value,
@@ -1975,7 +2086,7 @@ def validate_candidate_index(
                 covered.extend(epochs)
                 predecessor = segment["segment_id"]
                 expected_start = end + 20
-            if covered != list(schedule):
+            if covered != list(schedules[stage]):
                 raise ContractError(f"{stage} segmented schedule mismatch")
             for entry in stages[stage]:
                 matching = [
@@ -2028,7 +2139,7 @@ def candidate_lookup(
     if (
         stage not in STAGES
         or stage not in candidate_index.get("stages", {})
-        or epoch not in candidate_epochs(candidate_index)
+        or epoch not in candidate_epochs_for_stage(candidate_index, stage)
     ):
         raise ContractError("candidate lookup outside the frozen schedule")
     matches = [
@@ -2066,7 +2177,7 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
         "selection receipt",
     )
     if (
-        payload["format"] != SELECTION_FORMAT
+        payload["format"] not in {SELECTION_FORMAT, PER_STAGE_SELECTION_FORMAT}
         or payload["status"] != "selected"
         or payload["target_dataset"] != "SHOW"
         or payload["target_speaker_scope"] != TARGET_SPEAKER_SCOPE
@@ -2074,32 +2185,75 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
         or payload["test_visible"] is not False
     ):
         raise ContractError("selection receipt protocol mismatch")
-    protocol = exact_keys(
-        payload["protocol"],
-        (
-            "name",
-            "candidate_epochs",
-            "candidates_per_stage",
-            "clips_per_candidate",
-            "shards_per_candidate",
-            "window_length",
-            "window_stride",
-            "full_base_fgd_used",
-        ),
-        "selection receipt protocol",
-    )
-    epochs = validate_candidate_epochs(protocol["candidate_epochs"])
-    if protocol != {
-        "name": "five_independent_show_prerequisite_validation_v1",
-        "candidate_epochs": list(epochs),
-        "candidates_per_stage": len(epochs),
-        "clips_per_candidate": EXPECTED_VAL_CLIPS,
-        "shards_per_candidate": EXPECTED_SHARDS,
-        "window_length": WINDOW_LENGTH,
-        "window_stride": WINDOW_STRIDE,
-        "full_base_fgd_used": False,
-    }:
-        raise ContractError("selection receipt candidate protocol mismatch")
+    if payload["format"] == PER_STAGE_SELECTION_FORMAT:
+        protocol = exact_keys(
+            payload["protocol"],
+            (
+                "name",
+                "candidate_epochs",
+                "candidate_epochs_by_stage",
+                "candidates_per_stage",
+                "clips_per_candidate",
+                "shards_per_candidate",
+                "window_length",
+                "window_stride",
+                "full_base_fgd_used",
+            ),
+            "selection receipt protocol",
+        )
+        epochs = validate_candidate_epochs(protocol["candidate_epochs"])
+        raw_schedules = protocol["candidate_epochs_by_stage"]
+        if not isinstance(raw_schedules, dict) or set(raw_schedules) != set(STAGES):
+            raise ContractError("selection per-stage schedule coverage mismatch")
+        schedules = {
+            stage: validate_candidate_epochs(raw_schedules[stage])
+            for stage in STAGES
+        }
+        union = sorted({epoch for values in schedules.values() for epoch in values})
+        if protocol != {
+            "name": "five_independent_show_prerequisite_validation_v2",
+            "candidate_epochs": union,
+            "candidate_epochs_by_stage": {
+                stage: list(schedules[stage]) for stage in STAGES
+            },
+            "candidates_per_stage": {
+                stage: len(schedules[stage]) for stage in STAGES
+            },
+            "clips_per_candidate": EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": EXPECTED_SHARDS,
+            "window_length": WINDOW_LENGTH,
+            "window_stride": WINDOW_STRIDE,
+            "full_base_fgd_used": False,
+        }:
+            raise ContractError("selection receipt candidate protocol mismatch")
+    else:
+        protocol = exact_keys(
+            payload["protocol"],
+            (
+                "name",
+                "candidate_epochs",
+                "candidates_per_stage",
+                "clips_per_candidate",
+                "shards_per_candidate",
+                "window_length",
+                "window_stride",
+                "full_base_fgd_used",
+            ),
+            "selection receipt protocol",
+        )
+        epochs = validate_candidate_epochs(protocol["candidate_epochs"])
+        schedules = {stage: epochs for stage in STAGES}
+        if protocol != {
+            "name": "five_independent_show_prerequisite_validation_v1",
+            "candidate_epochs": list(epochs),
+            "candidates_per_stage": len(epochs),
+            "clips_per_candidate": EXPECTED_VAL_CLIPS,
+            "shards_per_candidate": EXPECTED_SHARDS,
+            "window_length": WINDOW_LENGTH,
+            "window_stride": WINDOW_STRIDE,
+            "full_base_fgd_used": False,
+        }:
+            raise ContractError("selection receipt candidate protocol mismatch")
     stages = payload["stages"]
     if (
         not isinstance(stages, list)
@@ -2128,8 +2282,8 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
         if (
             result["stage"] != stage
             or result["selection_metric"] != SELECTION_METRICS[stage]
-            or epoch not in epochs
-            or result["candidate_index"] != epochs.index(epoch)
+            or epoch not in schedules[stage]
+            or result["candidate_index"] != schedules[stage].index(epoch)
             or result["optimizer_updates"]
             != epoch * updates_per_epoch(stage)
         ):

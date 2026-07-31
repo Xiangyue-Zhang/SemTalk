@@ -136,7 +136,7 @@ class DualNodePrerequisiteLauncherTest(unittest.TestCase):
         self.assertIn("--continuation-wave WAVE_JSON WAVE_SHA256", self.source)
         self.assertIn("wave.replay_wave_file", self.source)
         self.assertIn(
-            "continuation_target_epoch != continuation_boundary_epoch + 20",
+            'entry["target_epoch"] != entry["boundary_epoch"] + 20',
             self.source,
         )
         self.assertIn("refusing to reuse continuation segment", self.source)
@@ -147,9 +147,12 @@ class DualNodePrerequisiteLauncherTest(unittest.TestCase):
             self.source,
         )
         self.assertIn(
-            'final_name="show_ft_${stage}_${continuation_target_epoch}.bin"',
+            'final_name="show_ft_${stage}_${stage_target}.bin"',
             self.source,
         )
+        self.assertIn('active_stages+=("$stage")', self.source)
+        self.assertIn("continuation partition has no authorized active stages", self.source)
+        self.assertNotIn("continuation wave does not cover exact five stages", self.source)
 
     def test_scope_is_show_all_base_without_sparse_generation(self) -> None:
         self.assertIn("--training_speakers 0 1 2 3", self.source)

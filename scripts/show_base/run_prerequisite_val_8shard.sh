@@ -260,7 +260,10 @@ index_stages = tuple(
     stage for stage in contract.STAGES if stage in index["stages"]
 )
 is_partial = (
-    index["format"] == contract.PARTIAL_CANDIDATE_INDEX_FORMAT
+    index["format"] in {
+        contract.PARTIAL_CANDIDATE_INDEX_FORMAT,
+        contract.SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT,
+    }
 )
 if set(index_stages) not in (
     set(contract.STAGES),
@@ -268,7 +271,7 @@ if set(index_stages) not in (
 ):
     raise SystemExit("candidate index stage authority is invalid")
 for stage in index_stages:
-    for epoch in contract.candidate_epochs(index):
+    for epoch in contract.candidate_epochs_for_stage(index, stage):
         item = contract.candidate_lookup(index, stage, epoch)
         fields = (
             stage,
@@ -280,7 +283,10 @@ for stage in index_stages:
         if any("\t" in field or "\n" in field for field in fields):
             raise SystemExit("candidate plan contains unsafe text")
         lines.append("\t".join(fields))
-expected = len(index_stages) * len(contract.candidate_epochs(index))
+expected = sum(
+    len(contract.candidate_epochs_for_stage(index, stage))
+    for stage in index_stages
+)
 if len(lines) != expected:
     raise SystemExit("candidate plan is not exact")
 path = Path(sys.argv[9])
@@ -298,16 +304,20 @@ value, _ = contract.load_candidate_index(
 )
 print(value["format"])
 print(contract.PARTIAL_CANDIDATE_INDEX_FORMAT)
+print(contract.SEGMENTED_PARTIAL_CANDIDATE_INDEX_FORMAT)
 PY
 )
-if [[ ${#candidate_index_formats[@]} -ne 2 ]]; then
+if [[ ${#candidate_index_formats[@]} -ne 3 ]]; then
     printf 'candidate index format preflight returned incomplete fields\n' >&2
     exit 1
 fi
 candidate_index_format=${candidate_index_formats[0]}
 partial_candidate_index_format=${candidate_index_formats[1]}
+segmented_partial_candidate_index_format=${candidate_index_formats[2]}
 if [[ "$candidate_index_format" == \
-      "$partial_candidate_index_format" ]]; then
+      "$partial_candidate_index_format" || \
+      "$candidate_index_format" == \
+      "$segmented_partial_candidate_index_format" ]]; then
     case "$partition" in
         nonglobal|gate) ;;
         *)
