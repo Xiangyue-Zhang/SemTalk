@@ -251,6 +251,133 @@ class SelectedPrerequisiteBridgeTests(unittest.TestCase):
                     label="attacked",
                 )
 
+    def test_dataset_summary_rejects_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            real = root / "real"
+            real.mkdir()
+            summary_path = real / "summary.json"
+            summary_sha = selector_fixture.write_json(
+                summary_path,
+                {
+                    "status": "complete",
+                    "protocol": {
+                        "split": "train",
+                        "speaker_map": dict(consumer.EXPECTED_SPEAKER_MAP),
+                    },
+                    "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                    "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                    "speaker_clip_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_CLIPS
+                    ),
+                    "speaker_window_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_WINDOWS
+                    ),
+                },
+            )
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            source = self.fixture["candidate_index"][
+                "source_receipts"
+            ]["face"]
+            dataset = {
+                "summary": str(alias / summary_path.name),
+                "summary_sha256": summary_sha,
+                "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                "split_label": "SHOW available frozen subset",
+                "source_binding": {
+                    key: source["portable_identity"][key]
+                    for key in ("origin", "commit", "tree")
+                },
+            }
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "canonical path with no symlink ancestor",
+            ):
+                consumer._validate_show_all_training_dataset(
+                    dataset,
+                    source=source,
+                    expected_sha256=(
+                        producer_contract.canonical_payload_sha256(dataset)
+                    ),
+                    label="symlinked",
+                )
+
+    def test_dataset_summary_parses_the_attested_snapshot_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            summary_path = root / "summary.json"
+            summary_sha = selector_fixture.write_json(
+                summary_path,
+                {
+                    "status": "complete",
+                    "protocol": {
+                        "split": "train",
+                        "speaker_map": dict(consumer.EXPECTED_SPEAKER_MAP),
+                    },
+                    "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                    "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                    "speaker_clip_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_CLIPS
+                    ),
+                    "speaker_window_counts": dict(
+                        consumer.EXPECTED_TRAIN_SPEAKER_WINDOWS
+                    ),
+                },
+            )
+            source = self.fixture["candidate_index"][
+                "source_receipts"
+            ]["face"]
+            dataset = {
+                "summary": str(summary_path),
+                "summary_sha256": summary_sha,
+                "train_clips": consumer.EXPECTED_TRAIN_CLIPS,
+                "entries": consumer.EXPECTED_TRAIN_WINDOWS,
+                "split_label": "SHOW available frozen subset",
+                "source_binding": {
+                    key: source["portable_identity"][key]
+                    for key in ("origin", "commit", "tree")
+                },
+            }
+            original_snapshot = consumer._safe_file_snapshot
+
+            def swap_after_snapshot(value, label, *, val_only=True):
+                path, payload = original_snapshot(
+                    value,
+                    label,
+                    val_only=val_only,
+                )
+                path.write_text('{"status":"attacked"}\n', encoding="utf-8")
+                return path, payload
+
+            with mock.patch.object(
+                consumer,
+                "_safe_file_snapshot",
+                side_effect=swap_after_snapshot,
+            ):
+                observed = consumer._validate_show_all_training_dataset(
+                    dataset,
+                    source=source,
+                    expected_sha256=(
+                        producer_contract.canonical_payload_sha256(dataset)
+                    ),
+                    label="transient-swap",
+                )
+            self.assertEqual(observed, dataset)
+            with self.assertRaisesRegex(
+                consumer.SelectedPrerequisiteError,
+                "representation summary changed",
+            ):
+                consumer._validate_show_all_training_dataset(
+                    dataset,
+                    source=source,
+                    expected_sha256=(
+                        producer_contract.canonical_payload_sha256(dataset)
+                    ),
+                    label="post-swap",
+                )
+
     def test_missing_global_fails_closed(self) -> None:
         def mutate(value: dict[str, object]) -> None:
             value["stages"] = value["stages"][:-1]

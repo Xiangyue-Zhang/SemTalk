@@ -517,13 +517,13 @@ def _validate_show_all_training_dataset(
         raise SelectedPrerequisiteError(
             f"{label} dataset receipt is not frozen SHOW All-speakers"
         )
-    summary_path = regular_file(
+    summary_path, summary_payload = _safe_file_snapshot(
         value.get("summary"),
         f"{label} representation summary",
         val_only=False,
     )
     if (
-        sha256_file(summary_path)
+        hashlib.sha256(summary_payload).hexdigest()
         != require_sha256(
             value.get("summary_sha256"),
             f"{label} representation summary SHA-256",
@@ -533,7 +533,7 @@ def _validate_show_all_training_dataset(
             f"{label} representation summary changed"
         )
     summary = strict_json_bytes(
-        summary_path.read_bytes(),
+        summary_payload,
         str(summary_path),
     )
     protocol = summary.get("protocol")
