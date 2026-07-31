@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -37,6 +38,7 @@ from scripts.show_base import base_long_val_contract as val_contract
 
 PLAN_FORMAT = "semtalk_show_base_fresh_val_plan_v1"
 RUN_SPEC_FORMAT = "semtalk_show_base_fresh_val_run_spec_v1"
+RUN_SPEC_INPUT_FORMAT = "semtalk_show_base_fresh_val_run_spec_input_v1"
 RUN_SPEC_AUDIT_FORMAT = "semtalk_show_base_fresh_val_run_spec_audit_v1"
 CANDIDATE_SEAL_FORMAT = "semtalk_show_base_fresh_val_candidate_seal_v1"
 PARTITION_FORMAT = "semtalk_show_base_fresh_val_partition_v1"
@@ -49,6 +51,9 @@ MULTICANDIDATE_COMPARISON_FORMAT = (
 )
 MULTICANDIDATE_PROBE_RUN_FORMAT = (
     "semtalk_show_base_fresh_val_multicandidate_probe_run_v1"
+)
+MULTICANDIDATE_PROBE_RUN_INPUT_FORMAT = (
+    "semtalk_show_base_fresh_val_multicandidate_probe_run_input_v1"
 )
 MULTICANDIDATE_PROBE_METRIC_FORMAT = (
     "semtalk_show_base_fresh_val_multicandidate_probe_metric_v1"
@@ -410,6 +415,34 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
     return artifact
 
 
+def _fresh_validate_generated_receipt(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+    replay: Any,
+) -> None:
+    """Replay a generated receipt before its create-new publication.
+
+    The temporary artifact exists only so existing file-identity validators
+    exercise the exact bytes that would be published.  The requested output
+    path is untouched unless this fresh replay succeeds.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix="semtalk-base-fresh-producer-"
+    ) as raw:
+        path = Path(raw).resolve() / f"{label}.json"
+        artifact = _write_new(path, value)
+        replay(artifact)
+
+
+def _reject_non_base_scope(value: Any, label: str) -> None:
+    try:
+        authority._reject_forbidden_tree(value, label)
+    except authority.PublishedWinnerClaimError as error:
+        raise BaseFreshValOrchestratorError(str(error)) from error
+
+
 def _create_new_directory_tree(
     path: Path,
     *,
@@ -691,6 +724,7 @@ def build_plan(
 
 
 def _probe_binding(value: Any) -> dict[str, Any]:
+    _reject_non_base_scope(value, "fresh Base throughput probe binding")
     binding = _exact(
         value,
         {
@@ -734,8 +768,11 @@ def _probe_binding(value: Any) -> dict[str, Any]:
         )
     normalized_payloads = {}
     for role in ("pipeline", "prerequisite_selection", "val_inputs"):
-        normalized, _payload = authority._verify_compact_receipt(
+        normalized, payload = authority._verify_compact_receipt(
             binding[role], f"fresh Base throughput probe {role}"
+        )
+        _reject_non_base_scope(
+            payload, f"fresh Base throughput probe {role} payload"
         )
         normalized_payloads[role] = normalized
     checkpoint_rows = binding["candidate_checkpoints"]
@@ -802,8 +839,12 @@ def _probe_metric(
     prediction_manifest: Mapping[str, Any],
     subset_manifest: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    _reject_non_base_scope(value, f"throughput probe Base e{epoch} metric")
     artifact, metric = authority._verify_compact_receipt(
         value, f"throughput probe Base e{epoch} metric"
+    )
+    _reject_non_base_scope(
+        metric, f"throughput probe Base e{epoch} metric payload"
     )
     _exact(
         metric,
@@ -847,6 +888,75 @@ def _probe_metric(
     return artifact, metric
 
 
+def build_probe_metric(
+    *,
+    epoch: int,
+    checkpoint: Mapping[str, Any],
+    subset_manifest: Mapping[str, Any],
+    prediction_manifest: Mapping[str, Any],
+    metric_values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal one finite, validation-only metric receipt for a probe output."""
+
+    if epoch not in PROBE_EPOCHS:
+        raise BaseFreshValOrchestratorError(
+            "throughput probe metric epoch is outside the frozen probe set"
+        )
+    normalized_checkpoint = authority._validate_checkpoint(
+        checkpoint, f"throughput probe Base e{epoch} checkpoint"
+    )
+    normalized_subset, _ = authority._normalize_artifact(
+        subset_manifest,
+        "fresh Base throughput probe subset",
+        with_payload=False,
+    )
+    normalized_prediction, _ = authority._normalize_artifact(
+        prediction_manifest,
+        f"throughput probe Base e{epoch} prediction manifest",
+        with_payload=False,
+    )
+    if (
+        not isinstance(metric_values, Mapping)
+        or not metric_values
+        or any(
+            not isinstance(key, str)
+            or not key
+            or type(number) not in (int, float)
+            or not math.isfinite(float(number))
+            for key, number in metric_values.items()
+        )
+    ):
+        raise BaseFreshValOrchestratorError(
+            "throughput probe metric values must be finite and nonempty"
+        )
+    result = _with_payload_sha(
+        {
+            "format": MULTICANDIDATE_PROBE_METRIC_FORMAT,
+            "status": "complete",
+            "split": "val",
+            "test_visible": False,
+            "epoch": epoch,
+            "candidate_checkpoint": normalized_checkpoint,
+            "subset_manifest": normalized_subset,
+            "prediction_manifest": normalized_prediction,
+            "metric_values": dict(metric_values),
+        }
+    )
+    _reject_non_base_scope(result, "fresh Base throughput probe metric")
+    _fresh_validate_generated_receipt(
+        result,
+        label=f"probe-metric-e{epoch}",
+        replay=lambda artifact: _probe_metric(
+            artifact,
+            epoch=epoch,
+            checkpoint=normalized_checkpoint,
+            prediction_manifest=normalized_prediction,
+            subset_manifest=normalized_subset,
+        ),
+    )
+    return result
+
+
 def _probe_candidate_output(
     value: Any,
     *,
@@ -878,6 +988,10 @@ def _probe_candidate_output(
     )
     rows = authority._strict_jsonl_bytes(
         manifest_payload,
+        f"throughput probe Base e{expected_epoch} prediction manifest",
+    )
+    _reject_non_base_scope(
+        rows,
         f"throughput probe Base e{expected_epoch} prediction manifest",
     )
     expected_subset_path = binding["subset_manifest"]["path"]
@@ -998,6 +1112,10 @@ def _replay_probe_run(
         or run["formal_host"] not in FORMAL_HOST_BY_PARTITION.values()
         or run["candidates_per_wave"] not in CONCURRENCY_SELECTION_ORDER
         or run["execution_mode"] not in {"serial", "concurrent"}
+        or (
+            run["execution_mode"] == "serial"
+            and run["candidates_per_wave"] != 1
+        )
         or type(started) is not int
         or type(finished) is not int
         or started < 0
@@ -1069,6 +1187,73 @@ def _replay_probe_run(
     return artifact, run, summary
 
 
+def build_probe_run(
+    input_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal one externally captured serial/concurrent probe transaction."""
+
+    _normalized_input, captured = authority._verify_compact_receipt(
+        input_artifact, "fresh Base multi-candidate probe capture"
+    )
+    _exact(
+        captured,
+        {
+            "format",
+            "status",
+            "split",
+            "test_visible",
+            "formal_host",
+            "candidates_per_wave",
+            "execution_mode",
+            "probe_binding",
+            "candidate_outputs",
+            "execution_trace",
+            "process_evidence",
+            "receipt_payload_sha256",
+        },
+        "fresh Base multi-candidate probe capture",
+    )
+    process = captured["process_evidence"]
+    if (
+        captured["format"] != MULTICANDIDATE_PROBE_RUN_INPUT_FORMAT
+        or captured["status"] != "captured"
+        or captured["split"] != "val"
+        or captured["test_visible"] is not False
+        or not isinstance(process, dict)
+    ):
+        raise BaseFreshValOrchestratorError(
+            "fresh Base multi-candidate probe capture identity changed"
+        )
+    process_success = (
+        process.get("runner_rc") == 0
+        and process.get("oom") is False
+        and process.get("descendants_exited") is True
+        and process.get("guards_restored") is True
+    )
+    result = _with_payload_sha(
+        {
+            "format": MULTICANDIDATE_PROBE_RUN_FORMAT,
+            "status": "complete" if process_success else "failed",
+            "split": "val",
+            "test_visible": False,
+            "formal_host": captured["formal_host"],
+            "candidates_per_wave": captured["candidates_per_wave"],
+            "execution_mode": captured["execution_mode"],
+            "probe_binding": captured["probe_binding"],
+            "candidate_outputs": captured["candidate_outputs"],
+            "execution_trace": captured["execution_trace"],
+            "process_evidence": process,
+        }
+    )
+    _reject_non_base_scope(result, "fresh Base throughput probe run")
+    _fresh_validate_generated_receipt(
+        result,
+        label="probe-run",
+        replay=_replay_probe_run,
+    )
+    return result
+
+
 def build_multicandidate_comparison(
     *,
     serial_run: Mapping[str, Any],
@@ -1136,7 +1321,7 @@ def build_multicandidate_comparison(
         failures.append("metric_values_mismatch")
     serial_elapsed = serial_summary["elapsed_seconds"]
     concurrent_elapsed = concurrent_summary["elapsed_seconds"]
-    return _with_payload_sha(
+    result = _with_payload_sha(
         {
             "format": MULTICANDIDATE_COMPARISON_FORMAT,
             "status": "pass" if comparison_pass else "fail",
@@ -1175,6 +1360,10 @@ def build_multicandidate_comparison(
             "failure_reasons": failures,
         }
     )
+    _reject_non_base_scope(
+        result, "fresh Base multi-candidate comparison"
+    )
+    return result
 
 
 def _replay_multicandidate_comparison(
@@ -1296,7 +1485,7 @@ def build_multicandidate_gate(
         if elapsed
         <= fastest_elapsed * (1.0 + CONCURRENCY_SELECTION_SAFETY_MARGIN)
     )
-    return _with_payload_sha(
+    result = _with_payload_sha(
         {
             "format": MULTICANDIDATE_GATE_FORMAT,
             "status": "pass",
@@ -1331,6 +1520,10 @@ def build_multicandidate_gate(
             "selected_bottleneck_elapsed_seconds": safe_scores[selected],
         }
     )
+    _reject_non_base_scope(
+        result, "fresh Base multi-candidate throughput gate"
+    )
+    return result
 
 
 def _validate_multicandidate_gate(
@@ -1753,6 +1946,100 @@ def validate_run_spec(
             "run specification is not canonical"
         )
     return normalized, spec
+
+
+def build_run_spec(
+    input_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build and freshly replay the sole frozen Base validation input."""
+
+    _normalized_input, frozen = authority._verify_compact_receipt(
+        input_artifact, "fresh Base validation run-spec inputs"
+    )
+    _exact(
+        frozen,
+        {
+            "format",
+            "status",
+            "split",
+            "test_visible",
+            "source",
+            "multi_candidate_gate",
+            "candidate_bundle",
+            "val_inputs",
+            "pipeline",
+            "prerequisite_selection",
+            "continuation_decision",
+            "continuation_waves",
+            "canonical_manifest",
+            "validation_gates",
+            "metric_assets",
+            "real_feature_cache",
+            "receipt_payload_sha256",
+        },
+        "fresh Base validation run-spec inputs",
+    )
+    source = frozen["source"]
+    if (
+        frozen["format"] != RUN_SPEC_INPUT_FORMAT
+        or frozen["status"] != "frozen_inputs"
+        or frozen["split"] != "val"
+        or frozen["test_visible"] is not False
+        or not isinstance(source, dict)
+        or re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit")))
+        is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(source.get("tree")))
+        is None
+    ):
+        raise BaseFreshValOrchestratorError(
+            "fresh Base validation run-spec input identity changed"
+        )
+    result = _with_payload_sha(
+        {
+            "format": RUN_SPEC_FORMAT,
+            "payload_hash_algorithm": PAYLOAD_HASH_ALGORITHM,
+            "status": "frozen",
+            "generator": "SemTalk Base Motion Generation",
+            "generator_module": GENERATOR_MODULE,
+            "dataset": "SHOW",
+            "target_speaker_scope": authority.EXPECTED_SCOPE,
+            "split": "val",
+            "test_visible": False,
+            "formal_hosts": {
+                "partition_count": 2,
+                "partition_id_to_hostname": {
+                    "0": FORMAL_HOST_BY_PARTITION[0],
+                    "1": FORMAL_HOST_BY_PARTITION[1],
+                },
+            },
+            "multi_candidate_gate": frozen["multi_candidate_gate"],
+            "source": source,
+            "candidate_bundle": frozen["candidate_bundle"],
+            "val_inputs": frozen["val_inputs"],
+            "pipeline": frozen["pipeline"],
+            "prerequisite_selection": frozen[
+                "prerequisite_selection"
+            ],
+            "continuation_decision": frozen["continuation_decision"],
+            "continuation_waves": frozen["continuation_waves"],
+            "canonical_manifest": frozen["canonical_manifest"],
+            "validation_gates": frozen["validation_gates"],
+            "metric_assets": frozen["metric_assets"],
+            "real_feature_cache": frozen["real_feature_cache"],
+            "seed": 20260731,
+        }
+    )
+    _reject_non_base_scope(result, "fresh Base validation run specification")
+    _fresh_validate_generated_receipt(
+        result,
+        label="run-spec",
+        replay=lambda artifact: validate_run_spec(
+            artifact,
+            expected_source_commit=source["commit"],
+            expected_source_tree=source["tree"],
+        ),
+    )
+    return result
 
 
 def _prediction_records(
@@ -2765,6 +3052,49 @@ def _add_payload_artifact(parser: argparse.ArgumentParser, prefix: str) -> None:
     parser.add_argument(f"--{prefix}-payload-sha256", required=True)
 
 
+def _add_plain_artifact(parser: argparse.ArgumentParser, prefix: str) -> None:
+    parser.add_argument(f"--{prefix}-path", type=Path, required=True)
+    parser.add_argument(f"--{prefix}-sha256", required=True)
+    parser.add_argument(f"--{prefix}-bytes", type=int, required=True)
+
+
+def _plain_from_args(
+    args: argparse.Namespace, prefix: str
+) -> dict[str, Any]:
+    attr = prefix.replace("-", "_")
+    artifact, _ = _artifact(
+        getattr(args, f"{attr}_path"),
+        getattr(args, f"{attr}_sha256"),
+        payload_receipt=False,
+    )
+    if artifact["bytes"] != getattr(args, f"{attr}_bytes"):
+        raise BaseFreshValOrchestratorError(
+            f"{prefix} byte count changed"
+        )
+    return artifact
+
+
+def _json_object_from_args(
+    args: argparse.Namespace, prefix: str
+) -> dict[str, Any]:
+    attr = prefix.replace("-", "_")
+    path, payload = _safe_snapshot(
+        getattr(args, f"{attr}_path"), prefix
+    )
+    if _sha256_bytes(payload) != _require_sha(
+        getattr(args, f"{attr}_sha256"), f"{prefix} SHA-256"
+    ):
+        raise BaseFreshValOrchestratorError(f"{prefix} SHA-256 changed")
+    if len(payload) != getattr(args, f"{attr}_bytes"):
+        raise BaseFreshValOrchestratorError(f"{prefix} byte count changed")
+    value = _strict_json(payload, str(path))
+    if not isinstance(value, dict):
+        raise BaseFreshValOrchestratorError(
+            f"{prefix} must be a strict JSON object"
+        )
+    return value
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2773,6 +3103,53 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     create_root.add_argument("--path", type=Path, required=True)
     create_root.add_argument("--subdirectory", action="append", default=[])
+
+    probe_metric = commands.add_parser(
+        "build-probe-metric", allow_abbrev=False
+    )
+    probe_metric.add_argument("--epoch", type=int, required=True)
+    for prefix in (
+        "checkpoint",
+        "subset-manifest",
+        "prediction-manifest",
+        "metric-values",
+    ):
+        _add_plain_artifact(probe_metric, prefix)
+    probe_metric.add_argument("--output-json", type=Path, required=True)
+
+    probe_run = commands.add_parser(
+        "build-probe-run", allow_abbrev=False
+    )
+    _add_payload_artifact(probe_run, "probe-run-input")
+    probe_run.add_argument("--output-json", type=Path, required=True)
+
+    comparison = commands.add_parser(
+        "build-concurrency-comparison", allow_abbrev=False
+    )
+    _add_payload_artifact(comparison, "serial-run")
+    _add_payload_artifact(comparison, "concurrent-run")
+    comparison.add_argument("--output-json", type=Path, required=True)
+
+    gate = commands.add_parser(
+        "build-concurrency-gate", allow_abbrev=False
+    )
+    gate.add_argument(
+        "--comparison-path", action="append", type=Path, required=True
+    )
+    gate.add_argument(
+        "--comparison-sha256", action="append", required=True
+    )
+    gate.add_argument(
+        "--comparison-payload-sha256", action="append", required=True
+    )
+    gate.add_argument("--output-json", type=Path, required=True)
+
+    build_spec = commands.add_parser(
+        "build-run-spec", allow_abbrev=False
+    )
+    _add_payload_artifact(build_spec, "run-spec-input")
+    build_spec.add_argument("--output-json", type=Path, required=True)
+
     spec = commands.add_parser("validate-run-spec", allow_abbrev=False)
     _add_payload_artifact(spec, "run-spec")
     spec.add_argument("--source-commit", required=True)
@@ -2993,7 +3370,70 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
         )
         return 0
-    if args.command == "validate-run-spec":
+    if args.command == "build-probe-metric":
+        result = build_probe_metric(
+            epoch=args.epoch,
+            checkpoint=_plain_from_args(args, "checkpoint"),
+            subset_manifest=_plain_from_args(args, "subset-manifest"),
+            prediction_manifest=_plain_from_args(
+                args, "prediction-manifest"
+            ),
+            metric_values=_json_object_from_args(args, "metric-values"),
+        )
+    elif args.command == "build-probe-run":
+        result = build_probe_run(
+            _compact_from_args(args, "probe-run-input")
+        )
+    elif args.command == "build-concurrency-comparison":
+        result = build_multicandidate_comparison(
+            serial_run=_compact_from_args(args, "serial-run"),
+            concurrent_run=_compact_from_args(args, "concurrent-run"),
+        )
+        _reject_non_base_scope(
+            result, "fresh Base multi-candidate comparison"
+        )
+        _fresh_validate_generated_receipt(
+            result,
+            label="concurrency-comparison",
+            replay=_replay_multicandidate_comparison,
+        )
+    elif args.command == "build-concurrency-gate":
+        if not (
+            len(args.comparison_path)
+            == len(args.comparison_sha256)
+            == len(args.comparison_payload_sha256)
+        ):
+            raise BaseFreshValOrchestratorError(
+                "comparison path/SHA/payload lists differ"
+            )
+        comparisons = []
+        for path, digest, payload_digest in zip(
+            args.comparison_path,
+            args.comparison_sha256,
+            args.comparison_payload_sha256,
+        ):
+            artifact, _ = _artifact(
+                path, digest, payload_receipt=True
+            )
+            if artifact["receipt_payload_sha256"] != payload_digest:
+                raise BaseFreshValOrchestratorError(
+                    "comparison payload SHA-256 changed"
+                )
+            comparisons.append(artifact)
+        result = build_multicandidate_gate(comparisons)
+        _reject_non_base_scope(
+            result, "fresh Base multi-candidate throughput gate"
+        )
+        _fresh_validate_generated_receipt(
+            result,
+            label="concurrency-gate",
+            replay=_validate_multicandidate_gate,
+        )
+    elif args.command == "build-run-spec":
+        result = build_run_spec(
+            _compact_from_args(args, "run-spec-input")
+        )
+    elif args.command == "validate-run-spec":
         normalized, _spec = validate_run_spec(
             _compact_from_args(args, "run-spec"),
             expected_source_commit=args.source_commit,
