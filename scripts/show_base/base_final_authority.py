@@ -1669,6 +1669,10 @@ def _control_authority(
             raise BaseFinalAuthorityError(
                 f"selected-five replay does not bind the {stage!r} checkpoint"
             )
+        pinned_measurement = _payload_artifact_from_binding(
+            stage_receipt.get("measurement_receipt"),
+            f"selected-five {stage} measurement receipt",
+        )
         explicit_stages[stage] = {
             "stage": stage,
             "epoch": stage_receipt.get("epoch"),
@@ -1680,9 +1684,7 @@ def _control_authority(
             "candidate_checkpoint": dict(
                 stage_receipt["candidate_checkpoint"]
             ),
-            "measurement_receipt": stage_receipt.get(
-                "measurement_receipt"
-            ),
+            "measurement_receipt": pinned_measurement,
         }
     if set(explicit_stages) != set(REPRESENTATION_STAGES):
         raise BaseFinalAuthorityError(
@@ -1821,7 +1823,7 @@ def _control_authority(
         _reject_forbidden(payload, label)
     return {
         "winner_selection": {
-            **selection,
+            **pinned_winner_selection,
             "canonical_payload_sha256": canonical_json_sha256(
                 selection_payload
             ),
@@ -1839,16 +1841,18 @@ def _control_authority(
             },
         },
         "continuation_decision": {
-            **continuation,
+            **pinned_continuation_decision,
             "canonical_payload_sha256": canonical_json_sha256(
                 replayed_continuation
             ),
             "decision": "stop",
-            "prerequisite_selection": dict(selection_binding),
+            "prerequisite_selection": dict(
+                pinned_prerequisite_selection
+            ),
         },
-        "continuation_waves": replayed_waves,
+        "continuation_waves": pinned_continuation_waves,
         "prerequisite_selection": {
-            **dict(selection_binding),
+            **pinned_prerequisite_selection,
             "canonical_payload_sha256": canonical_json_sha256(
                 prerequisite_selection
             ),

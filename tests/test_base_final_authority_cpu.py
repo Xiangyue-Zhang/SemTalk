@@ -394,6 +394,10 @@ class AuthorityFixture:
         self.continuation = root / "continuation.json"
         self.continuation_waves: list[dict[str, object]] = []
         self.test_claim = root / "test-claim.json"
+        for stage in AUTH.REPRESENTATION_STAGES:
+            (root / f"{stage}-measurement.json").write_bytes(
+                f"{stage}-measurement".encode()
+            )
         prerequisite_unsigned = {
             "format": "semtalk_show_prerequisite_val_selection_v1",
             "status": "selected",
@@ -796,6 +800,36 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                     ],
                 )
             self.assertEqual(validated, authority)
+            payload_artifact_keys = {
+                "path",
+                "sha256",
+                "bytes",
+                "receipt_payload_sha256",
+            }
+            for role in (
+                "winner_selection",
+                "continuation_decision",
+                "prerequisite_selection",
+            ):
+                self.assertTrue(
+                    payload_artifact_keys.issubset(authority[role])
+                )
+            self.assertEqual(
+                authority["continuation_decision"][
+                    "prerequisite_selection"
+                ],
+                {
+                    key: authority["prerequisite_selection"][key]
+                    for key in payload_artifact_keys
+                },
+            )
+            for stage in authority["prerequisite_selection"][
+                "stages"
+            ].values():
+                self.assertEqual(
+                    set(stage["measurement_receipt"]),
+                    payload_artifact_keys,
+                )
             self.assertEqual(
                 [validator.call_count for validator in validators],
                 [2, 2, 2, 2, 2],
