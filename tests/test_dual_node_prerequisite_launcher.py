@@ -105,6 +105,25 @@ class DualNodePrerequisiteLauncherTest(unittest.TestCase):
             )
         self.assertEqual(self.training_source.count('"epochs": 200,'), 5)
 
+    def test_continuation_requires_replayed_immutable_exact_plus_20_wave(self) -> None:
+        self.assertIn("--continuation-wave WAVE_JSON WAVE_SHA256", self.source)
+        self.assertIn("wave.replay_wave_file", self.source)
+        self.assertIn(
+            "continuation_target_epoch != continuation_boundary_epoch + 20",
+            self.source,
+        )
+        self.assertIn("refusing to reuse continuation segment", self.source)
+        self.assertIn("--resume_wave_receipt", self.source)
+        self.assertIn("--expected_resume_wave_sha256", self.source)
+        self.assertIn(
+            'old["boundary_resume"]["path"]',
+            self.source,
+        )
+        self.assertIn(
+            'final_name="show_ft_${stage}_${continuation_target_epoch}.bin"',
+            self.source,
+        )
+
     def test_scope_is_show_all_base_without_sparse_generation(self) -> None:
         self.assertIn("--training_speakers 0 1 2 3", self.source)
         self.assertIn("--sparse 0", self.source)

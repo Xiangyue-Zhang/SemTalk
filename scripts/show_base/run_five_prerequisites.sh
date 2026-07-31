@@ -17,10 +17,10 @@ export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 [--resume]"
+        "Usage: $0 REPO_ROOT PYTHON REP_LMDB REP_SUMMARY LINEAGE ASSET_ROOT OUTPUT_ROOT RUN_ID PARITY_BUNDLE PARITY_SHA256 [--resume | --continuation-wave WAVE_JSON WAVE_SHA256]"
 }
 
-if [[ $# -ne 10 && $# -ne 11 ]]; then
+if [[ $# -ne 10 && $# -ne 11 && $# -ne 13 ]]; then
     usage
     exit 2
 fi
@@ -36,6 +36,9 @@ run_id=$8
 parity_bundle=$9
 parity_sha256=${10}
 resume_mode=false
+continuation_mode=false
+continuation_wave=
+continuation_wave_sha256=
 formal_smplx_sha256=bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74
 official_vq_root=${SEMTALK_OFFICIAL_VQ_ROOT:-/local-ssd/xiangyuezhang/semtalk_all_speakers_full_vq_20260730/pretrained_vq}
 if [[ $# -eq 11 ]]; then
@@ -44,6 +47,14 @@ if [[ $# -eq 11 ]]; then
         exit 2
     fi
     resume_mode=true
+elif [[ $# -eq 13 ]]; then
+    if [[ ${11} != "--continuation-wave" ]]; then
+        usage
+        exit 2
+    fi
+    continuation_mode=true
+    continuation_wave=${12}
+    continuation_wave_sha256=${13}
 fi
 
 formal_partition=${SEMTALK_FORMAL_PARTITION:-}
@@ -68,6 +79,17 @@ for required in "$repo_root/show_base_train.py" "$python_bin" "$rep_summary" \
         exit 1
     fi
 done
+if [[ "$continuation_mode" == true ]]; then
+    if [[ ! -f "$continuation_wave" || -L "$continuation_wave" ]]; then
+        printf 'missing regular continuation wave: %s\n' \
+            "$continuation_wave" >&2
+        exit 1
+    fi
+    if [[ ! "$continuation_wave_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+        printf 'invalid continuation wave SHA-256\n' >&2
+        exit 1
+    fi
+fi
 if [[ ! -d "$rep_lmdb" ]]; then
     printf 'missing representation LMDB: %s\n' "$rep_lmdb" >&2
     exit 1
@@ -248,10 +270,100 @@ print(entries, updates, fastpath)
 PY
 )
 
+declare -A continuation_resume_path=()
+declare -A continuation_new_run_path=()
+continuation_boundary_epoch=0
+continuation_target_epoch=200
+if [[ "$continuation_mode" == true ]]; then
+    mapfile -d '' -t continuation_fields < <(
+        "$python_bin" - "$repo_root" "$continuation_wave" \
+            "$continuation_wave_sha256" "$formal_partition" \
+            "$output_root" "$run_id" <<'PY'
+from pathlib import Path
+import socket
+import sys
+
+repo = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(repo))
+from scripts.show_base import prerequisite_continuation_wave as wave
+
+wave_path = Path(sys.argv[2])
+wave_sha = sys.argv[3]
+partition = sys.argv[4]
+output_root = Path(sys.argv[5])
+run_id = sys.argv[6]
+receipt = wave.replay_wave_file(wave_path, wave_sha)
+expected = {
+    "master": ("face", "hands", "global"),
+    "worker": ("upper", "lower"),
+}[partition]
+entries = {entry["stage"]: entry for entry in receipt["stages"]}
+if set(entries) != set(wave.STAGES):
+    raise SystemExit("continuation wave does not cover exact five stages")
+hostname = socket.gethostname()
+fields = [
+    str(receipt["boundary_epoch"]),
+    str(receipt["target_epoch"]),
+]
+for stage in expected:
+    entry = entries[stage]
+    old = entry["old_segment"]
+    new = entry["new_segment"]
+    expected_run = output_root / stage / "custom" / f"{run_id}_{stage}"
+    if (
+        new["host"] != hostname
+        or new["run_path"] != str(expected_run)
+        or old["boundary_resume"]["path"]
+        != str(Path(old["run_path"]) / "latest_resume.pt")
+    ):
+        raise SystemExit(
+            f"{stage} continuation host/run/resume binding mismatch"
+        )
+    fields.extend(
+        (
+            stage,
+            old["boundary_resume"]["path"],
+            new["run_path"],
+        )
+    )
+sys.stdout.buffer.write(b"\0".join(item.encode() for item in fields) + b"\0")
+PY
+    )
+    expected_field_count=$((2 + 3 * ${#active_stages[@]}))
+    if [[ ${#continuation_fields[@]} -ne $expected_field_count ]]; then
+        printf 'continuation wave preflight returned incomplete fields\n' >&2
+        exit 1
+    fi
+    continuation_boundary_epoch=${continuation_fields[0]}
+    continuation_target_epoch=${continuation_fields[1]}
+    if ((continuation_target_epoch != continuation_boundary_epoch + 20)); then
+        printf 'continuation wave is not exact +20\n' >&2
+        exit 1
+    fi
+    field_index=2
+    while ((field_index < ${#continuation_fields[@]})); do
+        stage=${continuation_fields[$field_index]}
+        continuation_resume_path[$stage]=${continuation_fields[$((field_index + 1))]}
+        continuation_new_run_path[$stage]=${continuation_fields[$((field_index + 2))]}
+        field_index=$((field_index + 3))
+    done
+fi
+
 mkdir -p "$output_root/logs/$run_id"
 for stage in "${active_stages[@]}"; do
     stage_dir="$output_root/$stage/custom/${run_id}_${stage}"
-    if [[ "$resume_mode" == false && -e "$stage_dir" ]]; then
+    if [[ "$continuation_mode" == true ]]; then
+        if [[ "$stage_dir" != "${continuation_new_run_path[$stage]:-}" ]]; then
+            printf 'continuation new segment path mismatch: %s\n' \
+                "$stage" >&2
+            exit 1
+        fi
+        if [[ -e "$stage_dir" || -L "$stage_dir" ]]; then
+            printf 'refusing to reuse continuation segment: %s\n' \
+                "$stage_dir" >&2
+            exit 1
+        fi
+    elif [[ "$resume_mode" == false && -e "$stage_dir" ]]; then
         printf 'refusing to reuse stage output: %s\n' "$stage" >&2
         exit 1
     fi
@@ -502,6 +614,11 @@ launch_stage() {
     local log_path="$output_root/logs/$run_id/$stage.log"
     mkdir -p "$stage_out"
 
+    if [[ "$continuation_mode" == true ]]; then
+        epochs=$continuation_target_epoch
+        final_name="show_ft_${stage}_${continuation_target_epoch}.bin"
+    fi
+
     IFS=, read -r -a stage_gpus <<<"$physical_gpus"
     if [[ "$pool_mode" == disabled ]]; then
         local expected_world_size=4
@@ -523,7 +640,20 @@ launch_stage() {
         return 1
     fi
 
-    if [[ "$resume_mode" == true ]]; then
+    if [[ "$continuation_mode" == true ]]; then
+        if [[ ! -f "${continuation_resume_path[$stage]:-}" || \
+              -L "${continuation_resume_path[$stage]:-}" ]]; then
+            printf 'continuation boundary resume is missing: %s\n' \
+                "$stage" >&2
+            return 1
+        fi
+        resume_args=(
+            --resume_state "${continuation_resume_path[$stage]}"
+            --resume_wave_receipt "$continuation_wave"
+            --expected_resume_wave_sha256 "$continuation_wave_sha256"
+        )
+        log_path="$output_root/logs/$run_id/$stage.continuation.e${continuation_target_epoch}.$$.log"
+    elif [[ "$resume_mode" == true ]]; then
         if [[ ! -f "$stage_dir/latest_resume.pt" ]]; then
             printf 'resume checkpoint is missing: %s\n' \
                 "$stage_dir/latest_resume.pt" >&2
