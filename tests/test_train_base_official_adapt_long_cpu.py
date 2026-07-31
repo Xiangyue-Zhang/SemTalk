@@ -333,6 +333,43 @@ def _topology_selection_inputs(
     return probes, quality
 
 
+def _over_budget_quality_skip(
+    probe: dict[str, object],
+    *,
+    position: int,
+) -> dict[str, object]:
+    mode = str(probe["mode"])
+    return {
+        "mode": mode,
+        "status": "skipped_over_eta_budget",
+        "receipt_path": f"/quality-skips/{mode}.json",
+        "receipt_sha256": f"{position + 10:x}" * 64,
+        "receipt_payload_sha256": f"{position + 11:x}" * 64,
+        "topology_gate_spec_sha256": "b" * 64,
+        "quality_gate_spec_sha256": "f" * 64,
+        "topology_independent_input_sha256": probe[
+            "topology_independent_input_sha256"
+        ],
+        "source_binding": {
+            "frozen_receipt_sha256": "1" * 64,
+            "frozen_gate_compatibility_sha256": "2" * 64,
+            "topology_receipt_sha256": "3" * 64,
+        },
+        "probe_report": {
+            "path": probe["report_path"],
+            "sha256": probe["report_sha256"],
+            "bytes": 100,
+            "receipt_sha256": "4" * 64,
+        },
+        "estimated_training_seconds": probe[
+            "estimated_training_seconds"
+        ],
+        "maximum_estimated_training_seconds": (
+            SELECTOR.MAX_TRAINING_SECONDS
+        ),
+    }
+
+
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
     def test_formal_val_control_is_diffsheg_only_and_topology_exact(self) -> None:
         from scripts.show_base import base_final_authority as final_authority
@@ -1330,6 +1367,150 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 quality_gate_spec_sha256="f" * 64,
             )
 
+    def test_over_budget_non_w1_quality_can_be_safely_skipped(self) -> None:
+        eta = {
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE: 10_000.0,
+            ADAPT.W8_GLOBAL64_MODE: 8_000.0,
+            ADAPT.W16_GLOBAL64_MODE: 90_000.0,
+            ADAPT.W8_GLOBAL512_MODE: 7_000.0,
+            ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+        }
+        probes, quality = _topology_selection_inputs(eta)
+        skip_modes = {
+            ADAPT.W16_GLOBAL64_MODE,
+            ADAPT.W16_GLOBAL512_MODE,
+        }
+        skips = [
+            _over_budget_quality_skip(probe, position=index)
+            for index, probe in enumerate(probes)
+            if probe["mode"] in skip_modes
+        ]
+        measured = [
+            report for report in quality if report["mode"] not in skip_modes
+        ]
+        selection = SELECTOR.select_topology(
+            probes,
+            measured,
+            quality_skips=skips,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(
+            selection["selected"]["mode"], ADAPT.W8_GLOBAL512_MODE
+        )
+        self.assertEqual(
+            selection["quality_decisions"][ADAPT.W16_GLOBAL64_MODE][
+                "status"
+            ],
+            "skipped_over_eta_budget",
+        )
+        self.assertEqual(
+            [probe["mode"] for probe in selection["probes"]],
+            list(ADAPT.TOPOLOGY_SPECS),
+        )
+
+    def test_within_budget_and_w1_quality_cannot_be_skipped(self) -> None:
+        eta = {
+            mode: 10_000.0 + index
+            for index, mode in enumerate(ADAPT.TOPOLOGY_SPECS)
+        }
+        probes, quality = _topology_selection_inputs(eta)
+        candidate = probes[1]
+        skip = _over_budget_quality_skip(candidate, position=1)
+        measured = [
+            report
+            for report in quality
+            if report["mode"] != candidate["mode"]
+        ]
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "not bound to one over-budget probe",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                measured,
+                quality_skips=[skip],
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
+
+        eta[ADAPT.OFFICIAL_W1_REFERENCE_MODE] = 90_000.0
+        probes, quality = _topology_selection_inputs(eta)
+        reference_probe = probes[0]
+        reference_skip = _over_budget_quality_skip(
+            reference_probe,
+            position=0,
+        )
+        measured = quality[1:]
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "W1 full e1/e2/e4/e8 quality reference is mandatory",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                measured,
+                quality_skips=[reference_skip],
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
+
+    def test_training_consumer_accepts_over_budget_skip_receipts(self) -> None:
+        eta = {
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE: 10_000.0,
+            ADAPT.W8_GLOBAL64_MODE: 8_000.0,
+            ADAPT.W16_GLOBAL64_MODE: 90_000.0,
+            ADAPT.W8_GLOBAL512_MODE: 7_000.0,
+            ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+        }
+        probes, quality = _topology_selection_inputs(eta)
+        skip_modes = {
+            ADAPT.W16_GLOBAL64_MODE,
+            ADAPT.W16_GLOBAL512_MODE,
+        }
+        selection = SELECTOR.select_topology(
+            probes,
+            [
+                report
+                for report in quality
+                if report["mode"] not in skip_modes
+            ],
+            quality_skips=[
+                _over_budget_quality_skip(probe, position=index)
+                for index, probe in enumerate(probes)
+                if probe["mode"] in skip_modes
+            ],
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-eta-skip-selection-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            receipt = ADAPT.validate_topology_selection(
+                argparse.Namespace(
+                    topology_selection_report=path,
+                    expected_topology_selection_sha256=_sha(path),
+                    expected_topology_gate_spec_sha256="b" * 64,
+                    topology_mode=ADAPT.W8_GLOBAL512_MODE,
+                ),
+                throughput_gate={
+                    "sha256": selection["selected"]["report_sha256"]
+                },
+            )
+        self.assertEqual(
+            receipt["selected"]["mode"], ADAPT.W8_GLOBAL512_MODE
+        )
+
     def test_selection_tiebreak_is_p99_then_matrix_order(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
         eta = {mode: 10_000.0 for mode in modes}
@@ -1433,6 +1614,12 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 "maximum_estimated_training_seconds"
             ],
             86_400,
+        )
+        skip_policy = receipt["payload"]["over_eta_budget_quality_skip"]
+        self.assertTrue(skip_policy["w1_quality_report_required"])
+        self.assertTrue(skip_policy["within_budget_quality_report_required"])
+        self.assertEqual(
+            skip_policy["receipt_format"], SELECTOR.QUALITY_SKIP_FORMAT
         )
 
     def test_node_local_inode_differences_are_preserved_not_compared(self) -> None:

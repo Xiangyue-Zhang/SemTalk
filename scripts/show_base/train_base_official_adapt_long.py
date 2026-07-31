@@ -3322,7 +3322,104 @@ def validate_topology_selection(
     selected = report.get("selected")
     probes = report.get("probes")
     quality_reports = report.get("quality_reports")
+    quality_skips = report.get("quality_skips")
     quality_decisions = report.get("quality_decisions")
+    matrix_modes = list(TOPOLOGY_SPECS)
+    report_modes = (
+        [quality.get("mode") for quality in quality_reports]
+        if isinstance(quality_reports, list)
+        else []
+    )
+    skip_modes = (
+        [skip.get("mode") for skip in quality_skips]
+        if isinstance(quality_skips, list)
+        else []
+    )
+    probe_by_mode = (
+        {probe.get("mode"): probe for probe in probes}
+        if isinstance(probes, list)
+        else {}
+    )
+    quality_authority_valid = (
+        isinstance(quality_reports, list)
+        and isinstance(quality_skips, list)
+        and len(set(report_modes)) == len(report_modes)
+        and len(set(skip_modes)) == len(skip_modes)
+        and report_modes
+        == [mode for mode in matrix_modes if mode in report_modes]
+        and skip_modes == [mode for mode in matrix_modes if mode in skip_modes]
+        and not (set(report_modes) & set(skip_modes))
+        and set(report_modes) | set(skip_modes) == set(matrix_modes)
+        and OFFICIAL_W1_REFERENCE_MODE in report_modes
+    )
+    if quality_authority_valid:
+        for mode in matrix_modes:
+            probe = probe_by_mode.get(mode)
+            if not isinstance(probe, dict):
+                quality_authority_valid = False
+                break
+            eta = probe.get("estimated_training_seconds")
+            if (
+                not isinstance(eta, (int, float))
+                or isinstance(eta, bool)
+                or not math.isfinite(float(eta))
+                or float(eta) <= 0.0
+            ):
+                quality_authority_valid = False
+                break
+            if mode == OFFICIAL_W1_REFERENCE_MODE or float(eta) <= 86_400:
+                if mode not in report_modes:
+                    quality_authority_valid = False
+                    break
+            elif mode in skip_modes:
+                skip = next(
+                    item for item in quality_skips if item.get("mode") == mode
+                )
+                probe_report = skip.get("probe_report")
+                source_binding = skip.get("source_binding")
+                skip_eta = skip.get("estimated_training_seconds")
+                if (
+                    skip.get("status") != "skipped_over_eta_budget"
+                    or skip.get("topology_gate_spec_sha256")
+                    != args.expected_topology_gate_spec_sha256
+                    or not isinstance(
+                        skip.get("quality_gate_spec_sha256"), str
+                    )
+                    or skip.get("quality_gate_spec_sha256")
+                    != report.get("quality_gate_spec_sha256")
+                    or skip.get("maximum_estimated_training_seconds")
+                    != 86_400
+                    or not isinstance(skip_eta, (int, float))
+                    or isinstance(skip_eta, bool)
+                    or not math.isfinite(float(skip_eta))
+                    or float(skip_eta)
+                    != float(eta)
+                    or skip.get("topology_independent_input_sha256")
+                    != probe.get("topology_independent_input_sha256")
+                    or not isinstance(probe_report, dict)
+                    or probe_report.get("sha256")
+                    != probe.get("report_sha256")
+                    or not isinstance(source_binding, dict)
+                    or set(source_binding)
+                    != {
+                        "frozen_receipt_sha256",
+                        "frozen_gate_compatibility_sha256",
+                        "topology_receipt_sha256",
+                    }
+                    or any(
+                        not isinstance(value, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                        for value in source_binding.values()
+                    )
+                    or not isinstance(skip.get("receipt_sha256"), str)
+                    or len(skip["receipt_sha256"]) != 64
+                    or not isinstance(
+                        skip.get("receipt_payload_sha256"), str
+                    )
+                    or len(skip["receipt_payload_sha256"]) != 64
+                ):
+                    quality_authority_valid = False
+                    break
     if (
         report.get("format") != TOPOLOGY_SELECTION_FORMAT
         or report.get("status") != "pass"
@@ -3340,9 +3437,7 @@ def validate_topology_selection(
             or len(probe["report_sha256"]) != 64
             for probe in probes
         )
-        or not isinstance(quality_reports, list)
-        or [quality.get("mode") for quality in quality_reports]
-        != list(TOPOLOGY_SPECS)
+        or not quality_authority_valid
         or any(
             not isinstance(quality, dict)
             or quality.get("report_sha256") is None
@@ -3353,6 +3448,19 @@ def validate_topology_selection(
         )
         or not isinstance(quality_decisions, dict)
         or set(quality_decisions) != set(TOPOLOGY_SPECS)
+        or any(
+            not isinstance(quality_decisions[mode], dict)
+            for mode in matrix_modes
+        )
+        or any(
+            quality_decisions[mode].get("status")
+            != (
+                "skipped_over_eta_budget"
+                if mode in skip_modes
+                else "measured"
+            )
+            for mode in matrix_modes
+        )
         or not isinstance(selected, dict)
         or selected.get("mode") != args.topology_mode
         or selected.get("report_sha256") != throughput_gate["sha256"]
@@ -3373,7 +3481,7 @@ def validate_topology_selection(
         or report.get("w1_trajectory_equivalence_claimed_for_selected")
         is not False
         or report.get("selection_policy")
-        != "fastest_quality_safe_finite_under_24h_all_measured_topologies_v2"
+        != "fastest_quality_safe_finite_under_24h_eta_pruned_quality_v3"
         or report.get("selection_decision_branch")
         != "fastest_quality_safe_finite_under_24h"
         or report.get("quality_gate_policy", {}).get(
@@ -3384,6 +3492,18 @@ def validate_topology_selection(
             "maximum_training_seconds"
         )
         != 86_400
+        or report.get("quality_gate_policy", {}).get(
+            "w1_quality_report_required"
+        )
+        is not True
+        or report.get("quality_gate_policy", {}).get(
+            "within_budget_quality_report_required"
+        )
+        is not True
+        or report.get("quality_gate_policy", {}).get(
+            "over_budget_non_w1_skip_status"
+        )
+        != "skipped_over_eta_budget"
         or report.get("receipt_sha256")
         != canonical_json_sha256(
             {

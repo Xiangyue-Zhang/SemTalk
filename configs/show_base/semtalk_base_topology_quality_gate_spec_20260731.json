@@ -37,6 +37,27 @@
     "maximum_relative_fgd_regression": 0.02,
     "all_trajectory_epochs_must_pass": true
   },
+  "over_eta_budget_quality_skip": {
+    "receipt_format": "semtalk_show_base_topology_quality_skipped_over_eta_budget_v1",
+    "eligible_modes": [
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration"
+    ],
+    "condition": "estimated_training_seconds_strictly_greater_than_maximum",
+    "w1_quality_report_required": true,
+    "within_budget_quality_report_required": true,
+    "required_sha256_bindings": [
+      "source_binding.frozen_receipt_sha256",
+      "source_binding.frozen_gate_compatibility_sha256",
+      "source_binding.topology_receipt_sha256",
+      "topology_gate_spec_sha256",
+      "quality_gate_spec_sha256",
+      "probe_report.sha256",
+      "topology_independent_input_sha256"
+    ]
+  },
   "selection_tiebreak": [
     "estimated_training_seconds",
     "p99_seconds",

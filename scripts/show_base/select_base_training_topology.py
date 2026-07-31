@@ -28,6 +28,9 @@ class TopologySelectionError(RuntimeError):
 
 QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v1"
 QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v1"
+QUALITY_SKIP_FORMAT = (
+    "semtalk_show_base_topology_quality_skipped_over_eta_budget_v1"
+)
 SHORT_TRAJECTORY_FORMAT = (
     "semtalk_show_base_topology_short_trajectory_v1"
 )
@@ -1409,6 +1412,29 @@ def validate_quality_gate_spec(
             "maximum_relative_fgd_regression": MAX_RELATIVE_FGD_REGRESSION,
             "all_trajectory_epochs_must_pass": True,
         },
+        "over_eta_budget_quality_skip": {
+            "receipt_format": QUALITY_SKIP_FORMAT,
+            "eligible_modes": [
+                mode
+                for mode in contract.TOPOLOGY_SPECS
+                if mode != contract.OFFICIAL_W1_REFERENCE_MODE
+            ],
+            "condition": (
+                "estimated_training_seconds_strictly_greater_than_"
+                "maximum"
+            ),
+            "w1_quality_report_required": True,
+            "within_budget_quality_report_required": True,
+            "required_sha256_bindings": [
+                "source_binding.frozen_receipt_sha256",
+                "source_binding.frozen_gate_compatibility_sha256",
+                "source_binding.topology_receipt_sha256",
+                "topology_gate_spec_sha256",
+                "quality_gate_spec_sha256",
+                "probe_report.sha256",
+                "topology_independent_input_sha256",
+            ],
+        },
         "selection_tiebreak": [
             "estimated_training_seconds",
             "p99_seconds",
@@ -1737,12 +1763,265 @@ def validate_probe(
     }
 
 
+def _validated_probe_receipt_binding(
+    mode: str,
+    path: Path,
+    expected_sha256: str,
+    *,
+    gate_spec_sha256: str,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    """Return a validated probe plus its immutable source/hash binding."""
+
+    probe = validate_probe(
+        mode,
+        path,
+        expected_sha256,
+        gate_spec_sha256=gate_spec_sha256,
+    )
+    raw, resolved, observed_sha = contract._load_json_receipt(
+        path,
+        expected_sha256,
+        f"Base topology probe binding {mode}",
+    )
+    source_binding = {
+        "frozen_receipt_sha256": raw.get("frozen_receipt_sha256"),
+        "frozen_gate_compatibility_sha256": raw.get(
+            "frozen_gate_compatibility_sha256"
+        ),
+        "topology_receipt_sha256": raw.get("topology_receipt_sha256"),
+    }
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+        for value in source_binding.values()
+    ) or re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(probe.get("topology_independent_input_sha256")),
+    ) is None:
+        raise TopologySelectionError(
+            f"Base topology probe {mode} lacks one immutable source binding"
+        )
+    try:
+        canonical, data, _identity = contract._read_regular_file_bytes(
+            resolved,
+            f"Base topology probe binding {mode}",
+        )
+    except Exception as error:
+        raise TopologySelectionError(
+            f"Base topology probe binding {mode} is absent"
+        ) from error
+    probe_receipt_sha256 = raw.get("receipt_sha256")
+    if (
+        canonical != resolved
+        or resolved.is_symlink()
+        or not resolved.is_file()
+        or hashlib.sha256(data).hexdigest() != observed_sha
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(probe_receipt_sha256)
+        )
+        is None
+    ):
+        raise TopologySelectionError(
+            f"Base topology probe binding {mode} changed"
+        )
+    probe_artifact = {
+        "path": str(resolved),
+        "sha256": observed_sha,
+        "bytes": len(data),
+        "receipt_sha256": probe_receipt_sha256,
+    }
+    return probe, source_binding, probe_artifact
+
+
+def build_quality_skip_receipt(
+    mode: str,
+    probe_path: Path,
+    expected_probe_sha256: str,
+    *,
+    topology_gate_spec_sha256: str,
+    quality_gate_spec_sha256: str,
+) -> dict[str, Any]:
+    """Build one create-new authority for an uncompetitive over-budget mode."""
+
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            topology_gate_spec_sha256,
+            quality_gate_spec_sha256,
+        )
+    ):
+        raise TopologySelectionError(
+            "quality skip requires lowercase hash-pinned gate specifications"
+        )
+    if mode == contract.OFFICIAL_W1_REFERENCE_MODE:
+        raise TopologySelectionError(
+            "W1 is the mandatory quality reference and cannot be skipped"
+        )
+    probe, source_binding, probe_artifact = (
+        _validated_probe_receipt_binding(
+            mode,
+            probe_path,
+            expected_probe_sha256,
+            gate_spec_sha256=topology_gate_spec_sha256,
+        )
+    )
+    estimated = float(probe["estimated_training_seconds"])
+    if estimated <= MAX_TRAINING_SECONDS:
+        raise TopologySelectionError(
+            f"{mode} ETA is within 24 hours and requires full e1/e2/e4/e8 "
+            "quality"
+        )
+    receipt: dict[str, Any] = {
+        "format": QUALITY_SKIP_FORMAT,
+        "status": "skipped_over_eta_budget",
+        "mode": mode,
+        "reference_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
+        "topology_gate_spec_sha256": topology_gate_spec_sha256,
+        "quality_gate_spec_sha256": quality_gate_spec_sha256,
+        "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+        "estimated_training_seconds": estimated,
+        "topology_independent_input_sha256": probe[
+            "topology_independent_input_sha256"
+        ],
+        "source_binding": source_binding,
+        "probe_report": probe_artifact,
+    }
+    receipt["receipt_sha256"] = contract.canonical_json_sha256(receipt)
+    return receipt
+
+
+def validate_quality_skip(
+    mode: str,
+    path: Path,
+    expected_sha256: str,
+    *,
+    topology_gate_spec_sha256: str,
+    quality_gate_spec_sha256: str,
+) -> dict[str, Any]:
+    """Validate one immutable over-budget quality-skip receipt."""
+
+    receipt, resolved, observed_sha = contract._load_json_receipt(
+        path,
+        expected_sha256,
+        f"Base topology over-budget quality skip {mode}",
+    )
+    required = {
+        "format",
+        "status",
+        "mode",
+        "reference_mode",
+        "topology_gate_spec_sha256",
+        "quality_gate_spec_sha256",
+        "maximum_estimated_training_seconds",
+        "estimated_training_seconds",
+        "topology_independent_input_sha256",
+        "source_binding",
+        "probe_report",
+        "receipt_sha256",
+    }
+    probe_report = receipt.get("probe_report")
+    source_binding = receipt.get("source_binding")
+    if (
+        mode == contract.OFFICIAL_W1_REFERENCE_MODE
+        or not isinstance(receipt, dict)
+        or set(receipt) != required
+        or receipt.get("format") != QUALITY_SKIP_FORMAT
+        or receipt.get("status") != "skipped_over_eta_budget"
+        or receipt.get("mode") != mode
+        or receipt.get("reference_mode")
+        != contract.OFFICIAL_W1_REFERENCE_MODE
+        or receipt.get("topology_gate_spec_sha256")
+        != topology_gate_spec_sha256
+        or receipt.get("quality_gate_spec_sha256")
+        != quality_gate_spec_sha256
+        or receipt.get("maximum_estimated_training_seconds")
+        != MAX_TRAINING_SECONDS
+        or not _finite_positive(receipt.get("estimated_training_seconds"))
+        or float(receipt["estimated_training_seconds"])
+        <= MAX_TRAINING_SECONDS
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(receipt.get("topology_independent_input_sha256")),
+        )
+        is None
+        or not isinstance(source_binding, dict)
+        or set(source_binding)
+        != {
+            "frozen_receipt_sha256",
+            "frozen_gate_compatibility_sha256",
+            "topology_receipt_sha256",
+        }
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+            for value in source_binding.values()
+        )
+        or not isinstance(probe_report, dict)
+        or set(probe_report)
+        != {"path", "sha256", "bytes", "receipt_sha256"}
+        or receipt.get("receipt_sha256")
+        != contract.canonical_json_sha256(
+            {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
+    ):
+        raise TopologySelectionError(
+            f"Base topology over-budget quality skip {mode} is forged or stale"
+        )
+    probe_artifact, _ = _artifact(
+        {
+            key: probe_report[key]
+            for key in ("path", "sha256", "bytes")
+        },
+        f"{mode} skipped-over-budget probe report",
+    )
+    probe, observed_source, observed_probe_artifact = (
+        _validated_probe_receipt_binding(
+            mode,
+            Path(probe_artifact["path"]),
+            probe_artifact["sha256"],
+            gate_spec_sha256=topology_gate_spec_sha256,
+        )
+    )
+    if (
+        probe_report != observed_probe_artifact
+        or source_binding != observed_source
+        or receipt["topology_independent_input_sha256"]
+        != probe["topology_independent_input_sha256"]
+        or float(receipt["estimated_training_seconds"])
+        != float(probe["estimated_training_seconds"])
+    ):
+        raise TopologySelectionError(
+            f"Base topology over-budget quality skip {mode} probe binding changed"
+        )
+    return {
+        "mode": mode,
+        "status": "skipped_over_eta_budget",
+        "receipt_path": str(resolved),
+        "receipt_sha256": observed_sha,
+        "receipt_payload_sha256": receipt["receipt_sha256"],
+        "topology_gate_spec_sha256": topology_gate_spec_sha256,
+        "quality_gate_spec_sha256": quality_gate_spec_sha256,
+        "topology_independent_input_sha256": receipt[
+            "topology_independent_input_sha256"
+        ],
+        "source_binding": dict(source_binding),
+        "probe_report": dict(probe_report),
+        "estimated_training_seconds": float(
+            receipt["estimated_training_seconds"]
+        ),
+        "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+    }
+
+
 def select_topology(
     probes: Sequence[Mapping[str, Any]],
     quality_reports: Sequence[Mapping[str, Any]],
     *,
     gate_spec_sha256: str,
     quality_gate_spec_sha256: str,
+    quality_skips: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     if [probe.get("mode") for probe in probes] != list(
         contract.TOPOLOGY_SPECS
@@ -1760,15 +2039,90 @@ def select_topology(
     ]
     if [probe["mode"] for probe in eligible] != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError("formal candidate topology set changed")
-    if [report.get("mode") for report in quality_reports] != list(
-        contract.TOPOLOGY_SPECS
+    order = list(contract.TOPOLOGY_SPECS)
+    report_modes = [report.get("mode") for report in quality_reports]
+    skip_modes = [skip.get("mode") for skip in quality_skips]
+    if (
+        len(set(report_modes)) != len(report_modes)
+        or len(set(skip_modes)) != len(skip_modes)
+        or report_modes != [mode for mode in order if mode in report_modes]
+        or skip_modes != [mode for mode in order if mode in skip_modes]
+        or set(report_modes) & set(skip_modes)
+        or set(report_modes) | set(skip_modes) != set(order)
     ):
         raise TopologySelectionError(
-            "all five quality reports must be ordered exactly"
+            "quality reports/skips must cover all five modes exactly once "
+            "in matrix order"
         )
+    if contract.OFFICIAL_W1_REFERENCE_MODE not in report_modes:
+        raise TopologySelectionError(
+            "W1 full e1/e2/e4/e8 quality reference is mandatory"
+        )
+    probe_by_mode = {probe["mode"]: probe for probe in eligible}
+    skip_by_mode = {skip["mode"]: skip for skip in quality_skips}
+    for mode, skip in skip_by_mode.items():
+        probe = probe_by_mode[mode]
+        probe_report = skip.get("probe_report")
+        if (
+            mode == contract.OFFICIAL_W1_REFERENCE_MODE
+            or float(probe["estimated_training_seconds"])
+            <= MAX_TRAINING_SECONDS
+            or skip.get("status") != "skipped_over_eta_budget"
+            or skip.get("topology_gate_spec_sha256")
+            != gate_spec_sha256
+            or skip.get("quality_gate_spec_sha256")
+            != quality_gate_spec_sha256
+            or skip.get("topology_independent_input_sha256")
+            != probe["topology_independent_input_sha256"]
+            or not _finite_positive(
+                skip.get("estimated_training_seconds")
+            )
+            or float(skip["estimated_training_seconds"])
+            != float(probe["estimated_training_seconds"])
+            or skip.get("maximum_estimated_training_seconds")
+            != MAX_TRAINING_SECONDS
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(skip.get("receipt_sha256"))
+            )
+            is None
+            or not isinstance(skip.get("receipt_path"), str)
+            or not Path(skip["receipt_path"]).is_absolute()
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(skip.get("receipt_payload_sha256")),
+            )
+            is None
+            or not isinstance(skip.get("source_binding"), dict)
+            or set(skip["source_binding"])
+            != {
+                "frozen_receipt_sha256",
+                "frozen_gate_compatibility_sha256",
+                "topology_receipt_sha256",
+            }
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+                for value in skip["source_binding"].values()
+            )
+            or not isinstance(probe_report, dict)
+            or set(probe_report)
+            != {"path", "sha256", "bytes", "receipt_sha256"}
+            or probe_report.get("path") != probe["report_path"]
+            or probe_report.get("sha256") != probe["report_sha256"]
+            or type(probe_report.get("bytes")) is not int
+            or probe_report["bytes"] <= 0
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(probe_report.get("receipt_sha256"))
+            )
+            is None
+        ):
+            raise TopologySelectionError(
+                f"{mode} quality skip is not bound to one over-budget probe"
+            )
     quality_semantic_hashes = {
         report["topology_independent_input_sha256"]
         for report in quality_reports
+    } | {
+        skip["topology_independent_input_sha256"] for skip in quality_skips
     }
     canonical_manifests = {
         (
@@ -1797,6 +2151,22 @@ def select_topology(
     quality_decisions: dict[str, dict[str, Any]] = {}
     for probe in eligible:
         mode = probe["mode"]
+        if mode in skip_by_mode:
+            skip = skip_by_mode[mode]
+            quality_decisions[mode] = {
+                "status": "skipped_over_eta_budget",
+                "quality_evaluated": False,
+                "selection_eligible": False,
+                "skip_receipt_path": skip["receipt_path"],
+                "skip_receipt_sha256": skip["receipt_sha256"],
+                "estimated_training_seconds": float(
+                    probe["estimated_training_seconds"]
+                ),
+                "maximum_estimated_training_seconds": (
+                    MAX_TRAINING_SECONDS
+                ),
+            }
+            continue
         report = by_mode[mode]
         comparisons = []
         for epoch in QUALITY_EPOCHS:
@@ -1813,6 +2183,9 @@ def select_topology(
                 }
             )
         quality_decisions[mode] = {
+            "status": "measured",
+            "quality_evaluated": True,
+            "selection_eligible": True,
             "report_path": report["report_path"],
             "report_sha256": report["report_sha256"],
             "comparisons": comparisons,
@@ -1821,7 +2194,6 @@ def select_topology(
             ),
         }
 
-    order = list(contract.TOPOLOGY_SPECS)
     rank_key = lambda probe: (
         probe["estimated_training_seconds"],
         probe["p99_seconds"],
@@ -1834,6 +2206,7 @@ def select_topology(
         and _finite_positive(probe.get("p99_seconds"))
         and float(probe["estimated_training_seconds"])
         <= MAX_TRAINING_SECONDS
+        and probe["mode"] in by_mode
         and quality_decisions[probe["mode"]][
             "all_trajectory_epochs_pass"
         ]
@@ -1854,8 +2227,7 @@ def select_topology(
         "candidate_modes": list(contract.TOPOLOGY_SPECS),
         "topology_independent_input_sha256": next(iter(semantic_hashes)),
         "selection_policy": (
-            "fastest_quality_safe_finite_under_24h_all_measured_"
-            "topologies_v2"
+            "fastest_quality_safe_finite_under_24h_eta_pruned_quality_v3"
         ),
         "selection_decision_branch": decision_branch,
         "quality_gate_policy": {
@@ -1869,10 +2241,16 @@ def select_topology(
             "maximum_relative_fgd_regression": (
                 MAX_RELATIVE_FGD_REGRESSION
             ),
+            "w1_quality_report_required": True,
+            "within_budget_quality_report_required": True,
+            "over_budget_non_w1_skip_status": (
+                "skipped_over_eta_budget"
+            ),
         },
         "w1_trajectory_equivalence_claimed_for_selected": False,
         "probes": [dict(probe) for probe in probes],
         "quality_reports": [dict(report) for report in quality_reports],
+        "quality_skips": [dict(skip) for skip in quality_skips],
         "quality_decisions": quality_decisions,
         "selected": dict(selected),
     }
@@ -1903,7 +2281,14 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=3,
         action="append",
         metavar=("MODE", "REPORT", "SHA256"),
-        required=True,
+        default=[],
+    )
+    parser.add_argument(
+        "--quality-skip",
+        nargs=3,
+        action="append",
+        metavar=("MODE", "RECEIPT", "SHA256"),
+        default=[],
     )
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -1917,9 +2302,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--probe must name all five measured modes exactly once"
         )
     quality_modes = [report[0] for report in args.quality_report]
-    if quality_modes != list(contract.TOPOLOGY_SPECS):
+    skip_modes = [receipt[0] for receipt in args.quality_skip]
+    known_modes = set(contract.TOPOLOGY_SPECS)
+    if any(mode not in known_modes for mode in quality_modes + skip_modes):
         raise TopologySelectionError(
-            "--quality-report must name all five measured modes exactly once"
+            "quality authority names an unknown topology mode"
         )
     gate_spec = contract.validate_topology_gate_spec(
         SimpleNamespace(
@@ -1953,11 +2340,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for mode, report, sha256 in args.quality_report
     ]
+    quality_skips = [
+        validate_quality_skip(
+            mode,
+            Path(receipt),
+            sha256,
+            topology_gate_spec_sha256=gate_spec["sha256"],
+            quality_gate_spec_sha256=quality_gate["sha256"],
+        )
+        for mode, receipt, sha256 in args.quality_skip
+    ]
     payload = select_topology(
         probes,
         quality_reports,
         gate_spec_sha256=gate_spec["sha256"],
         quality_gate_spec_sha256=quality_gate["sha256"],
+        quality_skips=quality_skips,
     )
     contract._write_new_json(args.output, payload)
     return 0
