@@ -32,6 +32,20 @@ def _profile_values() -> dict[str, Any]:
         "validate_candidate_bundle": (
             long_contract.validate_candidate_bundle
         ),
+        # The audited decision math lives in the legacy DiffSHEG selector,
+        # but the long producer uses the fresh five-prerequisite pipeline.
+        # Patch the complete producer/consumer ABI, not just candidate
+        # constants, so TalkSHOW-v2 lineage can never be mixed with a
+        # DiffSHEG measurement receipt.
+        "validate_val_inputs": long_contract.validate_val_inputs,
+        "validate_pipeline": long_contract.validate_pipeline,
+        "validate_val_inference_lineage": (
+            long_contract.validate_val_inference_lineage
+        ),
+        "public_val_coverage": long_contract.public_val_coverage,
+        "VAL_INFERENCE_LINEAGE_FORMAT": (
+            long_contract.VAL_INFERENCE_LINEAGE_FORMAT
+        ),
     }
 
 
@@ -85,6 +99,25 @@ def build_selection(
         unsigned
     )
     return selection
+
+
+def validate_measurement(
+    *,
+    measurement_path: Path,
+    expected_measurement_sha256: str,
+    candidate_bundle: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fresh-validate one production 22-way DiffSHEG measurement receipt."""
+
+    with _long_profile():
+        artifact, row, _val_inputs, _pipeline = legacy._measurement_artifact(
+            measurement_path,
+            expected_measurement_sha256,
+            candidates=candidate_bundle["candidates"],
+            common_val_inputs=None,
+            common_pipeline=None,
+        )
+    return artifact, row
 
 
 def build_parser() -> argparse.ArgumentParser:

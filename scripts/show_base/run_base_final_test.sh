@@ -21,11 +21,13 @@ validation_gate=
 validation_gate_sha=
 validation_gate_bytes=
 validation_gate_payload_sha=
-talkshow_metric_root=
-feature_extractor=
-smplx_asset=
+paspa_root=
+diffsheg_root=
+talkshow_root=
+source_audio_root=
+smplx_path=
 seed=20260801
-torch_threads=1
+diffsheg_batch_size=64
 
 while (($#)); do
     case "$1" in
@@ -47,16 +49,20 @@ while (($#)); do
             validation_gate_bytes=$2; shift 2 ;;
         --expected-validation-gate-receipt-payload-sha256)
             validation_gate_payload_sha=$2; shift 2 ;;
-        --talkshow-metric-root)
-            talkshow_metric_root=$2; shift 2 ;;
-        --feature-extractor)
-            feature_extractor=$2; shift 2 ;;
-        --smplx-asset)
-            smplx_asset=$2; shift 2 ;;
+        --paspa-root)
+            paspa_root=$2; shift 2 ;;
+        --diffsheg-root)
+            diffsheg_root=$2; shift 2 ;;
+        --talkshow-root)
+            talkshow_root=$2; shift 2 ;;
+        --source-audio-root)
+            source_audio_root=$2; shift 2 ;;
+        --smplx-path)
+            smplx_path=$2; shift 2 ;;
         --seed)
             seed=$2; shift 2 ;;
-        --torch-threads)
-            torch_threads=$2; shift 2 ;;
+        --diffsheg-batch-size)
+            diffsheg_batch_size=$2; shift 2 ;;
         --)
             shift
             (($# == 0)) || {
@@ -73,8 +79,8 @@ done
 for value_name in \
     python_bin fresh_test_authority authority_sha authority_bytes \
     authority_payload_sha validation_gate validation_gate_sha \
-    validation_gate_bytes validation_gate_payload_sha talkshow_metric_root \
-    feature_extractor smplx_asset; do
+    validation_gate_bytes validation_gate_payload_sha paspa_root \
+    diffsheg_root talkshow_root source_audio_root smplx_path; do
     if [[ -z ${!value_name} ]]; then
         printf 'missing required option value: %s\n' "$value_name" >&2
         exit 2
@@ -94,16 +100,17 @@ for integer in "$authority_bytes" "$validation_gate_bytes"; do
         exit 2
     }
 done
-[[ $seed =~ ^[0-9]+$ && $torch_threads =~ ^[1-9][0-9]*$ ]] || {
-    printf 'seed/torch-threads contract mismatch\n' >&2
+[[ $seed =~ ^[0-9]+$ && $diffsheg_batch_size =~ ^[1-9][0-9]*$ ]] || {
+    printf 'seed/diffsheg-batch-size contract mismatch\n' >&2
     exit 2
 }
 
 adapter=$launcher_dir/run_base_final_test.py
-evaluator=$launcher_dir/evaluate_talkshow_show_metrics.py
+evaluator=$launcher_dir/evaluate_diffsheg_final_test.py
 for required in \
     "$python_bin" "$fresh_test_authority" "$validation_gate" \
-    "$feature_extractor" "$smplx_asset" "$adapter" "$evaluator"; do
+    "$paspa_root" "$diffsheg_root" "$talkshow_root" \
+    "$source_audio_root" "$smplx_path" "$adapter" "$evaluator"; do
     [[ -e $required ]] || {
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
@@ -112,9 +119,11 @@ done
 
 fresh_test_authority=$(realpath -e -- "$fresh_test_authority")
 validation_gate=$(realpath -e -- "$validation_gate")
-talkshow_metric_root=$(realpath -e -- "$talkshow_metric_root")
-feature_extractor=$(realpath -e -- "$feature_extractor")
-smplx_asset=$(realpath -e -- "$smplx_asset")
+paspa_root=$(realpath -e -- "$paspa_root")
+diffsheg_root=$(realpath -e -- "$diffsheg_root")
+talkshow_root=$(realpath -e -- "$talkshow_root")
+source_audio_root=$(realpath -e -- "$source_audio_root")
+smplx_path=$(realpath -e -- "$smplx_path")
 python_bin=$(realpath -e -- "$python_bin")
 
 authority_args=(
@@ -380,21 +389,44 @@ distribution_sha=$(
         <<<"$distribution_json"
 )
 
-prediction_manifest=$output_root/final_manifest.jsonl
-prediction_lineage=$output_root/final_lineage.json
-distribution_declaration=$output_root/distribution-declaration.json
-metric_report=$output_root/talkshow_metrics.json
-prediction_manifest_sha=$(sha256sum "$prediction_manifest")
-prediction_manifest_sha=${prediction_manifest_sha%% *}
-prediction_lineage_sha=$(sha256sum "$prediction_lineage")
-prediction_lineage_sha=${prediction_lineage_sha%% *}
+diffsheg_preflight=$log_root/diffsheg-preflight.json
+diffsheg_output=$output_root/diffsheg-final-metrics
+diffsheg_asset_args=(
+    --inference-final-root "$output_root"
+    --paspa-root "$paspa_root"
+    --diffsheg-root "$diffsheg_root"
+    --talkshow-root "$talkshow_root"
+    --source-audio-root "$source_audio_root"
+    --smplx-path "$smplx_path"
+    --batch-size "$diffsheg_batch_size"
+)
 
-[[ ! -e $metric_report && ! -L $metric_report ]] || {
-    printf 'metric report already exists; refusing a second test evaluation\n' >&2
+# CPU-only preflight consumes no test metric allowance.  It is published once,
+# externally pinned below, and replayed by the sole formal DiffSHEG process.
+preflight_result=$(
+    "$python_bin" "$evaluator" \
+        "${workload_authority_args[@]}" \
+        "${diffsheg_asset_args[@]}" \
+        --preflight-only \
+        --output-report "$diffsheg_preflight"
+)
+read -r diffsheg_preflight_sha diffsheg_audio_set_sha < <(
+    "$python_bin" -c \
+        'import json,sys; v=json.load(sys.stdin); print(v["sha256"],v["audio_set_sha256"])' \
+        <<<"$preflight_result"
+)
+[[ $diffsheg_preflight_sha =~ ^[0-9a-f]{64}$ && \
+   $diffsheg_audio_set_sha =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'DiffSHEG preflight did not return exact external pins\n' >&2
+    exit 1
+}
+[[ ! -e $diffsheg_output && ! -L $diffsheg_output ]] || {
+    printf 'DiffSHEG output already exists; refusing a second test evaluation\n' >&2
     exit 1
 }
 
-# This command is intentionally spawned exactly once.  There is no retry path.
+# This is the sole formal seven-metric test process.  No compatibility
+# evaluator is reachable from this launcher or can consume a claim.
 pids=()
 starttimes=()
 argv_hashes=()
@@ -403,32 +435,14 @@ trap 'signal_exit 130' INT
 trap 'signal_exit 143' TERM
 trap 'signal_exit 129' HUP
 CUDA_VISIBLE_DEVICES=0 "$python_bin" "$evaluator" \
-    --canonical-manifest "$canonical_manifest" \
-    --expected-canonical-manifest-sha256 "$canonical_manifest_sha" \
-    --prediction-manifest "$prediction_manifest" \
-    --expected-prediction-manifest-sha256 "$prediction_manifest_sha" \
-    --prediction-lineage "$prediction_lineage" \
-    --expected-prediction-lineage-sha256 "$prediction_lineage_sha" \
-    --validation-gate-json "$validation_gate" \
-    --expected-validation-gate-sha256 "$validation_gate_sha" \
-    --expected-validation-gate-receipt-payload-sha256 \
-        "$validation_gate_payload_sha" \
-    --distribution-declaration-json "$distribution_declaration" \
-    --expected-distribution-declaration-sha256 "$distribution_sha" \
-    --test-authority-json "$fresh_test_authority" \
-    --expected-test-authority-sha256 "$authority_sha" \
-    --expected-test-authority-bytes "$authority_bytes" \
-    --expected-test-authority-receipt-payload-sha256 \
-        "$authority_payload_sha" \
-    --talkshow-metric-root "$talkshow_metric_root" \
-    --feature-extractor "$feature_extractor" \
-    --smplx-asset "$smplx_asset" \
+    "${workload_authority_args[@]}" \
+    "${diffsheg_asset_args[@]}" \
+    --preflight-json "$diffsheg_preflight" \
+    --expected-preflight-sha256 "$diffsheg_preflight_sha" \
+    --expected-audio-set-sha256 "$diffsheg_audio_set_sha" \
+    --output-root "$diffsheg_output" \
     --device cuda:0 \
-    --split test \
-    --expected-clip-count 1708 \
-    --torch-threads "$torch_threads" \
-    --output-json "$metric_report" \
-    >"$log_root/talkshow-metrics.log" 2>&1 &
+    >"$log_root/diffsheg-metrics.log" 2>&1 &
 metric_pid=$!
 pending_pid=$metric_pid
 pending_entry=$evaluator
@@ -447,7 +461,7 @@ for _attempt in {1..200}; do
     sleep 0.01
 done
 if [[ -z $metric_snapshot ]]; then
-    printf 'cannot attest the sole TalkSHOW metric child\n' >&2
+    printf 'cannot attest the sole DiffSHEG metric child\n' >&2
     exit 1
 fi
 pids+=("$metric_pid")
@@ -460,7 +474,7 @@ printf 'metric\t%s\t%s\t%s\n' \
     "$metric_pid" "$metric_start" "$metric_argv" \
     >>"$log_root/children.tsv"
 if ! wait "$metric_pid"; then
-    printf 'the sole TalkSHOW test evaluation failed; no retry is allowed\n' >&2
+    printf 'the sole DiffSHEG test evaluation failed; no retry is allowed\n' >&2
     exit 1
 fi
 pids=()
@@ -468,14 +482,10 @@ starttimes=()
 argv_hashes=()
 trap - EXIT INT TERM HUP
 
-metric_report_sha=$(sha256sum "$metric_report")
-metric_report_sha=${metric_report_sha%% *}
-"$python_bin" "$adapter" seal \
-    "${workload_authority_args[@]}" \
-    --distribution-declaration-json "$distribution_declaration" \
-    --expected-distribution-declaration-sha256 "$distribution_sha" \
-    --metric-report-json "$metric_report" \
-    --expected-metric-report-sha256 "$metric_report_sha" \
-    >"$log_root/seal.log" 2>&1
-
-printf 'SemTalk SHOW final test complete: %s\n' "$output_root"
+[[ -f $diffsheg_output/final_metrics.json && \
+   -s $diffsheg_output/final_metrics.json ]] || {
+    printf 'formal result is not the unique DiffSHEG seven-metric closure\n' >&2
+    exit 1
+}
+printf 'SemTalk SHOW DiffSHEG final test complete: %s\n' \
+    "$diffsheg_output/final_metrics.json"

@@ -498,13 +498,33 @@ class AuthorityFixture:
             "test_visible": False,
         }
         winner_selection_unsigned = {
-            "format": (
-                "semtalk_show_base_talkshow_released2_fgd_selection_v1"
-            ),
+            "format": "semtalk_show_base_official_adapt_long_selection_v1",
             "status": "selected",
-            "candidates": copy.deepcopy(
-                self.base_long_bundle["candidates"]
-            ),
+            "split": "val",
+            "test_visible": False,
+            "candidate_metrics": [
+                {
+                    "epoch": row["epoch"],
+                    "candidate_checkpoint": copy.deepcopy(
+                        row["candidate_checkpoint"]
+                    ),
+                    "metrics": {
+                        "fgd": (
+                            0.125
+                            if row["epoch"] == 400
+                            else 10.0 + float(row["epoch"])
+                        )
+                    },
+                }
+                for row in self.base_long_bundle["candidates"]
+            ],
+            "selected": {
+                "epoch": 400,
+                "candidate_checkpoint": copy.deepcopy(
+                    self.checkpoints["base"]
+                ),
+                "fgd": 0.125,
+            },
         }
         self.winner_selection_payload = {
             **winner_selection_unsigned,
@@ -564,13 +584,12 @@ class AuthorityFixture:
             "selected_checkpoint": self.checkpoints["base"],
         }
         full_closure_unsigned = {
-            "format": (
-                "semtalk_show_base_fresh_val_winner_full_metric_closure_v1"
-            ),
+            "format": "diffsheg_show_metrics_v1",
             "status": "complete",
             "split": "val",
             "test_visible": False,
             "selected_epoch": 400,
+            "metrics": {"fgd": 0.125},
         }
         self.winner_full_metric_closure_payload = {
             **full_closure_unsigned,
@@ -592,14 +611,11 @@ class AuthorityFixture:
         }
         self.test_claim_payload = {
             **self.base_validation,
-            "format": (
-                "semtalk_show_base_fresh_val_published_test_winner_claim_v3"
-            ),
+            "format": "semtalk_show_base_long_test_winner_authorization_v1",
             "status": "authorized",
             "authorized_test_evaluations": 1,
-            "continuation_waves": self.continuation_waves,
-            "winner_full_metric_closure": (
-                self.winner_full_metric_closure_binding
+            "expected_output_root": str(
+                (root / "formal-output" / "final").resolve()
             ),
         }
         self.test_claim_payload["receipt_payload_sha256"] = (
@@ -622,17 +638,16 @@ class AuthorityFixture:
                 ],
             },
             "selected_base_checkpoint": self.checkpoints["base"],
-            "fixed_checkpoints": {
-                stage: self.checkpoints[stage]
-                for stage in AUTH.REPRESENTATION_STAGES
+            "selected_epoch": 400,
+            "selected_fgd": 0.125,
+            "selected_diffsheg_report": {
+                key: self.winner_full_metric_closure_binding[key]
+                for key in ("path", "sha256")
             },
-            "continuation_waves": self.continuation_waves,
-            "winner_full_metric_closure": (
-                self.winner_full_metric_closure_binding
-            ),
             "expected_output_root": str(self.output_root.resolve()),
             "test_policy": {
                 "authorized_evaluations": 1,
+                "one_shot_claim_required": True,
                 "selection_feedback": False,
             },
         }
@@ -664,11 +679,6 @@ class AuthorityFixture:
         published = mock.Mock(
             return_value=dict(self.published_validation)
         )
-        published_module = mock.Mock()
-        published_module.FRESH_CLAIM_FORMAT = (
-            "semtalk_show_base_fresh_val_published_test_winner_claim_v3"
-        )
-        published_module.validate_published_test_winner_claim = published
         with (
             mock.patch.object(
                 AUTH,
@@ -692,8 +702,8 @@ class AuthorityFixture:
             ) as base_long,
             mock.patch.object(
                 AUTH,
-                "_control_module",
-                return_value=published_module,
+                "_replay_long_diffsheg_test_winner_claim",
+                side_effect=published,
             ),
             mock.patch.object(
                 AUTH,
@@ -824,69 +834,51 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                 },
             )
 
-    def test_published_winner_replay_has_neutral_checkpoint_free_signature(
-        self,
-    ) -> None:
+    def test_long_claim_replay_has_checkpoint_free_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             claim_path = root / "claim.json"
             claim_path.write_bytes(b"claim")
             claim = artifact(claim_path)
             payload_sha = hashlib.sha256(b"claim-payload").hexdigest()
-            fresh_format = (
-                "semtalk_show_base_fresh_val_published_test_winner_claim_v3"
-            )
-            payload = {
-                "format": fresh_format,
-                "receipt_payload_sha256": payload_sha,
-            }
             output_root = root / "formal-output"
-            prerequisite = {
-                **claim,
-                "receipt_payload_sha256": payload_sha,
-            }
-            continuation = {
-                **claim,
-                "receipt_payload_sha256": payload_sha,
-            }
-            winner_full = {
-                **claim,
-                "receipt_payload_sha256": payload_sha,
-            }
+            candidate_bundle = {"candidates": {}}
             validated = {
                 "claim_artifact": claim,
                 "receipt_payload_sha256": payload_sha,
-                "winner_selection": {
-                    **artifact(claim_path),
-                    "receipt_payload_sha256": payload_sha,
+                "winner_selection": {},
+                "selected_base_checkpoint": claim,
+                "selected_epoch": 400,
+                "selected_fgd": 0.125,
+                "selected_diffsheg_report": {
+                    key: claim[key] for key in ("path", "sha256")
                 },
-                "selected_base_checkpoint": artifact(claim_path),
-                "fixed_checkpoints": {
-                    stage: artifact(claim_path)
-                    for stage in AUTH.REPRESENTATION_STAGES
-                },
-                "continuation_waves": [],
-                "winner_full_metric_closure": winner_full,
                 "expected_output_root": str(output_root),
-                "test_policy": {"authorized_evaluations": 1},
+                "test_policy": {
+                    "authorized_evaluations": 1,
+                    "one_shot_claim_required": True,
+                    "selection_feedback": False,
+                },
             }
             validator = mock.Mock(return_value=validated)
             module = mock.Mock()
-            module.FRESH_CLAIM_FORMAT = fresh_format
+            module.AUTHORIZATION_FORMAT = (
+                "semtalk_show_base_long_test_winner_authorization_v1"
+            )
             module.validate_published_test_winner_claim = validator
             with mock.patch.object(
                 AUTH,
                 "_control_module",
                 return_value=module,
             ):
-                observed = AUTH._replay_published_test_winner_claim(
+                observed = AUTH._replay_long_diffsheg_test_winner_claim(
                     claim,
-                    payload,
+                    {
+                        "format": module.AUTHORIZATION_FORMAT,
+                        "receipt_payload_sha256": payload_sha,
+                    },
                     expected_output_root=output_root,
-                    prerequisite_selection=prerequisite,
-                    continuation_decision=continuation,
-                    continuation_waves=[],
-                    winner_full_metric_closure=winner_full,
+                    candidate_bundle=candidate_bundle,
                 )
             self.assertEqual(observed, validated)
             validator.assert_called_once_with(
@@ -895,49 +887,155 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                 expected_claim_bytes=claim["bytes"],
                 expected_claim_payload_sha256=payload_sha,
                 expected_output_root=output_root,
-                prerequisite_selection=prerequisite,
-                continuation_decision=continuation,
-                continuation_waves=[],
-                winner_full_metric_closure=winner_full,
-                expected_claim_format=fresh_format,
+                candidate_bundle=candidate_bundle,
             )
-            self.assertNotIn(
-                "checkpoints",
-                validator.call_args.kwargs,
-            )
+            self.assertNotIn("checkpoints", validator.call_args.kwargs)
 
-    def test_legacy_v1_published_claim_downgrade_is_rejected(self) -> None:
+    def test_non_long_claim_protocol_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            claim_path = root / "legacy-v1-claim.json"
-            claim_path.write_bytes(b"legacy")
-            claim = artifact(claim_path)
-            payload = {
-                "format": "semtalk_show_base_published_test_winner_claim_v1",
-                "receipt_payload_sha256": hashlib.sha256(
-                    b"legacy-payload"
-                ).hexdigest(),
-            }
+            claim_path = root / "old-claim.json"
+            claim_path.write_bytes(b"old")
             module = mock.Mock()
-            module.FRESH_CLAIM_FORMAT = (
-                "semtalk_show_base_fresh_val_published_test_winner_claim_v3"
+            module.AUTHORIZATION_FORMAT = (
+                "semtalk_show_base_long_test_winner_authorization_v1"
             )
             with (
                 mock.patch.object(AUTH, "_control_module", return_value=module),
                 self.assertRaisesRegex(
                     AUTH.BaseFinalAuthorityError,
-                    "requires the fresh v3 claim protocol",
+                    "requires the long DiffSHEG one-shot claim protocol",
                 ),
             ):
-                AUTH._replay_published_test_winner_claim(
-                    claim,
-                    payload,
+                AUTH._replay_long_diffsheg_test_winner_claim(
+                    artifact(claim_path),
+                    {
+                        "format": "semtalk_show_base_old_claim_v1",
+                        "receipt_payload_sha256": hashlib.sha256(
+                            b"old-payload"
+                        ).hexdigest(),
+                    },
                     expected_output_root=root / "formal-output",
-                    prerequisite_selection={},
-                    continuation_decision={},
-                    continuation_waves=[],
-                    winner_full_metric_closure={},
+                    candidate_bundle={},
                 )
+
+    def test_long_diffsheg_winner_is_the_final_test_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = AuthorityFixture(Path(directory))
+            report_path = fixture.root / "selected-diffsheg-val-report.json"
+            write_json(
+                report_path,
+                {"status": "ok", "metrics": {"fgd": 0.125}},
+            )
+            rows = [
+                {
+                    "epoch": row["epoch"],
+                    "candidate_checkpoint": copy.deepcopy(
+                        row["candidate_checkpoint"]
+                    ),
+                    "metrics": {
+                        "fgd": 0.125
+                        if row["epoch"] == 400
+                        else float(row["epoch"] + 1)
+                    },
+                }
+                for row in fixture.base_long_bundle["candidates"]
+            ]
+            selection_unsigned = {
+                "format": LONG.SELECTION_FORMAT,
+                "status": "selected",
+                "candidate_metrics": rows,
+                "selected": {
+                    "epoch": 400,
+                    "candidate_checkpoint": fixture.checkpoints["base"],
+                    "fgd": 0.125,
+                    "diffsheg_report": {
+                        key: artifact(report_path)[key]
+                        for key in ("path", "sha256")
+                    },
+                },
+            }
+            selection = {
+                **selection_unsigned,
+                "receipt_payload_sha256": AUTH.canonical_json_sha256(
+                    selection_unsigned
+                ),
+            }
+            write_json(fixture.winner_selection, selection)
+            claim_unsigned = {
+                "format": (
+                    "semtalk_show_base_long_test_winner_authorization_v1"
+                ),
+                "status": "authorized",
+                "expected_output_root": str(fixture.output_root.resolve()),
+            }
+            claim = {
+                **claim_unsigned,
+                "receipt_payload_sha256": AUTH.canonical_json_sha256(
+                    claim_unsigned
+                ),
+            }
+            write_json(fixture.test_claim, claim)
+            pinned_selection = {
+                **artifact(fixture.winner_selection),
+                "receipt_payload_sha256": selection[
+                    "receipt_payload_sha256"
+                ],
+            }
+            published = {
+                "claim_artifact": artifact(fixture.test_claim),
+                "receipt_payload_sha256": claim[
+                    "receipt_payload_sha256"
+                ],
+                "winner_selection": pinned_selection,
+                "selected_base_checkpoint": fixture.checkpoints["base"],
+                "selected_epoch": 400,
+                "selected_fgd": 0.125,
+                "selected_diffsheg_report": {
+                    key: artifact(report_path)[key]
+                    for key in ("path", "sha256")
+                },
+                "expected_output_root": str(fixture.output_root.resolve()),
+                "test_policy": {
+                    "authorized_evaluations": 1,
+                    "one_shot_claim_required": True,
+                    "selection_feedback": False,
+                },
+            }
+            kwargs = fixture.kwargs()
+            kwargs["winner_selection"] = artifact(
+                fixture.winner_selection
+            )
+            kwargs["winner_full_metric_closure"] = artifact(report_path)
+            kwargs["test_claim"] = artifact(fixture.test_claim)
+            with (
+                fixture.fresh_control_validators(),
+                mock.patch.object(
+                    AUTH,
+                    "_replay_long_diffsheg_test_winner_claim",
+                    return_value=published,
+                ) as replay,
+            ):
+                authority = AUTH.build_test_authority(**kwargs)
+            self.assertEqual(
+                authority["contract"]["base_selection_metric"],
+                AUTH.BASE_SELECTION_METRIC,
+            )
+            self.assertEqual(
+                authority["winner_selection"]["selection_protocol"],
+                AUTH.BASE_SELECTION_PROTOCOL,
+            )
+            self.assertEqual(
+                authority["winner_full_metric_closure"]["selection_role"],
+                "selected_validation_diffsheg_report",
+            )
+            self.assertEqual(
+                authority["test_claim"]["test_policy"][
+                    "authorized_evaluations"
+                ],
+                1,
+            )
+            replay.assert_called_once()
 
     def test_round_trip_and_external_three_way_pin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -959,7 +1057,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             self.assertEqual(validated, authority)
             self.assertEqual(
                 fixture.test_claim_payload["format"],
-                "semtalk_show_base_fresh_val_published_test_winner_claim_v3",
+                "semtalk_show_base_long_test_winner_authorization_v1",
             )
             payload_artifact_keys = {
                 "path",
@@ -970,12 +1068,19 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             for role in (
                 "winner_selection",
                 "continuation_decision",
-                "winner_full_metric_closure",
                 "prerequisite_selection",
             ):
                 self.assertTrue(
                     payload_artifact_keys.issubset(authority[role])
                 )
+            self.assertTrue(
+                {"path", "sha256", "bytes", "canonical_payload_sha256"}
+                .issubset(authority["winner_full_metric_closure"])
+            )
+            self.assertEqual(
+                authority["winner_full_metric_closure"]["selection_role"],
+                "selected_validation_diffsheg_report",
+            )
             self.assertEqual(
                 authority["continuation_decision"][
                     "prerequisite_selection"
@@ -1042,7 +1147,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
         ):
             AUTH._prerequisite_candidate_schedules(selection)
 
-    def test_fresh_v3_winner_full_closure_is_mandatory_and_external(self) -> None:
+    def test_selected_diffsheg_report_is_mandatory_and_external(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = AuthorityFixture(Path(directory))
             missing = fixture.kwargs()
@@ -1054,9 +1159,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
 
             replacement_path = fixture.root / "replacement-full-closure.json"
             replacement_payload = {
-                "format": (
-                    "semtalk_show_base_fresh_val_winner_full_metric_closure_v1"
-                ),
+                "format": "diffsheg_show_metrics_v1",
                 "status": "complete",
                 "split": "val",
                 "test_visible": False,
@@ -1072,7 +1175,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
             )
             with fixture.fresh_control_validators(), self.assertRaisesRegex(
                 AUTH.BaseFinalAuthorityError,
-                "neutral published winner does not bind|authority changed",
+                "DiffSHEG winner does not bind",
             ):
                 AUTH.build_test_authority(**replaced)
 
@@ -1310,7 +1413,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = AuthorityFixture(Path(directory))
             selection = copy.deepcopy(fixture.winner_selection_payload)
-            selection["candidates"][0]["candidate_checkpoint"] = dict(
+            selection["candidate_metrics"][0]["candidate_checkpoint"] = dict(
                 fixture.checkpoints["base"]
             )
             selection.pop("receipt_payload_sha256")
@@ -1328,7 +1431,7 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                 fixture.fresh_control_validators(),
                 self.assertRaisesRegex(
                     AUTH.BaseFinalAuthorityError,
-                    "Base e1 candidate",
+                    "DiffSHEG Base e1 candidate",
                 ),
             ):
                 AUTH.build_test_authority(**fixture.kwargs())

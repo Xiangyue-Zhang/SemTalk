@@ -582,65 +582,15 @@ class FinalTestCpuContractTests(unittest.TestCase):
                 str((root / "distribution-declaration.json").resolve()),
             )
 
-    def test_seal_is_terminal_and_exposes_no_selection_feedback(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "final"
-            root.mkdir()
-            manifest = artifact(root / "final_manifest.jsonl", b"{}\n")
-            artifact(root / "final_lineage.json", b"{}\n")
-            distribution_value = {"receipt_payload_sha256": SHA_A}
-            distribution_payload = target._canonical_json_bytes(distribution_value)
-            distribution = artifact(
-                root / "distribution-declaration.json",
-                distribution_payload,
-            )
-            protocol = {
-                "primary_metric": "body.released2.metrics.FGD",
-                "mode": "min",
-                "validation_only_for_selection": True,
-                "test_evaluations": 1,
-            }
-            report_value = {
-                "selection_protocol": protocol,
-                "report_payload_sha256": SHA_B,
-            }
-            report_payload = target._canonical_json_bytes(report_value)
-            report = artifact(root / "talkshow_metrics.json", report_payload)
-            value = fake_authority(root)
-            args = SimpleNamespace(
-                **vars(authority_args(Path(directory) / "authority.json")),
-                distribution_declaration_json=Path(distribution["path"]),
-                expected_distribution_declaration_sha256=distribution["sha256"],
-                metric_report_json=Path(report["path"]),
-                expected_metric_report_sha256=report["sha256"],
-            )
-            contract = target._contract(value, args)
-            lineage = {"contract": contract}
-            validated = []
+    def test_metric_seal_subcommand_is_not_exposed(self) -> None:
+        with self.assertRaises(SystemExit):
+            target.parse_args(["seal"])
+        parser_source = (
+            Path(target.__file__).resolve().read_text(encoding="utf-8")
+        )
+        self.assertNotIn('add_parser("seal"', parser_source)
+        self.assertNotIn("run_seal", parser_source)
 
-            class Evaluator:
-                @staticmethod
-                def validate_report(report, **kwargs):
-                    validated.append(kwargs)
-                    return report
-
-            with mock.patch.object(
-                target, "_validated_authority", return_value=value
-            ), mock.patch.object(
-                target,
-                "_load_final_rows",
-                return_value=(manifest, [{"canonical_clip_id": "oliver__x"}], lineage),
-            ), mock.patch.object(
-                target.importlib, "import_module", return_value=Evaluator
-            ), redirect_stdout(io.StringIO()):
-                target.run_seal(args)
-            completion = json.loads((root / "formal_completion.json").read_text())
-            self.assertEqual(completion["test_evaluations"], 1)
-            self.assertIs(completion["test_feedback_into_selection"], False)
-            self.assertEqual(completion["training_mutations_after_test"], 0)
-            self.assertEqual(validated[0]["expected_split"], "test")
-
-    def test_final_rows_revalidate_artifacts_after_metric_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.multiple(
             target,
             TEST_CLIPS=1,

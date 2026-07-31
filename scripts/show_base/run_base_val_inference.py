@@ -2073,8 +2073,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                         "uncovered_tail_frames"
                     ],
                     "clip_ids_sha256": coverage["clip_ids_sha256"],
-                    "talkshow_window_manifest_sha256": coverage[
-                        "talkshow_window_manifest_sha256"
+                    "diffsheg_clip_manifest_sha256": coverage[
+                        "diffsheg_clip_manifest_sha256"
                     ],
                     "prediction_files": selector.EXPECTED_VAL_CLIPS,
                     "ground_truth_files": selector.EXPECTED_VAL_CLIPS,

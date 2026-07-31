@@ -766,7 +766,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 "window_count": 1715,
                 "uncovered_tail_frames": 0,
                 "clip_ids_sha256": "9" * 64,
-                "talkshow_window_manifest_sha256": "a" * 64,
+                "diffsheg_clip_manifest_sha256": "a" * 64,
                 "_ordered_clips": [],
             }
             pipeline = {
@@ -890,7 +890,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                         for position in range(4)
                     ).encode()
                 ).hexdigest(),
-                "talkshow_window_manifest_sha256": "d" * 64,
+                "diffsheg_clip_manifest_sha256": "d" * 64,
             }
             preflight = {
                 "candidate_bundle": {

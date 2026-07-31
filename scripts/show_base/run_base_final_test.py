@@ -20,9 +20,11 @@ audio shards.  This module only performs these irreversible phases:
 ``distribution``
     Bind the already validated ``final_winner`` deterministic-replication
     gate to the physical predictions.
-``seal``
-    Fresh-validate the sole TalkSHOW test report and publish a terminal
-    receipt that explicitly forbids test-to-selection feedback.
+
+The shell launcher then invokes the sole seven-metric DiffSHEG test
+evaluation.  This inference module has no metric-evaluation subcommand, so a
+metric report cannot be wrapped into a second authority or flow back into
+selection.
 
 No command accepts an epoch, a candidate checkpoint, a split, or a selection
 metric.  Test output is therefore incapable of changing the validation
@@ -72,7 +74,6 @@ SHARD_SUMMARY_FORMAT = "semtalk_show_base_inference_shard_summary_v1"
 SHARD_LINEAGE_FORMAT = "semtalk_show_base_inference_shard_lineage_v1"
 FINAL_LINEAGE_FORMAT = "semtalk_show_base_inference_final_lineage_v1"
 FINAL_SUMMARY_FORMAT = "semtalk_show_base_inference_final_summary_v1"
-COMPLETION_FORMAT = "semtalk_show_base_final_test_completion_v1"
 CONTRACT_FORMAT = "semtalk_show_base_final_test_consumer_contract_v1"
 RUNTIME_FORMAT = "semtalk_show_base_final_test_runtime_v1"
 PREPARED_AUTHORITY_FORMAT = (
@@ -1086,7 +1087,8 @@ def _contract(
             },
         },
         "selection_policy": {
-            "primary_metric": "body.released2.metrics.FGD",
+            "primary_metric": final_authority.BASE_SELECTION_METRIC,
+            "protocol": final_authority.BASE_SELECTION_PROTOCOL,
             "mode": "min",
             "validation_only_for_selection": True,
             "test_evaluations": 1,
@@ -1819,99 +1821,6 @@ def run_distribution(args: argparse.Namespace) -> dict[str, Any]:
     return receipt
 
 
-def run_seal(args: argparse.Namespace) -> dict[str, Any]:
-    authority = _validated_authority(args)
-    manifest, rows, lineage = _load_final_rows(authority)
-    if lineage.get("contract") != _contract(authority, args):
-        raise FinalTestContractError(
-            "final lineage differs from the fresh test authority"
-        )
-    root, _shards = _output_roots(authority)
-    distribution_path, distribution_payload, distribution_sha = _safe_file_snapshot(
-        args.distribution_declaration_json,
-        "distribution declaration",
-        expected_sha256=args.expected_distribution_declaration_sha256,
-    )
-    distribution = _strict_json(distribution_payload, "distribution declaration")
-    report_path, report_payload, report_sha = _safe_file_snapshot(
-        args.metric_report_json,
-        "TalkSHOW final test report",
-        expected_sha256=args.expected_metric_report_sha256,
-    )
-    report = _strict_json(report_payload, "TalkSHOW final test report")
-    evaluator = importlib.import_module(
-        "scripts.show_base.evaluate_talkshow_show_metrics"
-    )
-    authority_artifact = _authority_artifact(args)
-    selection_protocol = {
-        "primary_metric": "body.released2.metrics.FGD",
-        "mode": "min",
-        "validation_only_for_selection": True,
-        "test_evaluations": 1,
-    }
-    evaluator.validate_report(
-        report,
-        expected_split="test",
-        expected_clip_count=TEST_CLIPS,
-        expected_prediction_manifest=manifest,
-        expected_distribution_receipt=distribution,
-        expected_selection_protocol=selection_protocol,
-        expected_test_authority=authority_artifact,
-    )
-    if (
-        report.get("selection_protocol") != selection_protocol
-        or lineage.get("contract", {}).get("selection_policy", {}).get(
-            "test_feedback_into_selection"
-        )
-        is not False
-    ):
-        raise FinalTestContractError("test report can flow back into selection")
-    completion = {
-        "format": COMPLETION_FORMAT,
-        "status": "complete",
-        "fresh_test_authority": authority_artifact,
-        "validation_winner": {
-            "selected_epoch": authority["winner_selection"]["selected_epoch"],
-            "selected_optimizer_updates": authority["winner_selection"]
-            ["selected_optimizer_updates"],
-            "checkpoint_sha256": authority["checkpoints"]["base"]["sha256"],
-        },
-        "validation_selected_five_sha256": {
-            stage: authority["checkpoints"][stage]["sha256"]
-            for stage in REPRESENTATION_STAGES
-        },
-        "prediction_manifest": manifest,
-        "prediction_lineage": _artifact(root / "final_lineage.json"),
-        "distribution_declaration": {
-            "path": str(distribution_path),
-            "sha256": distribution_sha,
-            "bytes": len(distribution_payload),
-            "receipt_payload_sha256": distribution[
-                "receipt_payload_sha256"
-            ],
-        },
-        "metric_report": {
-            "path": str(report_path),
-            "sha256": report_sha,
-            "bytes": len(report_payload),
-            "report_payload_sha256": report["report_payload_sha256"],
-        },
-        "selection_protocol": selection_protocol,
-        "test_evaluations": 1,
-        "test_feedback_into_selection": False,
-        "training_mutations_after_test": 0,
-        "exact_once": True,
-        "finite": True,
-        "clips": len(rows),
-    }
-    completion["receipt_payload_sha256"] = _canonical_json_sha256(completion)
-    destination = root / "formal_completion.json"
-    _write_new(destination, _canonical_json_bytes(completion))
-    receipt = _artifact(destination)
-    print(_canonical_json_bytes(receipt).decode(), end="")
-    return receipt
-
-
 def _authority_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fresh-test-authority", type=Path, required=True)
     parser.add_argument("--expected-test-authority-sha256", required=True)
@@ -1959,17 +1868,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-validation-gate-receipt-payload-sha256", required=True
     )
 
-    seal = subparsers.add_parser("seal", allow_abbrev=False)
-    _authority_options(seal)
-    seal.add_argument(
-        "--distribution-declaration-json", type=Path, required=True
-    )
-    seal.add_argument(
-        "--expected-distribution-declaration-sha256", required=True
-    )
-    seal.add_argument("--metric-report-json", type=Path, required=True)
-    seal.add_argument("--expected-metric-report-sha256", required=True)
-
     args = parser.parse_args(argv)
     if args.seed < 0:
         parser.error("seed must be non-negative")
@@ -1998,8 +1896,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_finalize(args)
     elif args.command == "distribution":
         run_distribution(args)
-    elif args.command == "seal":
-        run_seal(args)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     return 0

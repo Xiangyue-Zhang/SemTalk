@@ -30,6 +30,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.bundle, self.selection_path = self._fixture()
         self.selection_sha = _sha(self.selection_path)
+        self.output_root = self.root / "formal-output" / "final"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -317,6 +318,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         claimed = validator.publish_test_winner_claim(
             validation,
             selection_path=self.selection_path,
+            expected_output_root=self.output_root,
         )
         claim_path = Path(claimed["claim"]["path"])
         self.assertEqual(
@@ -339,6 +341,35 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
             },
         )
         self.assertEqual(payload["selected_checkpoint"]["bytes"], 13)
+        self.assertEqual(
+            payload["expected_output_root"],
+            str(self.output_root),
+        )
+        with mock.patch.object(
+            validator.long_selector,
+            "build_selection",
+            side_effect=lambda **kwargs: self._replay_selection(
+                self.selection_path,
+                **kwargs,
+            ),
+        ):
+            replayed = validator.validate_published_test_winner_claim(
+                claim_path,
+                expected_claim_sha256=_sha(claim_path),
+                expected_claim_bytes=claim_path.stat().st_size,
+                expected_claim_payload_sha256=claimed[
+                    "receipt_payload_sha256"
+                ],
+                expected_output_root=self.output_root,
+                candidate_bundle=self.bundle,
+            )
+        self.assertEqual(replayed["selected_epoch"], 200)
+        self.assertEqual(
+            replayed["selected_diffsheg_report"],
+            json.loads(
+                self.selection_path.read_text(encoding="utf-8")
+            )["selected"]["diffsheg_report"],
+        )
         with self.assertRaisesRegex(
             validator.TestWinnerContractError,
             "already claimed",
@@ -346,6 +377,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
             validator.publish_test_winner_claim(
                 validation,
                 selection_path=self.selection_path,
+                expected_output_root=self.output_root,
             )
 
 

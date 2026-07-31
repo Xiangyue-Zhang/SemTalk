@@ -10,6 +10,7 @@ count, and payload SHA-256 before any output is accepted.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -22,7 +23,10 @@ from typing import Any, Mapping, Sequence
 
 
 FORMAT = "semtalk_show_base_final_test_authority_v1"
+INPUTS_FORMAT = "semtalk_show_base_final_authority_inputs_v1"
 PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_newline_v1"
+BASE_SELECTION_METRIC = "validation.diffsheg.metrics.fgd"
+BASE_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
 ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 OFFICIAL_BASELINE_COMMIT = "806b008c97bf51fce203e54109e4c22325253618"
 CHECKPOINT_STAGES = ("base", "face", "hands", "upper", "lower", "global")
@@ -162,15 +166,28 @@ _CONTROL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "merge_prerequisite_val_shards",
         "selected_prerequisites",
     ),
+    "select_base_official_adapt": (
+        "gate_task_space_on_show_v2",
+        "selected_prerequisites",
+    ),
     "base_long_val_contract": (
         "gate_released_all_speakers_on_show",
         "gate_task_space_on_show_v2",
         "prerequisite_val_contract",
         "merge_prerequisite_val_shards",
         "selected_prerequisites",
+        "select_base_official_adapt",
         "talkshow_base_val_contract",
     ),
-    "published_test_winner_claim": (),
+    "select_base_official_adapt_long": (
+        "select_base_official_adapt",
+        "base_long_val_contract",
+    ),
+    "validate_base_long_test_winner": (
+        "select_base_official_adapt",
+        "base_long_val_contract",
+        "select_base_official_adapt_long",
+    ),
 }
 
 
@@ -1677,37 +1694,34 @@ def _payload_artifact_from_binding(
     }
 
 
-def _replay_published_test_winner_claim(
+def _replay_long_diffsheg_test_winner_claim(
     artifact: Mapping[str, Any],
     payload: Mapping[str, Any],
     *,
     expected_output_root: Path,
-    prerequisite_selection: Mapping[str, Any],
-    continuation_decision: Mapping[str, Any],
-    continuation_waves: Sequence[Mapping[str, Any]],
-    winner_full_metric_closure: Mapping[str, Any],
+    candidate_bundle: Mapping[str, Any],
 ) -> dict[str, Any]:
-    winner = _control_module("published_test_winner_claim")
+    """Fresh-replay the one-shot claim for the 22-way DiffSHEG winner."""
+
+    module = _control_module("validate_base_long_test_winner")
     validator = getattr(
-        winner,
+        module,
         "validate_published_test_winner_claim",
         None,
     )
-    if not callable(validator):
-        raise BaseFinalAuthorityError(
-            "neutral published Base test-winner validator is unavailable"
-        )
-    expected_claim_format = getattr(winner, "FRESH_CLAIM_FORMAT", None)
+    expected_format = getattr(module, "AUTHORIZATION_FORMAT", None)
     if (
-        type(expected_claim_format) is not str
-        or payload.get("format") != expected_claim_format
+        not callable(validator)
+        or type(expected_format) is not str
+        or payload.get("format") != expected_format
     ):
         raise BaseFinalAuthorityError(
-            "formal Base final authority requires the fresh v3 claim protocol"
+            "formal Base authority requires the long DiffSHEG one-shot "
+            "claim protocol"
         )
     payload_sha = _sha256(
         payload.get("receipt_payload_sha256"),
-        "published Base test-winner claim payload SHA",
+        "long DiffSHEG test-winner claim payload SHA",
     )
     try:
         validated = validator(
@@ -1716,40 +1730,40 @@ def _replay_published_test_winner_claim(
             expected_claim_bytes=artifact["bytes"],
             expected_claim_payload_sha256=payload_sha,
             expected_output_root=expected_output_root,
-            prerequisite_selection=prerequisite_selection,
-            continuation_decision=continuation_decision,
-            continuation_waves=list(continuation_waves),
-            winner_full_metric_closure=winner_full_metric_closure,
-            expected_claim_format=expected_claim_format,
+            candidate_bundle=candidate_bundle,
         )
     except Exception as exc:
         raise BaseFinalAuthorityError(
-            f"neutral published Base test-winner replay failed: {exc}"
+            f"long DiffSHEG test-winner replay failed: {exc}"
         ) from exc
-    if type(validated) is not dict or set(validated) != {
+    expected_keys = {
         "claim_artifact",
         "receipt_payload_sha256",
         "winner_selection",
         "selected_base_checkpoint",
-        "fixed_checkpoints",
-        "continuation_waves",
-        "winner_full_metric_closure",
+        "selected_epoch",
+        "selected_fgd",
+        "selected_diffsheg_report",
         "expected_output_root",
         "test_policy",
-    }:
+    }
+    if type(validated) is not dict or set(validated) != expected_keys:
         raise BaseFinalAuthorityError(
-            "neutral published Base test-winner validator schema mismatch"
+            "long DiffSHEG test-winner validator schema mismatch"
         )
     if (
         validated["claim_artifact"] != artifact
         or validated["receipt_payload_sha256"] != payload_sha
         or validated["expected_output_root"] != str(expected_output_root)
-        or validated["continuation_waves"] != list(continuation_waves)
-        or validated["winner_full_metric_closure"]
-        != winner_full_metric_closure
+        or validated["test_policy"]
+        != {
+            "authorized_evaluations": 1,
+            "one_shot_claim_required": True,
+            "selection_feedback": False,
+        }
     ):
         raise BaseFinalAuthorityError(
-            "neutral published Base test-winner authority changed"
+            "long DiffSHEG test-winner authority changed"
         )
     return validated
 
@@ -1942,165 +1956,191 @@ def _control_authority(
         },
         "winner selection",
     )
-    full_closure, full_closure_payload = _json_artifact(
-        winner_full_metric_closure,
-        "winner full validation metric closure",
-    )
-    pinned_full_closure = _payload_artifact_from_binding(
-        {
-            **full_closure,
-            "receipt_payload_sha256": _sha256(
-                full_closure_payload.get("receipt_payload_sha256"),
-                "winner full validation metric closure payload SHA",
-            ),
-        },
-        "winner full validation metric closure",
-    )
-    claim, claim_payload = _json_artifact(
-        test_claim,
-        "one-shot test claim",
-    )
-    published = _replay_published_test_winner_claim(
-        claim,
-        claim_payload,
-        expected_output_root=expected_output_root,
-        prerequisite_selection=pinned_prerequisite_selection,
-        continuation_decision=pinned_continuation_decision,
-        continuation_waves=pinned_continuation_waves,
-        winner_full_metric_closure=pinned_full_closure,
-    )
-    published_rows = selection_payload.get("candidates")
-    long_rows = base_long_candidate_bundle["candidates"]
-    if (
-        type(published_rows) is not list
-        or len(published_rows) != len(long_rows)
+    if selection_payload.get("format") != (
+        "semtalk_show_base_official_adapt_long_selection_v1"
     ):
         raise BaseFinalAuthorityError(
-            "published winner selection does not cover the exact Base-long "
-            "candidate family"
+            "formal Base authority requires the 22-way DiffSHEG "
+            "validation selection"
         )
-    normalized_published_checkpoints: list[dict[str, Any]] = []
-    for long_row, published_row in zip(long_rows, published_rows):
+    if selection_payload.get("format") == (
+        "semtalk_show_base_official_adapt_long_selection_v1"
+    ):
+        full_closure, full_closure_payload = _json_artifact(
+            winner_full_metric_closure,
+            "selected DiffSHEG validation report",
+        )
+        claim, claim_payload = _json_artifact(
+            test_claim,
+            "long DiffSHEG one-shot test claim",
+        )
+        raw_candidate_bundle = {
+            "manifest": dict(base_long_candidate_bundle["manifest"]),
+            "status": dict(base_long_candidate_bundle["status"]),
+            "frozen_inputs": dict(
+                base_long_candidate_bundle["frozen_inputs"]
+            ),
+            "candidates": {
+                row["epoch"]: dict(row["candidate_checkpoint"])
+                for row in base_long_candidate_bundle["candidates"]
+            },
+        }
+        published = _replay_long_diffsheg_test_winner_claim(
+            claim,
+            claim_payload,
+            expected_output_root=expected_output_root,
+            candidate_bundle=raw_candidate_bundle,
+        )
+        published_rows = selection_payload.get("candidate_metrics")
+        long_rows = base_long_candidate_bundle["candidates"]
         if (
-            type(published_row) is not dict
-            or published_row.get("epoch") != long_row["epoch"]
-            or published_row.get("optimizer_updates")
-            != long_row["optimizer_updates"]
-            or published_row.get("candidate_checkpoint")
-            != long_row["candidate_checkpoint"]
+            type(published_rows) is not list
+            or len(published_rows) != len(long_rows)
         ):
             raise BaseFinalAuthorityError(
-                f"published Base e{long_row['epoch']} candidate is not the "
-                "fresh Base-long training artifact"
+                "DiffSHEG winner selection does not cover the exact "
+                "Base-long candidate family"
             )
-        normalized_published_checkpoints.append(
-            {
-                "epoch": long_row["epoch"],
-                "optimizer_updates": long_row["optimizer_updates"],
-                "candidate_checkpoint": dict(
-                    long_row["candidate_checkpoint"]
-                ),
+        normalized_published_checkpoints: list[dict[str, Any]] = []
+        for long_row, published_row in zip(long_rows, published_rows):
+            if (
+                type(published_row) is not dict
+                or published_row.get("epoch") != long_row["epoch"]
+                or published_row.get("candidate_checkpoint")
+                != long_row["candidate_checkpoint"]
+            ):
+                raise BaseFinalAuthorityError(
+                    f"DiffSHEG Base e{long_row['epoch']} candidate is not "
+                    "the fresh Base-long training artifact"
+                )
+            normalized_published_checkpoints.append(
+                {
+                    "epoch": long_row["epoch"],
+                    "optimizer_updates": long_row["optimizer_updates"],
+                    "candidate_checkpoint": dict(
+                        long_row["candidate_checkpoint"]
+                    ),
+                }
+            )
+        matching_winners = [
+            row
+            for row in long_rows
+            if row["candidate_checkpoint"]
+            == published["selected_base_checkpoint"]
+        ]
+        selected_report = published["selected_diffsheg_report"]
+        if (
+            published["winner_selection"] != pinned_winner_selection
+            or published["selected_base_checkpoint"] != checkpoints["base"]
+            or len(matching_winners) != 1
+            or published["selected_epoch"] != matching_winners[0]["epoch"]
+            or type(published["selected_fgd"]) not in {int, float}
+            or not isinstance(selected_report, dict)
+            or set(selected_report) != {"path", "sha256"}
+            or {
+                key: full_closure[key]
+                for key in ("path", "sha256")
             }
-        )
-    matching_winners = [
-        row
-        for row in long_rows
-        if row["candidate_checkpoint"]
-        == published["selected_base_checkpoint"]
-    ]
-    if (
-        published["winner_selection"] != pinned_winner_selection
-        or published["selected_base_checkpoint"] != checkpoints["base"]
-        or len(matching_winners) != 1
-        or published["fixed_checkpoints"]
-        != {
-            stage: checkpoints[stage]
-            for stage in REPRESENTATION_STAGES
+            != selected_report
+        ):
+            raise BaseFinalAuthorityError(
+                "DiffSHEG winner does not bind the selected Base/report"
+            )
+        for label, payload in (
+            ("winner selection", selection_payload),
+            ("continuation decision", replayed_continuation),
+            ("continuation waves", replayed_waves),
+            ("prerequisite selection", prerequisite_selection),
+            ("selected DiffSHEG validation report", full_closure_payload),
+            ("one-shot test claim", claim_payload),
+        ):
+            _reject_forbidden(payload, label)
+        return {
+            "winner_selection": {
+                **pinned_winner_selection,
+                "canonical_payload_sha256": canonical_json_sha256(
+                    selection_payload
+                ),
+                "selection_protocol": BASE_SELECTION_PROTOCOL,
+                "selection_metric": BASE_SELECTION_METRIC,
+                "candidate_checkpoints": normalized_published_checkpoints,
+                "selected_epoch": matching_winners[0]["epoch"],
+                "selected_optimizer_updates": matching_winners[0][
+                    "optimizer_updates"
+                ],
+                "selected_fgd": float(published["selected_fgd"]),
+                "selected_checkpoint": dict(
+                    published["selected_base_checkpoint"]
+                ),
+                "selected_validation_report": dict(selected_report),
+                "fixed_checkpoints": {
+                    stage: dict(checkpoints[stage])
+                    for stage in REPRESENTATION_STAGES
+                },
+            },
+            "continuation_decision": {
+                **pinned_continuation_decision,
+                "canonical_payload_sha256": canonical_json_sha256(
+                    replayed_continuation
+                ),
+                "decision": "stop",
+                "prerequisite_selection": dict(
+                    pinned_prerequisite_selection
+                ),
+            },
+            "continuation_waves": pinned_continuation_waves,
+            "winner_full_metric_closure": {
+                **full_closure,
+                "canonical_payload_sha256": canonical_json_sha256(
+                    full_closure_payload
+                ),
+                "selection_role": "selected_validation_diffsheg_report",
+            },
+            "prerequisite_selection": {
+                **pinned_prerequisite_selection,
+                "canonical_payload_sha256": canonical_json_sha256(
+                    prerequisite_selection
+                ),
+                "bridge_format": prerequisite_bridge["format"],
+                "prerequisite_consumption": {
+                    "base_training_feature_graph": {
+                        "live_prerequisite_models": [],
+                        "consumed_precomputed_selected_outputs": [
+                            "face",
+                            "hands",
+                            "upper",
+                            "lower",
+                        ],
+                        "global_model_consumed": False,
+                    },
+                    "official_base_inference": {
+                        "strict_loaded_models": list(
+                            REPRESENTATION_STAGES
+                        ),
+                        "decoded_models": list(REPRESENTATION_STAGES),
+                        "global_translation_reconstruction": True,
+                    },
+                },
+                "stages": explicit_stages,
+            },
+            "test_claim": {
+                **claim,
+                "canonical_payload_sha256": canonical_json_sha256(
+                    claim_payload
+                ),
+                "receipt_payload_sha256": published[
+                    "receipt_payload_sha256"
+                ],
+                "test_policy": {
+                    **dict(published["test_policy"]),
+                    "num_shards": NUM_SHARDS,
+                    "canonical_test_clips": TEST_CLIPS,
+                },
+            },
+            "base_long_candidate_bundle": dict(
+                base_long_candidate_bundle
+            ),
         }
-        or type(published["test_policy"]) is not dict
-        or published["winner_full_metric_closure"]
-        != pinned_full_closure
-    ):
-        raise BaseFinalAuthorityError(
-            "neutral published winner does not bind Base plus selected five"
-        )
-    for label, payload in (
-        ("winner selection", selection_payload),
-        ("continuation decision", replayed_continuation),
-        ("continuation waves", replayed_waves),
-        ("prerequisite selection", prerequisite_selection),
-        ("winner full validation metric closure", full_closure_payload),
-        ("one-shot test claim", claim_payload),
-    ):
-        _reject_forbidden(payload, label)
-    return {
-        "winner_selection": {
-            **pinned_winner_selection,
-            "canonical_payload_sha256": canonical_json_sha256(
-                selection_payload
-            ),
-            "candidate_checkpoints": normalized_published_checkpoints,
-            "selected_epoch": matching_winners[0]["epoch"],
-            "selected_optimizer_updates": matching_winners[0][
-                "optimizer_updates"
-            ],
-            "selected_checkpoint": dict(
-                published["selected_base_checkpoint"]
-            ),
-            "fixed_checkpoints": {
-                stage: dict(published["fixed_checkpoints"][stage])
-                for stage in REPRESENTATION_STAGES
-            },
-        },
-        "continuation_decision": {
-            **pinned_continuation_decision,
-            "canonical_payload_sha256": canonical_json_sha256(
-                replayed_continuation
-            ),
-            "decision": "stop",
-            "prerequisite_selection": dict(
-                pinned_prerequisite_selection
-            ),
-        },
-        "continuation_waves": pinned_continuation_waves,
-        "winner_full_metric_closure": pinned_full_closure,
-        "prerequisite_selection": {
-            **pinned_prerequisite_selection,
-            "canonical_payload_sha256": canonical_json_sha256(
-                prerequisite_selection
-            ),
-            "bridge_format": prerequisite_bridge["format"],
-            "prerequisite_consumption": {
-                "base_training_feature_graph": {
-                    "live_prerequisite_models": [],
-                    "consumed_precomputed_selected_outputs": [
-                        "face",
-                        "hands",
-                        "upper",
-                        "lower",
-                    ],
-                    "global_model_consumed": False,
-                },
-                "official_base_inference": {
-                    "strict_loaded_models": list(REPRESENTATION_STAGES),
-                    "decoded_models": list(REPRESENTATION_STAGES),
-                    "global_translation_reconstruction": True,
-                },
-            },
-            "stages": explicit_stages,
-        },
-        "test_claim": {
-            **claim,
-            "canonical_payload_sha256": canonical_json_sha256(
-                claim_payload
-            ),
-            "receipt_payload_sha256": published[
-                "receipt_payload_sha256"
-            ],
-            "test_policy": dict(published["test_policy"]),
-        },
-        "base_long_candidate_bundle": dict(base_long_candidate_bundle),
-    }
 
 
 def _authority_inputs(
@@ -2158,6 +2198,15 @@ def _authority_inputs(
         test_claim=test_claim,
         checkpoints=checkpoint_bundle,
     )
+    if (
+        control["winner_selection"].get("selection_protocol")
+        != BASE_SELECTION_PROTOCOL
+        or control["winner_selection"].get("selection_metric")
+        != BASE_SELECTION_METRIC
+    ):
+        raise BaseFinalAuthorityError(
+            "final Base authority selection protocol changed"
+        )
     return {
         "expected_output_root": str(output_root),
         "canonical": canonical,
@@ -2185,6 +2234,11 @@ def _authority_inputs(
             "selected_base_epoch": control["winner_selection"][
                 "selected_epoch"
             ],
+            "base_selection_protocol": BASE_SELECTION_PROTOCOL,
+            "base_selection_metric": BASE_SELECTION_METRIC,
+            "selection_split": "val",
+            "test_evaluations": 1,
+            "test_feedback_into_selection": False,
             "forbidden_generator_identities": list(
                 FORBIDDEN_IDENTITIES
             ),
@@ -2478,3 +2532,168 @@ def atomic_write_new(path: str | Path, value: Mapping[str, Any]) -> None:
         if created:
             destination.unlink(missing_ok=True)
         raise
+
+
+def _load_authority_inputs(
+    path: Path,
+    *,
+    expected_file_sha256: str,
+) -> dict[str, Any]:
+    resolved, payload = _safe_file_snapshot(
+        str(path),
+        "final authority inputs",
+    )
+    if hashlib.sha256(payload).hexdigest() != _sha256(
+        expected_file_sha256,
+        "final authority inputs file SHA",
+    ):
+        raise BaseFinalAuthorityError(
+            "final authority inputs external file pin mismatch"
+        )
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BaseFinalAuthorityError(
+            "final authority inputs are invalid JSON"
+        ) from exc
+    expected_keys = {
+        "format",
+        "status",
+        "selection_protocol",
+        "test_policy",
+        "expected_output_root",
+        "canonical_manifest",
+        "canonical_summary",
+        "canonical_lineage",
+        "canonical_root_receipt",
+        "audio_authorities",
+        "base_long_candidate_artifacts",
+        "winner_selection",
+        "continuation_decision",
+        "continuation_waves",
+        "winner_validation_metric_closure",
+        "test_claim",
+        "inference_source",
+        "checkpoints",
+        "receipt_payload_sha256",
+    }
+    if type(value) is not dict or set(value) != expected_keys:
+        raise BaseFinalAuthorityError(
+            "final authority inputs schema mismatch"
+        )
+    claimed = _sha256(
+        value["receipt_payload_sha256"],
+        "final authority inputs payload SHA",
+    )
+    unsigned = dict(value)
+    del unsigned["receipt_payload_sha256"]
+    if (
+        canonical_json_sha256(unsigned) != claimed
+        or value["format"] != INPUTS_FORMAT
+        or value["status"] != "ready"
+        or value["selection_protocol"] != BASE_SELECTION_PROTOCOL
+        or value["test_policy"]
+        != {
+            "test_evaluations": 1,
+            "test_feedback_into_selection": False,
+        }
+    ):
+        raise BaseFinalAuthorityError(
+            "final authority inputs identity/policy mismatch"
+        )
+    if str(resolved) != str(path):
+        raise BaseFinalAuthorityError(
+            "final authority inputs path is not canonical"
+        )
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build the sole final-test authority from a hash-pinned "
+            "DiffSHEG validation winner"
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("--inputs-json", type=Path, required=True)
+    parser.add_argument("--expected-inputs-sha256", required=True)
+    parser.add_argument("--output-json", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    inputs_path = args.inputs_json.expanduser()
+    if not inputs_path.is_absolute():
+        raise BaseFinalAuthorityError("--inputs-json must be absolute")
+    output_path = args.output_json.expanduser()
+    if not output_path.is_absolute():
+        raise BaseFinalAuthorityError("--output-json must be absolute")
+    canonical_output = output_path.parent.resolve() / output_path.name
+    if canonical_output != output_path or os.path.lexists(output_path):
+        raise BaseFinalAuthorityError(
+            "final authority output must be canonical and absent"
+        )
+    inputs = _load_authority_inputs(
+        inputs_path,
+        expected_file_sha256=args.expected_inputs_sha256,
+    )
+    authority = build_test_authority(
+        expected_output_root=inputs["expected_output_root"],
+        canonical_manifest=inputs["canonical_manifest"],
+        canonical_summary=inputs["canonical_summary"],
+        canonical_lineage=inputs["canonical_lineage"],
+        canonical_root_receipt=inputs["canonical_root_receipt"],
+        audio_authorities=inputs["audio_authorities"],
+        base_long_candidate_artifacts=inputs[
+            "base_long_candidate_artifacts"
+        ],
+        winner_selection=inputs["winner_selection"],
+        continuation_decision=inputs["continuation_decision"],
+        continuation_waves=inputs["continuation_waves"],
+        winner_full_metric_closure=inputs[
+            "winner_validation_metric_closure"
+        ],
+        test_claim=inputs["test_claim"],
+        inference_source=inputs["inference_source"],
+        checkpoints=inputs["checkpoints"],
+    )
+    atomic_write_new(output_path, authority)
+    output_payload = output_path.read_bytes()
+    output_sha = hashlib.sha256(output_payload).hexdigest()
+    try:
+        validate_test_authority(
+            output_path,
+            expected_file_sha256=output_sha,
+            expected_bytes=len(output_payload),
+            expected_receipt_payload_sha256=authority[
+                "receipt_payload_sha256"
+            ],
+        )
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
+    print(
+        json.dumps(
+            {
+                "status": "authorized_pre_inference",
+                "output": str(output_path),
+                "sha256": output_sha,
+                "bytes": len(output_payload),
+                "receipt_payload_sha256": authority[
+                    "receipt_payload_sha256"
+                ],
+                "selection_protocol": BASE_SELECTION_PROTOCOL,
+                "selection_metric": BASE_SELECTION_METRIC,
+                "test_evaluations": 1,
+                "test_feedback_into_selection": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

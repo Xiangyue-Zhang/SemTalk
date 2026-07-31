@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Twenty-two-candidate TalkSHOW validation contract for Base adaptation.
+"""Twenty-two-candidate DiffSHEG validation contract for Base adaptation.
 
-The validation input, five-prerequisite pipeline, and inference-lineage
-helpers come exclusively from the TalkSHOW released2 authority.  Historical
-evaluator selectors are intentionally outside this formal control closure.
+The Base checkpoint family and the five-prerequisite inference pipeline stay
+under the fresh SemTalk/TalkSHOW source authority.  Checkpoint selection is a
+different concern: all 22 candidates are compared only by the reconstructed
+DiffSHEG SHOW validation FGD protocol.  The explicit
+``diffsheg_eval_clip_ids.txt`` manifest is therefore the selection coverage
+authority; TalkSHOW released2 metrics never participate in Base selection.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from scripts.show_base import select_base_official_adapt as diffsheg
 from scripts.show_base import talkshow_base_val_contract as talkshow
 
 
@@ -138,27 +142,59 @@ READY_FORMAT = (
 )
 SELECTION_FORMAT = "semtalk_show_base_official_adapt_long_selection_v1"
 
-# Re-export the audited TalkSHOW-only validation helpers used by inference.
-EXPECTED_VAL_CLIPS = talkshow.EXPECTED_VAL_CLIPS
+# Re-export the exact formal validation ABI used by the 22-way producer.  The
+# input/lineage and coverage validators are the pinned DiffSHEG selectors;
+# only the fresh five-prerequisite pipeline validator remains TalkSHOW-owned.
+EXPECTED_VAL_CLIPS = diffsheg.EXPECTED_VAL_CLIPS
 INFERENCE_HELPERS = talkshow.INFERENCE_HELPERS
-VAL_INFERENCE_LINEAGE_FORMAT = talkshow.VAL_INFERENCE_LINEAGE_FORMAT
+VAL_INFERENCE_LINEAGE_FORMAT = diffsheg.VAL_INFERENCE_LINEAGE_FORMAT
 VAL_INFERENCE_SOURCE = talkshow.VAL_INFERENCE_SOURCE
 canonical_json_sha256 = talkshow.canonical_json_sha256
 sha256_file = talkshow.sha256_file
 require_sha256 = talkshow.require_sha256
 require_exact_int = talkshow.require_exact_int
-reject_test_path = talkshow.reject_test_path
 canonical_clip_id = talkshow.canonical_clip_id
-public_val_coverage = talkshow.public_val_coverage
-validate_val_inputs = talkshow.validate_val_inputs
-validate_pipeline = talkshow.validate_fresh_pipeline
-validate_val_inference_lineage = talkshow.validate_val_inference_lineage
-_strict_json_bytes = talkshow._strict_json_bytes
-_strict_jsonl = talkshow._strict_jsonl
-SelectionContractError = talkshow.SelectionContractError
+public_val_coverage = diffsheg.public_val_coverage
+validate_val_inputs = diffsheg.validate_val_inputs
+validate_val_inference_lineage = diffsheg.validate_val_inference_lineage
+validate_diffsheg_report = diffsheg.validate_diffsheg_report
+_strict_json_bytes = diffsheg._strict_json_bytes
+_strict_jsonl = diffsheg._strict_jsonl
+SelectionContractError = diffsheg.SelectionContractError
 
 
-class LongCandidateContractError(talkshow.SelectionContractError):
+def reject_test_path(path: Path, label: str) -> None:
+    """Expose one error ABI while retaining the strict TalkSHOW path gate."""
+
+    try:
+        talkshow.reject_test_path(path, label)
+    except talkshow.SelectionContractError as exc:
+        raise SelectionContractError(str(exc)) from exc
+
+
+def validate_pipeline(
+    path: Path,
+    expected_sha256: str,
+    *,
+    expected_prerequisite_selection: Mapping[str, Any] | None = None,
+    expected_source: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the fresh selected-five pipeline under the unified ABI."""
+
+    try:
+        return talkshow.validate_fresh_pipeline(
+            path,
+            expected_sha256,
+            expected_prerequisite_selection=(
+                expected_prerequisite_selection
+            ),
+            expected_source=expected_source,
+        )
+    except talkshow.SelectionContractError as exc:
+        raise SelectionContractError(str(exc)) from exc
+
+
+class LongCandidateContractError(SelectionContractError):
     """Raised when the complete long Base candidate transaction is absent."""
 
 

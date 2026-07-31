@@ -271,6 +271,7 @@ def publish_test_winner_claim(
     validation: Mapping[str, Any],
     *,
     selection_path: Path,
+    expected_output_root: Path,
 ) -> dict[str, Any]:
     """Atomically consume the validation selection's sole test allowance."""
 
@@ -309,11 +310,21 @@ def publish_test_winner_claim(
         raise TestWinnerContractError(
             "test-winner selection changed before one-shot claim"
         )
+    if not expected_output_root.is_absolute():
+        raise TestWinnerContractError(
+            "expected test output root must be absolute"
+        )
+    output_root = expected_output_root.parent.resolve() / expected_output_root.name
+    if output_root != expected_output_root or os.path.lexists(output_root):
+        raise TestWinnerContractError(
+            "expected test output root must be canonical and absent"
+        )
     claim_path = _claim_path(selection_resolved)
     body = {
         **dict(validation),
         "status": "authorized",
         "authorized_test_evaluations": 1,
+        "expected_output_root": str(output_root),
     }
     body["receipt_payload_sha256"] = legacy.canonical_json_sha256(body)
     encoded = (
@@ -365,6 +376,153 @@ def publish_test_winner_claim(
     }
 
 
+def validate_published_test_winner_claim(
+    claim_path: Path,
+    *,
+    expected_claim_sha256: str,
+    expected_claim_bytes: int,
+    expected_claim_payload_sha256: str,
+    expected_output_root: Path,
+    candidate_bundle: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fresh-replay one claimed DiffSHEG winner for final-test authority."""
+
+    try:
+        resolved, claim, observed_sha = legacy._verified_json(
+            claim_path,
+            expected_claim_sha256,
+            "long Base one-shot test claim",
+        )
+        if resolved.stat().st_size != expected_claim_bytes:
+            raise TestWinnerContractError("test claim byte count changed")
+        claimed_payload = legacy.require_sha256(
+            claim.get("receipt_payload_sha256"),
+            "long Base one-shot claim payload SHA-256",
+        )
+        if claimed_payload != legacy.require_sha256(
+            expected_claim_payload_sha256,
+            "expected long Base one-shot claim payload SHA-256",
+        ):
+            raise TestWinnerContractError("test claim payload pin changed")
+        unsigned = dict(claim)
+        unsigned.pop("receipt_payload_sha256", None)
+        if legacy.canonical_json_sha256(unsigned) != claimed_payload:
+            raise TestWinnerContractError("test claim payload SHA mismatch")
+        expected_keys = {
+            "format",
+            "status",
+            "selection",
+            "selected_epoch",
+            "selected_fgd",
+            "selected_checkpoint",
+            "candidate_bundle",
+            "candidate_count",
+            "selection_split",
+            "test_visible_during_selection",
+            "authorized_test_evaluations",
+            "one_shot_claim_required",
+            "test_feedback_into_selection",
+            "expected_output_root",
+            "receipt_payload_sha256",
+        }
+        if set(claim) != expected_keys:
+            raise TestWinnerContractError("test claim schema mismatch")
+        if not expected_output_root.is_absolute():
+            raise TestWinnerContractError(
+                "expected test output root must be absolute"
+            )
+        output_root = (
+            expected_output_root.parent.resolve()
+            / expected_output_root.name
+        )
+        if (
+            output_root != expected_output_root
+            or claim.get("expected_output_root") != str(output_root)
+            or os.path.lexists(output_root)
+        ):
+            raise TestWinnerContractError(
+                "test claim output root is changed or already consumed"
+            )
+        selection = claim.get("selection")
+        selected = claim.get("selected_checkpoint")
+        if not isinstance(selection, dict) or not isinstance(selected, dict):
+            raise TestWinnerContractError("test claim winner binding missing")
+        validation = validate_test_winner(
+            selection_path=Path(selection["path"]),
+            expected_selection_sha256=selection["sha256"],
+            checkpoint_path=Path(selected["path"]),
+            expected_checkpoint_sha256=selected["sha256"],
+            candidate_bundle=candidate_bundle,
+        )
+        expected_body = {
+            **validation,
+            "status": "authorized",
+            "authorized_test_evaluations": 1,
+            "expected_output_root": str(output_root),
+        }
+        expected_claim = {
+            **expected_body,
+            "receipt_payload_sha256": legacy.canonical_json_sha256(
+                expected_body
+            ),
+        }
+        if claim != expected_claim:
+            raise TestWinnerContractError(
+                "test claim differs from fresh DiffSHEG winner replay"
+            )
+        selection_path = Path(selection["path"]).resolve(strict=True)
+        if resolved != _claim_path(selection_path):
+            raise TestWinnerContractError(
+                "test claim is not the selection's exclusive slot"
+            )
+    except TestWinnerContractError:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        legacy.SelectionContractError,
+    ) as error:
+        raise TestWinnerContractError(
+            f"invalid published long Base test claim: {error}"
+        ) from error
+    _selection_path, selection_payload, selection_sha = legacy._verified_json(
+        Path(claim["selection"]["path"]),
+        claim["selection"]["sha256"],
+        "long Base validation selection",
+    )
+    if selection_sha != claim["selection"]["sha256"]:
+        raise TestWinnerContractError("selection changed after claim replay")
+    selected_report = selection_payload["selected"]["diffsheg_report"]
+    return {
+        "claim_artifact": {
+            "path": str(resolved),
+            "sha256": observed_sha,
+            "bytes": expected_claim_bytes,
+        },
+        "receipt_payload_sha256": claimed_payload,
+        "winner_selection": {
+            "path": claim["selection"]["path"],
+            "sha256": claim["selection"]["sha256"],
+            "bytes": Path(claim["selection"]["path"]).stat().st_size,
+            "receipt_payload_sha256": claim["selection"][
+                "receipt_payload_sha256"
+            ],
+        },
+        "selected_base_checkpoint": dict(claim["selected_checkpoint"]),
+        "selected_epoch": claim["selected_epoch"],
+        "selected_fgd": claim["selected_fgd"],
+        "selected_diffsheg_report": dict(selected_report),
+        "expected_output_root": str(output_root),
+        "test_policy": {
+            "authorized_evaluations": 1,
+            "one_shot_claim_required": True,
+            "selection_feedback": False,
+        },
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Authorize only the long Base validation winner for test",
@@ -387,6 +545,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-frozen-inputs-json", type=Path, required=True)
     parser.add_argument(
         "--expected-base-frozen-inputs-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-test-output-root",
+        type=Path,
         required=True,
     )
     return parser
@@ -416,6 +579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     authorization = publish_test_winner_claim(
         validation,
         selection_path=args.selection_json,
+        expected_output_root=args.expected_test_output_root,
     )
     print(json.dumps(authorization, sort_keys=True))
     return 0
