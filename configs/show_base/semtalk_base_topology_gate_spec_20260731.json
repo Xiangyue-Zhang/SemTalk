@@ -3,6 +3,7 @@
   "scope": "SemTalk Base on fresh SHOW five-stage features",
   "reference_mode": "official_w1_b64_reference",
   "candidate_modes": [
+    "official_w1_b64_reference",
     "official_objective_w8_l8_g64_ddp_adaptation",
     "official_objective_w16_l4_g64_ddp_adaptation",
     "validation_gated_w8_l64_g512_empirical_acceleration",
@@ -20,7 +21,7 @@
       "unique_samples_per_epoch": 127232,
       "learning_rate": 0.00005,
       "precision": "fp32",
-      "formal_training_eligible": false
+      "formal_training_eligible": true
     },
     "official_objective_w8_l8_g64_ddp_adaptation": {
       "classification": "official_objective_ddp_adaptation_not_trajectory_equivalent",

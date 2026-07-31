@@ -29,7 +29,7 @@ TOPOLOGY_SPECS = {
         "unique_samples_per_epoch": 127_232,
         "learning_rate": 5e-5,
         "precision": "fp32",
-        "formal_training_eligible": False,
+        "formal_training_eligible": True,
     },
     "official_objective_w8_l8_g64_ddp_adaptation": {
         "classification": (

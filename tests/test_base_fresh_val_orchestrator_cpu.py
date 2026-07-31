@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -861,6 +863,118 @@ class BaseFreshValOrchestratorCpuTests(unittest.TestCase):
             self.assertIn("printf '%s\\0%s\\0%s\\0'", script)
         self.assertIn("expected_formal_host=${context[35]}", winner_full)
         self.assertIn('"$(hostname)" != "$expected_formal_host"', winner_full)
+
+    def test_two_candidate_seals_bind_each_epoch_screen_in_real_argv(
+        self,
+    ) -> None:
+        root = Path(__file__).resolve().parents[1]
+        launcher_path = (
+            root / "scripts/show_base/run_base_fresh_val_8shard.sh"
+        )
+        launcher = launcher_path.read_text(encoding="utf-8")
+        start = "    # BEGIN CANDIDATE_SEAL_ARGV_DATAFLOW\n"
+        end = "    # END CANDIDATE_SEAL_ARGV_DATAFLOW\n"
+        self.assertEqual(launcher.count(start), 1)
+        self.assertEqual(launcher.count(end), 1)
+        production_block = launcher.split(start, 1)[1].split(end, 1)[0]
+
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-seal-argv-", dir="/private/tmp"
+        ) as raw:
+            temp = Path(raw)
+            argv_log = temp / "argv.jsonl"
+            orchestrator = temp / "orchestrator_stub.py"
+            orchestrator.write_text(
+                "import json, os, sys\n"
+                "with open(os.environ['SEAL_ARGV_LOG'], 'a', "
+                "encoding='utf-8') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+                encoding="utf-8",
+            )
+            run_root = temp / "run"
+            prefix = "\n".join(
+                (
+                    "set -euo pipefail",
+                    f"python_bin={shlex.quote(sys.executable)}",
+                    f"orchestrator={shlex.quote(str(orchestrator))}",
+                    f"run_root={shlex.quote(str(run_root))}",
+                    'mkdir -p "$run_root/logs" "$run_root/seals"',
+                    "wave_epochs=(25 50)",
+                    "declare -a replay_by_epoch=()",
+                    "declare -a replay_sha_by_epoch=()",
+                    "declare -a replay_payload_by_epoch=()",
+                    "declare -a screen_by_epoch=()",
+                    "declare -a screen_sha_by_epoch=()",
+                    "declare -a screen_payload_by_epoch=()",
+                    "declare -a transaction_by_epoch=()",
+                    "declare -a transaction_sha_by_epoch=()",
+                    "declare -a transaction_payload_by_epoch=()",
+                    "for epoch in 25 50; do",
+                    '  replay_by_epoch[$epoch]="/artifacts/e${epoch}-replay.json"',
+                    '  screen_by_epoch[$epoch]="/artifacts/e${epoch}-screen.json"',
+                    '  screen_sha_by_epoch[$epoch]="${epoch}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+                    '  screen_payload_by_epoch[$epoch]="${epoch}bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
+                    '  transaction_by_epoch[$epoch]="/artifacts/e${epoch}-transaction.json"',
+                    '  transaction_sha_by_epoch[$epoch]="${epoch}cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"',
+                    '  transaction_payload_by_epoch[$epoch]="${epoch}dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"',
+                    "done",
+                    'prerequisite="/artifacts/prerequisite.json"',
+                    'prerequisite_sha="e"',
+                    'prerequisite_payload="f"',
+                    'continuation="/artifacts/continuation.json"',
+                    'continuation_sha="1"',
+                    'continuation_payload="2"',
+                    'real_cache="/artifacts/real-cache.json"',
+                    'real_cache_sha="3"',
+                    'real_cache_payload="4"',
+                    "seal_paths=()",
+                    "seal_shas=()",
+                    "seal_payloads=()",
+                    "artifact_result=()",
+                    "artifact_fields() {",
+                    '  artifact_result=("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "1" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")',
+                    "}",
+                    "# Reproduce the stale scalar left by the preceding replay loop.",
+                    'screen="${screen_by_epoch[50]}"',
+                    "",
+                )
+            )
+            harness = temp / "harness.sh"
+            harness.write_text(
+                prefix + production_block + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["bash", str(harness)],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, "SEAL_ARGV_LOG": str(argv_log)},
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+            calls = [
+                json.loads(line)
+                for line in argv_log.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(calls), 2)
+        for epoch, argv in zip((25, 50), calls):
+            self.assertEqual(argv[0], "candidate-seal")
+            screen_index = argv.index("--primary-screen-path") + 1
+            output_index = argv.index("--output-json") + 1
+            self.assertEqual(
+                argv[screen_index], f"/artifacts/e{epoch}-screen.json"
+            )
+            self.assertTrue(argv[output_index].endswith(f"/seals/e{epoch}.json"))
+        self.assertNotEqual(
+            calls[0][calls[0].index("--primary-screen-path") + 1],
+            calls[1][calls[1].index("--primary-screen-path") + 1],
+        )
 
     def test_direct_gpu_launcher_invocation_is_rejected(self) -> None:
         root = Path(__file__).resolve().parents[1]

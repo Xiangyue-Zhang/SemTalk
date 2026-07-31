@@ -178,7 +178,7 @@ TOPOLOGY_SPECS = {
         "unique_samples_per_epoch": 127_232,
         "learning_rate": 5e-5,
         "precision": "fp32",
-        "formal_training_eligible": False,
+        "formal_training_eligible": True,
     },
     W8_GLOBAL64_MODE: {
         "classification": (
@@ -2920,12 +2920,7 @@ def validate_topology_gate_spec(
         args.expected_topology_gate_spec_sha256,
         "Base topology gate specification",
     )
-    expected_candidates = [
-        W8_GLOBAL64_MODE,
-        W16_GLOBAL64_MODE,
-        W8_GLOBAL512_MODE,
-        W16_GLOBAL512_MODE,
-    ]
+    expected_candidates = list(TOPOLOGY_SPECS)
     if (
         payload.get("format") != TOPOLOGY_GATE_SPEC_FORMAT
         or payload.get("scope") != "SemTalk Base on fresh SHOW five-stage features"
@@ -3186,13 +3181,7 @@ def validate_topology_selection(
         or report.get("topology_gate_spec_sha256")
         != args.expected_topology_gate_spec_sha256
         or report.get("reference_mode") != OFFICIAL_W1_REFERENCE_MODE
-        or report.get("candidate_modes")
-        != [
-            W8_GLOBAL64_MODE,
-            W16_GLOBAL64_MODE,
-            W8_GLOBAL512_MODE,
-            W16_GLOBAL512_MODE,
-        ]
+        or report.get("candidate_modes") != list(TOPOLOGY_SPECS)
         or not isinstance(probes, list)
         or [probe.get("mode") for probe in probes]
         != list(TOPOLOGY_SPECS)
@@ -3215,16 +3204,9 @@ def validate_topology_selection(
             for quality in quality_reports
         )
         or not isinstance(quality_decisions, dict)
-        or set(quality_decisions)
-        != {
-            W8_GLOBAL64_MODE,
-            W16_GLOBAL64_MODE,
-            W8_GLOBAL512_MODE,
-            W16_GLOBAL512_MODE,
-        }
+        or set(quality_decisions) != set(TOPOLOGY_SPECS)
         or not isinstance(selected, dict)
         or selected.get("mode") != args.topology_mode
-        or selected.get("mode") == OFFICIAL_W1_REFERENCE_MODE
         or selected.get("report_sha256") != throughput_gate["sha256"]
         or selected.get("classification")
         != TOPOLOGY_SPECS[args.topology_mode]["classification"]
@@ -3243,16 +3225,17 @@ def validate_topology_selection(
         or report.get("w1_trajectory_equivalence_claimed_for_selected")
         is not False
         or report.get("selection_policy")
-        != "g64_under_24h_else_raw_replay_quality_gated_acceleration_v1"
+        != "fastest_quality_safe_finite_under_24h_all_measured_topologies_v2"
         or report.get("selection_decision_branch")
-        not in {
-            "fastest_safe_g64_under_24h",
-            "fastest_quality_gated_global512",
-        }
+        != "fastest_quality_safe_finite_under_24h"
         or report.get("quality_gate_policy", {}).get(
             "raw_prediction_replay_required"
         )
         is not True
+        or report.get("quality_gate_policy", {}).get(
+            "maximum_training_seconds"
+        )
+        != 86_400
         or report.get("receipt_sha256")
         != canonical_json_sha256(
             {
@@ -3396,7 +3379,8 @@ def validate_args(args: argparse.Namespace) -> None:
         is None
     ):
         raise AdaptationContractError(
-            "formal W16 node/host/static-rendezvous identity changed"
+            "formal selected-topology node/host/static-rendezvous identity "
+            "changed"
         )
     if args.local_batch_size != topology["local_batch_size"]:
         raise AdaptationContractError(
@@ -3427,13 +3411,12 @@ def validate_args(args: argparse.Namespace) -> None:
             "throughput_gate mode cannot consume a previous gate"
         )
     if args.mode == "train" and (
-        args.topology_mode == OFFICIAL_W1_REFERENCE_MODE
-        or args.topology_selection_report is None
+        args.topology_selection_report is None
         or args.expected_topology_selection_sha256 is None
     ):
         raise AdaptationContractError(
-            "formal training requires one non-W1 topology selected by the "
-            "sealed five-mode gate"
+            "formal training requires one topology selected by the sealed "
+            "five-mode gate"
         )
 
 

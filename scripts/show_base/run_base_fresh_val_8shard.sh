@@ -675,11 +675,13 @@ for ((wave_start = 0; wave_start < ${#epochs[@]}; \
         exit 1
     fi
 
+    # BEGIN CANDIDATE_SEAL_ARGV_DATAFLOW
     for epoch in "${wave_epochs[@]}"; do
         replay_receipt=${replay_by_epoch[$epoch]}
         artifact_fields "$replay_receipt" true
         replay_sha_by_epoch[$epoch]=${artifact_result[0]}
         replay_payload_by_epoch[$epoch]=${artifact_result[2]}
+        screen=${screen_by_epoch[$epoch]}
         seal="$run_root/seals/e${epoch}.json"
         "$python_bin" "$orchestrator" candidate-seal \
             --transaction-path "${transaction_by_epoch[$epoch]}" \
@@ -708,6 +710,7 @@ for ((wave_start = 0; wave_start < ${#epochs[@]}; \
         seal_shas+=("${artifact_result[0]}")
         seal_payloads+=("${artifact_result[2]}")
     done
+    # END CANDIDATE_SEAL_ARGV_DATAFLOW
 done
 
 partition_receipt="$run_root/partition-receipt.json"

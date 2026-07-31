@@ -29,7 +29,7 @@ TRAJECTORY_ANCHOR_SHA256 = (
     "e27c27a0da2793f44608b618d08356df0b60f55ae039434a228c50ff73028cf2"
 )
 TRAINER_ENTRYPOINT_SHA256 = (
-    "592ec80df79f9692b03064b0770d21de4b05f51e582e714d5612fc38d6981d68"
+    "78fe3daf6be389c3c2d6150b39b41b76c52d2650fb77487c6ba7becc1186958f"
 )
 READY_FORMAT = "semtalk_show_base_official_adapt_long_candidate_ready_v1"
 MANIFEST_FORMAT = "semtalk_show_base_official_adapt_long_manifest_v1"

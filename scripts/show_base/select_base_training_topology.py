@@ -30,7 +30,7 @@ QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v1"
 QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v1"
 QUALITY_EPOCHS = (1, 2, 4, 8)
 PRIMARY_METRIC_PATH = "body.released2.metrics.FGD"
-MAX_G64_TRAINING_SECONDS = 24 * 60 * 60
+MAX_TRAINING_SECONDS = 24 * 60 * 60
 MAX_ABSOLUTE_FGD_REGRESSION = 0.01
 MAX_RELATIVE_FGD_REGRESSION = 0.02
 SELECTION_PROTOCOL = {
@@ -132,18 +132,17 @@ def validate_quality_gate_spec(
         "primary_metric": PRIMARY_METRIC_PATH,
         "raw_prediction_replay_required": True,
         "comparison_reference": contract.OFFICIAL_W1_REFERENCE_MODE,
-        "g64_preference": {
-            "modes": [contract.W8_GLOBAL64_MODE, contract.W16_GLOBAL64_MODE],
-            "maximum_estimated_training_seconds": MAX_G64_TRAINING_SECONDS,
-            "policy": "fastest_safe_g64_under_24h_before_any_global512_mode",
+        "measured_eta_constraint": {
+            "modes": list(contract.TOPOLOGY_SPECS),
+            "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+            "finite_probe_required": True,
+            "policy": (
+                "all_quality_safe_finite_modes_compete_by_measured_eta_"
+                "under_24h"
+            ),
         },
         "candidate_quality_gate": {
-            "modes": [
-                contract.W8_GLOBAL64_MODE,
-                contract.W16_GLOBAL64_MODE,
-                contract.W8_GLOBAL512_MODE,
-                contract.W16_GLOBAL512_MODE,
-            ],
+            "modes": list(contract.TOPOLOGY_SPECS),
             "per_epoch_comparison": "candidate_fgd_lte_reference_fgd_plus_max_of_absolute_or_relative_margin",
             "maximum_absolute_fgd_regression": MAX_ABSOLUTE_FGD_REGRESSION,
             "maximum_relative_fgd_regression": MAX_RELATIVE_FGD_REGRESSION,
@@ -534,7 +533,7 @@ def select_topology(
     eligible = [
         probe for probe in probes if probe["formal_training_eligible"] is True
     ]
-    if len(eligible) != 4:
+    if [probe["mode"] for probe in eligible] != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError("formal candidate topology set changed")
     if [report.get("mode") for report in quality_reports] != list(
         contract.TOPOLOGY_SPECS
@@ -603,53 +602,42 @@ def select_topology(
         probe["p99_seconds"],
         order.index(probe["mode"]),
     )
-    g64 = [
+    safe_under_budget = [
         probe
         for probe in eligible
-        if probe["mode"]
-        in {contract.W8_GLOBAL64_MODE, contract.W16_GLOBAL64_MODE}
-        and probe["estimated_training_seconds"] <= MAX_G64_TRAINING_SECONDS
+        if _finite_positive(probe.get("estimated_training_seconds"))
+        and _finite_positive(probe.get("p99_seconds"))
+        and float(probe["estimated_training_seconds"])
+        <= MAX_TRAINING_SECONDS
         and quality_decisions[probe["mode"]][
             "all_trajectory_epochs_pass"
         ]
     ]
-    if g64:
-        selected = min(g64, key=rank_key)
-        decision_branch = "fastest_safe_g64_under_24h"
-    else:
-        gated = [
-            probe
-            for probe in eligible
-            if probe["mode"]
-            in {contract.W8_GLOBAL512_MODE, contract.W16_GLOBAL512_MODE}
-            and quality_decisions[probe["mode"]][
-                "all_trajectory_epochs_pass"
-            ]
-        ]
-        if not gated:
-            raise TopologySelectionError(
-                "no g64 topology meets 24h and no accelerated topology passes "
-                "the preregistered raw-replay quality gate"
-            )
-        selected = min(gated, key=rank_key)
-        decision_branch = "fastest_quality_gated_global512"
+    if not safe_under_budget:
+        raise TopologySelectionError(
+            "no quality-safe finite topology meets the 24-hour measured "
+            "ETA limit"
+        )
+    selected = min(safe_under_budget, key=rank_key)
+    decision_branch = "fastest_quality_safe_finite_under_24h"
     payload = {
         "format": contract.TOPOLOGY_SELECTION_FORMAT,
         "status": "pass",
         "topology_gate_spec_sha256": gate_spec_sha256,
         "quality_gate_spec_sha256": quality_gate_spec_sha256,
         "reference_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
-        "candidate_modes": list(contract.TOPOLOGY_SPECS)[1:],
+        "candidate_modes": list(contract.TOPOLOGY_SPECS),
         "topology_independent_input_sha256": next(iter(semantic_hashes)),
         "selection_policy": (
-            "g64_under_24h_else_raw_replay_quality_gated_acceleration_v1"
+            "fastest_quality_safe_finite_under_24h_all_measured_"
+            "topologies_v2"
         ),
         "selection_decision_branch": decision_branch,
         "quality_gate_policy": {
             "trajectory_epochs": list(QUALITY_EPOCHS),
             "primary_metric": PRIMARY_METRIC_PATH,
             "raw_prediction_replay_required": True,
-            "maximum_g64_training_seconds": MAX_G64_TRAINING_SECONDS,
+            "maximum_training_seconds": MAX_TRAINING_SECONDS,
             "maximum_absolute_fgd_regression": (
                 MAX_ABSOLUTE_FGD_REGRESSION
             ),
@@ -701,13 +689,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     modes = [probe[0] for probe in args.probe]
     if modes != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError(
-            "--probe must name W1 then the four candidate modes exactly once"
+            "--probe must name all five measured modes exactly once"
         )
     quality_modes = [report[0] for report in args.quality_report]
     if quality_modes != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError(
-            "--quality-report must name W1 then the four candidate modes "
-            "exactly once"
+            "--quality-report must name all five measured modes exactly once"
         )
     gate_spec = contract.validate_topology_gate_spec(
         SimpleNamespace(

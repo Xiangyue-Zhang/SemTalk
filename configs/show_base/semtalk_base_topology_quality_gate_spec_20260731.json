@@ -12,16 +12,21 @@
   "primary_metric": "body.released2.metrics.FGD",
   "raw_prediction_replay_required": true,
   "comparison_reference": "official_w1_b64_reference",
-  "g64_preference": {
+  "measured_eta_constraint": {
     "modes": [
+      "official_w1_b64_reference",
       "official_objective_w8_l8_g64_ddp_adaptation",
-      "official_objective_w16_l4_g64_ddp_adaptation"
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration"
     ],
     "maximum_estimated_training_seconds": 86400,
-    "policy": "fastest_safe_g64_under_24h_before_any_global512_mode"
+    "finite_probe_required": true,
+    "policy": "all_quality_safe_finite_modes_compete_by_measured_eta_under_24h"
   },
   "candidate_quality_gate": {
     "modes": [
+      "official_w1_b64_reference",
       "official_objective_w8_l8_g64_ddp_adaptation",
       "official_objective_w16_l4_g64_ddp_adaptation",
       "validation_gated_w8_l64_g512_empirical_acceleration",
