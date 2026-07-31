@@ -161,6 +161,7 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
             {path.name for path in launchers},
             {
                 "run_audio_cache_8shard.sh",
+                "run_base_final_test.sh",
                 "run_base_formal_inference.sh",
                 "run_base_official_adapt_long.sh",
                 "run_base_released_all_speakers_inference.sh",
