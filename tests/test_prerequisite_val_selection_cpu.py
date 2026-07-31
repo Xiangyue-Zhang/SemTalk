@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1722,6 +1723,43 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         self.assertIn(
             "partial_candidate_index_format=${candidate_index_formats[1]}",
             source,
+        )
+
+    def test_launcher_executes_identical_legacy_and_segmented_partial_policy(
+        self,
+    ) -> None:
+        helper = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "show_base"
+            / "prerequisite_val_launcher_contract.sh"
+        )
+        subprocess.run(["bash", "-n", str(helper)], check=True)
+
+        def authority(actual: str) -> str:
+            command = (
+                f"source {shlex.quote(str(helper))}; "
+                "semtalk_prereq_candidate_index_authority "
+                f"{shlex.quote(actual)} legacy-partial segmented-partial"
+            )
+            return subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(
+            authority("legacy-partial"),
+            "partial\t40\t4\tface",
+        )
+        self.assertEqual(
+            authority("segmented-partial"),
+            "partial\t40\t4\tface",
+        )
+        self.assertEqual(
+            authority("complete"),
+            "complete\t50\t5\tglobal",
         )
 
     def test_source_policy_accepts_only_global_descendant(self) -> None:

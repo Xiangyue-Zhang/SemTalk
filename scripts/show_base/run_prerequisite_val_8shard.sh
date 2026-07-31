@@ -23,6 +23,8 @@ fi
 launcher_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=guarded_runner_contract.sh
 . "$launcher_dir/guarded_runner_contract.sh"
+# shellcheck source=prerequisite_val_launcher_contract.sh
+. "$launcher_dir/prerequisite_val_launcher_contract.sh"
 semtalk_require_exact_guarded_runner_all_gpus
 
 repo_root=$1
@@ -314,10 +316,14 @@ fi
 candidate_index_format=${candidate_index_formats[0]}
 partial_candidate_index_format=${candidate_index_formats[1]}
 segmented_partial_candidate_index_format=${candidate_index_formats[2]}
-if [[ "$candidate_index_format" == \
-      "$partial_candidate_index_format" || \
-      "$candidate_index_format" == \
-      "$segmented_partial_candidate_index_format" ]]; then
+IFS=$'\t' read -r candidate_index_authority minimum_plan_jobs \
+    plan_stage_modulus gate_stage < <(
+        semtalk_prereq_candidate_index_authority \
+            "$candidate_index_format" \
+            "$partial_candidate_index_format" \
+            "$segmented_partial_candidate_index_format"
+    )
+if [[ "$candidate_index_authority" == partial ]]; then
     case "$partition" in
         nonglobal|gate) ;;
         *)
@@ -339,13 +345,6 @@ if [[ ! -f "$plan_path" || -L "$plan_path" ]]; then
     exit 1
 fi
 mapfile -t candidate_plan <"$plan_path"
-minimum_plan_jobs=50
-plan_stage_modulus=5
-if [[ "$candidate_index_format" == \
-      "$partial_candidate_index_format" ]]; then
-    minimum_plan_jobs=40
-    plan_stage_modulus=4
-fi
 if [[ ${#candidate_plan[@]} -lt "$minimum_plan_jobs" || \
       $((${#candidate_plan[@]} % plan_stage_modulus)) -ne 0 ]]; then
     printf 'candidate plan lacks its required complete stage/schedule authority\n' >&2
@@ -375,11 +374,6 @@ for ((plan_index = 0; plan_index < ${#candidate_plan[@]}; plan_index++)); do
             [[ "$plan_stage" == global ]] && include=true
             ;;
         gate)
-            gate_stage=face
-            if [[ "$candidate_index_format" != \
-                  "$partial_candidate_index_format" ]]; then
-                gate_stage=global
-            fi
             # Four deterministic same-stage candidates prove byte-exact
             # equivalence and measure 1-vs-4 throughput for each authority.
             if [[ "$plan_stage" == "$gate_stage" && \
