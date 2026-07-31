@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -71,7 +72,12 @@ def _payload_artifact(
     }
 
 
-def _validate_source_receipt(value: Any, label: str) -> dict[str, Any]:
+def _validate_source_receipt(
+    value: Any,
+    label: str,
+    *,
+    reprove_local: bool = False,
+) -> dict[str, Any]:
     value = contract.exact_keys(
         value,
         (
@@ -90,28 +96,139 @@ def _validate_source_receipt(value: Any, label: str) -> dict[str, Any]:
         raise contract.ContractError(f"{label} is not clean SemTalk source")
     contract.require_git_oid(value["commit"], f"{label}.commit")
     contract.require_git_oid(value["tree"], f"{label}.tree")
-    script = contract.regular_file(
-        value["script"],
-        f"{label}.script",
-        val_only=False,
+    if (
+        not isinstance(value["source_root"], str)
+        or not Path(value["source_root"]).is_absolute()
+        or not isinstance(value["script"], str)
+        or not Path(value["script"]).is_absolute()
+    ):
+        raise contract.ContractError(f"{label} source paths must be absolute")
+    relative = contract._portable_relative(
+        value["script_relative"],
+        f"{label}.script_relative",
     )
     script_sha = contract.require_sha256(
         value["script_sha256"],
         f"{label}.script_sha256",
     )
-    if contract.sha256_file(script) != script_sha:
-        raise contract.ContractError(f"{label} script changed")
     root = Path(value["source_root"])
-    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
-        raise contract.ContractError(f"{label}.source_root is invalid")
-    root = root.resolve(strict=True)
+    script = Path(value["script"])
     try:
-        relative = str(script.relative_to(root))
+        observed_relative = script.relative_to(root).as_posix()
     except ValueError as error:
         raise contract.ContractError(f"{label} script escapes source root") from error
-    if relative != value["script_relative"]:
+    if observed_relative != relative:
         raise contract.ContractError(f"{label}.script_relative mismatch")
+    if reprove_local:
+        if root.is_symlink() or not root.is_dir():
+            raise contract.ContractError(f"{label}.source_root is invalid")
+        resolved_root = root.resolve(strict=True)
+        resolved_script = contract.regular_file(
+            script,
+            f"{label}.script",
+            val_only=False,
+        )
+        try:
+            resolved_relative = resolved_script.relative_to(
+                resolved_root
+            ).as_posix()
+        except ValueError as error:
+            raise contract.ContractError(
+                f"{label} resolved script escapes source root"
+            ) from error
+        if (
+            resolved_relative != relative
+            or contract.sha256_file(resolved_script) != script_sha
+        ):
+            raise contract.ContractError(f"{label} live script changed")
     return dict(value)
+
+
+def _portable_source_identity(
+    value: Mapping[str, Any],
+    label: str,
+) -> dict[str, str]:
+    value = _validate_source_receipt(value, label, reprove_local=False)
+    return {
+        "origin": value["origin"],
+        "commit": value["commit"],
+        "tree": value["tree"],
+        "script_relative": value["script_relative"],
+        "script_sha256": value["script_sha256"],
+    }
+
+
+def _repository_identity(
+    value: Mapping[str, Any],
+    label: str,
+) -> dict[str, str]:
+    source = _validate_source_receipt(value, label, reprove_local=False)
+    return {
+        "origin": source["origin"],
+        "commit": source["commit"],
+        "tree": source["tree"],
+    }
+
+
+def _expected_shard_paths() -> set[Path]:
+    return {
+        Path("shards")
+        / stage
+        / f"epoch_{epoch:04d}"
+        / f"shard_{shard_index:02d}.json"
+        for stage in contract.STAGES
+        for epoch in contract.EXPECTED_CANDIDATE_EPOCHS
+        for shard_index in range(contract.EXPECTED_SHARDS)
+    }
+
+
+def _inventory_shard_subtree(
+    root: Path,
+    *,
+    expected_files: set[Path],
+) -> set[Path]:
+    expected_directories = {Path("shards")}
+    for path in expected_files:
+        expected_directories.update(path.parents)
+    expected_directories.discard(Path("."))
+    shard_directory = root / "shards"
+    try:
+        shard_mode = os.lstat(shard_directory).st_mode
+    except FileNotFoundError:
+        raise contract.ContractError(
+            f"shard root lacks its shards subtree: {root}"
+        ) from None
+    if stat.S_ISLNK(shard_mode) or not stat.S_ISDIR(shard_mode):
+        raise contract.ContractError("shards subtree must be a non-symlink directory")
+    observed_files: set[Path] = set()
+    stack = [(shard_directory, Path("shards"))]
+    while stack:
+        directory, relative_directory = stack.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative = relative_directory / entry.name
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    raise contract.ContractError(
+                        f"shard subtree contains a symlink: {relative}"
+                    )
+                if stat.S_ISDIR(mode):
+                    if relative not in expected_directories:
+                        raise contract.ContractError(
+                            f"unexpected shard directory: {relative}"
+                        )
+                    stack.append((Path(entry.path), relative))
+                elif stat.S_ISREG(mode):
+                    if relative not in expected_files:
+                        raise contract.ContractError(
+                            f"unexpected shard file: {relative}"
+                        )
+                    observed_files.add(relative)
+                else:
+                    raise contract.ContractError(
+                        f"shard subtree contains a special file: {relative}"
+                    )
+    return observed_files
 
 
 def _validate_artifact(
@@ -538,7 +655,11 @@ def merge(
         raise contract.ContractError("measurement output root must be absolute")
     output_parent = output_root.parent.resolve(strict=True)
     output_root = output_parent / output_root.name
-    merge_source = _validate_source_receipt(merge_source, "merge source")
+    merge_source = _validate_source_receipt(
+        merge_source,
+        "merge source",
+        reprove_local=True,
+    )
     candidate_index, candidate_artifact = contract.load_candidate_index(
         candidate_index_path,
         candidate_index_sha256,
@@ -569,6 +690,27 @@ def merge(
         if shard_root in resolved_shard_roots:
             raise contract.ContractError("shard root is duplicated")
         resolved_shard_roots.append(shard_root)
+    expected_shard_paths = _expected_shard_paths()
+    shard_locations: dict[Path, Path] = {}
+    for shard_root in resolved_shard_roots:
+        observed = _inventory_shard_subtree(
+            shard_root,
+            expected_files=expected_shard_paths,
+        )
+        for relative in observed:
+            if relative in shard_locations:
+                raise contract.ContractError(
+                    f"duplicate shard path across roots: {relative}"
+                )
+            shard_locations[relative] = shard_root / relative
+    observed_shard_paths = set(shard_locations)
+    if observed_shard_paths != expected_shard_paths:
+        missing = sorted(expected_shard_paths - observed_shard_paths)
+        extra = sorted(observed_shard_paths - expected_shard_paths)
+        raise contract.ContractError(
+            "shard subtree inventory is not the exact expected 400 files; "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
     candidate_receipt = {
         **candidate_artifact,
         "receipt_payload_sha256": candidate_index[
@@ -606,18 +748,7 @@ def merge(
                     / f"epoch_{epoch:04d}"
                     / f"shard_{shard_index:02d}.json"
                 )
-                matches = [
-                    root / relative
-                    for root in resolved_shard_roots
-                    if os.path.lexists(root / relative)
-                ]
-                if len(matches) != 1:
-                    raise contract.ContractError(
-                        f"{stage} epoch {epoch} shard {shard_index} "
-                        f"must exist in exactly one shard root; "
-                        f"observed={len(matches)}"
-                    )
-                path = matches[0]
+                path = shard_locations[relative]
                 value, receipt = _read_shard(
                     path,
                     stage=stage,
@@ -629,9 +760,15 @@ def merge(
                 )
                 if evaluator_source is None:
                     evaluator_source = value["source"]
-                elif value["source"] != evaluator_source:
+                elif _portable_source_identity(
+                    value["source"],
+                    "shard evaluator source",
+                ) != _portable_source_identity(
+                    evaluator_source,
+                    "first shard evaluator source",
+                ):
                     raise contract.ContractError(
-                        "evaluator source changed across shards"
+                        "evaluator portable source changed across shards"
                     )
                 versions = {
                     key: value["runtime"][key]
@@ -754,6 +891,13 @@ def merge(
             }
         )
     assert evaluator_source is not None
+    if _repository_identity(
+        evaluator_source,
+        "evaluator source",
+    ) != _repository_identity(merge_source, "merge source"):
+        raise contract.ContractError(
+            "evaluator and merge repository identities differ"
+        )
     final_stage_receipts = {}
     for stage in contract.STAGES:
         encoded = (

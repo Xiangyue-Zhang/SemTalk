@@ -75,31 +75,13 @@ def _checkpoint_payload(
         "audit",
     }:
         raise RuntimeError("candidate checkpoint container schema mismatch")
-    audit = checkpoint["audit"]
-    if (
-        not isinstance(audit, dict)
-        or audit.get("format") != "semtalk_show_representation_candidate_v1"
-        or audit.get("formal_stage") != stage
-        or audit.get("completed_epochs") != epoch
-        or audit.get("optimizer_updates") != optimizer_updates
-        or audit.get("selection_status") != "offline_validation_pending"
-    ):
-        raise RuntimeError("candidate checkpoint audit binding mismatch")
-    source = audit.get("source_receipt")
-    source = contract.validate_training_audit_source(
-        source,
-        "candidate training source",
+    audit = contract.validate_representation_candidate_audit(
+        checkpoint["audit"],
+        stage=stage,
+        epoch=epoch,
+        label="candidate checkpoint audit",
+        reprove_paths=False,
     )
-    source_sha = hashlib.sha256(
-        json.dumps(
-            source,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    if audit.get("source_receipt_sha256") != source_sha:
-        raise RuntimeError("candidate source receipt payload hash mismatch")
     state: dict[str, Any] = {}
     raw_state = checkpoint["model_state"]
     if not isinstance(raw_state, dict) or not raw_state:

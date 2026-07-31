@@ -48,7 +48,58 @@ STAGE_MEASUREMENT_FORMAT = (
 )
 MEASUREMENT_FORMAT = "semtalk_show_prerequisite_val_measurement_index_v1"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
-TRAINING_SOURCE_FREEZE_FORMAT = "semtalk_show_training_source_freeze_v1"
+TRAINING_SOURCE_FREEZE_FORMAT = "semtalk_show_training_source_freeze_v2"
+
+SHOW_SPEAKERS = {"oliver": 0, "chemistry": 1, "seth": 2, "conan": 3}
+OFFICIAL_INITIALIZATION = {
+    "face": {
+        "filename": "rvq_face_600.bin",
+        "sha256": (
+            "31b04c88456a25f4d57841c0cb507b4c856daccb3875878d06545110a6152127"
+        ),
+    },
+    "hands": {
+        "filename": "rvq_hands_500.bin",
+        "sha256": (
+            "08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a38055ca47a539b03e436"
+        ),
+    },
+    "upper": {
+        "filename": "rvq_upper_500.bin",
+        "sha256": (
+            "05101461e75b4e9b687ef30437585d56969c6a13d0047b91000b31d88d08ac17"
+        ),
+    },
+    "lower": {
+        "filename": "rvq_lower_600.bin",
+        "sha256": (
+            "2bb43d10e5f32d13d21e6b85580a1b70d36e407c8552a7e62f99c171ae4efce8"
+        ),
+    },
+    "global": {
+        "filename": "last_1700_foot.bin",
+        "sha256": (
+            "6e6f88abd98ccbe2c52102b937067f4ade0aa307d6e1dac8e127e19e0144ee12"
+        ),
+    },
+}
+
+REPRESENTATION_CANDIDATE_AUDIT_KEYS = (
+    "format",
+    "formal_stage",
+    "completed_epochs",
+    "optimizer_updates",
+    "config_sha256",
+    "lineage_manifest_sha256",
+    "dataset_receipt_sha256",
+    "source_receipt",
+    "source_receipt_sha256",
+    "initialization_receipt",
+    "rvq_ema_prior_receipt",
+    "distributed_training_receipt",
+    "rvq_rank_state_receipt",
+    "selection_status",
+)
 
 SELECTION_METRICS = {
     "face": "face_geometry_expression_objective_v1",
@@ -284,6 +335,8 @@ def read_verified_file(
 def validate_training_audit_source(
     value: Any,
     label: str,
+    *,
+    reprove_entrypoint: bool = True,
 ) -> dict[str, Any]:
     """Validate the exact limited source receipt embedded by e2d training."""
     value = exact_keys(
@@ -301,17 +354,57 @@ def validate_training_audit_source(
         raise ContractError(f"{label} origin mismatch")
     require_git_oid(value["commit"], f"{label}.commit")
     require_git_oid(value["tree"], f"{label}.tree")
-    entrypoint = regular_file(
-        value["entrypoint"],
-        f"{label}.entrypoint",
-        val_only=False,
-    )
+    entrypoint_value = value["entrypoint"]
+    if (
+        not isinstance(entrypoint_value, str)
+        or not Path(entrypoint_value).is_absolute()
+    ):
+        raise ContractError(f"{label}.entrypoint must be absolute")
     expected_sha = require_sha256(
         value["entrypoint_sha256"],
         f"{label}.entrypoint_sha256",
     )
-    if sha256_file(entrypoint) != expected_sha:
-        raise ContractError(f"{label} entrypoint changed")
+    if reprove_entrypoint:
+        entrypoint = regular_file(
+            entrypoint_value,
+            f"{label}.entrypoint",
+            val_only=False,
+        )
+        if sha256_file(entrypoint) != expected_sha:
+            raise ContractError(f"{label} entrypoint changed")
+    return dict(value)
+
+
+def _portable_relative(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"{label} must be a nonempty relative path")
+    path = Path(value)
+    if path.is_absolute() or value != path.as_posix() or ".." in path.parts:
+        raise ContractError(f"{label} is not a canonical relative path")
+    return value
+
+
+def portable_training_source_identity(
+    value: Any,
+    label: str,
+) -> dict[str, str]:
+    value = exact_keys(
+        value,
+        (
+            "origin",
+            "commit",
+            "tree",
+            "script_relative",
+            "script_sha256",
+        ),
+        label,
+    )
+    if value["origin"] != EXPECTED_ORIGIN:
+        raise ContractError(f"{label}.origin mismatch")
+    require_git_oid(value["commit"], f"{label}.commit")
+    require_git_oid(value["tree"], f"{label}.tree")
+    _portable_relative(value["script_relative"], f"{label}.script_relative")
+    require_sha256(value["script_sha256"], f"{label}.script_sha256")
     return dict(value)
 
 
@@ -320,7 +413,11 @@ def freeze_training_audit_source(
     label: str,
 ) -> dict[str, Any]:
     """Prove and enrich the limited training receipt at index-freeze time."""
-    training_audit = validate_training_audit_source(value, label)
+    training_audit = validate_training_audit_source(
+        value,
+        label,
+        reprove_entrypoint=True,
+    )
     entrypoint = Path(training_audit["entrypoint"]).resolve(strict=True)
 
     def git(*arguments: str, check: bool = True) -> str:
@@ -374,14 +471,16 @@ def freeze_training_audit_source(
             "format": TRAINING_SOURCE_FREEZE_FORMAT,
             "training_audit": training_audit,
             "source_root": str(source_root),
-            "origin": origin,
-            "commit": commit,
-            "tree": tree,
+            "portable_identity": {
+                "origin": origin,
+                "commit": commit,
+                "tree": tree,
+                "script_relative": relative,
+                "script_sha256": training_audit["entrypoint_sha256"],
+            },
             "clean": True,
             "detached": True,
             "local_branch_count": 0,
-            "entrypoint_relative": relative,
-            "entrypoint_sha256": training_audit["entrypoint_sha256"],
         }
     )
 
@@ -399,14 +498,10 @@ def validate_frozen_training_source(
             "format",
             "training_audit",
             "source_root",
-            "origin",
-            "commit",
-            "tree",
+            "portable_identity",
             "clean",
             "detached",
             "local_branch_count",
-            "entrypoint_relative",
-            "entrypoint_sha256",
             "receipt_payload_sha256",
         ),
         label,
@@ -414,31 +509,36 @@ def validate_frozen_training_source(
     training_audit = validate_training_audit_source(
         value["training_audit"],
         f"{label}.training_audit",
+        reprove_entrypoint=False,
+    )
+    portable = portable_training_source_identity(
+        value["portable_identity"],
+        f"{label}.portable_identity",
     )
     if (
         value["format"] != TRAINING_SOURCE_FREEZE_FORMAT
-        or value["origin"] != EXPECTED_ORIGIN
-        or value["origin"] != training_audit["origin"]
-        or value["commit"] != training_audit["commit"]
-        or value["tree"] != training_audit["tree"]
+        or portable["origin"] != training_audit["origin"]
+        or portable["commit"] != training_audit["commit"]
+        or portable["tree"] != training_audit["tree"]
+        or portable["script_sha256"]
+        != training_audit["entrypoint_sha256"]
         or value["clean"] is not True
         or value["detached"] is not True
         or value["local_branch_count"] != 0
-        or value["entrypoint_sha256"]
-        != training_audit["entrypoint_sha256"]
     ):
         raise ContractError(f"{label} freeze binding mismatch")
     root = Path(value["source_root"])
-    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
-        raise ContractError(f"{label}.source_root is invalid")
-    root = root.resolve(strict=True)
-    entrypoint = Path(training_audit["entrypoint"]).resolve(strict=True)
+    if not root.is_absolute():
+        raise ContractError(f"{label}.source_root must be absolute")
+    entrypoint = Path(training_audit["entrypoint"])
+    if not entrypoint.is_absolute():
+        raise ContractError(f"{label} entrypoint must be absolute")
     try:
-        relative = str(entrypoint.relative_to(root))
+        relative = entrypoint.relative_to(root).as_posix()
     except ValueError as error:
         raise ContractError(f"{label} entrypoint escapes source root") from error
-    if relative != value["entrypoint_relative"]:
-        raise ContractError(f"{label} entrypoint relative path mismatch")
+    if relative != portable["script_relative"]:
+        raise ContractError(f"{label} portable script path mismatch")
     if reprove_checkout:
         observed = freeze_training_audit_source(training_audit, label)
         if observed != value:
@@ -467,6 +567,320 @@ def verify_receipt_payload(payload: Any, label: str) -> dict[str, Any]:
             f"{label} receipt payload mismatch: {claimed} != {observed}"
         )
     return payload
+
+
+def verify_named_compact_hash(
+    value: Any,
+    *,
+    hash_key: str,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ContractError(f"{label} must be an object")
+    claimed = require_sha256(value.get(hash_key), f"{label}.{hash_key}")
+    unsigned = dict(value)
+    unsigned.pop(hash_key, None)
+    if canonical_payload_sha256(unsigned) != claimed:
+        raise ContractError(f"{label} compact self-hash mismatch")
+    return dict(value)
+
+
+def validate_initialization_receipt(
+    value: Any,
+    *,
+    stage: str,
+    label: str,
+    reprove_path: bool,
+) -> dict[str, Any]:
+    value = exact_keys(
+        value,
+        (
+            "stage",
+            "path",
+            "filename",
+            "sha256",
+            "official_all_speakers",
+            "withdrawn_e30_allowed",
+            "model_state_sha256",
+        ),
+        label,
+    )
+    spec = OFFICIAL_INITIALIZATION.get(stage)
+    if spec is None:
+        raise ContractError(f"{label}: unsupported stage")
+    path_value = value["path"]
+    if (
+        not isinstance(path_value, str)
+        or not Path(path_value).is_absolute()
+    ):
+        raise ContractError(f"{label}.path must be absolute")
+    reject_forbidden_label(path_value, f"{label}.path")
+    checkpoint_sha = require_sha256(value["sha256"], f"{label}.sha256")
+    require_sha256(
+        value["model_state_sha256"],
+        f"{label}.model_state_sha256",
+    )
+    if (
+        value["stage"] != stage
+        or value["filename"] != spec["filename"]
+        or Path(path_value).name != spec["filename"]
+        or checkpoint_sha != spec["sha256"]
+        or value["official_all_speakers"] is not True
+        or value["withdrawn_e30_allowed"] is not False
+    ):
+        raise ContractError(f"{label} official All-Speakers binding mismatch")
+    if reprove_path:
+        resolved = regular_file(path_value, f"{label}.path")
+        if sha256_file(resolved) != checkpoint_sha:
+            raise ContractError(f"{label} checkpoint changed")
+    return dict(value)
+
+
+def validate_distributed_training_receipt(
+    value: Any,
+    *,
+    stage: str,
+    label: str,
+) -> dict[str, Any]:
+    value = exact_keys(
+        verify_named_compact_hash(
+            value,
+            hash_key="receipt_sha256",
+            label=label,
+        ),
+        (
+            "format",
+            "formal_stage",
+            "world_size",
+            "local_batch_size",
+            "global_batch_size",
+            "train_samples",
+            "available_train_samples",
+            "consumed_samples_per_epoch",
+            "dropped_samples_per_epoch",
+            "padding_or_duplicate_samples_per_epoch",
+            "updates_per_epoch",
+            "loader_drop_last",
+            "sampler",
+            "rvq_ema",
+            "receipt_sha256",
+        ),
+        label,
+    )
+    world_size = require_exact_int(value["world_size"], f"{label}.world_size")
+    local_batch = require_exact_int(
+        value["local_batch_size"],
+        f"{label}.local_batch_size",
+    )
+    seed = None
+    sampler = value["sampler"]
+    if not isinstance(sampler, dict):
+        raise ContractError(f"{label}.sampler must be an object")
+    seed = require_exact_int(sampler.get("seed"), f"{label}.sampler.seed")
+    if seed < 0:
+        raise ContractError(f"{label}.sampler.seed must be nonnegative")
+    if stage in RVQ_STAGES:
+        expected_sampler = {
+            "class": "torch.utils.data.distributed.DistributedSampler",
+            "shuffle": True,
+            "seed": seed,
+            "drop_last": True,
+            "set_epoch": "before every epoch",
+        }
+        expected_ema = {
+            "enabled": True,
+            "assignment": "rank-local Gumbel samples from seed + global rank",
+            "statistics": ["code_count", "code_sum"],
+            "collective": "all_reduce SUM",
+            "initialization": "global rank-ordered prefix; rank0 broadcast",
+            "dead_code_reset": (
+                "global rank-ordered prefix on demand; rank0 broadcast"
+            ),
+            "perplexity": "global code_count all_reduce SUM",
+            "rank_state": "exact SHA-256 agreement at save/resume/finalize",
+        }
+        valid_parallelism = (
+            world_size in {2, 4}
+            and local_batch * world_size == 256
+        )
+    else:
+        expected_sampler = {
+            "class": "RandomSampler",
+            "shuffle": True,
+            "seed": seed,
+            "drop_last": True,
+            "set_epoch": None,
+        }
+        expected_ema = {"enabled": False}
+        valid_parallelism = world_size == 1 and local_batch == 256
+    integer_expectations = {
+        "global_batch_size": 256,
+        "train_samples": 127_286,
+        "available_train_samples": 127_286,
+        "consumed_samples_per_epoch": 127_232,
+        "dropped_samples_per_epoch": 54,
+        "padding_or_duplicate_samples_per_epoch": 0,
+        "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+    }
+    if (
+        value["format"] != "semtalk_show_representation_ddp_v1"
+        or value["formal_stage"] != stage
+        or not valid_parallelism
+        or value["loader_drop_last"] is not True
+        or value["sampler"] != expected_sampler
+        or value["rvq_ema"] != expected_ema
+    ):
+        raise ContractError(f"{label} distributed protocol mismatch")
+    for key, expected in integer_expectations.items():
+        if require_exact_int(value[key], f"{label}.{key}") != expected:
+            raise ContractError(f"{label}.{key} mismatch")
+    return dict(value)
+
+
+def validate_rvq_ema_prior_receipt(
+    value: Any,
+    *,
+    stage: str,
+    label: str,
+) -> dict[str, Any] | None:
+    if stage == "global":
+        if value is not None:
+            raise ContractError(f"{label} must be null for Global")
+        return None
+    value = exact_keys(value, ("format", "layers"), label)
+    layers = value["layers"]
+    if (
+        value["format"] != "semtalk_show_official_rvq_ema_prior_v2"
+        or not isinstance(layers, list)
+        or len(layers) != RVQ_LEVELS
+    ):
+        raise ContractError(f"{label} RVQ EMA-prior schema mismatch")
+    names: set[str] = set()
+    for index, layer in enumerate(layers):
+        layer = exact_keys(
+            layer,
+            ("name", "ema_decay", "prior_count"),
+            f"{label}.layers[{index}]",
+        )
+        name = layer["name"]
+        decay = require_finite(
+            layer["ema_decay"],
+            f"{label}.layers[{index}].ema_decay",
+        )
+        prior = require_finite(
+            layer["prior_count"],
+            f"{label}.layers[{index}].prior_count",
+        )
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in names
+            or not 0.0 < decay < 1.0
+            or prior <= 1.0
+            or not math.isclose(prior, 1.0 / (1.0 - decay))
+        ):
+            raise ContractError(f"{label} invalid RVQ EMA-prior layer")
+        names.add(name)
+    return dict(value)
+
+
+def validate_rvq_rank_state_receipt(
+    value: Any,
+    *,
+    stage: str,
+    distributed: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any] | None:
+    if stage == "global":
+        if value is not None:
+            raise ContractError(f"{label} must be null for Global")
+        return None
+    value = exact_keys(
+        value,
+        ("format", "world_size", "state_sha256", "all_ranks_exact"),
+        label,
+    )
+    if (
+        value["format"] != "semtalk_show_rvq_rank_state_v1"
+        or require_exact_int(value["world_size"], f"{label}.world_size")
+        != distributed["world_size"]
+        or value["all_ranks_exact"] is not True
+    ):
+        raise ContractError(f"{label} rank-state mismatch")
+    require_sha256(value["state_sha256"], f"{label}.state_sha256")
+    return dict(value)
+
+
+def validate_representation_candidate_audit(
+    value: Any,
+    *,
+    stage: str,
+    epoch: int,
+    label: str,
+    reprove_paths: bool,
+) -> dict[str, Any]:
+    value = exact_keys(value, REPRESENTATION_CANDIDATE_AUDIT_KEYS, label)
+    updates = epoch * EXPECTED_UPDATES_PER_EPOCH
+    if (
+        stage not in STAGES
+        or epoch not in EXPECTED_CANDIDATE_EPOCHS
+        or value["format"] != "semtalk_show_representation_candidate_v1"
+        or value["formal_stage"] != stage
+        or require_exact_int(
+            value["completed_epochs"],
+            f"{label}.completed_epochs",
+        )
+        != epoch
+        or require_exact_int(
+            value["optimizer_updates"],
+            f"{label}.optimizer_updates",
+        )
+        != updates
+        or value["selection_status"] != "offline_validation_pending"
+    ):
+        raise ContractError(f"{label} candidate protocol mismatch")
+    for key in (
+        "config_sha256",
+        "lineage_manifest_sha256",
+        "dataset_receipt_sha256",
+    ):
+        require_sha256(value[key], f"{label}.{key}")
+    source = validate_training_audit_source(
+        value["source_receipt"],
+        f"{label}.source_receipt",
+        reprove_entrypoint=reprove_paths,
+    )
+    if (
+        require_sha256(
+            value["source_receipt_sha256"],
+            f"{label}.source_receipt_sha256",
+        )
+        != canonical_payload_sha256(source)
+    ):
+        raise ContractError(f"{label} source payload hash mismatch")
+    validate_initialization_receipt(
+        value["initialization_receipt"],
+        stage=stage,
+        label=f"{label}.initialization_receipt",
+        reprove_path=reprove_paths,
+    )
+    distributed = validate_distributed_training_receipt(
+        value["distributed_training_receipt"],
+        stage=stage,
+        label=f"{label}.distributed_training_receipt",
+    )
+    validate_rvq_ema_prior_receipt(
+        value["rvq_ema_prior_receipt"],
+        stage=stage,
+        label=f"{label}.rvq_ema_prior_receipt",
+    )
+    validate_rvq_rank_state_receipt(
+        value["rvq_rank_state_receipt"],
+        stage=stage,
+        distributed=distributed,
+        label=f"{label}.rvq_rank_state_receipt",
+    )
+    return dict(value)
 
 
 def atomic_json_new(path: Path, payload: Mapping[str, Any]) -> str:
@@ -577,25 +991,65 @@ def load_val_canonical(
         raise ContractError("validation canonical clip count mismatch")
     indices: list[int] = []
     clip_ids: list[str] = []
+    canonical_paths: list[Path] = []
+    speakers: set[str] = set()
+    required_row_keys = {
+        "global_index",
+        "clip_id",
+        "split",
+        "speaker",
+        "speaker_id",
+        "frames",
+        "canonical_npz",
+        "canonical_npz_sha256",
+    }
     for line_number, row in enumerate(rows, 1):
+        if not required_row_keys <= set(row):
+            raise ContractError(
+                f"validation row {line_number} schema is incomplete"
+            )
         index = require_exact_int(
             row.get("global_index"),
             f"validation row {line_number} global_index",
         )
         clip_id = row.get("clip_id")
+        speaker = row.get("speaker")
+        speaker_id = require_exact_int(
+            row.get("speaker_id"),
+            f"validation row {line_number} speaker_id",
+        )
+        frames = require_exact_int(
+            row.get("frames"),
+            f"validation row {line_number} frames",
+        )
         if (
             row.get("split") != "val"
             or not isinstance(clip_id, str)
             or not clip_id
+            or not isinstance(speaker, str)
+            or SHOW_SPEAKERS.get(speaker) != speaker_id
+            or frames <= 0
+            or window_count(frames) <= 0
         ):
             raise ContractError(f"validation row {line_number} is not val-only")
         reject_forbidden_label(clip_id, f"validation row {line_number} clip_id")
+        canonical_path = regular_file(
+            row.get("canonical_npz"),
+            f"validation row {line_number} canonical_npz",
+        )
+        require_sha256(
+            row.get("canonical_npz_sha256"),
+            f"validation row {line_number} canonical_npz_sha256",
+        )
         indices.append(index)
         clip_ids.append(clip_id)
+        canonical_paths.append(canonical_path)
+        speakers.add(speaker)
     if (
-        indices != sorted(indices)
-        or len(set(indices)) != EXPECTED_VAL_CLIPS
+        indices != list(range(EXPECTED_VAL_CLIPS))
         or len(set(clip_ids)) != EXPECTED_VAL_CLIPS
+        or len(set(canonical_paths)) != EXPECTED_VAL_CLIPS
+        or speakers != set(SHOW_SPEAKERS)
     ):
         raise ContractError("validation rows are not exact-once ordered")
     receipt = {
@@ -752,6 +1206,17 @@ def validate_candidate_index(
             f"{stage} frozen training source",
             reprove_checkout=False,
         )
+    portable_sources = {
+        canonical_payload_sha256(
+            portable_training_source_identity(
+                source_receipts[stage]["portable_identity"],
+                f"{stage} portable training source",
+            )
+        )
+        for stage in STAGES
+    }
+    if len(portable_sources) != 1:
+        raise ContractError("candidate index portable training sources differ")
     observed_paths: set[Path] = set()
     for stage in STAGES:
         entries = stages[stage]
@@ -836,6 +1301,80 @@ def candidate_lookup(
     if len(matches) != 1:
         raise ContractError("candidate index is not exact-once")
     return dict(matches[0])
+
+
+def validate_selection_receipt(value: Any) -> dict[str, Any]:
+    payload = verify_receipt_payload(value, "selection receipt")
+    payload = exact_keys(
+        payload,
+        (
+            "format",
+            "status",
+            "target_dataset",
+            "target_speaker_scope",
+            "split",
+            "test_visible",
+            "protocol",
+            "selection_policy",
+            "canonical_view",
+            "producer_sources",
+            "training_sources",
+            "config_sha256",
+            "candidate_index_receipt",
+            "measurement_index_receipt",
+            "stages",
+            "receipt_payload_sha256",
+        ),
+        "selection receipt",
+    )
+    if (
+        payload["format"] != SELECTION_FORMAT
+        or payload["status"] != "selected"
+        or payload["target_dataset"] != "SHOW"
+        or payload["target_speaker_scope"] != TARGET_SPEAKER_SCOPE
+        or payload["split"] != "val"
+        or payload["test_visible"] is not False
+    ):
+        raise ContractError("selection receipt protocol mismatch")
+    stages = payload["stages"]
+    if (
+        not isinstance(stages, list)
+        or len(stages) != len(STAGES)
+        or any(not isinstance(stage, dict) for stage in stages)
+        or [stage.get("stage") for stage in stages] != list(STAGES)
+    ):
+        raise ContractError("selection receipt stage coverage mismatch")
+    for stage, result in zip(STAGES, stages):
+        result = exact_keys(
+            result,
+            (
+                "stage",
+                "selection_metric",
+                "epoch",
+                "optimizer_updates",
+                "candidate_index",
+                "selection_score",
+                "candidate_checkpoint",
+                "measurement_receipt",
+                "coverage",
+            ),
+            f"{stage} selection result",
+        )
+        epoch = require_exact_int(result["epoch"], f"{stage} selected epoch")
+        if (
+            result["stage"] != stage
+            or result["selection_metric"] != SELECTION_METRICS[stage]
+            or epoch not in EXPECTED_CANDIDATE_EPOCHS
+            or result["optimizer_updates"]
+            != epoch * EXPECTED_UPDATES_PER_EPOCH
+        ):
+            raise ContractError(f"{stage} selection result mismatch")
+        require_finite(
+            result["selection_score"],
+            f"{stage} selection score",
+            nonnegative=True,
+        )
+    return payload
 
 
 def exact_keys(value: Any, keys: Sequence[str], label: str) -> dict[str, Any]:

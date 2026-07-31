@@ -451,6 +451,7 @@ def select(
     selector_source = merger._validate_source_receipt(
         selector_source,
         "selector source",
+        reprove_local=True,
     )
     candidate_index, candidate_artifact = contract.load_candidate_index(
         candidate_index_path,
@@ -573,8 +574,26 @@ def select(
         or set(producer_sources) != {"evaluator", "merge"}
     ):
         raise contract.ContractError("measurement producer roles mismatch")
-    for role, source in producer_sources.items():
-        merger._validate_source_receipt(source, f"{role} source")
+    validated_producers = {
+        role: merger._validate_source_receipt(
+            source,
+            f"{role} source",
+            reprove_local=False,
+        )
+        for role, source in producer_sources.items()
+    }
+    expected_repository = merger._repository_identity(
+        selector_source,
+        "selector source",
+    )
+    for role, source in validated_producers.items():
+        if (
+            merger._repository_identity(source, f"{role} source")
+            != expected_repository
+        ):
+            raise contract.ContractError(
+                f"{role} and selector repository identities differ"
+            )
     stage_receipts = measurement_index["stages"]
     if not isinstance(stage_receipts, dict) or set(stage_receipts) != set(
         contract.STAGES
@@ -742,6 +761,7 @@ def select(
             }
         ):
             raise AssertionError("selection bridge nested schema drift")
+    contract.validate_selection_receipt(result)
     contract.atomic_json_new(output_json, result)
     return result
 

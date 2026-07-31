@@ -41,7 +41,7 @@ def _checkpoint_audit(
     *,
     stage: str,
     epoch: int,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     payload_bytes = path.read_bytes()
     checkpoint = torch.load(
         io.BytesIO(payload_bytes),
@@ -53,32 +53,13 @@ def _checkpoint_audit(
         "audit",
     }:
         raise RuntimeError(f"{path}: invalid representation candidate")
-    audit = checkpoint["audit"]
-    updates = epoch * contract.EXPECTED_UPDATES_PER_EPOCH
-    if (
-        not isinstance(audit, dict)
-        or audit.get("format") != "semtalk_show_representation_candidate_v1"
-        or audit.get("formal_stage") != stage
-        or audit.get("completed_epochs") != epoch
-        or audit.get("optimizer_updates") != updates
-        or audit.get("selection_status") != "offline_validation_pending"
-    ):
-        raise RuntimeError(f"{path}: candidate audit mismatch")
-    source = audit.get("source_receipt")
-    source = contract.validate_training_audit_source(
-        source,
-        f"{path} candidate source",
+    audit = contract.validate_representation_candidate_audit(
+        checkpoint["audit"],
+        stage=stage,
+        epoch=epoch,
+        label=f"{path} candidate audit",
+        reprove_paths=False,
     )
-    source_sha = hashlib.sha256(
-        json.dumps(
-            source,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    if audit.get("source_receipt_sha256") != source_sha:
-        raise RuntimeError(f"{path}: candidate source payload hash mismatch")
     model_state = checkpoint["model_state"]
     if not isinstance(model_state, dict) or not model_state:
         raise RuntimeError(f"{path}: empty candidate model state")
@@ -92,7 +73,7 @@ def _checkpoint_audit(
             )
         ):
             raise RuntimeError(f"{path}: invalid/non-finite model tensor")
-    return audit, contract.sha256_file(path)
+    return audit, contract.sha256_file(path), dict(model_state)
 
 
 def _finite_metrics(value: Any, label: str) -> dict[str, Any]:
@@ -122,8 +103,7 @@ def _audit_final_checkpoint(
     status: dict[str, Any],
     run: Path,
     stage: str,
-    training_source: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     final_path = contract.regular_file(
         status.get("final_checkpoint"),
         f"{stage} final checkpoint",
@@ -154,10 +134,54 @@ def _audit_final_checkpoint(
         or audit.get("formal_stage") != stage
         or audit.get("optimizer_updates")
         != 200 * contract.EXPECTED_UPDATES_PER_EPOCH
-        or audit.get("source_receipt") != training_source
-        or audit.get("config_sha256") != status.get("config_sha256")
     ):
         raise RuntimeError(f"{stage} final checkpoint audit mismatch")
+    source = contract.validate_training_audit_source(
+        audit.get("source_receipt"),
+        f"{stage} final checkpoint source",
+        reprove_entrypoint=False,
+    )
+    if (
+        contract.require_sha256(
+            audit.get("source_receipt_sha256"),
+            f"{stage} final source receipt SHA-256",
+        )
+        != contract.canonical_payload_sha256(source)
+    ):
+        raise RuntimeError(f"{stage} final source payload hash mismatch")
+    for key in (
+        "config_sha256",
+        "lineage_manifest_sha256",
+        "dataset_summary_sha256",
+        "data_mdb_sha256",
+        "dataset_receipt_sha256",
+    ):
+        contract.require_sha256(
+            audit.get(key),
+            f"{stage} final {key}",
+        )
+    contract.validate_initialization_receipt(
+        audit.get("initialization_receipt"),
+        stage=stage,
+        label=f"{stage} final initialization receipt",
+        reprove_path=False,
+    )
+    distributed = contract.validate_distributed_training_receipt(
+        audit.get("distributed_training_receipt"),
+        stage=stage,
+        label=f"{stage} final distributed training receipt",
+    )
+    contract.validate_rvq_ema_prior_receipt(
+        audit.get("rvq_ema_prior_receipt"),
+        stage=stage,
+        label=f"{stage} final RVQ EMA-prior receipt",
+    )
+    contract.validate_rvq_rank_state_receipt(
+        audit.get("rvq_rank_state_receipt"),
+        stage=stage,
+        distributed=distributed,
+        label=f"{stage} final RVQ rank-state receipt",
+    )
     state = checkpoint["model_state"]
     if not isinstance(state, dict) or not state:
         raise RuntimeError(f"{stage} final checkpoint model state is empty")
@@ -173,14 +197,83 @@ def _audit_final_checkpoint(
             raise RuntimeError(f"{stage} final tensor {name!r} is non-finite")
         tensor_count += 1
         element_count += tensor.numel()
-    return {
-        "path": str(final_path),
-        "sha256": expected_sha,
-        "bytes": len(payload),
-        "tensor_count": tensor_count,
-        "element_count": element_count,
-        "all_model_tensors_finite": True,
-    }
+    return (
+        {
+            "path": str(final_path),
+            "sha256": expected_sha,
+            "bytes": len(payload),
+            "tensor_count": tensor_count,
+            "element_count": element_count,
+            "all_model_tensors_finite": True,
+        },
+        dict(audit),
+        dict(state),
+    )
+
+
+def _assert_tensor_states_equal(
+    torch: Any,
+    left: dict[str, Any],
+    right: dict[str, Any],
+    label: str,
+) -> None:
+    if set(left) != set(right):
+        raise RuntimeError(f"{label}: tensor key sets differ")
+    for name in sorted(left):
+        left_value = left[name]
+        right_value = right[name]
+        if (
+            not torch.is_tensor(left_value)
+            or not torch.is_tensor(right_value)
+            or left_value.dtype != right_value.dtype
+            or tuple(left_value.shape) != tuple(right_value.shape)
+            or not bool(
+                torch.equal(
+                    left_value.detach().cpu(),
+                    right_value.detach().cpu(),
+                )
+            )
+        ):
+            raise RuntimeError(f"{label}: tensor {name!r} differs")
+
+
+def _validate_latest_candidate_receipt(
+    value: Any,
+    *,
+    stage: str,
+    candidate: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    value = contract.exact_keys(
+        value,
+        (
+            "path",
+            "sha256",
+            "completed_epochs",
+            "optimizer_updates",
+            "selection_status",
+        ),
+        label,
+    )
+    if value != {
+        "path": candidate["checkpoint"],
+        "sha256": candidate["checkpoint_sha256"],
+        "completed_epochs": 200,
+        "optimizer_updates": 200 * contract.EXPECTED_UPDATES_PER_EPOCH,
+        "selection_status": "offline_validation_pending",
+    }:
+        raise RuntimeError(f"{stage} latest representation candidate mismatch")
+    return dict(value)
+
+
+def _require_common_audit_binding(
+    value: dict[str, Any],
+    expected: dict[str, Any],
+    label: str,
+) -> None:
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise RuntimeError(f"{label}: {key} binding mismatch")
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
@@ -214,40 +307,123 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         status_source = contract.validate_training_audit_source(
             status.get("source_receipt"),
             f"{stage} status training source",
+            reprove_entrypoint=True,
         )
-        status_source_sha = hashlib.sha256(
-            json.dumps(
-                status_source,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        status_source_sha = contract.canonical_payload_sha256(status_source)
+        status_config_sha = contract.require_sha256(
+            status.get("config_sha256"),
+            f"{stage} status config SHA-256",
+        )
+        status_lineage_sha = contract.require_sha256(
+            status.get("lineage_manifest_sha256"),
+            f"{stage} status lineage SHA-256",
+        )
+        status_dataset_receipt = status.get("dataset_receipt")
+        if (
+            not isinstance(status_dataset_receipt, dict)
+            or not status_dataset_receipt
+        ):
+            raise RuntimeError(f"{stage} status dataset receipt is missing")
+        dataset_source_binding = contract.exact_keys(
+            status_dataset_receipt.get("source_binding"),
+            ("origin", "commit", "tree"),
+            f"{stage} status dataset source binding",
+        )
+        if dataset_source_binding != {
+            key: status_source[key]
+            for key in ("origin", "commit", "tree")
+        }:
+            raise RuntimeError(f"{stage} dataset/source binding mismatch")
+        if (
+            status_dataset_receipt.get("entries") != 127_286
+            or status_dataset_receipt.get("train_clips") != 13_687
+            or status_dataset_receipt.get("split_label")
+            != "SHOW available frozen subset"
+        ):
+            raise RuntimeError(f"{stage} dataset accounting mismatch")
+        for key in (
+            "summary_sha256",
+            "lineage_sha256",
+            "data_mdb_sha256",
+        ):
+            contract.require_sha256(
+                status_dataset_receipt.get(key),
+                f"{stage} status dataset {key}",
+            )
+        status_dataset_sha = contract.canonical_payload_sha256(
+            status_dataset_receipt
+        )
+        status_initialization = contract.validate_initialization_receipt(
+            status.get("initialization_receipt"),
+            stage=stage,
+            label=f"{stage} status initialization receipt",
+            reprove_path=True,
+        )
+        status_distributed = (
+            contract.validate_distributed_training_receipt(
+                status.get("distributed_training_receipt"),
+                stage=stage,
+                label=f"{stage} status distributed training receipt",
+            )
+        )
+        status_rvq_prior = contract.validate_rvq_ema_prior_receipt(
+            status.get("rvq_ema_prior_receipt"),
+            stage=stage,
+            label=f"{stage} status RVQ EMA-prior receipt",
+        )
+        status_rvq_rank = contract.validate_rvq_rank_state_receipt(
+            status.get("rvq_rank_state_receipt"),
+            stage=stage,
+            distributed=status_distributed,
+            label=f"{stage} status RVQ rank-state receipt",
+        )
         if (
             status.get("source_receipt_sha256") != status_source_sha
-            or contract.require_sha256(
-                status.get("config_sha256"),
-                f"{stage} status config SHA-256",
-            )
-            != status.get("config_sha256")
-            or contract.require_sha256(
-                status.get("lineage_manifest_sha256"),
-                f"{stage} status lineage SHA-256",
-            )
-            != status.get("lineage_manifest_sha256")
         ):
             raise RuntimeError(f"{stage} status source/config binding mismatch")
         final_metrics = _finite_metrics(
             status.get("last_metrics"),
             f"{stage} status",
         )
-        final_checkpoint_evidence = _audit_final_checkpoint(
+        (
+            final_checkpoint_evidence,
+            final_audit,
+            final_model_state,
+        ) = _audit_final_checkpoint(
             torch,
             status=status,
             run=run,
             stage=stage,
-            training_source=status_source,
         )
+        expected_common = {
+            "source_receipt": status_source,
+            "source_receipt_sha256": status_source_sha,
+            "config_sha256": status_config_sha,
+            "lineage_manifest_sha256": status_lineage_sha,
+            "dataset_receipt_sha256": status_dataset_sha,
+            "initialization_receipt": status_initialization,
+            "rvq_ema_prior_receipt": status_rvq_prior,
+            "distributed_training_receipt": status_distributed,
+        }
+        _require_common_audit_binding(
+            final_audit,
+            expected_common,
+            f"{stage} final/status",
+        )
+        if (
+            final_audit.get("rvq_rank_state_receipt") != status_rvq_rank
+            or final_audit.get("dataset_summary_sha256")
+            != status_dataset_receipt.get("summary_sha256")
+            or final_audit.get("data_mdb_sha256")
+            != status_dataset_receipt.get("data_mdb_sha256")
+            or final_audit.get("smplx_asset_receipt")
+            != status_dataset_receipt.get("smplx_asset")
+            or status.get("smplx_asset_receipt")
+            != status_dataset_receipt.get("smplx_asset")
+        ):
+            raise RuntimeError(
+                f"{stage} final/status dataset or RVQ binding mismatch"
+            )
         resume_path = contract.regular_file(
             run / "latest_resume.pt",
             f"{stage} latest resume",
@@ -284,11 +460,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
             for epoch in contract.EXPECTED_CANDIDATE_EPOCHS
         ]
-        actual = {path.resolve() for path in candidate_dir.iterdir()}
-        if actual != {path.resolve() for path in expected_paths}:
+        actual_paths = list(candidate_dir.iterdir())
+        if (
+            {path.name for path in actual_paths}
+            != {path.name for path in expected_paths}
+            or len(actual_paths) != len(expected_paths)
+            or any(
+                path.is_symlink() or not path.is_file()
+                for path in actual_paths
+            )
+        ):
             raise RuntimeError(f"{stage} candidate file set is not exact")
         entries = []
         stage_audit: dict[str, Any] | None = None
+        final_candidate_model_state: dict[str, Any] | None = None
+        final_candidate_audit: dict[str, Any] | None = None
         for epoch, path in zip(
             contract.EXPECTED_CANDIDATE_EPOCHS,
             expected_paths,
@@ -297,11 +483,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 path,
                 f"{stage} epoch {epoch} candidate",
             )
-            audit, digest = _checkpoint_audit(
+            audit, digest, candidate_model_state = _checkpoint_audit(
                 torch,
                 resolved,
                 stage=stage,
                 epoch=epoch,
+            )
+            _require_common_audit_binding(
+                audit,
+                expected_common,
+                (
+                    f"{stage} epoch {epoch} "
+                    "candidate/status/final"
+                ),
             )
             if stage_audit is None:
                 stage_audit = audit
@@ -313,6 +507,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     "source_receipt",
                     "source_receipt_sha256",
                     "initialization_receipt",
+                    "rvq_ema_prior_receipt",
                     "distributed_training_receipt",
                 ):
                     if audit.get(key) != stage_audit.get(key):
@@ -333,9 +528,40 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                 }
             )
+            if epoch == 200:
+                final_candidate_model_state = candidate_model_state
+                final_candidate_audit = audit
         assert stage_audit is not None
+        assert final_candidate_model_state is not None
+        assert final_candidate_audit is not None
         if stage_audit["source_receipt"] != status_source:
             raise RuntimeError(f"{stage} candidate/status source mismatch")
+        final_candidate = entries[-1]
+        _validate_latest_candidate_receipt(
+            status.get("latest_representation_candidate"),
+            stage=stage,
+            candidate=final_candidate,
+            label=f"{stage} status latest representation candidate",
+        )
+        _validate_latest_candidate_receipt(
+            final_audit.get("latest_representation_candidate"),
+            stage=stage,
+            candidate=final_candidate,
+            label=f"{stage} final latest representation candidate",
+        )
+        if (
+            final_candidate_audit.get("rvq_rank_state_receipt")
+            != status_rvq_rank
+        ):
+            raise RuntimeError(
+                f"{stage} epoch 200/status/final RVQ rank binding mismatch"
+            )
+        _assert_tensor_states_equal(
+            torch,
+            final_candidate_model_state,
+            final_model_state,
+            f"{stage} epoch 200/final model state",
+        )
         source_receipts[stage] = contract.freeze_training_audit_source(
             stage_audit["source_receipt"],
             f"{stage} training source",
@@ -350,13 +576,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         )
         stages[stage] = entries
     source_core = {
-        (
-            value["origin"],
-            value["commit"],
-            value["tree"],
-            value["clean"],
-            value["detached"],
-            value["local_branch_count"],
+        contract.canonical_payload_sha256(
+            contract.portable_training_source_identity(
+                value["portable_identity"],
+                "portable training source",
+            )
         )
         for value in source_receipts.values()
     }

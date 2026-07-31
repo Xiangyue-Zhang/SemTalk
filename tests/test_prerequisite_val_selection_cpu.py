@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -11,6 +12,7 @@ import unittest
 
 
 from scripts.show_base import merge_prerequisite_val_shards as merger
+from scripts.show_base import build_prerequisite_candidate_index as builder
 from scripts.show_base import prerequisite_val_contract as contract
 from scripts.show_base import select_prerequisite_candidates as selector
 
@@ -90,14 +92,16 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "format": contract.TRAINING_SOURCE_FREEZE_FORMAT,
                 "training_audit": training_audit,
                 "source_root": str(source_root.resolve()),
-                "origin": contract.EXPECTED_ORIGIN,
-                "commit": "e" * 40,
-                "tree": "f" * 40,
+                "portable_identity": {
+                    "origin": contract.EXPECTED_ORIGIN,
+                    "commit": "e" * 40,
+                    "tree": "f" * 40,
+                    "script_relative": name,
+                    "script_sha256": digest,
+                },
                 "clean": True,
                 "detached": True,
                 "local_branch_count": 0,
-                "entrypoint_relative": name,
-                "entrypoint_sha256": digest,
             }
         )
 
@@ -113,16 +117,30 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
         Path,
         str,
     ]:
-        rows: list[dict[str, object]] = [
-            {
-                "global_index": index,
-                "clip_id": f"oliver/video-{index}/sequence-{index}",
-                "split": "val",
-                "frames": 90,
-                "canonical_npz_sha256": f"{index:064x}"[-64:],
-            }
-            for index in range(contract.EXPECTED_VAL_CLIPS)
-        ]
+        canonical_root = root / "canonical_npz"
+        canonical_root.mkdir(parents=True)
+        speakers = tuple(contract.SHOW_SPEAKERS)
+        rows: list[dict[str, object]] = []
+        for index in range(contract.EXPECTED_VAL_CLIPS):
+            speaker = speakers[index % len(speakers)]
+            canonical = canonical_root / f"clip_{index:04d}.npz"
+            canonical.write_bytes(f"canonical:{index}\n".encode())
+            rows.append(
+                {
+                    "global_index": index,
+                    "clip_id": (
+                        f"{speaker}/video-{index}/sequence-{index}"
+                    ),
+                    "split": "val",
+                    "speaker": speaker,
+                    "speaker_id": contract.SHOW_SPEAKERS[speaker],
+                    "frames": 90,
+                    "canonical_npz": str(canonical.resolve()),
+                    "canonical_npz_sha256": hashlib.sha256(
+                        canonical.read_bytes()
+                    ).hexdigest(),
+                }
+            )
         manifest = root / "canonical" / "manifest.jsonl"
         manifest_sha = write_jsonl(manifest, rows)
         lineage = root / "canonical" / "lineage.json"
@@ -159,6 +177,27 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             lineage,
             lineage_sha,
         )
+
+    def rewrite_canonical_receipts(
+        self,
+        rows: list[dict[str, object]],
+        manifest: Path,
+        summary: Path,
+        lineage: Path,
+    ) -> tuple[str, str, str]:
+        manifest_sha = write_jsonl(manifest, rows)
+        lineage_payload = json.loads(lineage.read_text())
+        lineage_payload.pop("receipt_payload_sha256")
+        lineage_payload["manifest_sha256"] = manifest_sha
+        lineage_payload = contract.receipt_payload(lineage_payload)
+        lineage_sha = write_json(lineage, lineage_payload)
+        summary_payload = json.loads(summary.read_text())
+        summary_payload.pop("receipt_payload_sha256")
+        summary_payload["manifest_sha256"] = manifest_sha
+        summary_payload["lineage_sha256"] = lineage_sha
+        summary_payload = contract.receipt_payload(summary_payload)
+        summary_sha = write_json(summary, summary_payload)
+        return manifest_sha, summary_sha, lineage_sha
 
     def candidate_fixture(
         self,
@@ -385,19 +424,23 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
     def build_full_fixture(self, root: Path) -> dict[str, object]:
         source_root = root / "source"
         evaluator_source = self.source_receipt(
-            source_root,
+            source_root / "host0",
+            "evaluate_prerequisite_val_shard.py",
+        )
+        evaluator_source_host1 = self.source_receipt(
+            source_root / "host1",
             "evaluate_prerequisite_val_shard.py",
         )
         merge_source = self.source_receipt(
-            source_root,
+            source_root / "merge",
             "merge_prerequisite_val_shards.py",
         )
         selector_source = self.source_receipt(
-            source_root,
+            source_root / "selector",
             "select_prerequisite_candidates.py",
         )
         training_source = self.training_source_receipt(
-            source_root,
+            source_root / "training",
             "show_base_train.py",
         )
         (
@@ -447,6 +490,13 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 shutil.move(str(source), str(destination_parent / source.name))
                 plan_index += 1
         shutil.rmtree(shard_root)
+        for shard_path in (
+            shard_roots[1] / "shards"
+        ).glob("*/*/shard_*.json"):
+            payload = json.loads(shard_path.read_text(encoding="utf-8"))
+            payload.pop("receipt_payload_sha256")
+            payload["producer_source"] = evaluator_source_host1
+            write_json(shard_path, contract.receipt_payload(payload))
         return {
             "rows": rows,
             "manifest": manifest,
@@ -559,6 +609,174 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 ],
             )
             self.assertTrue(output.is_file())
+            contract.validate_selection_receipt(selected)
+            tampered_cases = []
+            tampered = copy.deepcopy(selected)
+            tampered["status"] = "tampered"
+            tampered_cases.append(tampered)
+            tampered = copy.deepcopy(selected)
+            tampered["stages"][0]["epoch"] = 200
+            tampered_cases.append(tampered)
+            tampered = copy.deepcopy(selected)
+            tampered["producer_sources"]["selector"]["tree"] = "0" * 40
+            tampered_cases.append(tampered)
+            for tampered in tampered_cases:
+                with self.assertRaisesRegex(
+                    contract.ContractError,
+                    "receipt payload mismatch",
+                ):
+                    contract.validate_selection_receipt(tampered)
+
+            mismatched_selector = copy.deepcopy(
+                fixture["selector_source"]
+            )
+            mismatched_selector["commit"] = "c" * 40
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "repository identities differ",
+            ):
+                selector.select(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    measurement_index_path=measurement_index,
+                    measurement_index_sha256=measurement_sha,
+                    output_json=root / "mismatched_selector.json",
+                    selector_source=mismatched_selector,
+                )
+
+            mismatched_shard = (
+                fixture["shard_roots"][1]
+                / "shards"
+                / "face"
+                / "epoch_0040"
+                / "shard_00.json"
+            )
+            original_shard_bytes = mismatched_shard.read_bytes()
+            mismatched_payload = json.loads(
+                original_shard_bytes.decode("utf-8")
+            )
+            mismatched_payload.pop("receipt_payload_sha256")
+            mismatched_payload["producer_source"]["commit"] = "c" * 40
+            write_json(
+                mismatched_shard,
+                contract.receipt_payload(mismatched_payload),
+            )
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "portable source changed",
+            ):
+                merger.merge(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    canonical_manifest=fixture["manifest"],
+                    canonical_manifest_sha256=fixture["manifest_sha"],
+                    canonical_summary=fixture["summary"],
+                    canonical_summary_sha256=fixture["summary_sha"],
+                    canonical_lineage=fixture["lineage"],
+                    canonical_lineage_sha256=fixture["lineage_sha"],
+                    shard_roots=fixture["shard_roots"],
+                    output_root=root / "source_mismatch_measurements",
+                    merge_source=fixture["merge_source"],
+                )
+            mismatched_shard.write_bytes(original_shard_bytes)
+
+            shard_tree = fixture["shard_roots"][0] / "shards"
+            extra_stage = shard_tree / "extra_stage"
+            extra_stage.mkdir()
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "unexpected shard directory",
+            ):
+                merger.merge(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    canonical_manifest=fixture["manifest"],
+                    canonical_manifest_sha256=fixture["manifest_sha"],
+                    canonical_summary=fixture["summary"],
+                    canonical_summary_sha256=fixture["summary_sha"],
+                    canonical_lineage=fixture["lineage"],
+                    canonical_lineage_sha256=fixture["lineage_sha"],
+                    shard_roots=fixture["shard_roots"],
+                    output_root=root / "extra_stage_measurements",
+                    merge_source=fixture["merge_source"],
+                )
+            extra_stage.rmdir()
+
+            extra_epoch = shard_tree / "face" / "epoch_9999"
+            extra_epoch.mkdir()
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "unexpected shard directory",
+            ):
+                merger.merge(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    canonical_manifest=fixture["manifest"],
+                    canonical_manifest_sha256=fixture["manifest_sha"],
+                    canonical_summary=fixture["summary"],
+                    canonical_summary_sha256=fixture["summary_sha"],
+                    canonical_lineage=fixture["lineage"],
+                    canonical_lineage_sha256=fixture["lineage_sha"],
+                    shard_roots=fixture["shard_roots"],
+                    output_root=root / "extra_epoch_measurements",
+                    merge_source=fixture["merge_source"],
+                )
+            extra_epoch.rmdir()
+
+            shard08 = (
+                shard_tree
+                / "face"
+                / "epoch_0020"
+                / "shard_08.json"
+            )
+            shutil.copyfile(
+                shard08.with_name("shard_00.json"),
+                shard08,
+            )
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "unexpected shard file",
+            ):
+                merger.merge(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    canonical_manifest=fixture["manifest"],
+                    canonical_manifest_sha256=fixture["manifest_sha"],
+                    canonical_summary=fixture["summary"],
+                    canonical_summary_sha256=fixture["summary_sha"],
+                    canonical_lineage=fixture["lineage"],
+                    canonical_lineage_sha256=fixture["lineage_sha"],
+                    shard_roots=fixture["shard_roots"],
+                    output_root=root / "shard08_measurements",
+                    merge_source=fixture["merge_source"],
+                )
+            shard08.unlink()
+
+            shard_symlink = (
+                shard_tree
+                / "face"
+                / "epoch_0020"
+                / "shard_alias.json"
+            )
+            shard_symlink.symlink_to("shard_00.json")
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "contains a symlink",
+            ):
+                merger.merge(
+                    candidate_index_path=fixture["candidate_path"],
+                    candidate_index_sha256=fixture["candidate_sha"],
+                    canonical_manifest=fixture["manifest"],
+                    canonical_manifest_sha256=fixture["manifest_sha"],
+                    canonical_summary=fixture["summary"],
+                    canonical_summary_sha256=fixture["summary_sha"],
+                    canonical_lineage=fixture["lineage"],
+                    canonical_lineage_sha256=fixture["lineage_sha"],
+                    shard_roots=fixture["shard_roots"],
+                    output_root=root / "symlink_measurements",
+                    merge_source=fixture["merge_source"],
+                )
+            shard_symlink.unlink()
 
             duplicate_source = (
                 fixture["shard_roots"][0]
@@ -578,7 +796,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             shutil.copyfile(duplicate_source, duplicate_target)
             with self.assertRaisesRegex(
                 contract.ContractError,
-                "exactly one shard root",
+                "duplicate shard path",
             ):
                 merger.merge(
                     candidate_index_path=fixture["candidate_path"],
@@ -605,7 +823,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             missing.unlink()
             with self.assertRaisesRegex(
                 contract.ContractError,
-                "exactly one shard root",
+                "inventory is not the exact expected 400",
             ):
                 merger.merge(
                     candidate_index_path=fixture["candidate_path"],
@@ -672,6 +890,264 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             ):
                 contract.validate_candidate_index(broken)
 
+    def test_candidate_audit_exact_schema_and_status_final_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = "face"
+            epoch = 200
+            source = {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "origin": contract.EXPECTED_ORIGIN,
+                "entrypoint": str((root / "show_base_train.py").resolve()),
+                "entrypoint_sha256": "c" * 64,
+            }
+            initialization_spec = contract.OFFICIAL_INITIALIZATION[stage]
+            initialization = {
+                "stage": stage,
+                "path": str(
+                    (root / initialization_spec["filename"]).resolve()
+                ),
+                "filename": initialization_spec["filename"],
+                "sha256": initialization_spec["sha256"],
+                "official_all_speakers": True,
+                "withdrawn_e30_allowed": False,
+                "model_state_sha256": "d" * 64,
+            }
+            sampler = {
+                "class": (
+                    "torch.utils.data.distributed.DistributedSampler"
+                ),
+                "shuffle": True,
+                "seed": 43,
+                "drop_last": True,
+                "set_epoch": "before every epoch",
+            }
+            rvq_ema = {
+                "enabled": True,
+                "assignment": (
+                    "rank-local Gumbel samples from seed + global rank"
+                ),
+                "statistics": ["code_count", "code_sum"],
+                "collective": "all_reduce SUM",
+                "initialization": (
+                    "global rank-ordered prefix; rank0 broadcast"
+                ),
+                "dead_code_reset": (
+                    "global rank-ordered prefix on demand; rank0 broadcast"
+                ),
+                "perplexity": "global code_count all_reduce SUM",
+                "rank_state": (
+                    "exact SHA-256 agreement at save/resume/finalize"
+                ),
+            }
+            distributed_unsigned = {
+                "format": "semtalk_show_representation_ddp_v1",
+                "formal_stage": stage,
+                "world_size": 2,
+                "local_batch_size": 128,
+                "global_batch_size": 256,
+                "train_samples": 127_286,
+                "available_train_samples": 127_286,
+                "consumed_samples_per_epoch": 127_232,
+                "dropped_samples_per_epoch": 54,
+                "padding_or_duplicate_samples_per_epoch": 0,
+                "updates_per_epoch": 497,
+                "loader_drop_last": True,
+                "sampler": sampler,
+                "rvq_ema": rvq_ema,
+            }
+            distributed = {
+                **distributed_unsigned,
+                "receipt_sha256": contract.canonical_payload_sha256(
+                    distributed_unsigned
+                ),
+            }
+            rvq_prior = {
+                "format": "semtalk_show_official_rvq_ema_prior_v2",
+                "layers": [
+                    {
+                        "name": f"quantizer.{index}",
+                        "ema_decay": 0.99,
+                        "prior_count": 100.0,
+                    }
+                    for index in range(contract.RVQ_LEVELS)
+                ],
+            }
+            rvq_rank = {
+                "format": "semtalk_show_rvq_rank_state_v1",
+                "world_size": 2,
+                "state_sha256": "e" * 64,
+                "all_ranks_exact": True,
+            }
+            audit = {
+                "format": "semtalk_show_representation_candidate_v1",
+                "formal_stage": stage,
+                "completed_epochs": epoch,
+                "optimizer_updates": 99_400,
+                "config_sha256": "1" * 64,
+                "lineage_manifest_sha256": "2" * 64,
+                "dataset_receipt_sha256": "3" * 64,
+                "source_receipt": source,
+                "source_receipt_sha256": (
+                    contract.canonical_payload_sha256(source)
+                ),
+                "initialization_receipt": initialization,
+                "rvq_ema_prior_receipt": rvq_prior,
+                "distributed_training_receipt": distributed,
+                "rvq_rank_state_receipt": rvq_rank,
+                "selection_status": "offline_validation_pending",
+            }
+            validated = contract.validate_representation_candidate_audit(
+                audit,
+                stage=stage,
+                epoch=epoch,
+                label="fixture candidate",
+                reprove_paths=False,
+            )
+            self.assertEqual(validated, audit)
+            for mutation in ("extra", "missing"):
+                broken = copy.deepcopy(audit)
+                if mutation == "extra":
+                    broken["unexpected"] = True
+                else:
+                    broken.pop("dataset_receipt_sha256")
+                with self.assertRaisesRegex(
+                    contract.ContractError,
+                    "schema mismatch",
+                ):
+                    contract.validate_representation_candidate_audit(
+                        broken,
+                        stage=stage,
+                        epoch=epoch,
+                        label="fixture candidate",
+                        reprove_paths=False,
+                    )
+            expected_common = {
+                key: audit[key]
+                for key in (
+                    "source_receipt",
+                    "source_receipt_sha256",
+                    "config_sha256",
+                    "lineage_manifest_sha256",
+                    "dataset_receipt_sha256",
+                    "initialization_receipt",
+                    "rvq_ema_prior_receipt",
+                    "distributed_training_receipt",
+                )
+            }
+            for key in expected_common:
+                broken = copy.deepcopy(audit)
+                broken[key] = None
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"{key} binding mismatch",
+                ):
+                    builder._require_common_audit_binding(
+                        broken,
+                        expected_common,
+                        "candidate/status/final",
+                    )
+
+            candidate = {
+                "checkpoint": str((root / "face_e200.bin").resolve()),
+                "checkpoint_sha256": "f" * 64,
+            }
+            latest = {
+                "path": candidate["checkpoint"],
+                "sha256": candidate["checkpoint_sha256"],
+                "completed_epochs": 200,
+                "optimizer_updates": 99_400,
+                "selection_status": "offline_validation_pending",
+            }
+            builder._validate_latest_candidate_receipt(
+                latest,
+                stage=stage,
+                candidate=candidate,
+                label="latest",
+            )
+            broken_latest = dict(latest)
+            broken_latest["sha256"] = "0" * 64
+            with self.assertRaisesRegex(RuntimeError, "latest"):
+                builder._validate_latest_candidate_receipt(
+                    broken_latest,
+                    stage=stage,
+                    candidate=candidate,
+                    label="latest",
+                )
+
+            class FakeTensor:
+                dtype = "float32"
+                shape = (1,)
+
+                def __init__(self, value: float):
+                    self.value = value
+
+                def detach(self) -> "FakeTensor":
+                    return self
+
+                def cpu(self) -> "FakeTensor":
+                    return self
+
+            class FakeTorch:
+                @staticmethod
+                def is_tensor(value: object) -> bool:
+                    return isinstance(value, FakeTensor)
+
+                @staticmethod
+                def equal(left: FakeTensor, right: FakeTensor) -> bool:
+                    return left.value == right.value
+
+            builder._assert_tensor_states_equal(
+                FakeTorch,
+                {"weight": FakeTensor(1.0)},
+                {"weight": FakeTensor(1.0)},
+                "e200/final",
+            )
+            with self.assertRaisesRegex(RuntimeError, "tensor 'weight'"):
+                builder._assert_tensor_states_equal(
+                    FakeTorch,
+                    {"weight": FakeTensor(1.0)},
+                    {"weight": FakeTensor(2.0)},
+                    "e200/final",
+                )
+
+    def test_portable_source_identity_allows_different_absolute_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.training_source_receipt(
+                root / "host0",
+                "show_base_train.py",
+            )
+            second = self.training_source_receipt(
+                root / "host1",
+                "show_base_train.py",
+            )
+            self.assertNotEqual(first["source_root"], second["source_root"])
+            self.assertEqual(
+                first["portable_identity"],
+                second["portable_identity"],
+            )
+            contract.validate_frozen_training_source(
+                first,
+                "host0",
+                reprove_checkout=False,
+            )
+            contract.validate_frozen_training_source(
+                second,
+                "host1",
+                reprove_checkout=False,
+            )
+            _, _, candidate_index = self.candidate_fixture(root, first)
+            unsigned = dict(candidate_index)
+            unsigned.pop("receipt_payload_sha256")
+            unsigned["source_receipts"] = {
+                stage: (first if index % 2 == 0 else second)
+                for index, stage in enumerate(contract.STAGES)
+            }
+            portable_index = contract.receipt_payload(unsigned)
+            contract.validate_candidate_index(portable_index)
+
     def test_canonical_duplicate_clip_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -709,6 +1185,85 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     lineage_path=lineage,
                     lineage_sha256=lineage_sha,
                 )
+
+    def test_canonical_npz_paths_and_row_windows_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (
+                rows,
+                manifest,
+                _,
+                summary,
+                _,
+                lineage,
+                _,
+            ) = self.canonical_fixture(root)
+
+            def reject(
+                mutated_rows: list[dict[str, object]],
+                pattern: str,
+            ) -> None:
+                manifest_sha, summary_sha, lineage_sha = (
+                    self.rewrite_canonical_receipts(
+                        mutated_rows,
+                        manifest,
+                        summary,
+                        lineage,
+                    )
+                )
+                with self.assertRaisesRegex(contract.ContractError, pattern):
+                    contract.load_val_canonical(
+                        manifest_path=manifest,
+                        manifest_sha256=manifest_sha,
+                        summary_path=summary,
+                        summary_sha256=summary_sha,
+                        lineage_path=lineage,
+                        lineage_sha256=lineage_sha,
+                    )
+
+            for forbidden in ("test", "Speaker2", "e30"):
+                mutated = copy.deepcopy(rows)
+                mutated[0]["canonical_npz"] = str(
+                    root / forbidden / "must_not_be_opened.npz"
+                )
+                reject(mutated, "forbidden|test-labelled|Speaker2|e30")
+
+            for index, forbidden in enumerate(("test", "Speaker2", "e30")):
+                forbidden_target = root / f"{forbidden}_target"
+                forbidden_target.mkdir()
+                resolved_file = forbidden_target / "clip.npz"
+                resolved_file.write_bytes(b"resolved forbidden\n")
+                safe_alias = root / f"safe_alias_{index}"
+                safe_alias.symlink_to(
+                    forbidden_target,
+                    target_is_directory=True,
+                )
+                mutated = copy.deepcopy(rows)
+                mutated[0]["canonical_npz"] = str(
+                    safe_alias / resolved_file.name
+                )
+                reject(
+                    mutated,
+                    "forbidden|test-labelled|Speaker2|e30",
+                )
+
+            safe_file_alias = root / "safe_file_alias.npz"
+            safe_file_alias.symlink_to(Path(rows[0]["canonical_npz"]))
+            mutated = copy.deepcopy(rows)
+            mutated[0]["canonical_npz"] = str(safe_file_alias)
+            reject(mutated, "regular non-symlink")
+
+            mutated = copy.deepcopy(rows)
+            mutated[0]["canonical_npz"] = "relative/canonical.npz"
+            reject(mutated, "must be absolute")
+
+            mutated = copy.deepcopy(rows)
+            mutated[0]["frames"] = 30
+            reject(mutated, "not val-only")
+
+            mutated = copy.deepcopy(rows)
+            mutated[0].pop("canonical_npz")
+            reject(mutated, "schema is incomplete")
 
     def test_limited_training_source_is_enriched_at_freeze(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -800,6 +1355,16 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             self.assertTrue(frozen["detached"])
             self.assertEqual(frozen["local_branch_count"], 0)
             self.assertEqual(set(frozen["training_audit"]), set(raw))
+            self.assertEqual(
+                set(frozen["portable_identity"]),
+                {
+                    "origin",
+                    "commit",
+                    "tree",
+                    "script_relative",
+                    "script_sha256",
+                },
+            )
             contract.validate_frozen_training_source(
                 frozen,
                 "fixture",
