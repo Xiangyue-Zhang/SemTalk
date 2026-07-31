@@ -106,7 +106,8 @@ METRIC_DEFINITIONS = {
     },
 }
 SHOW_SPEAKERS = frozenset({"oliver", "chemistry", "seth", "conan"})
-VALIDATION_PRIMARY_METRIC = "body.released2.metrics.FGD"
+VALIDATION_PRIMARY_METRIC = "validation.diffsheg.metrics.fgd"
+VALIDATION_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
 INFERENCE_SUMMARY_FORMAT = "semtalk_show_base_inference_final_summary_v1"
 INFERENCE_LINEAGE_FORMAT = "semtalk_show_base_inference_final_lineage_v1"
 PREFLIGHT_FORMAT = "semtalk_show_diffsheg_full_test_preflight_v2"
@@ -494,6 +495,7 @@ def _load_current_authority(
         "selection": {
             "split": "val",
             "primary_metric": VALIDATION_PRIMARY_METRIC,
+            "protocol": VALIDATION_SELECTION_PROTOCOL,
             "validation_only_for_selection": True,
             "test_visible_during_selection": False,
             "test_feedback_into_selection": False,
@@ -635,6 +637,7 @@ def _validate_inference_bundle(
     selection_policy = expected_contract.get("selection_policy")
     if selection_policy != {
         "primary_metric": VALIDATION_PRIMARY_METRIC,
+        "protocol": VALIDATION_SELECTION_PROTOCOL,
         "mode": "min",
         "validation_only_for_selection": True,
         "test_evaluations": 1,

@@ -253,6 +253,7 @@ class FinalInferencePreflightTests(unittest.TestCase):
         contract = {
             "selection_policy": {
                 "primary_metric": BRIDGE.VALIDATION_PRIMARY_METRIC,
+                "protocol": BRIDGE.VALIDATION_SELECTION_PROTOCOL,
                 "mode": "min",
                 "validation_only_for_selection": True,
                 "test_evaluations": 1,
