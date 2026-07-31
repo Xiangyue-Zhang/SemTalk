@@ -4,6 +4,8 @@ import copy
 import struct
 import unittest
 
+import numpy as np
+
 from scripts.show_base import prerequisite_boundary_state as state
 
 
@@ -43,12 +45,32 @@ def cosine_state(boundary: int, base_lr: float = 0.001) -> dict:
     }
 
 
+def step_state(decay_t: int = 780, base_lr: float = 0.001) -> dict:
+    return {
+        "base_values": [base_lr],
+        "metric": None,
+        "noise_range_t": None,
+        "noise_pct": 0.67,
+        "noise_type": "normal",
+        "noise_std": 1.0,
+        "noise_seed": 42,
+        "decay_t": decay_t,
+        "decay_rate": 0.3,
+        "warmup_t": 0,
+        "warmup_lr_init": 0.0005,
+        "t_in_epochs": True,
+        "warmup_steps": [1],
+        "param_group_field": "lr",
+        "_initial_param_group_field": "initial_lr",
+    }
+
+
 def rng_state(seed: int) -> dict:
     return {
         "python": (3, (seed, seed + 1), None),
         "numpy": (
             "MT19937",
-            (seed, seed + 1),
+            np.array((seed, seed + 1), dtype=np.uint32),
             624,
             0,
             0.0,
@@ -60,8 +82,8 @@ def rng_state(seed: int) -> dict:
 
 def resume_fixture(stage_name: str = "face", boundary: int = 200) -> dict:
     updates = boundary * state.UPDATES_PER_EPOCH
-    scheduler = cosine_state(boundary)
-    current_lr = state._cosine_epoch_values(scheduler, boundary - 1)[0]
+    scheduler = step_state()
+    current_lr = state._step_epoch_values(scheduler, boundary - 1)[0]
     optimizer = {
         "state": {
             0: {
@@ -198,10 +220,39 @@ class BoundaryStateTests(unittest.TestCase):
 
     def test_scheduler_reset_or_wrong_epoch_is_rejected(self) -> None:
         resume = resume_fixture()
-        resume["optimizer_state"]["param_groups"][0]["lr"] = 0.001
+        resume["optimizer_state"]["param_groups"][0]["lr"] = 0.0001
         with self.assertRaisesRegex(
             state.BoundaryStateError,
             "scheduler progress",
+        ):
+            state.build_boundary_state_proof(
+                resume,
+                stage="face",
+                boundary_epoch=200,
+                world_size=4,
+            )
+
+    def test_cosine_scheduler_state_remains_supported(self) -> None:
+        resume = resume_fixture()
+        scheduler = cosine_state(200)
+        resume["scheduler_state"] = scheduler
+        resume["optimizer_state"]["param_groups"][0]["lr"] = (
+            state._cosine_epoch_values(scheduler, 199)[0]
+        )
+        proof = state.build_boundary_state_proof(
+            resume,
+            stage="face",
+            boundary_epoch=200,
+            world_size=4,
+        )
+        self.assertEqual(proof["scheduler_epoch"], 199)
+
+    def test_ambiguous_scheduler_state_is_rejected(self) -> None:
+        resume = resume_fixture()
+        resume["scheduler_state"]["t_initial"] = 200
+        with self.assertRaisesRegex(
+            state.BoundaryStateError,
+            "ambiguous",
         ):
             state.build_boundary_state_proof(
                 resume,

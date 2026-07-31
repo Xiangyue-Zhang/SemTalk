@@ -133,7 +133,7 @@ def _tensor_info(value: Any, label: str) -> dict[str, Any]:
         and not bool(torch.isfinite(tensor).all().item())
     ):
         raise BoundaryStateError(f"{label} contains non-finite values")
-    raw = tensor.view(torch.uint8).numpy().tobytes()
+    raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
     return {
         "shape": tuple(tensor.shape),
         "numel": int(tensor.numel()),
@@ -198,6 +198,33 @@ def _semantic_update(digest: Any, value: Any) -> None:
         digest.update(b"T" + str(len(descriptor)).encode("ascii") + b":")
         digest.update(descriptor)
         digest.update(info["bytes"])
+    elif (
+        type(value).__module__.startswith("numpy")
+        and hasattr(value, "dtype")
+        and hasattr(value, "shape")
+        and hasattr(value, "tobytes")
+    ):
+        import numpy as np
+
+        array = np.asarray(value)
+        if array.size <= 0:
+            raise BoundaryStateError("state contains an empty NumPy array")
+        if array.dtype.kind in {"f", "c"} and not bool(
+            np.isfinite(array).all()
+        ):
+            raise BoundaryStateError(
+                "state contains a non-finite NumPy array"
+            )
+        contiguous = np.ascontiguousarray(array)
+        descriptor = _canonical_bytes(
+            {
+                "dtype": str(contiguous.dtype),
+                "shape": list(contiguous.shape),
+            }
+        )
+        digest.update(b"A" + str(len(descriptor)).encode("ascii") + b":")
+        digest.update(descriptor)
+        digest.update(contiguous.tobytes(order="C"))
     elif type(value).__module__.startswith("numpy") and hasattr(value, "item"):
         _semantic_update(digest, value.item())
     else:
@@ -396,6 +423,56 @@ def _cosine_epoch_values(
     ]
 
 
+def _step_epoch_values(
+    scheduler: Mapping[str, Any],
+    epoch: int,
+) -> list[float]:
+    base_values = scheduler.get("base_values")
+    if not isinstance(base_values, list) or not base_values:
+        raise BoundaryStateError("scheduler base_values are unavailable")
+    base = [
+        _require_finite(value, "scheduler base value")
+        for value in base_values
+    ]
+    decay_t = _require_int(
+        scheduler.get("decay_t"),
+        "scheduler decay_t",
+    )
+    decay_rate = _require_finite(
+        scheduler.get("decay_rate"),
+        "scheduler decay_rate",
+    )
+    warmup_t = _require_int(
+        scheduler.get("warmup_t"),
+        "scheduler warmup_t",
+    )
+    warmup_lr = _require_finite(
+        scheduler.get("warmup_lr_init"),
+        "scheduler warmup_lr_init",
+    )
+    if decay_t <= 0 or decay_rate <= 0.0 or warmup_t < 0:
+        raise BoundaryStateError("step scheduler envelope is invalid")
+    if scheduler.get("noise_range_t") is not None:
+        raise BoundaryStateError(
+            "scheduler noise requires a separate deterministic proof"
+        )
+    if scheduler.get("t_in_epochs") is not True:
+        raise BoundaryStateError("scheduler is not epoch based")
+    if epoch < warmup_t:
+        steps = scheduler.get("warmup_steps")
+        if not isinstance(steps, list) or len(steps) != len(base):
+            raise BoundaryStateError("scheduler warmup steps mismatch")
+        return [
+            warmup_lr
+            + epoch * _require_finite(step, "scheduler warmup step")
+            for step in steps
+        ]
+    return [
+        value * (decay_rate ** (epoch // decay_t))
+        for value in base
+    ]
+
+
 def _validate_scheduler_state(
     value: Any,
     *,
@@ -404,7 +481,17 @@ def _validate_scheduler_state(
 ) -> tuple[str, list[float]]:
     if not isinstance(value, dict) or not value:
         raise BoundaryStateError("scheduler state is empty")
-    expected_lrs = _cosine_epoch_values(value, boundary_epoch - 1)
+    has_step = "decay_t" in value
+    has_cosine = "t_initial" in value
+    if has_step == has_cosine:
+        raise BoundaryStateError(
+            "scheduler state kind is ambiguous or unsupported"
+        )
+    expected_lrs = (
+        _step_epoch_values(value, boundary_epoch - 1)
+        if has_step
+        else _cosine_epoch_values(value, boundary_epoch - 1)
+    )
     groups = optimizer_state["param_groups"]
     observed_lrs = [
         _require_finite(group.get("lr"), "optimizer current lr")
