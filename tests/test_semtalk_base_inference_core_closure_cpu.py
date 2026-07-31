@@ -16,6 +16,85 @@ from scripts.show_base import talkshow_base_val_contract as contract
 ROOT = Path(__file__).resolve().parents[1]
 CORE_RELATIVE = "scripts/show_base/semtalk_base_inference_core.py"
 LEGACY_RELATIVE = "scripts/show_base/run_base_" + "inference.py"
+INTERNAL_RELEASED2_EVALUATORS = frozenset(
+    {
+        "scripts/show_base/evaluate_talkshow_show_metrics.py",
+        "scripts/show_base/replay_released2_primary.py",
+    }
+)
+FORMAL_DIFFSHEG_ROOTS = frozenset(
+    {
+        "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+        "scripts/show_base/evaluate_diffsheg_final_test.py",
+    }
+)
+
+
+def local_show_base_imports(relative: str) -> set[str]:
+    syntax = ast.parse(
+        (ROOT / relative).read_text(encoding="utf-8"),
+        relative,
+    )
+    modules: set[str] = set()
+    for node in ast.walk(syntax):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "scripts.show_base":
+                names = [
+                    f"scripts.show_base.{alias.name}"
+                    for alias in node.names
+                ]
+            elif (node.module or "").startswith("scripts.show_base."):
+                names = [node.module or ""]
+            else:
+                names = []
+        else:
+            continue
+        for name in names:
+            prefix = "scripts.show_base."
+            if not name.startswith(prefix):
+                continue
+            module = name[len(prefix):].split(".", 1)[0]
+            candidate = f"scripts/show_base/{module}.py"
+            if (ROOT / candidate).is_file():
+                modules.add(candidate)
+    for node in ast.walk(syntax):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        loader = node.func
+        loader_name = (
+            loader.id
+            if isinstance(loader, ast.Name)
+            else loader.attr
+            if isinstance(loader, ast.Attribute)
+            else ""
+        )
+        argument = node.args[0]
+        if (
+            loader_name
+            not in {"import_module", "_fresh_local_module", "_control_module"}
+            or not isinstance(argument, ast.Constant)
+            or not isinstance(argument.value, str)
+        ):
+            continue
+        module = argument.value.removeprefix("scripts.show_base.")
+        candidate = f"scripts/show_base/{module}.py"
+        if (ROOT / candidate).is_file():
+            modules.add(candidate)
+    return modules
+
+
+def local_show_base_import_closure(roots: set[str]) -> set[str]:
+    pending = list(roots)
+    closure: set[str] = set()
+    while pending:
+        relative = pending.pop()
+        if relative in closure:
+            continue
+        closure.add(relative)
+        pending.extend(local_show_base_imports(relative) - closure)
+    return closure
 
 
 def source_entry(path: Path) -> dict[str, object]:
@@ -38,26 +117,40 @@ class NeutralBaseInferenceClosureTest(unittest.TestCase):
             LEGACY_RELATIVE,
             contract.FRESH_PIPELINE_SOURCE_FILES,
         )
+        # The archived released2 evaluator remains hash-pinned for internal
+        # compatibility runs.  Presence in that source snapshot must not be
+        # confused with runtime reachability from the formal protocol.
+        self.assertTrue(
+            INTERNAL_RELEASED2_EVALUATORS.issubset(
+                contract.FRESH_PIPELINE_SOURCE_FILES
+            )
+        )
 
         control_modules = set(authority._CONTROL_DEPENDENCIES)
         for dependencies in authority._CONTROL_DEPENDENCIES.values():
             control_modules.update(dependencies)
-        relative_paths = set(contract.FRESH_PIPELINE_SOURCE_FILES) | {
+        formal_roots = {
             "scripts/show_base/base_final_authority.py",
             *(f"scripts/show_base/{name}.py" for name in control_modules),
+            "scripts/show_base/base_long_val_contract.py",
+            "scripts/show_base/produce_base_val_measurement.py",
+            "scripts/show_base/run_base_val_inference.py",
+            "scripts/show_base/run_base_final_test.py",
+            CORE_RELATIVE,
+            *FORMAL_DIFFSHEG_ROOTS,
         }
-        legacy_tokens = (
-            "diff" + "sheg",
-            "diff" + "_sheg",
-            "diff" + "-sheg",
-            "diff" + "/sheg",
+        formal_closure = local_show_base_import_closure(formal_roots)
+        self.assertTrue(FORMAL_DIFFSHEG_ROOTS.issubset(formal_closure))
+        self.assertFalse(INTERNAL_RELEASED2_EVALUATORS & formal_closure)
+        self.assertNotIn(LEGACY_RELATIVE, formal_closure)
+        self.assertEqual(
+            {
+                relative
+                for relative in formal_closure
+                if Path(relative).name.startswith("evaluate_")
+            },
+            set(FORMAL_DIFFSHEG_ROOTS),
         )
-        for relative in sorted(relative_paths):
-            source = (ROOT / relative).read_text(encoding="utf-8")
-            folded = source.casefold()
-            for token in legacy_tokens:
-                self.assertNotIn(token, folded, relative)
-            self.assertNotIn(LEGACY_RELATIVE, source, relative)
 
     def test_neutral_core_exports_exact_pinned_callable_closure(self) -> None:
         required = set(contract.INFERENCE_HELPERS) | {

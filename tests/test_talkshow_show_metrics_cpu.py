@@ -30,6 +30,79 @@ PRIMARY_CLI = importlib.import_module(
     "scripts.show_base.replay_released2_primary"
 )
 ROOT = Path(__file__).resolve().parents[1]
+INTERNAL_RELEASED2_MODULES = frozenset(
+    {
+        "scripts/show_base/evaluate_talkshow_show_metrics.py",
+        "scripts/show_base/replay_released2_primary.py",
+    }
+)
+
+
+def local_show_base_imports(relative: str) -> set[str]:
+    tree = ast.parse(
+        (ROOT / relative).read_text(encoding="utf-8"),
+        filename=relative,
+    )
+    dependencies: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "scripts.show_base":
+                names = [
+                    f"scripts.show_base.{alias.name}"
+                    for alias in node.names
+                ]
+            elif (node.module or "").startswith("scripts.show_base."):
+                names = [node.module or ""]
+            else:
+                names = []
+        else:
+            continue
+        for name in names:
+            prefix = "scripts.show_base."
+            if not name.startswith(prefix):
+                continue
+            module = name[len(prefix):].split(".", 1)[0]
+            candidate = f"scripts/show_base/{module}.py"
+            if (ROOT / candidate).is_file():
+                dependencies.add(candidate)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        loader = node.func
+        loader_name = (
+            loader.id
+            if isinstance(loader, ast.Name)
+            else loader.attr
+            if isinstance(loader, ast.Attribute)
+            else ""
+        )
+        argument = node.args[0]
+        if (
+            loader_name
+            not in {"import_module", "_fresh_local_module", "_control_module"}
+            or not isinstance(argument, ast.Constant)
+            or not isinstance(argument.value, str)
+        ):
+            continue
+        module = argument.value.removeprefix("scripts.show_base.")
+        candidate = f"scripts/show_base/{module}.py"
+        if (ROOT / candidate).is_file():
+            dependencies.add(candidate)
+    return dependencies
+
+
+def local_show_base_import_closure(roots: set[str]) -> set[str]:
+    pending = list(roots)
+    closure: set[str] = set()
+    while pending:
+        relative = pending.pop()
+        if relative in closure:
+            continue
+        closure.add(relative)
+        pending.extend(local_show_base_imports(relative) - closure)
+    return closure
 
 
 def load_external_gate_test_module() -> object:
@@ -1679,43 +1752,104 @@ class OfflineAdapterTest(unittest.TestCase):
         )
 
     def test_production_dependency_closure_excludes_legacy_evaluator(self) -> None:
-        production = (
-            ROOT / "scripts" / "show_base" / "evaluate_talkshow_show_metrics.py",
-            ROOT / "scripts" / "show_base" / "base_final_authority.py",
+        validation = importlib.import_module(
+            "scripts.show_base.evaluate_diffsheg_val_fgd"
         )
-        for path in production:
-            source = path.read_text(encoding="utf-8")
-            forbidden = [
-                "diff" + "sheg",
-                "base_long_selection_bridge",
-                "validate_base_long_test_winner",
-            ]
-            if path.name == "evaluate_talkshow_show_metrics.py":
-                forbidden.append("base_long_val_contract")
-            for token in forbidden:
-                self.assertNotIn(token, source.casefold(), path.name)
-            tree = ast.parse(source, filename=str(path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    names = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    names = [node.module or ""] + [
-                        alias.name for alias in node.names
-                    ]
-                elif isinstance(node, ast.Name):
-                    names = [node.id]
-                elif isinstance(node, ast.Attribute):
-                    names = [node.attr]
-                else:
-                    continue
-                self.assertTrue(
-                    all(
-                        token not in name.casefold()
-                        for token in forbidden
-                        for name in names
-                    ),
-                    f"{path.name}: forbidden production dependency {names}",
-                )
+        final = importlib.import_module(
+            "scripts.show_base.evaluate_diffsheg_final_test"
+        )
+        authority = importlib.import_module(
+            "scripts.show_base.base_final_authority"
+        )
+
+        # released2 remains callable for explicitly internal compatibility
+        # reports, but it is not the validation or final-test authority.
+        self.assertEqual(
+            METRICS.PRIMARY_METRIC_PATH,
+            "body.released2.metrics.FGD",
+        )
+        self.assertIs(PRIMARY_CLI.metrics, METRICS)
+
+        control_modules = set(authority._CONTROL_DEPENDENCIES)
+        for dependencies in authority._CONTROL_DEPENDENCIES.values():
+            control_modules.update(dependencies)
+        formal_roots = {
+            "scripts/show_base/base_final_authority.py",
+            "scripts/show_base/base_long_val_contract.py",
+            "scripts/show_base/produce_base_val_measurement.py",
+            "scripts/show_base/run_base_final_test.py",
+            "scripts/show_base/run_base_val_inference.py",
+            "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+            "scripts/show_base/evaluate_diffsheg_final_test.py",
+            *(f"scripts/show_base/{name}.py" for name in control_modules),
+        }
+        formal_closure = local_show_base_import_closure(formal_roots)
+        self.assertFalse(INTERNAL_RELEASED2_MODULES & formal_closure)
+        self.assertEqual(
+            {
+                relative
+                for relative in formal_closure
+                if Path(relative).name.startswith("evaluate_")
+            },
+            {
+                "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+                "scripts/show_base/evaluate_diffsheg_final_test.py",
+            },
+        )
+        for launcher_name in (
+            "run_base_final_test.sh",
+            "run_diffsheg_final_test_eval.sh",
+        ):
+            launcher = (
+                ROOT / "scripts" / "show_base" / launcher_name
+            ).read_text(encoding="utf-8")
+            self.assertIn("evaluate_diffsheg_final_test.py", launcher)
+            for internal in INTERNAL_RELEASED2_MODULES:
+                self.assertNotIn(Path(internal).name, launcher)
+
+        # Validation and final evaluation share one audited PASPA entrypoint
+        # and one DiffSHEG statistics/FGD asset lineage.  Final evaluation
+        # extends that exact lineage with the other two published AEs and the
+        # TalkSHOW/SMPL-X inputs needed only for the DiffSHEG BA metric.
+        self.assertEqual(
+            validation.PASPA_EVALUATOR_RELATIVE,
+            Path("scripts/diffsheg_show_eval.py"),
+        )
+        self.assertEqual(
+            final.PASPA_EVALUATOR_RELATIVE,
+            validation.PASPA_EVALUATOR_RELATIVE,
+        )
+        self.assertEqual(
+            final.PASPA_EVALUATOR_SHA256,
+            validation.PASPA_EVALUATOR_SHA256,
+        )
+        self.assertEqual(
+            final.DIFFSHEG_COMMIT,
+            validation.DIFFSHEG_REFERENCE_COMMIT,
+        )
+        self.assertEqual(
+            final.DIFFSHEG_STATS_SHA256,
+            validation.DIFFSHEG_STATS_SHA256,
+        )
+        self.assertEqual(
+            final.DIFFSHEG_AE_PINS["fgd"]["sha256"],
+            validation.DIFFSHEG_GESTURE_AE_SHA256,
+        )
+        self.assertEqual(set(final.DIFFSHEG_AE_PINS), {"fmd", "fed", "fgd"})
+        self.assertEqual(
+            final.EXPECTED_METRICS,
+            (
+                "fmd",
+                "fed",
+                "expression_diversity",
+                "fgd",
+                "ba",
+                "pcm",
+                "gesture_diversity",
+            ),
+        )
+        self.assertEqual(final.TALKSHOW_COMMIT, METRICS.TALKSHOW_METRIC_COMMIT)
+        self.assertRegex(final.SMPLX_NEUTRAL_SHA256, r"^[0-9a-f]{64}$")
 
     def test_generator_identity_filter_is_semantic_not_path_global(self) -> None:
         METRICS._reject_forbidden_generator_identity(

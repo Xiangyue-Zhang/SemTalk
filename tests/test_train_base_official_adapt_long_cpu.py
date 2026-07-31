@@ -334,19 +334,37 @@ def _topology_selection_inputs(
 
 
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
-    def test_formal_val_control_is_talkshow_only_and_topology_exact(self) -> None:
+    def test_formal_val_control_is_diffsheg_only_and_topology_exact(self) -> None:
+        from scripts.show_base import base_final_authority as final_authority
         from scripts.show_base import base_long_val_contract as base_long
+        from scripts.show_base import evaluate_diffsheg_val_fgd as evaluator
+        from scripts.show_base import select_base_official_adapt as diffsheg
         from scripts.show_base import talkshow_base_val_contract as talkshow
 
         self.assertEqual(base_long.TOPOLOGY_SPECS, ADAPT.TOPOLOGY_SPECS)
+        # The selected-five inference pipeline remains internally TalkSHOW
+        # owned.  The formal long-run selection ABI is DiffSHEG-only.
         self.assertIs(talkshow.validate_pipeline, talkshow.validate_fresh_pipeline)
+        self.assertIs(base_long.validate_val_inputs, diffsheg.validate_val_inputs)
+        self.assertIs(
+            base_long.validate_val_inference_lineage,
+            diffsheg.validate_val_inference_lineage,
+        )
+        self.assertIs(
+            base_long.validate_diffsheg_report,
+            diffsheg.validate_diffsheg_report,
+        )
         self.assertEqual(
+            base_long.VAL_INFERENCE_LINEAGE_FORMAT,
+            diffsheg.VAL_INFERENCE_LINEAGE_FORMAT,
+        )
+        self.assertNotEqual(
+            base_long.VAL_INFERENCE_LINEAGE_FORMAT,
             talkshow.VAL_INFERENCE_LINEAGE_FORMAT,
-            "semtalk_show_base_talkshow_val_inference_lineage_v2",
         )
         self.assertIn(
-            "talkshow_window_manifest_sha256",
-            talkshow.public_val_coverage(
+            "diffsheg_clip_manifest_sha256",
+            base_long.public_val_coverage(
                 {
                     "split": "val",
                     "clip_count": 1_715,
@@ -354,21 +372,89 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                     "window_count": 1,
                     "uncovered_tail_frames": 0,
                     "clip_ids_sha256": "a" * 64,
-                    "talkshow_window_manifest_sha256": "b" * 64,
+                    "diffsheg_clip_manifest_sha256": "b" * 64,
                 }
             ),
         )
-        for relative in (
+        self.assertEqual(diffsheg.VAL_METRIC_KEYS, ("fgd",))
+        self.assertEqual(
+            final_authority.BASE_SELECTION_PROTOCOL,
+            "diffsheg_show_validation_fgd_v1",
+        )
+        self.assertEqual(
+            final_authority.BASE_SELECTION_METRIC,
+            "validation.diffsheg.metrics.fgd",
+        )
+        pins = diffsheg.DIFFSHEG_PINNED_RECEIPT
+        self.assertEqual(pins["selection_metric"], "fgd")
+        self.assertFalse(pins["ba_during_selection"])
+        self.assertEqual(
+            pins["paspa"]["evaluator_sha256"],
+            evaluator.PASPA_EVALUATOR_SHA256,
+        )
+        self.assertEqual(
+            pins["diffsheg_reference_commit"],
+            evaluator.DIFFSHEG_REFERENCE_COMMIT,
+        )
+        self.assertEqual(
+            pins["stats_sha256"],
+            evaluator.DIFFSHEG_STATS_SHA256,
+        )
+        self.assertEqual(
+            pins["autoencoders"]["fgd"]["sha256"],
+            evaluator.DIFFSHEG_GESTURE_AE_SHA256,
+        )
+
+        internal_evaluators = {
+            "scripts.show_base.evaluate_talkshow_show_metrics",
+            "scripts.show_base.replay_released2_primary",
+        }
+        self.assertTrue(
+            {
+                module.replace(".", "/") + ".py"
+                for module in internal_evaluators
+            }.issubset(talkshow.FRESH_PIPELINE_SOURCE_FILES)
+        )
+        control_modules = set(final_authority._CONTROL_DEPENDENCIES)
+        for dependencies in final_authority._CONTROL_DEPENDENCIES.values():
+            control_modules.update(dependencies)
+        self.assertFalse(
+            {
+                module.rsplit(".", 1)[-1]
+                for module in internal_evaluators
+            }
+            & control_modules
+        )
+
+        formal_validation_files = (
             "scripts/show_base/talkshow_base_val_contract.py",
             "scripts/show_base/base_long_val_contract.py",
             "scripts/show_base/base_final_authority.py",
             "scripts/show_base/run_base_val_inference.py",
-            "scripts/show_base/published_test_winner_claim.py",
-            "scripts/show_base/evaluate_talkshow_show_metrics.py",
-        ):
+            "scripts/show_base/select_base_official_adapt.py",
+            "scripts/show_base/select_base_official_adapt_long.py",
+            "scripts/show_base/produce_base_val_measurement.py",
+            "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+        )
+        for relative in formal_validation_files:
             source = (REPOSITORY / relative).read_text(encoding="utf-8")
-            self.assertNotIn("select_base_official_adapt", source, relative)
-            self.assertNotIn("diffsheg", source.casefold(), relative)
+            syntax = ast.parse(source, filename=relative)
+            imports: set[str] = set()
+            for node in ast.walk(syntax):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    imports.add(module)
+                    if module == "scripts.show_base":
+                        imports.update(
+                            f"{module}.{alias.name}"
+                            for alias in node.names
+                        )
+            self.assertFalse(
+                imports & internal_evaluators,
+                f"{relative}: internal released2 evaluator became reachable",
+            )
 
     def test_launcher_binds_hash_seed_and_all_gate_topologies(self) -> None:
         source = LAUNCHER.read_text(encoding="utf-8")
