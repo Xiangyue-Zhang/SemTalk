@@ -1126,6 +1126,15 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                     }
                     for index in range(contract.RVQ_LEVELS)
                 ],
+                "init": True,
+                "code_sum": (
+                    "loaded codebook multiplied by decay-aware prior_count"
+                ),
+                "code_count": "1 / (1 - ema_decay) per code",
+                "first_forward_codebook_reset": False,
+                "unused_code_grace": (
+                    "legacy reset only after the decay-aware prior falls below one"
+                ),
             }
             rvq_rank = {
                 "format": "semtalk_show_rvq_rank_state_v1",
@@ -1159,6 +1168,44 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 reprove_paths=False,
             )
             self.assertEqual(validated, audit)
+            for key, invalid in (
+                ("init", False),
+                ("code_sum", "tampered"),
+                ("code_count", "tampered"),
+                ("first_forward_codebook_reset", True),
+                ("unused_code_grace", "tampered"),
+            ):
+                broken = copy.deepcopy(audit)
+                broken["rvq_ema_prior_receipt"][key] = invalid
+                with self.assertRaisesRegex(
+                    contract.ContractError,
+                    "RVQ EMA-prior schema mismatch",
+                ):
+                    contract.validate_representation_candidate_audit(
+                        broken,
+                        stage=stage,
+                        epoch=epoch,
+                        label="fixture candidate",
+                        reprove_paths=False,
+                    )
+            for mutation in ("extra", "missing"):
+                broken = copy.deepcopy(audit)
+                receipt = broken["rvq_ema_prior_receipt"]
+                if mutation == "extra":
+                    receipt["unexpected"] = True
+                else:
+                    receipt.pop("unused_code_grace")
+                with self.assertRaisesRegex(
+                    contract.ContractError,
+                    "schema mismatch",
+                ):
+                    contract.validate_representation_candidate_audit(
+                        broken,
+                        stage=stage,
+                        epoch=epoch,
+                        label="fixture candidate",
+                        reprove_paths=False,
+                    )
             for mutation in ("extra", "missing"):
                 broken = copy.deepcopy(audit)
                 if mutation == "extra":

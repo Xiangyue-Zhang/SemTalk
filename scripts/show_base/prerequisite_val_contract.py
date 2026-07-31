@@ -1233,12 +1233,31 @@ def validate_rvq_ema_prior_receipt(
         if value is not None:
             raise ContractError(f"{label} must be null for Global")
         return None
-    value = exact_keys(value, ("format", "layers"), label)
+    value = exact_keys(
+        value,
+        (
+            "format",
+            "layers",
+            "init",
+            "code_sum",
+            "code_count",
+            "first_forward_codebook_reset",
+            "unused_code_grace",
+        ),
+        label,
+    )
     layers = value["layers"]
     if (
         value["format"] != "semtalk_show_official_rvq_ema_prior_v2"
         or not isinstance(layers, list)
         or len(layers) != RVQ_LEVELS
+        or value["init"] is not True
+        or value["code_sum"]
+        != "loaded codebook multiplied by decay-aware prior_count"
+        or value["code_count"] != "1 / (1 - ema_decay) per code"
+        or value["first_forward_codebook_reset"] is not False
+        or value["unused_code_grace"]
+        != "legacy reset only after the decay-aware prior falls below one"
     ):
         raise ContractError(f"{label} RVQ EMA-prior schema mismatch")
     names: set[str] = set()
