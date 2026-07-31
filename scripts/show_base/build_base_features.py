@@ -2894,6 +2894,7 @@ def load_val_selected_models(
     """Load exactly the five independently validation-selected SHOW models."""
 
     import torch
+    from models.motion_representation import VAEConvZero
     from models.rvq import RVQVAE
 
     bridge = selected_contract.load_selected_prerequisites(
@@ -3000,22 +3001,27 @@ def load_val_selected_models(
             "strict_state_dict_load": True,
             "frozen_eval": True,
         }
-        if stage == "global":
-            # Global is required and fully audited but is not in the Base
-            # feature graph.
-            records[stage] = record
-            del state, payload
-            continue
-        model = RVQVAE(
-            SimpleNamespace(
-                vae_test_dim=dimensions[stage],
-                vae_layer=layers[stage],
-                vae_length=256,
-            )
+        model_args = SimpleNamespace(
+            vae_test_dim=(
+                61 if stage == "global" else dimensions[stage]
+            ),
+            vae_layer=4 if stage == "global" else layers[stage],
+            vae_length=256,
+        )
+        model = (
+            VAEConvZero(model_args)
+            if stage == "global"
+            else RVQVAE(model_args)
         ).to(args.device)
         _strict_load_freeze_eval(model, state, path=resolved)
-        models[stage] = model
         records[stage] = record
+        if stage == "global":
+            # Global is required and strict-loaded against the real
+            # VAEConvZero architecture, but it is not retained in the Base
+            # feature graph.
+            del model, state, payload
+            continue
+        models[stage] = model
         del state, payload
     if set(models) != set(RVQ_NAMES) or set(records) != {
         *RVQ_NAMES,

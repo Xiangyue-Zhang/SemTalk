@@ -21,6 +21,9 @@ import re
 import stat
 from typing import Any, Mapping, Sequence
 
+from scripts.show_base import merge_prerequisite_val_shards as raw_merger
+from scripts.show_base import prerequisite_val_contract as raw_contract
+
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SELECTION_FORMAT = "semtalk_show_prerequisite_val_selection_v1"
@@ -536,7 +539,9 @@ def _validate_producer_source(value: Any, label: str) -> dict[str, Any]:
     return dict(source)
 
 
-def _validate_canonical_view(value: Any) -> dict[str, Any]:
+def _validate_canonical_view(
+    value: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     view = exact_keys(value, CANONICAL_VIEW_KEYS, "canonical validation view")
     if (
         view["clip_count"] != EXPECTED_VAL_CLIPS
@@ -622,7 +627,7 @@ def _validate_canonical_view(value: Any) -> dict[str, Any]:
         raise SelectedPrerequisiteError(
             "canonical validation rows are not exact-once"
         )
-    return {
+    public = {
         "manifest": manifest_binding,
         "summary": summary_binding,
         "lineage": lineage_binding,
@@ -631,6 +636,24 @@ def _validate_canonical_view(value: Any) -> dict[str, Any]:
         "split": "val",
         "test_visible": False,
     }
+    try:
+        raw_rows, raw_receipt = raw_contract.load_val_canonical(
+            manifest_path=manifest_path,
+            manifest_sha256=manifest_binding["sha256"],
+            summary_path=Path(summary_binding["path"]),
+            summary_sha256=summary_binding["sha256"],
+            lineage_path=Path(lineage_binding["path"]),
+            lineage_sha256=lineage_binding["sha256"],
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(
+            f"canonical validation replay failed: {error}"
+        ) from error
+    if raw_receipt != public or raw_rows != rows:
+        raise SelectedPrerequisiteError(
+            "canonical validation replay changed its public receipt"
+        )
+    return public, raw_rows
 
 
 def _validate_candidate_index(
@@ -793,7 +816,12 @@ def _validate_shard_receipts(
     epoch: int,
     expected_checkpoint: Mapping[str, Any],
     expected_windows: int,
-) -> None:
+    candidate_index: Mapping[str, Any],
+    canonical_rows: Sequence[Mapping[str, Any]],
+    canonical_receipt: Mapping[str, Any],
+    evaluator_source: Mapping[str, Any],
+    replay_state: dict[str, Any],
+) -> tuple[dict[str, Any], float, Any]:
     if not isinstance(value, list) or len(value) != EXPECTED_SHARDS:
         raise SelectedPrerequisiteError(
             f"{stage} e{epoch} shard receipt coverage mismatch"
@@ -801,6 +829,18 @@ def _validate_shard_receipts(
     observed_sha: set[str] = set()
     total_clips = 0
     total_windows = 0
+    shard_values: list[dict[str, Any]] = []
+    union_clip_ids: list[str] = []
+    try:
+        raw_candidate = raw_contract.candidate_lookup(
+            candidate_index,
+            stage,
+            epoch,
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(
+            f"{stage} e{epoch} candidate replay failed: {error}"
+        ) from error
     for expected_index, receipt in enumerate(value):
         binding = exact_keys(
             receipt,
@@ -865,10 +905,97 @@ def _validate_shard_receipts(
             binding["windows"],
             f"{stage} e{epoch} shard {expected_index} windows",
         )
+        expected_rows = [
+            row
+            for row in canonical_rows
+            if int(row["global_index"]) % EXPECTED_SHARDS
+            == expected_index
+        ]
+        try:
+            replayed, replayed_receipt = raw_merger._read_shard(
+                Path(binding["path"]),
+                stage=stage,
+                epoch=epoch,
+                shard_index=expected_index,
+                candidate=raw_candidate,
+                expected_rows=expected_rows,
+                canonical_receipt=canonical_receipt,
+            )
+        except raw_contract.ContractError as error:
+            raise SelectedPrerequisiteError(
+                f"{stage} e{epoch} shard {expected_index} replay failed: "
+                f"{error}"
+            ) from error
+        if replayed_receipt != dict(binding):
+            raise SelectedPrerequisiteError(
+                f"{stage} e{epoch} shard {expected_index} public receipt "
+                "differs from raw replay"
+            )
+        if replayed["source"] != evaluator_source:
+            raise SelectedPrerequisiteError(
+                f"{stage} e{epoch} shard {expected_index} evaluator source "
+                "changed"
+            )
+        runtime_versions = {
+            key: replayed["runtime"][key]
+            for key in ("python", "torch", "numpy")
+        }
+        if replay_state.get("runtime_versions") is None:
+            replay_state["runtime_versions"] = runtime_versions
+        elif replay_state["runtime_versions"] != runtime_versions:
+            raise SelectedPrerequisiteError(
+                "raw shard runtime versions changed across prerequisite "
+                "measurements"
+            )
+        if replay_state.get("seed") is None:
+            replay_state["seed"] = replayed["seed"]
+        elif replay_state["seed"] != replayed["seed"]:
+            raise SelectedPrerequisiteError(
+                "raw shard deterministic seed changed across prerequisite "
+                "measurements"
+            )
+        shard_values.append(replayed)
+        union_clip_ids.extend(replayed["clip_ids"])
     if total_clips != EXPECTED_VAL_CLIPS or total_windows != expected_windows:
         raise SelectedPrerequisiteError(
             f"{stage} e{epoch} shard totals changed"
         )
+    canonical_clip_ids = [str(row["clip_id"]) for row in canonical_rows]
+    if (
+        len(union_clip_ids) != EXPECTED_VAL_CLIPS
+        or len(set(union_clip_ids)) != EXPECTED_VAL_CLIPS
+        or set(union_clip_ids) != set(canonical_clip_ids)
+        or sum(item["windows"] for item in shard_values)
+        != expected_windows
+    ):
+        raise SelectedPrerequisiteError(
+            f"{stage} e{epoch} raw shard coverage is not canonical "
+            "exact-once"
+        )
+    try:
+        merged_accumulators = {
+            name: raw_contract.merge_accumulators(
+                [item["accumulators"][name] for item in shard_values],
+                f"{stage} e{epoch}.{name}",
+            )
+            for name in raw_contract.ACCUMULATOR_KEYS[stage]
+        }
+        metrics, score = raw_contract.stage_metrics(
+            stage,
+            merged_accumulators,
+        )
+        merged_histograms = raw_merger._merge_histograms(
+            [item["histograms"] for item in shard_values],
+            stage,
+        )
+        histogram_summary = raw_merger._codebook_summary(
+            merged_histograms
+        )
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(
+            f"{stage} e{epoch} raw statistics replay failed: {error}"
+        ) from error
+    return metrics, score, histogram_summary
 
 
 def _validate_stage_measurement(
@@ -878,6 +1005,9 @@ def _validate_stage_measurement(
     measurement_index: Mapping[str, Any],
     candidate_index: Mapping[str, Any],
     candidates: Mapping[int, Mapping[str, Any]],
+    canonical_rows: Sequence[Mapping[str, Any]],
+    canonical_receipt: Mapping[str, Any],
+    replay_state: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     _, _, measurement, binding = _read_artifact(
         artifact,
@@ -1032,18 +1162,31 @@ def _validate_stage_measurement(
             raise SelectedPrerequisiteError(
                 f"{stage} e{expected_epoch} measurement changed"
             )
-        _validate_finite_tree(row["metrics"], f"{stage} e{expected_epoch} metrics")
-        _validate_finite_tree(
-            row["codebook_histograms"],
-            f"{stage} e{expected_epoch} codebook histograms",
-        )
-        _validate_shard_receipts(
+        replayed_metrics, replayed_score, replayed_histograms = (
+            _validate_shard_receipts(
             row["shard_receipts"],
             stage=stage,
             epoch=expected_epoch,
             expected_checkpoint=expected,
             expected_windows=expected_windows,
+            candidate_index=candidate_index,
+            canonical_rows=canonical_rows,
+            canonical_receipt=canonical_receipt,
+            evaluator_source=measurement_index["producer_sources"][
+                "evaluator"
+            ],
+            replay_state=replay_state,
         )
+        )
+        if (
+            row["metrics"] != replayed_metrics
+            or row["selection_score"] != replayed_score
+            or row["codebook_histograms"] != replayed_histograms
+        ):
+            raise SelectedPrerequisiteError(
+                f"{stage} e{expected_epoch} merged score/statistics differ "
+                "from the eight raw shards"
+            )
         validated.append({**dict(row), "selection_score": score})
     return measurement, binding, validated
 
@@ -1186,7 +1329,7 @@ def load_selected_prerequisites(
             "prerequisite measurement index coverage changed"
         )
 
-    canonical_view = _validate_canonical_view(
+    canonical_view, canonical_rows = _validate_canonical_view(
         measurement_index["canonical_view"]
     )
     if selection["canonical_view"] != canonical_view:
@@ -1245,6 +1388,10 @@ def load_selected_prerequisites(
 
     selected: dict[str, Any] = {}
     selected_paths: set[Path] = set()
+    replay_state: dict[str, Any] = {
+        "runtime_versions": None,
+        "seed": None,
+    }
     for expected_stage_index, stage in enumerate(STAGES):
         index_receipt = exact_keys(
             stage_receipts[stage],
@@ -1265,6 +1412,9 @@ def load_selected_prerequisites(
                 measurement_index=measurement_index,
                 candidate_index=candidate_index,
                 candidates=candidates[stage],
+                canonical_rows=canonical_rows,
+                canonical_receipt=canonical_view,
+                replay_state=replay_state,
             )
         )
         row = exact_keys(

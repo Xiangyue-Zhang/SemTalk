@@ -13,11 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from scripts.show_base import base_long_val_contract as long_contract
 from scripts.show_base import select_base_official_adapt as legacy
+from scripts.show_base import select_base_official_adapt_long as long_selector
 
 
 AUTHORIZATION_FORMAT = "semtalk_show_base_long_test_winner_authorization_v1"
@@ -40,7 +42,7 @@ def _reject_selection_paths(value: Any, label: str) -> None:
 
 
 def _artifact(value: Any, label: str) -> tuple[Path, str]:
-    if not isinstance(value, dict) or set(value) < {"path", "sha256"}:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
         raise TestWinnerContractError(f"{label} artifact schema mismatch")
     path = legacy.require_absolute_path(value["path"], label)
     resolved = legacy._regular_file(path, label)
@@ -71,6 +73,41 @@ def validate_test_winner(
         selection,
         "long Base validation selection",
     )
+    measurement_receipts = selection.get("measurement_receipts")
+    if (
+        not isinstance(measurement_receipts, list)
+        or len(measurement_receipts)
+        != len(long_contract.EXPECTED_CANDIDATE_EPOCHS)
+    ):
+        raise TestWinnerContractError(
+            "long Base selection does not bind exactly 22 measurements"
+        )
+    try:
+        rebuilt = long_selector.build_selection(
+            candidate_bundle=candidate_bundle,
+            measurement_paths=[
+                Path(receipt["path"])
+                for receipt in measurement_receipts
+            ],
+            expected_measurement_sha256=[
+                receipt["sha256"]
+                for receipt in measurement_receipts
+            ],
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+        legacy.SelectionContractError,
+    ) as error:
+        raise TestWinnerContractError(
+            f"long Base selection replay failed: {error}"
+        ) from error
+    if rebuilt != selection:
+        raise TestWinnerContractError(
+            "long Base selection differs from replayed DiffSHEG reports"
+        )
     claimed_payload_sha = legacy.require_sha256(
         selection.get("receipt_payload_sha256"),
         "long Base selection payload SHA-256",
@@ -194,7 +231,7 @@ def validate_test_winner(
         )
     return {
         "format": AUTHORIZATION_FORMAT,
-        "status": "authorized",
+        "status": "validated",
         "selection": {
             "path": str(selection_resolved),
             "sha256": selection_sha,
@@ -203,11 +240,117 @@ def validate_test_winner(
         "selected_epoch": winner_epoch,
         "selected_fgd": winner_fgd,
         "selected_checkpoint": dict(expected_candidate),
+        "candidate_bundle": expected_bundle,
         "candidate_count": len(long_contract.EXPECTED_CANDIDATE_EPOCHS),
         "selection_split": "val",
         "test_visible_during_selection": False,
-        "authorized_test_evaluations": 1,
+        "authorized_test_evaluations": 0,
+        "one_shot_claim_required": True,
         "test_feedback_into_selection": False,
+    }
+
+
+def _claim_path(selection_path: Path) -> Path:
+    return selection_path.with_name(
+        f"{selection_path.name}.test-winner-claim.json"
+    )
+
+
+def publish_test_winner_claim(
+    validation: Mapping[str, Any],
+    *,
+    selection_path: Path,
+) -> dict[str, Any]:
+    """Atomically consume the validation selection's sole test allowance."""
+
+    if set(validation) != {
+        "format",
+        "status",
+        "selection",
+        "selected_epoch",
+        "selected_fgd",
+        "selected_checkpoint",
+        "candidate_bundle",
+        "candidate_count",
+        "selection_split",
+        "test_visible_during_selection",
+        "authorized_test_evaluations",
+        "one_shot_claim_required",
+        "test_feedback_into_selection",
+    } or (
+        validation.get("format") != AUTHORIZATION_FORMAT
+        or validation.get("status") != "validated"
+        or validation.get("authorized_test_evaluations") != 0
+        or validation.get("one_shot_claim_required") is not True
+        or validation.get("test_feedback_into_selection") is not False
+    ):
+        raise TestWinnerContractError(
+            "test-winner validation evidence is not claimable"
+        )
+    selection_resolved = selection_path.resolve(strict=True)
+    expected_selection = validation.get("selection")
+    if (
+        not isinstance(expected_selection, dict)
+        or expected_selection.get("path") != str(selection_resolved)
+        or legacy.sha256_file(selection_resolved)
+        != expected_selection.get("sha256")
+    ):
+        raise TestWinnerContractError(
+            "test-winner selection changed before one-shot claim"
+        )
+    claim_path = _claim_path(selection_resolved)
+    body = {
+        **dict(validation),
+        "status": "authorized",
+        "authorized_test_evaluations": 1,
+    }
+    body["receipt_payload_sha256"] = legacy.canonical_json_sha256(body)
+    encoded = (
+        json.dumps(
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(claim_path, flags, 0o600)
+    except FileExistsError as error:
+        raise TestWinnerContractError(
+            "the selected Base winner's one-shot test allowance is already "
+            "claimed"
+        ) from error
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while publishing test claim")
+            view = view[written:]
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        claim_path.unlink(missing_ok=True)
+        raise
+    else:
+        os.close(descriptor)
+    directory = os.open(claim_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return {
+        "claim": {
+            "path": str(claim_path),
+            "sha256": legacy.sha256_file(claim_path),
+            "receipt_payload_sha256": body["receipt_payload_sha256"],
+        },
+        **body,
     }
 
 
@@ -252,12 +395,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.expected_base_frozen_inputs_sha256
         ),
     )
-    authorization = validate_test_winner(
+    validation = validate_test_winner(
         selection_path=args.selection_json,
         expected_selection_sha256=args.expected_selection_sha256,
         checkpoint_path=args.checkpoint,
         expected_checkpoint_sha256=args.expected_checkpoint_sha256,
         candidate_bundle=bundle,
+    )
+    authorization = publish_test_winner_claim(
+        validation,
+        selection_path=args.selection_json,
     )
     print(json.dumps(authorization, sort_keys=True))
     return 0

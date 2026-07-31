@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.show_base import base_long_val_contract as long_contract
 from scripts.show_base import validate_base_long_test_winner as validator
@@ -36,6 +37,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
     def _fixture(self) -> tuple[dict[str, object], Path]:
         candidates: dict[int, dict[str, object]] = {}
         rows = []
+        measurements = []
         for index, epoch in enumerate(
             long_contract.EXPECTED_CANDIDATE_EPOCHS
         ):
@@ -50,9 +52,23 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
             inference = self.root / f"val-lineage-e{epoch:04d}.json"
             report = self.root / f"val-diffsheg-e{epoch:04d}.json"
             _write_json(inference, {"epoch": epoch, "split": "val"})
-            _write_json(report, {"epoch": epoch, "fgd": index + 1.0})
             # e200 is the unique validation winner.
             fgd = 0.125 if epoch == 200 else index + 1.0
+            _write_json(report, {"epoch": epoch, "fgd": fgd})
+            measurement = self.root / f"measurement-e{epoch:04d}.json"
+            _write_json(
+                measurement,
+                {
+                    "epoch": epoch,
+                    "diffsheg_report": {
+                        "path": str(report),
+                        "sha256": _sha(report),
+                    },
+                },
+            )
+            measurements.append(
+                {"path": str(measurement), "sha256": _sha(measurement)}
+            )
             rows.append(
                 {
                     "epoch": epoch,
@@ -107,6 +123,7 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
                 for key in ("manifest", "status", "frozen_inputs")
             },
             "candidate_metrics": rows,
+            "measurement_receipts": measurements,
             "selected": {
                 "epoch": 200,
                 "candidate_checkpoint": winner["candidate_checkpoint"],
@@ -134,15 +151,67 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         selection_path: Path | None = None,
     ) -> dict[str, object]:
         checkpoint = self.bundle["candidates"][epoch]
-        return validator.validate_test_winner(
-            selection_path=selection_path or self.selection_path,
-            expected_selection_sha256=_sha(
-                selection_path or self.selection_path
+        active_selection = selection_path or self.selection_path
+        with mock.patch.object(
+            validator.long_selector,
+            "build_selection",
+            side_effect=lambda **kwargs: self._replay_selection(
+                active_selection,
+                **kwargs,
             ),
-            checkpoint_path=Path(checkpoint["path"]),
-            expected_checkpoint_sha256=checkpoint["sha256"],
-            candidate_bundle=self.bundle,
+        ):
+            return validator.validate_test_winner(
+                selection_path=active_selection,
+                expected_selection_sha256=_sha(active_selection),
+                checkpoint_path=Path(checkpoint["path"]),
+                expected_checkpoint_sha256=checkpoint["sha256"],
+                candidate_bundle=self.bundle,
+            )
+
+    def _replay_selection(
+        self,
+        selection_path: Path,
+        *,
+        candidate_bundle: object,
+        measurement_paths: object,
+        expected_measurement_sha256: object,
+    ) -> dict[str, object]:
+        self.assertEqual(candidate_bundle, self.bundle)
+        selection = json.loads(
+            selection_path.read_text(encoding="utf-8")
         )
+        rows = selection["candidate_metrics"]
+        self.assertEqual(len(measurement_paths), len(rows))
+        self.assertEqual(len(expected_measurement_sha256), len(rows))
+        for row, path, expected_sha in zip(
+            rows,
+            measurement_paths,
+            expected_measurement_sha256,
+        ):
+            self.assertEqual(_sha(path), expected_sha)
+            measurement = json.loads(path.read_text(encoding="utf-8"))
+            report_receipt = measurement["diffsheg_report"]
+            report_path = Path(report_receipt["path"])
+            self.assertEqual(_sha(report_path), report_receipt["sha256"])
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["epoch"], row["epoch"])
+            row["metrics"] = {"fgd": report["fgd"]}
+        winner = min(
+            rows,
+            key=lambda row: (row["metrics"]["fgd"], row["epoch"]),
+        )
+        selection["selected"] = {
+            "epoch": winner["epoch"],
+            "candidate_checkpoint": winner["candidate_checkpoint"],
+            "fgd": winner["metrics"]["fgd"],
+            "inference_lineage": winner["inference_lineage"],
+            "diffsheg_report": winner["diffsheg_report"],
+        }
+        selection.pop("receipt_payload_sha256")
+        selection["receipt_payload_sha256"] = (
+            long_contract.canonical_json_sha256(selection)
+        )
+        return selection
 
     def test_only_recomputed_twenty_two_way_val_winner_is_authorized(
         self,
@@ -151,7 +220,8 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         self.assertEqual(receipt["selected_epoch"], 200)
         self.assertEqual(receipt["candidate_count"], 22)
         self.assertFalse(receipt["test_visible_during_selection"])
-        self.assertEqual(receipt["authorized_test_evaluations"], 1)
+        self.assertEqual(receipt["status"], "validated")
+        self.assertEqual(receipt["authorized_test_evaluations"], 0)
 
     def test_nonwinner_checkpoint_is_rejected(self) -> None:
         with self.assertRaises(validator.TestWinnerContractError):
@@ -182,6 +252,101 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
         contaminated.write_bytes(self.selection_path.read_bytes())
         with self.assertRaises(long_contract.SelectionContractError):
             self._authorize(selection_path=contaminated)
+
+    def test_embedded_fgd_must_match_replayed_report(self) -> None:
+        selection = json.loads(
+            self.selection_path.read_text(encoding="utf-8")
+        )
+        winner = next(
+            row
+            for row in selection["candidate_metrics"]
+            if row["epoch"] == 200
+        )
+        report = Path(winner["diffsheg_report"]["path"])
+        _write_json(report, {"epoch": 200, "fgd": 99.0})
+        winner["diffsheg_report"]["sha256"] = _sha(report)
+        measurement = next(
+            Path(receipt["path"])
+            for receipt in selection["measurement_receipts"]
+            if json.loads(
+                Path(receipt["path"]).read_text(encoding="utf-8")
+            )["epoch"]
+            == 200
+        )
+        measurement_payload = json.loads(
+            measurement.read_text(encoding="utf-8")
+        )
+        measurement_payload["diffsheg_report"]["sha256"] = _sha(report)
+        _write_json(measurement, measurement_payload)
+        for receipt in selection["measurement_receipts"]:
+            if receipt["path"] == str(measurement):
+                receipt["sha256"] = _sha(measurement)
+        selection.pop("receipt_payload_sha256")
+        selection["receipt_payload_sha256"] = (
+            long_contract.canonical_json_sha256(selection)
+        )
+        inconsistent = self.root / "inconsistent-validation-selection.json"
+        _write_json(inconsistent, selection)
+        with self.assertRaisesRegex(
+            validator.TestWinnerContractError,
+            "differs from replayed",
+        ):
+            self._authorize(selection_path=inconsistent)
+
+    def test_artifact_receipts_reject_extra_keys(self) -> None:
+        selection = json.loads(
+            self.selection_path.read_text(encoding="utf-8")
+        )
+        selection["candidate_metrics"][0]["inference_lineage"][
+            "unexpected"
+        ] = True
+        selection.pop("receipt_payload_sha256")
+        selection["receipt_payload_sha256"] = (
+            long_contract.canonical_json_sha256(selection)
+        )
+        altered = self.root / "extra-artifact-key-selection.json"
+        _write_json(altered, selection)
+        with self.assertRaisesRegex(
+            validator.TestWinnerContractError,
+            "artifact schema mismatch",
+        ):
+            self._authorize(selection_path=altered)
+
+    def test_one_shot_claim_has_one_canonical_exclusive_slot(self) -> None:
+        validation = self._authorize()
+        claimed = validator.publish_test_winner_claim(
+            validation,
+            selection_path=self.selection_path,
+        )
+        claim_path = Path(claimed["claim"]["path"])
+        self.assertEqual(
+            claim_path,
+            self.selection_path.with_name(
+                f"{self.selection_path.name}.test-winner-claim.json"
+            ),
+        )
+        payload = json.loads(claim_path.read_text(encoding="utf-8"))
+        claimed_hash = payload.pop("receipt_payload_sha256")
+        self.assertEqual(
+            long_contract.canonical_json_sha256(payload),
+            claimed_hash,
+        )
+        self.assertEqual(
+            payload["candidate_bundle"],
+            {
+                key: self.bundle[key]
+                for key in ("manifest", "status", "frozen_inputs")
+            },
+        )
+        self.assertEqual(payload["selected_checkpoint"]["bytes"], 13)
+        with self.assertRaisesRegex(
+            validator.TestWinnerContractError,
+            "already claimed",
+        ):
+            validator.publish_test_winner_claim(
+                validation,
+                selection_path=self.selection_path,
+            )
 
 
 if __name__ == "__main__":
