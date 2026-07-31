@@ -759,7 +759,7 @@ def _validate_metric_report(
     prediction_manifest: Mapping[str, Any],
     lineage_artifact: Mapping[str, Any],
     distribution: Mapping[str, Any],
-) -> tuple[dict[str, Any], float]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     artifact, payload = _normalize_artifact(
         artifact_value, "TalkSHOW validation metric report", with_payload=False
     )
@@ -873,7 +873,7 @@ def _validate_metric_report(
         raise PublishedWinnerClaimError(
             "TalkSHOW released2 metric schema changed"
         )
-    fgd = _require_number(metrics["FGD"], PRIMARY_METRIC)
+    report_fgd = _require_number(metrics["FGD"], PRIMARY_METRIC)
     if (
         not isinstance(validation, dict)
         or validation.get("status") != "pass"
@@ -884,12 +884,95 @@ def _validate_metric_report(
             validation.get("primary_metric"),
             "fresh TalkSHOW primary metric",
         )
-        != fgd
+        != report_fgd
     ):
         raise PublishedWinnerClaimError(
             "neutral TalkSHOW report replay changed the primary metric"
         )
-    return artifact, fgd
+    return artifact, report, validation
+
+
+def _validate_primary_replay_receipt(
+    artifact_value: Any,
+    *,
+    report: Mapping[str, Any],
+    report_validation: Mapping[str, Any],
+    prediction_manifest: Mapping[str, Any],
+    distribution: Mapping[str, Any],
+    expected_real_feature_cache: Mapping[str, Any],
+) -> tuple[dict[str, Any], float]:
+    artifact = _exact_mapping(
+        artifact_value,
+        PAYLOAD_ARTIFACT_KEYS,
+        "released2 primary replay artifact",
+    )
+    try:
+        metric_adapter = importlib.import_module(
+            "scripts.show_base.evaluate_talkshow_show_metrics"
+        )
+        replay = metric_adapter.validate_released2_primary_replay_receipt(
+            artifact,
+            expected_report=report,
+            expected_prediction_manifest=prediction_manifest,
+            expected_distribution_receipt=distribution,
+            expected_selection_protocol={
+                "primary_metric": PRIMARY_METRIC,
+                "mode": "min",
+                "validation_only_for_selection": True,
+                "test_evaluations": 0,
+            },
+            expected_split="val",
+            expected_clip_count=EXPECTED_VAL_CLIPS,
+        )
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError) as error:
+        raise PublishedWinnerClaimError(
+            "released2 primary fresh replay verification failed"
+        ) from error
+    replay = _exact_mapping(
+        replay,
+        {
+            "artifact",
+            "receipt_payload_sha256",
+            "primary_metric_path",
+            "primary_metric",
+            "report_payload_sha256",
+            "prediction_manifest",
+            "real_feature_cache",
+            "metric_assets",
+            "runtime",
+        },
+        "released2 primary replay validation",
+    )
+    normalized_artifact, _payload = _normalize_artifact(
+        artifact,
+        "released2 primary replay",
+        with_payload=True,
+    )
+    cache_artifact, _cache_payload = _normalize_artifact(
+        replay["real_feature_cache"],
+        "released2 real-feature cache",
+        with_payload=True,
+    )
+    primary = _require_number(
+        replay["primary_metric"], "fresh-replayed released2 FGD"
+    )
+    if (
+        replay["artifact"] != normalized_artifact
+        or replay["receipt_payload_sha256"]
+        != normalized_artifact["receipt_payload_sha256"]
+        or replay["primary_metric_path"] != PRIMARY_METRIC
+        or replay["report_payload_sha256"]
+        != report_validation["report_payload_sha256"]
+        or replay["prediction_manifest"] != prediction_manifest
+        or replay["real_feature_cache"] != cache_artifact
+        or cache_artifact != expected_real_feature_cache
+        or not isinstance(replay["metric_assets"], dict)
+        or not isinstance(replay["runtime"], dict)
+    ):
+        raise PublishedWinnerClaimError(
+            "released2 primary fresh replay authority changed"
+        )
+    return normalized_artifact, primary
 
 
 def _validate_winner_selection(
@@ -897,6 +980,7 @@ def _validate_winner_selection(
     *,
     prerequisite_artifact: Mapping[str, Any],
     continuation_artifact: Mapping[str, Any],
+    expected_real_feature_cache: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     artifact, selection = _verify_compact_receipt(
         artifact_value, "Base validation winner selection"
@@ -917,6 +1001,7 @@ def _validate_winner_selection(
             "selection_policy",
             "prerequisite_selection",
             "continuation_decision",
+            "real_feature_cache",
             "candidates",
             "selected",
             "test_policy",
@@ -937,6 +1022,7 @@ def _validate_winner_selection(
         or selection["primary_metric"] != PRIMARY_METRIC
         or selection["prerequisite_selection"] != prerequisite_artifact
         or selection["continuation_decision"] != continuation_artifact
+        or selection["real_feature_cache"] != expected_real_feature_cache
         or selection["test_policy"] != TEST_POLICY
     ):
         raise PublishedWinnerClaimError(
@@ -968,6 +1054,7 @@ def _validate_winner_selection(
         "inference_lineage",
         "distribution_receipt",
         "talkshow_metric_report",
+        "primary_replay_receipt",
         "body_released2_fgd",
     }
     replayed: list[tuple[float, int, int, dict[str, Any]]] = []
@@ -1016,11 +1103,19 @@ def _validate_winner_selection(
             prerequisite_artifact=prerequisite_artifact,
             continuation_artifact=continuation_artifact,
         )
-        report_artifact, fgd = _validate_metric_report(
+        report_artifact, report, report_validation = _validate_metric_report(
             row["talkshow_metric_report"],
             prediction_manifest=prediction_manifest,
             lineage_artifact=lineage_artifact,
             distribution=distribution,
+        )
+        replay_artifact, fgd = _validate_primary_replay_receipt(
+            row["primary_replay_receipt"],
+            report=report,
+            report_validation=report_validation,
+            prediction_manifest=prediction_manifest,
+            distribution=distribution,
+            expected_real_feature_cache=expected_real_feature_cache,
         )
         if _require_number(
             row["body_released2_fgd"],
@@ -1037,6 +1132,7 @@ def _validate_winner_selection(
             "inference_lineage": lineage_artifact,
             "distribution_receipt": distribution_artifact,
             "talkshow_metric_report": report_artifact,
+            "primary_replay_receipt": replay_artifact,
             "body_released2_fgd": fgd,
         }
         if normalized_row != row:
@@ -1109,6 +1205,7 @@ def validate_published_test_winner_claim(
             "winner_selection",
             "prerequisite_selection",
             "continuation_decision",
+            "real_feature_cache",
             "selected_base_checkpoint",
             "fixed_checkpoints",
             "expected_output_root",
@@ -1154,10 +1251,16 @@ def validate_published_test_winner_claim(
             prerequisite_selection=prerequisite_payload,
         )
     )
+    real_feature_cache, _cache_payload = _normalize_artifact(
+        claim["real_feature_cache"],
+        "published released2 real-feature cache",
+        with_payload=True,
+    )
     winner_artifact, _winner_payload, winner = _validate_winner_selection(
         claim["winner_selection"],
         prerequisite_artifact=prerequisite_artifact,
         continuation_artifact=continuation_artifact,
+        expected_real_feature_cache=real_feature_cache,
     )
     if (
         claim["prerequisite_selection"] != prerequisite_artifact

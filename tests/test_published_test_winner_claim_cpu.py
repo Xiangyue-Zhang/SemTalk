@@ -170,6 +170,14 @@ class ClaimFixture:
             root / "continuation-decision.json",
             self.continuation_payload,
         )
+        self.real_feature_cache = _write_receipt(
+            root / "released2-real-feature-cache.json",
+            {
+                "format": "semtalk_show_released2_real_feature_cache_v1",
+                "status": "complete",
+                "feature_count": 1715,
+            },
+        )
         self.rows = self._candidate_rows()
         self.winner_payload = self._winner_payload()
         self.winner_artifact = _write_receipt(
@@ -353,6 +361,23 @@ class ClaimFixture:
             report_artifact = _write_json(
                 candidate_root / "metrics.json", report
             )
+            primary_replay = {
+                "format": "semtalk_show_released2_primary_fresh_replay_v1",
+                "status": "complete",
+                "primary_metric_path": CLAIM.PRIMARY_METRIC,
+                "primary_metric": fgd,
+                "report_payload_sha256": report[
+                    "report_payload_sha256"
+                ],
+                "prediction_manifest": manifest,
+                "real_feature_cache": self.real_feature_cache,
+                "metric_assets": report["metric_assets"],
+                "runtime": {"device": "cuda:0", "epoch": epoch},
+            }
+            primary_replay_artifact = _write_receipt(
+                candidate_root / "released2-primary-replay.json",
+                primary_replay,
+            )
             rows.append(
                 {
                     "epoch": epoch,
@@ -362,6 +387,7 @@ class ClaimFixture:
                     "inference_lineage": lineage_artifact,
                     "distribution_receipt": distribution_artifact,
                     "talkshow_metric_report": report_artifact,
+                    "primary_replay_receipt": primary_replay_artifact,
                     "body_released2_fgd": fgd,
                 }
             )
@@ -400,6 +426,7 @@ class ClaimFixture:
             },
             "prerequisite_selection": self.prerequisite_artifact,
             "continuation_decision": self.continuation_artifact,
+            "real_feature_cache": self.real_feature_cache,
             "candidates": self.rows,
             "selected": selected,
             "test_policy": CLAIM.TEST_POLICY,
@@ -416,6 +443,7 @@ class ClaimFixture:
             "winner_selection": self.winner_artifact,
             "prerequisite_selection": self.prerequisite_artifact,
             "continuation_decision": self.continuation_artifact,
+            "real_feature_cache": self.real_feature_cache,
             "selected_base_checkpoint": self.winner_payload["selected"][
                 "candidate_checkpoint"
             ],
@@ -434,7 +462,59 @@ class ClaimFixture:
             "clips": CLAIM.EXPECTED_VAL_CLIPS,
             "primary_metric_path": CLAIM.PRIMARY_METRIC,
             "primary_metric": report["body"]["released2"]["metrics"]["FGD"],
+            "report_payload_sha256": report["report_payload_sha256"],
         }
+
+    def fake_validate_primary_replay(
+        self,
+        artifact: dict[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        payload = json.loads(
+            Path(artifact["path"]).read_text(encoding="utf-8")
+        )
+        report = kwargs["expected_report"]
+        if (
+            kwargs["expected_split"] != "val"
+            or kwargs["expected_clip_count"] != CLAIM.EXPECTED_VAL_CLIPS
+            or kwargs["expected_selection_protocol"]
+            != {
+                "primary_metric": CLAIM.PRIMARY_METRIC,
+                "mode": "min",
+                "validation_only_for_selection": True,
+                "test_evaluations": 0,
+            }
+            or kwargs["expected_prediction_manifest"]
+            != payload["prediction_manifest"]
+            or kwargs["expected_distribution_receipt"]
+            != report["distribution_receipt"]
+            or payload["report_payload_sha256"]
+            != report["report_payload_sha256"]
+        ):
+            raise RuntimeError("fresh replay expectation changed")
+        return {
+            "artifact": artifact,
+            "receipt_payload_sha256": artifact[
+                "receipt_payload_sha256"
+            ],
+            "primary_metric_path": CLAIM.PRIMARY_METRIC,
+            "primary_metric": payload["primary_metric"],
+            "report_payload_sha256": report[
+                "report_payload_sha256"
+            ],
+            "prediction_manifest": payload["prediction_manifest"],
+            "real_feature_cache": payload["real_feature_cache"],
+            "metric_assets": payload["metric_assets"],
+            "runtime": payload["runtime"],
+        }
+
+    def adapter(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            validate_report=self.fake_validate_report,
+            validate_released2_primary_replay_receipt=(
+                self.fake_validate_primary_replay
+            ),
+        )
 
     @staticmethod
     def assert_adapter_call(
@@ -459,7 +539,7 @@ class ClaimFixture:
             raise AssertionError("metric adapter call changed")
 
     def validate(self) -> dict[str, object]:
-        adapter = SimpleNamespace(validate_report=self.fake_validate_report)
+        adapter = self.adapter()
         with mock.patch.object(
             CLAIM.importlib, "import_module", return_value=adapter
         ):
@@ -522,9 +602,7 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             self.fixture.validate()
 
     def test_wrong_output_root_fails(self) -> None:
-        adapter = SimpleNamespace(
-            validate_report=self.fixture.fake_validate_report
-        )
+        adapter = self.fixture.adapter()
         with mock.patch.object(
             CLAIM.importlib, "import_module", return_value=adapter
         ), self.assertRaisesRegex(
@@ -623,12 +701,35 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 continuation_decision=self.fixture.continuation_artifact,
             )
 
+    def test_primary_replay_failure_has_no_report_fgd_fallback(self) -> None:
+        adapter = self.fixture.adapter()
+        adapter.validate_released2_primary_replay_receipt = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("fresh primary replay rejected")
+            )
+        )
+        with mock.patch.object(
+            CLAIM.importlib, "import_module", return_value=adapter
+        ), self.assertRaisesRegex(
+            CLAIM.PublishedWinnerClaimError,
+            "released2 primary fresh replay verification failed",
+        ):
+            CLAIM.validate_published_test_winner_claim(
+                self.fixture.claim_artifact["path"],
+                expected_claim_sha256=self.fixture.claim_artifact["sha256"],
+                expected_claim_bytes=self.fixture.claim_artifact["bytes"],
+                expected_claim_payload_sha256=self.fixture.claim_artifact[
+                    "receipt_payload_sha256"
+                ],
+                expected_output_root=self.fixture.output_root,
+                prerequisite_selection=self.fixture.prerequisite_artifact,
+                continuation_decision=self.fixture.continuation_artifact,
+            )
+
     def test_external_prerequisite_artifact_swap_fails(self) -> None:
         swapped = dict(self.fixture.prerequisite_artifact)
         swapped["sha256"] = "0" * 64
-        adapter = SimpleNamespace(
-            validate_report=self.fixture.fake_validate_report
-        )
+        adapter = self.fixture.adapter()
         with mock.patch.object(
             CLAIM.importlib, "import_module", return_value=adapter
         ), self.assertRaisesRegex(
@@ -645,6 +746,24 @@ class PublishedWinnerClaimTests(unittest.TestCase):
                 prerequisite_selection=swapped,
                 continuation_decision=self.fixture.continuation_artifact,
             )
+
+    def test_claim_real_feature_cache_is_an_independent_pin(self) -> None:
+        replacement = _write_receipt(
+            Path(self.temporary.name) / "replacement-real-cache.json",
+            {
+                "format": "semtalk_show_released2_real_feature_cache_v1",
+                "status": "complete",
+                "feature_count": 1715,
+            },
+        )
+        self.fixture.rewrite_claim(
+            lambda claim: claim.update({"real_feature_cache": replacement})
+        )
+        with self.assertRaisesRegex(
+            CLAIM.PublishedWinnerClaimError,
+            "winner selection identity changed",
+        ):
+            self.fixture.validate()
 
 
 if __name__ == "__main__":
