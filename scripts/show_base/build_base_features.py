@@ -2890,6 +2890,8 @@ def load_released_all_speakers_models(
 
 def load_val_selected_models(
     args: argparse.Namespace,
+    *,
+    retain_global: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Load exactly the five independently validation-selected SHOW models."""
 
@@ -2932,6 +2934,10 @@ def load_val_selected_models(
                 f"{stage} selected checkpoint container schema mismatch"
             )
         audit = payload["audit"]
+        updates_per_epoch = selected_contract.require_exact_int(
+            selected.get("updates_per_epoch"),
+            f"{stage} selected updates per epoch",
+        )
         if (
             not isinstance(audit, dict)
             or audit.get("format")
@@ -2940,6 +2946,9 @@ def load_val_selected_models(
             or audit.get("completed_epochs") != selected["epoch"]
             or audit.get("optimizer_updates")
             != selected["optimizer_updates"]
+            or updates_per_epoch <= 0
+            or selected["optimizer_updates"]
+            != selected["epoch"] * updates_per_epoch
             or audit.get("selection_status")
             != "offline_validation_pending"
             or audit.get("source_receipt")
@@ -2987,6 +2996,7 @@ def load_val_selected_models(
             "test_visible": False,
             "selected_epoch": selected["epoch"],
             "selected_optimizer_updates": selected["optimizer_updates"],
+            "selected_updates_per_epoch": updates_per_epoch,
             "selection_metric": selected["selection_metric"],
             "selection_score": selected["selection_score"],
             "candidate_audit_sha256": selected[
@@ -3015,7 +3025,7 @@ def load_val_selected_models(
         ).to(args.device)
         _strict_load_freeze_eval(model, state, path=resolved)
         records[stage] = record
-        if stage == "global":
+        if stage == "global" and not retain_global:
             # Global is required and strict-loaded against the real
             # VAEConvZero architecture, but it is not retained in the Base
             # feature graph.
@@ -3023,12 +3033,16 @@ def load_val_selected_models(
             continue
         models[stage] = model
         del state, payload
-    if set(models) != set(RVQ_NAMES) or set(records) != {
+    expected_models = (
+        {*RVQ_NAMES, "global"} if retain_global else set(RVQ_NAMES)
+    )
+    if set(models) != expected_models or set(records) != {
         *RVQ_NAMES,
         "global",
     }:
         raise RuntimeError(
-            "show_val_selected_v1 did not load four RVQs and audit Global"
+            "show_val_selected_v1 did not load the exact requested five-stage "
+            "model set"
         )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

@@ -1277,8 +1277,7 @@ def validate_rvq_ema_prior_receipt(
             f"{label}.layers[{index}].prior_count",
         )
         if (
-            not isinstance(name, str)
-            or not name
+            name != f"module.quantizer.layers.{index}"
             or name in names
             or not 0.0 < decay < 1.0
             or prior <= 1.0

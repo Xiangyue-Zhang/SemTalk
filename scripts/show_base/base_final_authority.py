@@ -118,6 +118,8 @@ BASE_LONG_BUNDLE_KEYS = {
     "status",
     "frozen_inputs",
     "producer_source",
+    "selected_prerequisite_sha256",
+    "selected_topology",
     "candidate_epochs",
     "updates_per_epoch",
     "candidates",
@@ -153,14 +155,20 @@ _CONTROL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "gate_task_space_on_show_v2": (
         "gate_released_all_speakers_on_show",
     ),
-    "select_base_official_adapt": (
+    "talkshow_base_val_contract": (
         "gate_released_all_speakers_on_show",
         "gate_task_space_on_show_v2",
+        "prerequisite_val_contract",
+        "merge_prerequisite_val_shards",
+        "selected_prerequisites",
     ),
     "base_long_val_contract": (
         "gate_released_all_speakers_on_show",
         "gate_task_space_on_show_v2",
-        "select_base_official_adapt",
+        "prerequisite_val_contract",
+        "merge_prerequisite_val_shards",
+        "selected_prerequisites",
+        "talkshow_base_val_contract",
     ),
     "published_test_winner_claim": (),
 }
@@ -1078,11 +1086,9 @@ def _replay_base_long_candidate_bundle(
     module = _control_module("base_long_val_contract")
     validator = getattr(module, "validate_candidate_bundle", None)
     epochs = getattr(module, "EXPECTED_CANDIDATE_EPOCHS", None)
-    updates_per_epoch = getattr(module, "EXPECTED_UPDATES_PER_EPOCH", None)
     if (
         not callable(validator)
         or type(epochs) not in {tuple, list}
-        or type(updates_per_epoch) is not int
     ):
         raise BaseFinalAuthorityError(
             "Base-long neutral candidate validator ABI mismatch"
@@ -1129,7 +1135,6 @@ def _replay_base_long_candidate_bundle(
             360,
             400,
         )
-        or updates_per_epoch != 248
         or type(replayed) is not dict
         or set(replayed)
         != {
@@ -1137,6 +1142,9 @@ def _replay_base_long_candidate_bundle(
             "status",
             "frozen_inputs",
             "producer_source",
+            "selected_prerequisite_sha256",
+            "selected_topology",
+            "updates_per_epoch",
             "candidates",
         }
         or replayed["manifest"]
@@ -1158,12 +1166,20 @@ def _replay_base_long_candidate_bundle(
         != artifacts["frozen_inputs"]["sha256"]
         or type(replayed["candidates"]) is not dict
         or tuple(replayed["candidates"]) != expected_epochs
+        or type(replayed["selected_prerequisite_sha256"]) is not dict
+        or set(replayed["selected_prerequisite_sha256"])
+        != set(REPRESENTATION_STAGES)
+        or replayed.get("updates_per_epoch") not in {248, 1988}
+        or not isinstance(replayed.get("selected_topology"), dict)
+        or replayed["selected_topology"].get("updates_per_epoch")
+        != replayed["updates_per_epoch"]
     ):
         raise BaseFinalAuthorityError(
             "Base-long neutral candidate replay returned a non-canonical "
             "22-candidate authority"
         )
     candidates: list[dict[str, Any]] = []
+    updates_per_epoch = replayed["updates_per_epoch"]
     for epoch in expected_epochs:
         checkpoint, _payload = _verified_artifact(
             replayed["candidates"][epoch],
@@ -1186,6 +1202,10 @@ def _replay_base_long_candidate_bundle(
         "status": dict(replayed["status"]),
         "frozen_inputs": dict(replayed["frozen_inputs"]),
         "producer_source": producer_source,
+        "selected_prerequisite_sha256": dict(
+            replayed["selected_prerequisite_sha256"]
+        ),
+        "selected_topology": dict(replayed["selected_topology"]),
         "candidate_epochs": list(expected_epochs),
         "updates_per_epoch": updates_per_epoch,
         "candidates": candidates,
@@ -1664,6 +1684,7 @@ def _replay_published_test_winner_claim(
     prerequisite_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
+    winner_full_metric_closure: Mapping[str, Any],
 ) -> dict[str, Any]:
     winner = _control_module("published_test_winner_claim")
     validator = getattr(
@@ -1674,6 +1695,14 @@ def _replay_published_test_winner_claim(
     if not callable(validator):
         raise BaseFinalAuthorityError(
             "neutral published Base test-winner validator is unavailable"
+        )
+    expected_claim_format = getattr(winner, "FRESH_CLAIM_FORMAT", None)
+    if (
+        type(expected_claim_format) is not str
+        or payload.get("format") != expected_claim_format
+    ):
+        raise BaseFinalAuthorityError(
+            "formal Base final authority requires the fresh v3 claim protocol"
         )
     payload_sha = _sha256(
         payload.get("receipt_payload_sha256"),
@@ -1689,6 +1718,8 @@ def _replay_published_test_winner_claim(
             prerequisite_selection=prerequisite_selection,
             continuation_decision=continuation_decision,
             continuation_waves=list(continuation_waves),
+            winner_full_metric_closure=winner_full_metric_closure,
+            expected_claim_format=expected_claim_format,
         )
     except Exception as exc:
         raise BaseFinalAuthorityError(
@@ -1701,6 +1732,7 @@ def _replay_published_test_winner_claim(
         "selected_base_checkpoint",
         "fixed_checkpoints",
         "continuation_waves",
+        "winner_full_metric_closure",
         "expected_output_root",
         "test_policy",
     }:
@@ -1712,6 +1744,8 @@ def _replay_published_test_winner_claim(
         or validated["receipt_payload_sha256"] != payload_sha
         or validated["expected_output_root"] != str(expected_output_root)
         or validated["continuation_waves"] != list(continuation_waves)
+        or validated["winner_full_metric_closure"]
+        != winner_full_metric_closure
     ):
         raise BaseFinalAuthorityError(
             "neutral published Base test-winner authority changed"
@@ -1726,6 +1760,7 @@ def _control_authority(
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
+    winner_full_metric_closure: Mapping[str, Any],
     test_claim: Mapping[str, Any],
     checkpoints: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -1803,6 +1838,15 @@ def _control_authority(
     if set(explicit_stages) != set(REPRESENTATION_STAGES):
         raise BaseFinalAuthorityError(
             "selected-five replay stage coverage mismatch"
+        )
+    if base_long_candidate_bundle.get(
+        "selected_prerequisite_sha256"
+    ) != {
+        stage: explicit_stages[stage]["candidate_checkpoint"]["sha256"]
+        for stage in REPRESENTATION_STAGES
+    }:
+        raise BaseFinalAuthorityError(
+            "Base frozen inputs differ from the selected five SHOW winners"
         )
     candidate_epochs_by_stage = _prerequisite_candidate_schedules(
         prerequisite_selection
@@ -1897,6 +1941,20 @@ def _control_authority(
         },
         "winner selection",
     )
+    full_closure, full_closure_payload = _json_artifact(
+        winner_full_metric_closure,
+        "winner full validation metric closure",
+    )
+    pinned_full_closure = _payload_artifact_from_binding(
+        {
+            **full_closure,
+            "receipt_payload_sha256": _sha256(
+                full_closure_payload.get("receipt_payload_sha256"),
+                "winner full validation metric closure payload SHA",
+            ),
+        },
+        "winner full validation metric closure",
+    )
     claim, claim_payload = _json_artifact(
         test_claim,
         "one-shot test claim",
@@ -1908,6 +1966,7 @@ def _control_authority(
         prerequisite_selection=pinned_prerequisite_selection,
         continuation_decision=pinned_continuation_decision,
         continuation_waves=pinned_continuation_waves,
+        winner_full_metric_closure=pinned_full_closure,
     )
     published_rows = selection_payload.get("candidates")
     long_rows = base_long_candidate_bundle["candidates"]
@@ -1958,6 +2017,8 @@ def _control_authority(
             for stage in REPRESENTATION_STAGES
         }
         or type(published["test_policy"]) is not dict
+        or published["winner_full_metric_closure"]
+        != pinned_full_closure
     ):
         raise BaseFinalAuthorityError(
             "neutral published winner does not bind Base plus selected five"
@@ -1967,6 +2028,7 @@ def _control_authority(
         ("continuation decision", replayed_continuation),
         ("continuation waves", replayed_waves),
         ("prerequisite selection", prerequisite_selection),
+        ("winner full validation metric closure", full_closure_payload),
         ("one-shot test claim", claim_payload),
     ):
         _reject_forbidden(payload, label)
@@ -2000,12 +2062,30 @@ def _control_authority(
             ),
         },
         "continuation_waves": pinned_continuation_waves,
+        "winner_full_metric_closure": pinned_full_closure,
         "prerequisite_selection": {
             **pinned_prerequisite_selection,
             "canonical_payload_sha256": canonical_json_sha256(
                 prerequisite_selection
             ),
             "bridge_format": prerequisite_bridge["format"],
+            "prerequisite_consumption": {
+                "base_training_feature_graph": {
+                    "live_prerequisite_models": [],
+                    "consumed_precomputed_selected_outputs": [
+                        "face",
+                        "hands",
+                        "upper",
+                        "lower",
+                    ],
+                    "global_model_consumed": False,
+                },
+                "official_base_inference": {
+                    "strict_loaded_models": list(REPRESENTATION_STAGES),
+                    "decoded_models": list(REPRESENTATION_STAGES),
+                    "global_translation_reconstruction": True,
+                },
+            },
             "stages": explicit_stages,
         },
         "test_claim": {
@@ -2034,6 +2114,7 @@ def _authority_inputs(
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
+    winner_full_metric_closure: Mapping[str, Any],
     test_claim: Mapping[str, Any],
     inference_source: Mapping[str, Any],
     checkpoints: Mapping[str, Mapping[str, Any]],
@@ -2072,6 +2153,7 @@ def _authority_inputs(
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
+        winner_full_metric_closure=winner_full_metric_closure,
         test_claim=test_claim,
         checkpoints=checkpoint_bundle,
     )
@@ -2121,6 +2203,7 @@ def _build_test_authority(
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
+    winner_full_metric_closure: Mapping[str, Any],
     test_claim: Mapping[str, Any],
     inference_source: Mapping[str, Any],
     checkpoints: Mapping[str, Mapping[str, Any]],
@@ -2137,6 +2220,7 @@ def _build_test_authority(
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
+        winner_full_metric_closure=winner_full_metric_closure,
         test_claim=test_claim,
         inference_source=inference_source,
         checkpoints=checkpoints,
@@ -2164,6 +2248,7 @@ def build_test_authority(
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
+    winner_full_metric_closure: Mapping[str, Any],
     test_claim: Mapping[str, Any],
     inference_source: Mapping[str, Any],
     checkpoints: Mapping[str, Mapping[str, Any]],
@@ -2181,6 +2266,7 @@ def build_test_authority(
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
+        winner_full_metric_closure=winner_full_metric_closure,
         test_claim=test_claim,
         inference_source=inference_source,
         checkpoints=checkpoints,
@@ -2199,6 +2285,7 @@ def _replay_authority(value: Any) -> dict[str, Any]:
         "winner_selection",
         "continuation_decision",
         "continuation_waves",
+        "winner_full_metric_closure",
         "prerequisite_selection",
         "test_claim",
         "base_long_candidate_bundle",
@@ -2309,6 +2396,10 @@ def _replay_authority(value: Any) -> dict[str, Any]:
             }
             for wave in value["continuation_waves"]
         ],
+        winner_full_metric_closure={
+            key: value["winner_full_metric_closure"][key]
+            for key in ARTIFACT_KEYS
+        },
         test_claim={
             key: value["test_claim"][key]
             for key in ARTIFACT_KEYS

@@ -49,6 +49,9 @@ PRIMARY_REAL_FEATURE_CACHE_FORMAT = (
 PRIMARY_REPLAY_FORMAT = (
     "semtalk_show_released2_primary_fresh_replay_v1"
 )
+PRIMARY_SCREEN_FORMAT = (
+    "semtalk_show_released2_primary_screen_v1"
+)
 PRIMARY_METRIC_PATH = "body.released2.metrics.FGD"
 REPORT_PAYLOAD_HASH_ALGORITHM = (
     "canonical_json_utf8_sorted_compact_newline_v1"
@@ -487,7 +490,7 @@ def _fresh_base_selector_module() -> Any:
             "base_final_authority fresh control loader is unavailable"
         )
     try:
-        selector = loader("select_base_official_adapt")
+        selector = loader("talkshow_base_val_contract")
     except Exception as exc:
         raise MetricAdapterContractError(
             "cannot source-load the Base validation selector"
@@ -5133,6 +5136,7 @@ def _payload_json_artifact(
     value: Mapping[str, Any],
     *,
     label: str,
+    compact_payload_hash: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if type(value) is not dict or set(value) != {
         "path",
@@ -5163,9 +5167,14 @@ def _payload_json_artifact(
         unsigned.pop("receipt_payload_sha256", None),
         f"{label} payload SHA",
     )
+    payload_hasher = (
+        compact_canonical_json_sha256
+        if compact_payload_hash
+        else canonical_json_sha256
+    )
     if (
         payload_sha != value["receipt_payload_sha256"]
-        or canonical_json_sha256(unsigned) != payload_sha
+        or payload_hasher(unsigned) != payload_sha
     ):
         raise MetricAdapterContractError(
             f"{label} payload hash mismatch"
@@ -5385,6 +5394,398 @@ def _validate_released2_real_feature_cache(
     return artifact, moments
 
 
+def _fresh_primary_screen_inputs(
+    *,
+    canonical_manifest: Mapping[str, Any],
+    prediction_manifest: Mapping[str, Any],
+    distribution_receipt: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    fixture_mode: bool,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    if expected_split != "val":
+        raise MetricAdapterContractError(
+            "released2 primary screen is validation-selection-only"
+        )
+    if type(canonical_manifest) is not dict or set(canonical_manifest) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "primary screen canonical artifact schema mismatch"
+        )
+    if type(prediction_manifest) is not dict or set(prediction_manifest) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "primary screen prediction artifact schema mismatch"
+        )
+    canonical_path, canonical_payload = _verified_file_snapshot(
+        canonical_manifest["path"],
+        canonical_manifest["sha256"],
+        "primary screen canonical manifest",
+    )
+    prediction_path, prediction_payload = _verified_file_snapshot(
+        prediction_manifest["path"],
+        prediction_manifest["sha256"],
+        "primary screen prediction manifest",
+    )
+    if (
+        canonical_manifest["bytes"] != len(canonical_payload)
+        or prediction_manifest["bytes"] != len(prediction_payload)
+    ):
+        raise MetricAdapterContractError(
+            "primary screen manifest byte count mismatch"
+        )
+    canonical_rows = _strict_jsonl_snapshot(
+        canonical_payload,
+        "primary screen canonical manifest",
+    )
+    prediction_rows = _strict_jsonl_snapshot(
+        prediction_payload,
+        "primary screen prediction manifest",
+    )
+    canonical_by_id = _validate_canonical_rows(
+        canonical_rows,
+        split=expected_split,
+        expected_clip_count=expected_clip_count,
+        formal_mode=not fixture_mode,
+        test_only_allow_four_clip_subset=fixture_mode,
+    )
+    ordered_predictions = _validate_prediction_rows(
+        prediction_rows,
+        canonical=canonical_by_id,
+        split=expected_split,
+    )
+    distribution_artifact, distribution = _payload_json_artifact(
+        distribution_receipt,
+        label="primary screen distribution receipt",
+        compact_payload_hash=True,
+    )
+    validated_distribution = validate_distribution_declaration(
+        distribution,
+        expected_gate_artifact=distribution["validation_gate"],
+        expected_prediction_manifest={
+            "path": str(prediction_path),
+            "sha256": sha256_bytes(prediction_payload),
+            "bytes": len(prediction_payload),
+        },
+        expected_prediction_records=[
+            {
+                "canonical_clip_id": row["canonical_clip_id"],
+                "prediction_sha256": row["prediction"]["sha256"],
+                "prediction_bytes": row["prediction"]["bytes"],
+            }
+            for row in ordered_predictions
+        ],
+    )
+    if validated_distribution != distribution:
+        raise MetricAdapterContractError(
+            "primary screen distribution replay changed"
+        )
+    canonical_artifact = {
+        "path": str(canonical_path),
+        "sha256": sha256_bytes(canonical_payload),
+        "bytes": len(canonical_payload),
+        "rows": len(canonical_rows),
+        "selected_rows": len(canonical_by_id),
+    }
+    prediction_artifact = {
+        "path": str(prediction_path),
+        "sha256": sha256_bytes(prediction_payload),
+        "bytes": len(prediction_payload),
+    }
+    return (
+        canonical_artifact,
+        prediction_artifact,
+        distribution_artifact,
+        canonical_by_id,
+        ordered_predictions,
+    )
+
+
+def build_released2_primary_screen(
+    backend: MetricBackend,
+    *,
+    canonical_manifest: Mapping[str, Any],
+    prediction_manifest: Mapping[str, Any],
+    distribution_receipt: Mapping[str, Any],
+    real_feature_cache: Mapping[str, Any],
+    expected_real_feature_cache_artifact: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Compute only the released2 moments/FGD required for selection."""
+
+    fixture_mode = (
+        test_only_allow_four_clip_subset and expected_clip_count == 4
+    )
+    if not fixture_mode:
+        _require_concrete_formal_backend(backend)
+    selection_protocol = {
+        "primary_metric": PRIMARY_METRIC_PATH,
+        "mode": "min",
+        "validation_only_for_selection": True,
+        "test_evaluations": 0,
+    }
+    if dict(expected_selection_protocol) != selection_protocol:
+        raise MetricAdapterContractError(
+            "primary screen selection protocol changed"
+        )
+    (
+        canonical_artifact,
+        prediction_artifact,
+        distribution_artifact,
+        canonical_by_id,
+        ordered_predictions,
+    ) = _fresh_primary_screen_inputs(
+        canonical_manifest=canonical_manifest,
+        prediction_manifest=prediction_manifest,
+        distribution_receipt=distribution_receipt,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    assets, runtime = _validate_primary_metric_assets(
+        backend.asset_receipt,
+        backend.runtime_receipt,
+        fixture_mode=fixture_mode,
+    )
+    cache_artifact, real_moments = _validate_released2_real_feature_cache(
+        real_feature_cache,
+        expected_artifact=expected_real_feature_cache_artifact,
+        expected_canonical_manifest=canonical_artifact,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    if any(
+        real_feature_cache["metric_assets"][role] != assets[role]
+        for role in ("talkshow", "feature_extractor", "smplx")
+    ) or _metric_runtime_signature(
+        real_feature_cache["runtime"]
+    ) != _metric_runtime_signature(runtime):
+        raise MetricAdapterContractError(
+            "primary screen cache used different metric assets/runtime"
+        )
+    generated_moments = FeatureMoments()
+    for row in ordered_predictions:
+        output_id = row["canonical_clip_id"]
+        canonical_row = canonical_by_id[output_id]
+        arrays = _load_output_npz(
+            row["prediction"],
+            frames=canonical_row["frames"],
+            prediction=True,
+            expected_name=f"res_{output_id}.npz",
+        )
+        canonical_arrays = _load_canonical_npz(
+            canonical_row["canonical_npz"],
+            expected_sha256=canonical_row["canonical_npz_sha256"],
+            frames=canonical_row["frames"],
+            speaker_id=canonical_row["speaker_id"],
+        )
+        if not np.array_equal(arrays["betas"], canonical_arrays["beta"][0]):
+            raise MetricAdapterContractError(
+                f"{output_id}: primary screen prediction betas changed"
+            )
+        features = _validated_backend_features(
+            backend,
+            np.repeat(
+                reorder_to_talkshow(
+                    arrays["poses"], arrays["expressions"]
+                )[None],
+                len(RELEASED2_SLOTS),
+                axis=0,
+            ),
+        )
+        generated_moments.update(features)
+    if generated_moments.count != real_moments.count * len(RELEASED2_SLOTS):
+        raise MetricAdapterContractError(
+            "primary screen real/generated feature counts disagree"
+        )
+    primary = frechet_distance(real_moments, generated_moments)
+    result: dict[str, Any] = {
+        "format": PRIMARY_SCREEN_FORMAT,
+        "status": "pass",
+        "split": expected_split,
+        "test_visible": False,
+        "clip_count": expected_clip_count,
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": primary,
+        "canonical_manifest": canonical_artifact,
+        "prediction_manifest": prediction_artifact,
+        "distribution_receipt": distribution_artifact,
+        "selection_protocol": selection_protocol,
+        "real_feature_cache": cache_artifact,
+        "metric_assets": assets,
+        "runtime": runtime,
+        "real_feature_statistics": real_moments.to_json(),
+        "generated_feature_statistics": generated_moments.to_json(),
+        "formal_mode": not fixture_mode,
+        "test_only_mode": fixture_mode,
+    }
+    result["receipt_payload_sha256"] = canonical_json_sha256(result)
+    return result
+
+
+def validate_released2_primary_screen_receipt(
+    value: Mapping[str, Any],
+    *,
+    expected_prediction_manifest: Mapping[str, Any],
+    expected_distribution_receipt: Mapping[str, Any],
+    expected_real_feature_cache: Mapping[str, Any],
+    expected_canonical_manifest: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Purely replay one externally byte-pinned primary screen receipt."""
+
+    artifact, receipt = _payload_json_artifact(
+        value, label="released2 primary screen receipt"
+    )
+    fixture_mode = (
+        test_only_allow_four_clip_subset and expected_clip_count == 4
+    )
+    selection_protocol = {
+        "primary_metric": PRIMARY_METRIC_PATH,
+        "mode": "min",
+        "validation_only_for_selection": True,
+        "test_evaluations": 0,
+    }
+    if dict(expected_selection_protocol) != selection_protocol:
+        raise MetricAdapterContractError(
+            "primary screen expected selection protocol changed"
+        )
+    expected_keys = {
+        "format",
+        "status",
+        "split",
+        "test_visible",
+        "clip_count",
+        "primary_metric_path",
+        "primary_metric",
+        "canonical_manifest",
+        "prediction_manifest",
+        "distribution_receipt",
+        "selection_protocol",
+        "real_feature_cache",
+        "metric_assets",
+        "runtime",
+        "real_feature_statistics",
+        "generated_feature_statistics",
+        "formal_mode",
+        "test_only_mode",
+        "receipt_payload_sha256",
+    }
+    if type(receipt) is not dict or set(receipt) != expected_keys:
+        raise MetricAdapterContractError(
+            "released2 primary screen receipt schema mismatch"
+        )
+    if (
+        receipt["format"] != PRIMARY_SCREEN_FORMAT
+        or receipt["status"] != "pass"
+        or receipt["split"] != expected_split
+        or receipt["test_visible"] is not False
+        or receipt["clip_count"] != expected_clip_count
+        or receipt["primary_metric_path"] != PRIMARY_METRIC_PATH
+        or receipt["canonical_manifest"] != dict(expected_canonical_manifest)
+        or receipt["prediction_manifest"] != dict(expected_prediction_manifest)
+        or receipt["distribution_receipt"]
+        != dict(expected_distribution_receipt)
+        or receipt["selection_protocol"] != selection_protocol
+        or receipt["real_feature_cache"]
+        != dict(expected_real_feature_cache)
+        or receipt["formal_mode"] is not (not fixture_mode)
+        or receipt["test_only_mode"] is not fixture_mode
+    ):
+        raise MetricAdapterContractError(
+            "released2 primary screen authority mismatch"
+        )
+    cache_artifact, cache_payload = _payload_json_artifact(
+        expected_real_feature_cache,
+        label="primary screen bound real-feature cache",
+    )
+    _cache, real_moments = _validate_released2_real_feature_cache(
+        cache_payload,
+        expected_artifact=cache_artifact,
+        expected_canonical_manifest=expected_canonical_manifest,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    assets, runtime = _validate_primary_metric_assets(
+        receipt["metric_assets"],
+        receipt["runtime"],
+        fixture_mode=fixture_mode,
+    )
+    if any(
+        cache_payload["metric_assets"][role] != assets[role]
+        for role in ("talkshow", "feature_extractor", "smplx")
+    ) or _metric_runtime_signature(cache_payload["runtime"]) != (
+        _metric_runtime_signature(runtime)
+    ):
+        raise MetricAdapterContractError(
+            "primary screen cache assets/runtime differ"
+        )
+    if receipt["real_feature_statistics"] != real_moments.to_json():
+        raise MetricAdapterContractError(
+            "primary screen real moments differ from cache"
+        )
+    generated_statistics = receipt["generated_feature_statistics"]
+    generated_count = _require_exact_int(
+        generated_statistics.get("count")
+        if type(generated_statistics) is dict
+        else None,
+        "primary screen generated count",
+        minimum=2,
+    )
+    generated_moments = FeatureMoments.from_json(
+        generated_statistics,
+        expected_count=generated_count,
+        label="primary screen generated",
+    )
+    if generated_count != real_moments.count * len(RELEASED2_SLOTS):
+        raise MetricAdapterContractError(
+            "primary screen feature counts changed"
+        )
+    recomputed = frechet_distance(real_moments, generated_moments)
+    primary = _report_number(
+        receipt["primary_metric"],
+        "primary screen metric",
+        nonnegative=True,
+    )
+    # Selection is discrete and can involve near-ties.  A tolerance here
+    # would let a rehashed receipt perturb ordering while still passing.  The
+    # producer serializes this exact recomputed binary64 value, so authority
+    # requires exact equality and returns the recomputed value itself.
+    if primary != recomputed:
+        raise MetricAdapterContractError(
+            "primary screen metric derivation mismatch"
+        )
+    return {
+        "artifact": artifact,
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": recomputed,
+        "real_feature_statistics": real_moments.to_json(),
+        "generated_feature_statistics": generated_moments.to_json(),
+        "metric_assets": assets,
+        "runtime": runtime,
+    }
+
+
 def fresh_replay_released2_primary(
     report: Mapping[str, Any],
     backend: MetricBackend,
@@ -5554,6 +5955,197 @@ def fresh_replay_released2_primary(
         "report_payload_sha256": validated_report[
             "report_payload_sha256"
         ],
+        "canonical_manifest": dict(canonical_input),
+        "prediction_manifest": {
+            "path": str(prediction_path),
+            "sha256": sha256_bytes(prediction_payload),
+            "bytes": len(prediction_payload),
+        },
+        "distribution_receipt_payload_sha256": (
+            expected_distribution_receipt["receipt_payload_sha256"]
+        ),
+        "selection_protocol": dict(expected_selection_protocol),
+        "real_feature_cache": cache_artifact,
+        "metric_assets": assets,
+        "runtime": runtime,
+        "real_feature_statistics": real_moments.to_json(),
+        "generated_feature_statistics": generated_moments.to_json(),
+        "formal_mode": not fixture_mode,
+        "test_only_mode": fixture_mode,
+    }
+    result["receipt_payload_sha256"] = canonical_json_sha256(result)
+    return result
+
+
+def fresh_replay_released2_primary_screen(
+    screen: Mapping[str, Any],
+    screen_validation: Mapping[str, Any],
+    backend: MetricBackend,
+    *,
+    screen_artifact: Mapping[str, Any],
+    real_feature_cache: Mapping[str, Any],
+    expected_real_feature_cache_artifact: Mapping[str, Any],
+    expected_prediction_manifest: Mapping[str, Any],
+    expected_distribution_receipt: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Independently reopen raw predictions and replay a screen FGD.
+
+    The first screen receipt is intentionally not a ranking authority on its
+    own: its serialized moments can be self-consistent after tampering.  This
+    second pass reopens every byte-pinned prediction NPZ and recomputes the
+    generated TalkSHOW features before the selector is allowed to rank it.
+    """
+
+    fixture_mode = (
+        test_only_allow_four_clip_subset and expected_clip_count == 4
+    )
+    if expected_split != "val":
+        raise MetricAdapterContractError(
+            "released2 primary screen replay is validation-only"
+        )
+    if not fixture_mode:
+        _require_concrete_formal_backend(backend)
+    if (
+        screen.get("format") != PRIMARY_SCREEN_FORMAT
+        or screen_validation.get("artifact") != dict(screen_artifact)
+        or screen_validation.get("primary_metric_path")
+        != PRIMARY_METRIC_PATH
+        or screen.get("prediction_manifest")
+        != dict(expected_prediction_manifest)
+        or screen.get("distribution_receipt")
+        != dict(expected_distribution_receipt)
+        or screen.get("selection_protocol")
+        != dict(expected_selection_protocol)
+        or screen.get("split") != expected_split
+        or screen.get("clip_count") != expected_clip_count
+    ):
+        raise MetricAdapterContractError(
+            "released2 primary screen replay authority changed"
+        )
+    assets, runtime = _validate_primary_metric_assets(
+        backend.asset_receipt,
+        backend.runtime_receipt,
+        fixture_mode=fixture_mode,
+    )
+    if assets != screen["metric_assets"] or runtime != screen["runtime"]:
+        raise MetricAdapterContractError(
+            "screen replay backend differs from the first raw pass"
+        )
+    canonical_input = screen["canonical_manifest"]
+    cache_artifact, real_moments = _validate_released2_real_feature_cache(
+        real_feature_cache,
+        expected_artifact=expected_real_feature_cache_artifact,
+        expected_canonical_manifest=canonical_input,
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    cache_assets = real_feature_cache["metric_assets"]
+    if any(
+        cache_assets[role] != assets[role]
+        for role in ("talkshow", "feature_extractor", "smplx")
+    ) or _metric_runtime_signature(real_feature_cache["runtime"]) != (
+        _metric_runtime_signature(runtime)
+    ):
+        raise MetricAdapterContractError(
+            "screen replay cache used different metric assets/runtime"
+        )
+    canonical_path, canonical_payload = _verified_file_snapshot(
+        canonical_input["path"],
+        canonical_input["sha256"],
+        "primary screen replay canonical manifest",
+    )
+    prediction_path, prediction_payload = _verified_file_snapshot(
+        expected_prediction_manifest["path"],
+        expected_prediction_manifest["sha256"],
+        "primary screen replay prediction manifest",
+    )
+    if (
+        canonical_input["bytes"] != len(canonical_payload)
+        or expected_prediction_manifest["bytes"]
+        != len(prediction_payload)
+    ):
+        raise MetricAdapterContractError(
+            "primary screen replay manifest byte count mismatch"
+        )
+    canonical_rows = _strict_jsonl_snapshot(
+        canonical_payload,
+        "primary screen replay canonical manifest",
+    )
+    prediction_rows = _strict_jsonl_snapshot(
+        prediction_payload,
+        "primary screen replay prediction manifest",
+    )
+    canonical_by_id = _validate_canonical_rows(
+        canonical_rows,
+        split=expected_split,
+        expected_clip_count=expected_clip_count,
+        formal_mode=not fixture_mode,
+        test_only_allow_four_clip_subset=fixture_mode,
+    )
+    ordered_predictions = _validate_prediction_rows(
+        prediction_rows,
+        canonical=canonical_by_id,
+        split=expected_split,
+    )
+    generated_moments = FeatureMoments()
+    for row in ordered_predictions:
+        output_id = row["canonical_clip_id"]
+        canonical_row = canonical_by_id[output_id]
+        arrays = _load_output_npz(
+            row["prediction"],
+            frames=canonical_row["frames"],
+            prediction=True,
+            expected_name=f"res_{output_id}.npz",
+        )
+        canonical_arrays = _load_canonical_npz(
+            canonical_row["canonical_npz"],
+            expected_sha256=canonical_row["canonical_npz_sha256"],
+            frames=canonical_row["frames"],
+            speaker_id=canonical_row["speaker_id"],
+        )
+        if not np.array_equal(
+            arrays["betas"], canonical_arrays["beta"][0]
+        ):
+            raise MetricAdapterContractError(
+                f"{output_id}: screen replay prediction betas changed"
+            )
+        features = _validated_backend_features(
+            backend,
+            np.repeat(
+                reorder_to_talkshow(
+                    arrays["poses"], arrays["expressions"]
+                )[None],
+                len(RELEASED2_SLOTS),
+                axis=0,
+            ),
+        )
+        generated_moments.update(features)
+    if generated_moments.count != real_moments.count * len(
+        RELEASED2_SLOTS
+    ):
+        raise MetricAdapterContractError(
+            "screen replay real/generated feature counts disagree"
+        )
+    fresh_fgd = frechet_distance(real_moments, generated_moments)
+    screen_fgd = float(screen_validation["primary_metric"])
+    if fresh_fgd != screen_fgd:
+        raise MetricAdapterContractError(
+            "independent raw screen replay differs from first-pass FGD"
+        )
+    result: dict[str, Any] = {
+        "format": PRIMARY_REPLAY_FORMAT,
+        "status": "pass",
+        "split": expected_split,
+        "clip_count": expected_clip_count,
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": fresh_fgd,
+        "report_primary_metric": screen_fgd,
+        "report_payload_sha256": screen["receipt_payload_sha256"],
         "canonical_manifest": dict(canonical_input),
         "prediction_manifest": {
             "path": str(prediction_path),
@@ -5752,6 +6344,146 @@ def validate_released2_primary_replay_receipt(
         ],
         "primary_metric_path": PRIMARY_METRIC_PATH,
         "primary_metric": primary,
+        "report_payload_sha256": receipt["report_payload_sha256"],
+        "prediction_manifest": dict(receipt["prediction_manifest"]),
+        "real_feature_cache": dict(receipt["real_feature_cache"]),
+        "metric_assets": dict(receipt["metric_assets"]),
+        "runtime": dict(receipt["runtime"]),
+    }
+
+
+def validate_released2_primary_screen_replay_receipt(
+    value: Mapping[str, Any],
+    *,
+    expected_screen_artifact: Mapping[str, Any],
+    expected_screen: Mapping[str, Any],
+    screen_validation: Mapping[str, Any],
+    expected_prediction_manifest: Mapping[str, Any],
+    expected_distribution_receipt: Mapping[str, Any],
+    expected_selection_protocol: Mapping[str, Any],
+    expected_split: str,
+    expected_clip_count: int,
+    test_only_allow_four_clip_subset: bool = False,
+) -> dict[str, Any]:
+    """Validate one independent raw-NPZ replay of a screen receipt."""
+
+    artifact, receipt = _payload_json_artifact(
+        value,
+        label="released2 primary screen replay receipt",
+    )
+    fixture_mode = (
+        test_only_allow_four_clip_subset and expected_clip_count == 4
+    )
+    expected_keys = {
+        "format",
+        "status",
+        "split",
+        "clip_count",
+        "primary_metric_path",
+        "primary_metric",
+        "report_primary_metric",
+        "report_payload_sha256",
+        "canonical_manifest",
+        "prediction_manifest",
+        "distribution_receipt_payload_sha256",
+        "selection_protocol",
+        "real_feature_cache",
+        "metric_assets",
+        "runtime",
+        "real_feature_statistics",
+        "generated_feature_statistics",
+        "formal_mode",
+        "test_only_mode",
+        "receipt_payload_sha256",
+    }
+    if type(receipt) is not dict or set(receipt) != expected_keys:
+        raise MetricAdapterContractError(
+            "released2 primary screen replay receipt schema mismatch"
+        )
+    if (
+        expected_screen.get("format") != PRIMARY_SCREEN_FORMAT
+        or screen_validation.get("artifact")
+        != dict(expected_screen_artifact)
+        or receipt["format"] != PRIMARY_REPLAY_FORMAT
+        or receipt["status"] != "pass"
+        or receipt["split"] != expected_split
+        or receipt["clip_count"] != expected_clip_count
+        or receipt["primary_metric_path"] != PRIMARY_METRIC_PATH
+        or receipt["report_payload_sha256"]
+        != expected_screen["receipt_payload_sha256"]
+        or receipt["canonical_manifest"]
+        != expected_screen["canonical_manifest"]
+        or receipt["prediction_manifest"]
+        != dict(expected_prediction_manifest)
+        or receipt["distribution_receipt_payload_sha256"]
+        != expected_distribution_receipt["receipt_payload_sha256"]
+        or receipt["selection_protocol"]
+        != dict(expected_selection_protocol)
+        or receipt["metric_assets"] != expected_screen["metric_assets"]
+        or receipt["runtime"] != expected_screen["runtime"]
+        or receipt["formal_mode"] is not (not fixture_mode)
+        or receipt["test_only_mode"] is not fixture_mode
+    ):
+        raise MetricAdapterContractError(
+            "released2 primary screen replay authority mismatch"
+        )
+    cache_artifact, cache_payload = _payload_json_artifact(
+        receipt["real_feature_cache"],
+        label="screen replay bound real-feature cache",
+    )
+    _cache, real_moments = _validate_released2_real_feature_cache(
+        cache_payload,
+        expected_artifact=cache_artifact,
+        expected_canonical_manifest=receipt["canonical_manifest"],
+        expected_split=expected_split,
+        expected_clip_count=expected_clip_count,
+        fixture_mode=fixture_mode,
+    )
+    if receipt["real_feature_statistics"] != real_moments.to_json():
+        raise MetricAdapterContractError(
+            "screen replay real moments differ from frozen cache"
+        )
+    generated_statistics = receipt["generated_feature_statistics"]
+    generated_count = _require_exact_int(
+        generated_statistics.get("count")
+        if type(generated_statistics) is dict
+        else None,
+        "screen replay generated count",
+        minimum=2,
+    )
+    generated_moments = FeatureMoments.from_json(
+        generated_statistics,
+        expected_count=generated_count,
+        label="screen replay generated",
+    )
+    if generated_count != real_moments.count * len(RELEASED2_SLOTS):
+        raise MetricAdapterContractError(
+            "screen replay feature counts changed"
+        )
+    replay_fgd = frechet_distance(real_moments, generated_moments)
+    declared = _report_number(
+        receipt["primary_metric"],
+        "screen replay primary metric",
+        nonnegative=True,
+    )
+    first_pass = _report_number(
+        screen_validation["primary_metric"],
+        "first-pass screen primary metric",
+        nonnegative=True,
+    )
+    if (
+        declared != replay_fgd
+        or receipt["report_primary_metric"] != first_pass
+        or replay_fgd != first_pass
+    ):
+        raise MetricAdapterContractError(
+            "screen and independent raw replay FGD differ"
+        )
+    return {
+        "artifact": artifact,
+        "receipt_payload_sha256": receipt["receipt_payload_sha256"],
+        "primary_metric_path": PRIMARY_METRIC_PATH,
+        "primary_metric": replay_fgd,
         "report_payload_sha256": receipt["report_payload_sha256"],
         "prediction_manifest": dict(receipt["prediction_manifest"]),
         "real_feature_cache": dict(receipt["real_feature_cache"]),

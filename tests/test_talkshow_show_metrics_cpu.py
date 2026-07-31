@@ -1262,6 +1262,141 @@ class OfflineAdapterTest(unittest.TestCase):
                     test_only_allow_four_clip_subset=True,
                 )
 
+    def test_primary_screen_is_exactly_equivalent_to_full_released2(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = SyntheticBundle(root)
+            backend = SyntheticBackend()
+            report = fixture.evaluate(backend=backend)
+            cache = METRICS.build_released2_real_feature_cache(
+                canonical_manifest=fixture.canonical_manifest,
+                expected_canonical_manifest_sha256=sha256_file(
+                    fixture.canonical_manifest
+                ),
+                backend=backend,
+                split="val",
+                expected_clip_count=4,
+                formal_mode=False,
+                test_only_allow_four_clip_subset=True,
+            )
+            cache_path = root / "screen-real-cache.json"
+            canonical_json_write(cache_path, cache)
+            cache_artifact = {
+                "path": str(cache_path.resolve()),
+                "sha256": sha256_file(cache_path),
+                "bytes": cache_path.stat().st_size,
+                "receipt_payload_sha256": cache[
+                    "receipt_payload_sha256"
+                ],
+            }
+            distribution = fixture.distribution()
+            distribution_path = root / "screen-distribution.json"
+            canonical_json_write(distribution_path, distribution)
+            distribution_artifact = {
+                "path": str(distribution_path.resolve()),
+                "sha256": sha256_file(distribution_path),
+                "bytes": distribution_path.stat().st_size,
+                "receipt_payload_sha256": distribution[
+                    "receipt_payload_sha256"
+                ],
+            }
+            prediction_artifact = distribution["prediction_manifest"]
+            screen = METRICS.build_released2_primary_screen(
+                backend,
+                canonical_manifest={
+                    "path": str(fixture.canonical_manifest.resolve()),
+                    "sha256": sha256_file(fixture.canonical_manifest),
+                    "bytes": fixture.canonical_manifest.stat().st_size,
+                },
+                prediction_manifest=prediction_artifact,
+                distribution_receipt=distribution_artifact,
+                real_feature_cache=cache,
+                expected_real_feature_cache_artifact=cache_artifact,
+                expected_selection_protocol=report["selection_protocol"],
+                expected_split="val",
+                expected_clip_count=4,
+                test_only_allow_four_clip_subset=True,
+            )
+            screen_path = root / "primary-screen.json"
+            canonical_json_write(screen_path, screen)
+            screen_artifact = {
+                "path": str(screen_path.resolve()),
+                "sha256": sha256_file(screen_path),
+                "bytes": screen_path.stat().st_size,
+                "receipt_payload_sha256": screen[
+                    "receipt_payload_sha256"
+                ],
+            }
+            validated = METRICS.validate_released2_primary_screen_receipt(
+                screen_artifact,
+                expected_prediction_manifest=prediction_artifact,
+                expected_distribution_receipt=distribution_artifact,
+                expected_real_feature_cache=cache_artifact,
+                expected_canonical_manifest=screen["canonical_manifest"],
+                expected_selection_protocol=report["selection_protocol"],
+                expected_split="val",
+                expected_clip_count=4,
+                test_only_allow_four_clip_subset=True,
+            )
+            released = report["body"]["released2"]
+            self.assertEqual(
+                screen["generated_feature_statistics"],
+                released["feature_statistics"]["generated"],
+            )
+            self.assertEqual(
+                screen["primary_metric"], released["metrics"]["FGD"]
+            )
+            self.assertEqual(
+                validated["generated_feature_statistics"],
+                screen["generated_feature_statistics"],
+            )
+
+            # Even a one-ULP perturbation can reverse a near-tied checkpoint
+            # ordering.  Rehashing the receipt must not turn an approximate
+            # comparison into selection authority.
+            near_tie = copy.deepcopy(screen)
+            near_tie["primary_metric"] = float(
+                np.nextafter(
+                    np.float64(screen["primary_metric"]),
+                    np.float64(np.inf),
+                )
+            )
+            near_tie.pop("receipt_payload_sha256")
+            near_tie["receipt_payload_sha256"] = (
+                METRICS.canonical_json_sha256(near_tie)
+            )
+            near_tie_path = root / "near-tie-primary-screen.json"
+            canonical_json_write(near_tie_path, near_tie)
+            near_tie_artifact = {
+                "path": str(near_tie_path.resolve()),
+                "sha256": sha256_file(near_tie_path),
+                "bytes": near_tie_path.stat().st_size,
+                "receipt_payload_sha256": near_tie[
+                    "receipt_payload_sha256"
+                ],
+            }
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "metric derivation mismatch",
+            ):
+                METRICS.validate_released2_primary_screen_receipt(
+                    near_tie_artifact,
+                    expected_prediction_manifest=prediction_artifact,
+                    expected_distribution_receipt=distribution_artifact,
+                    expected_real_feature_cache=cache_artifact,
+                    expected_canonical_manifest=screen[
+                        "canonical_manifest"
+                    ],
+                    expected_selection_protocol=report[
+                        "selection_protocol"
+                    ],
+                    expected_split="val",
+                    expected_clip_count=4,
+                    test_only_allow_four_clip_subset=True,
+                )
+
             forged = copy.deepcopy(report)
             released = forged["body"]["released2"]
             real = METRICS.FeatureMoments.from_json(
@@ -1422,10 +1557,10 @@ class OfflineAdapterTest(unittest.TestCase):
             "semtalk_show_base_final_test_authority_v1",
         )
 
-    def test_same_path_cached_base_selector_is_ignored(self) -> None:
+    def test_same_path_cached_talkshow_contract_is_ignored(self) -> None:
         expected = (
             Path(METRICS.__file__).resolve().parent
-            / "select_base_official_adapt.py"
+            / "talkshow_base_val_contract.py"
         )
         fake = types.SimpleNamespace(
             __file__=str(expected),
@@ -1439,12 +1574,12 @@ class OfflineAdapterTest(unittest.TestCase):
                 "poisoned": True
             },
         )
-        full_name = "scripts.show_base.select_base_official_adapt"
+        full_name = "scripts.show_base.talkshow_base_val_contract"
         with (
             mock.patch.dict(sys.modules, {full_name: fake}),
             mock.patch.object(
                 SHOW_BASE_PACKAGE,
-                "select_base_official_adapt",
+                "talkshow_base_val_contract",
                 fake,
                 create=True,
             ),

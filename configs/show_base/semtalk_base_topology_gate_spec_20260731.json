@@ -1,0 +1,96 @@
+{
+  "format": "semtalk_show_base_topology_gate_spec_v1",
+  "scope": "SemTalk Base on fresh SHOW five-stage features",
+  "reference_mode": "official_w1_b64_reference",
+  "candidate_modes": [
+    "official_objective_w8_l8_g64_ddp_adaptation",
+    "official_objective_w16_l4_g64_ddp_adaptation",
+    "validation_gated_w8_l64_g512_empirical_acceleration",
+    "validation_gated_w16_l32_g512_empirical_acceleration"
+  ],
+  "topology_matrix": {
+    "official_w1_b64_reference": {
+      "classification": "exact_official_runtime_topology_reference",
+      "node_count": 1,
+      "local_world_size": 1,
+      "world_size": 1,
+      "local_batch_size": 64,
+      "global_batch_size": 64,
+      "updates_per_epoch": 1988,
+      "unique_samples_per_epoch": 127232,
+      "learning_rate": 0.00005,
+      "precision": "fp32",
+      "formal_training_eligible": false
+    },
+    "official_objective_w8_l8_g64_ddp_adaptation": {
+      "classification": "official_objective_ddp_adaptation_not_trajectory_equivalent",
+      "node_count": 1,
+      "local_world_size": 8,
+      "world_size": 8,
+      "local_batch_size": 8,
+      "global_batch_size": 64,
+      "updates_per_epoch": 1988,
+      "unique_samples_per_epoch": 127232,
+      "learning_rate": 0.00005,
+      "precision": "bf16",
+      "formal_training_eligible": true
+    },
+    "official_objective_w16_l4_g64_ddp_adaptation": {
+      "classification": "official_objective_ddp_adaptation_not_trajectory_equivalent",
+      "node_count": 2,
+      "local_world_size": 8,
+      "world_size": 16,
+      "local_batch_size": 4,
+      "global_batch_size": 64,
+      "updates_per_epoch": 1988,
+      "unique_samples_per_epoch": 127232,
+      "learning_rate": 0.00005,
+      "precision": "bf16",
+      "formal_training_eligible": true
+    },
+    "validation_gated_w8_l64_g512_empirical_acceleration": {
+      "classification": "validation_gated_empirical_acceleration",
+      "node_count": 1,
+      "local_world_size": 8,
+      "world_size": 8,
+      "local_batch_size": 64,
+      "global_batch_size": 512,
+      "updates_per_epoch": 248,
+      "unique_samples_per_epoch": 126976,
+      "learning_rate": 0.00003,
+      "precision": "bf16",
+      "formal_training_eligible": true
+    },
+    "validation_gated_w16_l32_g512_empirical_acceleration": {
+      "classification": "validation_gated_empirical_acceleration",
+      "node_count": 2,
+      "local_world_size": 8,
+      "world_size": 16,
+      "local_batch_size": 32,
+      "global_batch_size": 512,
+      "updates_per_epoch": 248,
+      "unique_samples_per_epoch": 126976,
+      "learning_rate": 0.00003,
+      "precision": "bf16",
+      "formal_training_eligible": true
+    }
+  },
+  "warmup_updates": 20,
+  "timed_updates": 50,
+  "optimizer_objective": "published_three_forward_base_objective_v1",
+  "sampler": "distributed_sampler_drop_last_true_no_padding_duplicates",
+  "required_measurements": [
+    "median_seconds",
+    "p90_seconds",
+    "p99_seconds",
+    "peak_cuda_memory_bytes_all_ranks",
+    "oom",
+    "all_losses_finite",
+    "all_gradients_finite",
+    "data_wait_seconds",
+    "collective_seconds",
+    "batchnorm_inventory",
+    "rng_inventory",
+    "sample_inventory"
+  ]
+}

@@ -1,54 +1,32 @@
 #!/usr/bin/env python3
-"""Select one official-adapt Base checkpoint using validation FGD only.
+"""Strict TalkSHOW released2 validation authority for SemTalk Base.
 
-This entry point is deliberately decision-only and CPU-only.  It consumes
-seven immutable measurement receipts produced by the exact final inference
-pipeline on a frozen, validation-only SHOW snapshot.  There is no split
-argument and no test input.  The selected checkpoint is the minimum
-``(FGD, epoch)`` among epochs 1/2/4/8/16/32/40.
-
-The measurement receipts bind:
-
-* the complete official-adapt candidate manifest, status, and frozen inputs;
-* an exact 1,715-clip canonical validation manifest and eight audio shards;
-* the fixed Face/Hands/Upper/Lower/Global downstream pipeline; and
-* the hash-pinned reconstructed DiffSHEG SHOW evaluator and assets.
-
-The selector never runs inference or an evaluator.  It validates their frozen
-receipts, recomputes the winner, and atomically creates one selection receipt.
+This module is the only formal validation contract used by fresh Base
+training, validation inference, winner selection, and independent metric
+replay. Historical evaluator contracts are intentionally outside this
+authority: selection is TalkSHOW body.released2 FGD, followed by one complete
+TalkSHOW body/face evaluation of the frozen winner.
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
-import sys
 from typing import Any, Mapping, Sequence
-
-
-sys.dont_write_bytecode = True
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.show_base import gate_task_space_on_show_v2 as _receipt
 from scripts.show_base import selected_prerequisites as _selected_prerequisites
 
 
-EXPECTED_CANDIDATE_EPOCHS = (1, 2, 4, 8, 16, 32, 40)
 EXPECTED_VAL_CLIPS = 1_715
 EXPECTED_AUDIO_SHARDS = 8
-EXPECTED_UPDATES_PER_EPOCH = 248
-DIFFSHEG_WINDOW = 88
-DIFFSHEG_STRIDE = 88
+TALKSHOW_WINDOW = 88
+TALKSHOW_STRIDE = 88
 SHOW_SPEAKER_IDS = {
     "oliver": 0,
     "chemistry": 1,
@@ -56,26 +34,35 @@ SHOW_SPEAKER_IDS = {
     "conan": 3,
 }
 
-CANDIDATE_MANIFEST_FORMAT = (
-    "semtalk_show_base_official_adapt_manifest_v1"
-)
-CANDIDATE_STATUS_FORMAT = "semtalk_show_base_official_adapt_status_v1"
-THROUGHPUT_GATE_FORMAT = (
-    "semtalk_show_base_official_adapt_throughput_gate_v1"
-)
-FROZEN_INPUTS_FORMAT = (
-    "semtalk_show_base_official_adapt_frozen_inputs_v1"
-)
-VAL_INPUTS_FORMAT = "semtalk_show_base_official_adapt_val_inputs_v1"
+VAL_INPUTS_FORMAT = "semtalk_show_base_talkshow_val_inputs_v2"
 VAL_CANONICAL_SUMMARY_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_summary_v1"
 )
 VAL_CANONICAL_LINEAGE_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_lineage_v1"
 )
-PIPELINE_FORMAT = "semtalk_show_base_official_adapt_val_pipeline_v1"
+VAL_INFERENCE_LINEAGE_FORMAT = (
+    "semtalk_show_base_talkshow_val_inference_lineage_v2"
+)
 FRESH_PIPELINE_FORMAT = "semtalk_show_base_fresh_val_pipeline_v2"
 FRESH_PIPELINE_MODE = "show_val_selected_five_prerequisites_v2"
+INFERENCE_HELPERS = (
+    "_load_canonical_clip",
+    "_load_audio_features",
+    "_infer_clip",
+    "_inference_only_auxiliary_loss_bypass",
+    "_inference_auxiliary_loss_bypass_receipt",
+    "_output_arrays",
+)
+VAL_INFERENCE_SOURCE = {
+    "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+    "commit": "94e33213455d3c3b1fe71ac87a3b16334e63c479",
+    "tree": "8f4ba28543b49cb1e04b3e8aaaaf4ee932ecf6d8",
+    "entrypoint": "run_base_inference.py",
+    "entrypoint_sha256": (
+        "ff4c86f065a2924ab1a7088584507f2163d4afba25ae7fb024d137df23204e0c"
+    ),
+}
 FRESH_PREREQUISITE_CONSUMPTION = {
     "base_training_feature_graph": {
         "live_prerequisite_models": [],
@@ -105,29 +92,14 @@ FRESH_PREREQUISITE_CONSUMPTION = {
         "global_translation_reconstruction": True,
     },
 }
-VAL_INFERENCE_LINEAGE_FORMAT = (
-    "semtalk_show_base_official_adapt_val_inference_lineage_v1"
-)
-MEASUREMENT_FORMAT = (
-    "semtalk_show_base_official_adapt_val_measurement_v1"
-)
-SELECTION_FORMAT = "semtalk_show_base_official_adapt_selection_v1"
-
-VAL_METRIC_KEYS = ("fgd",)
-INFERENCE_HELPERS = (
-    "_load_canonical_clip",
-    "_load_audio_features",
-    "_infer_clip",
-    "_inference_only_auxiliary_loss_bypass",
-    "_inference_auxiliary_loss_bypass_receipt",
-    "_output_arrays",
-)
 FRESH_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/__init__.py",
+    "scripts/show_base/talkshow_base_val_contract.py",
+    "scripts/show_base/base_long_val_contract.py",
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/run_base_inference.py",
-    "scripts/show_base/base_long_val_contract.py",
-    "scripts/show_base/select_base_official_adapt.py",
+    "scripts/show_base/evaluate_talkshow_show_metrics.py",
+    "scripts/show_base/replay_released2_primary.py",
     "scripts/show_base/build_base_features.py",
     "scripts/show_base/selected_prerequisites.py",
     "scripts/show_base/prerequisite_val_contract.py",
@@ -152,87 +124,11 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "models/utils/layer.py",
     "models/utils/skeleton.py",
 )
-# Match reserved labels, not incidental substrings such as Latest or contest.
 _TEST_PATH_LABEL_TOKENS = frozenset(
     {"test", "tests", "testset", "testsets"}
 )
-
-DIFFSHEG_PINNED_RECEIPT: dict[str, Any] = {
-    "protocol": "diffsheg_show_reconstructed",
-    "protocol_version": 1,
-    "paspa": {
-        "origin": "git@github.com:Ly403/PASPA.git",
-        "commit": "0df27e6cab4b5ced19cc923afe352f77d547924b",
-        "tree": "574662eaf3122beb5631c02c847456e752d77f0b",
-        "evaluator_sha256": (
-            "21fa84fdb9c3f64eb2920714e1d27a685210a225bcffa78503452c4018a53f8c"
-        ),
-    },
-    "diffsheg_reference_commit": (
-        "3ebf3058f48cba3da9146afb7623e9ec1ab9e9a5"
-    ),
-    "stats_sha256": (
-        "b90320eba94d0777e7160fd31d0fe6f04a7c86822ac875fb7db5cf58d298cef0"
-    ),
-    "autoencoders": {
-        "fgd": {
-            "filename": "gesture.pth.tar",
-            "sha256": (
-                "5eaf9b882a5ccd5f6eb4385aaadf3d28f3ee4382360ecb13c12f4904b3c3216e"
-            ),
-            "input_dim": 129,
-        },
-    },
-    "window_length": DIFFSHEG_WINDOW,
-    "window_stride": DIFFSHEG_STRIDE,
-    "precision": "float32 AE inference; no autocast",
-    "selection_metric": "fgd",
-    "ba_during_selection": False,
-}
-
-FIXED_OFFICIAL_CHECKPOINTS = {
-    "hands": {
-        "filename": "rvq_hands_500.bin",
-        "sha256": (
-            "08f887aac60d5a2102dce7c57559a6b3d9b7f56e3d4a38055ca47a539b03e436"
-        ),
-    },
-    "upper": {
-        "filename": "rvq_upper_500.bin",
-        "sha256": (
-            "05101461e75b4e9b687ef30437585d56969c6a13d0047b91000b31d88d08ac17"
-        ),
-    },
-    "lower": {
-        "filename": "rvq_lower_600.bin",
-        "sha256": (
-            "2bb43d10e5f32d13d21e6b85580a1b70d36e407c8552a7e62f99c171ae4efce8"
-        ),
-    },
-}
-OFFICIAL_BASE_CHECKPOINT = {
-    "filename": "best_semtalk_base.bin",
-    "sha256": (
-        "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc1d89603"
-    ),
-}
 BASE_PRODUCER_SOURCE = {
     "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "5b5c8dc72f0e171c52cb4729314ed977c02c1376",
-    "tree": "a2f738b9b33f1b70444e4c3876701876da9919ea",
-    "entrypoint": "train_base_official_adapt.py",
-    "entrypoint_sha256": (
-        "6e2eef748f8b1fee3e5c5ddf54dd71fb3b3f3a575975c0cea24cf11973031534"
-    ),
-}
-VAL_INFERENCE_SOURCE = {
-    "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "94e33213455d3c3b1fe71ac87a3b16334e63c479",
-    "tree": "8f4ba28543b49cb1e04b3e8aaaaf4ee932ecf6d8",
-    "entrypoint": "run_base_inference.py",
-    "entrypoint_sha256": (
-        "ff4c86f065a2924ab1a7088584507f2163d4afba25ae7fb024d137df23204e0c"
-    ),
 }
 
 
@@ -420,15 +316,6 @@ def require_exact_int(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise SelectionContractError(f"{label} must be an exact integer")
     return value
-
-
-def require_finite_number(value: Any, label: str) -> float:
-    if isinstance(value, bool) or type(value) not in {int, float}:
-        raise SelectionContractError(f"{label} must be a JSON number")
-    converted = float(value)
-    if not math.isfinite(converted):
-        raise SelectionContractError(f"{label} must be finite")
-    return converted
 
 
 def require_exact_keys(
@@ -654,556 +541,6 @@ def _verify_artifact(
     return receipt, resolved, payload
 
 
-def _validate_frozen_inputs(payload: Any) -> str:
-    payload = require_exact_keys(
-        payload,
-        {
-            "format",
-            "source",
-            "official_base",
-            "speaker_initialization",
-            "dataset",
-            "protocol",
-            "receipt_sha256",
-        },
-        "Base frozen inputs",
-    )
-    receipt_sha = _payload_hash_without(
-        payload,
-        "receipt_sha256",
-        "Base frozen inputs",
-    )
-    source = require_exact_keys(
-        payload["source"],
-        {
-            "origin",
-            "commit",
-            "tree",
-            "branch",
-            "clean",
-            "entrypoint",
-            "entrypoint_sha256",
-        },
-        "Base producer source",
-    )
-    source_entrypoint = require_absolute_path(
-        source["entrypoint"],
-        "Base producer source entrypoint",
-    )
-    if (
-        source["origin"] != BASE_PRODUCER_SOURCE["origin"]
-        or require_git_oid(
-            source["commit"],
-            "Base producer source commit",
-        )
-        != BASE_PRODUCER_SOURCE["commit"]
-        or require_git_oid(
-            source["tree"],
-            "Base producer source tree",
-        )
-        != BASE_PRODUCER_SOURCE["tree"]
-        or source["branch"] is not None
-        or source["clean"] is not True
-        or source_entrypoint.name != BASE_PRODUCER_SOURCE["entrypoint"]
-        or require_sha256(
-            source["entrypoint_sha256"],
-            "Base producer entrypoint SHA",
-        )
-        != BASE_PRODUCER_SOURCE["entrypoint_sha256"]
-    ):
-        raise SelectionContractError(
-            "Base frozen inputs do not bind the pinned detached producer"
-        )
-    protocol = payload["protocol"]
-    candidate_epochs = (
-        protocol.get("candidate_epochs")
-        if isinstance(protocol, dict)
-        else None
-    )
-    optimizer = protocol.get("optimizer") if isinstance(protocol, dict) else None
-    protocol_learning_rate = (
-        require_finite_number(
-            optimizer.get("learning_rate"),
-            "Base protocol learning_rate",
-        )
-        if isinstance(optimizer, dict)
-        else math.nan
-    )
-    if (
-        payload["format"] != FROZEN_INPUTS_FORMAT
-        or not isinstance(protocol, dict)
-        or protocol.get("format")
-        != "semtalk_show_base_official_adapt_protocol_v1"
-        or protocol.get("target_dataset") != "SHOW"
-        or protocol.get("target_speaker_scope") != "All"
-        or not isinstance(candidate_epochs, list)
-        or any(type(epoch) is not int for epoch in candidate_epochs)
-        or candidate_epochs != list(EXPECTED_CANDIDATE_EPOCHS)
-        or require_exact_int(
-            protocol.get("epochs"),
-            "Base protocol epochs",
-        )
-        != 40
-        or require_exact_int(
-            protocol.get("expected_updates_per_epoch"),
-            "Base protocol updates per epoch",
-        )
-        != EXPECTED_UPDATES_PER_EPOCH
-        or protocol.get("vq_models_in_training_graph") is not False
-        or protocol.get("precision") not in {"bf16", "fp32"}
-        or not isinstance(optimizer, dict)
-        or optimizer.get("name") != "Adam"
-        or not 0.0 < protocol_learning_rate <= 3e-4
-        or protocol.get("throughput_gate")
-        != {"warmup_updates": 20, "timed_updates": 50}
-        or protocol.get("initialization", {}).get("forbidden_sources")
-        != ["e30", "Speaker2"]
-    ):
-        raise SelectionContractError(
-            "Base frozen inputs do not preserve the official adaptation "
-            "training contract"
-        )
-    dataset = payload["dataset"]
-    if (
-        not isinstance(dataset, dict)
-        or require_exact_int(
-            dataset.get("entries"),
-            "Base training dataset entries",
-        )
-        != 127_286
-        or require_exact_int(
-            dataset.get("train_clips"),
-            "Base training dataset clips",
-        )
-        != 13_687
-        or dataset.get("vq_models_in_training_graph") is not False
-    ):
-        raise SelectionContractError("Base frozen training dataset mismatch")
-    official_base = payload["official_base"]
-    if (
-        not isinstance(official_base, dict)
-        or official_base.get("source") != "released_all_speakers_v1"
-        or official_base.get("filename")
-        != OFFICIAL_BASE_CHECKPOINT["filename"]
-        or official_base.get("sha256")
-        != OFFICIAL_BASE_CHECKPOINT["sha256"]
-        or official_base.get("speaker_scope") != "All-Speakers"
-        or official_base.get("all_model_state_tensors_finite") is not True
-        or official_base.get("strict_state_dict_load") is not True
-    ):
-        raise SelectionContractError(
-            "Base frozen inputs do not bind the exact official initialization"
-        )
-    for field in ("path", "filename"):
-        if field in official_base:
-            reject_forbidden_source_labels(official_base[field])
-    return receipt_sha
-
-
-def _validate_throughput_gate(
-    value: Any,
-    *,
-    frozen_receipt_sha256: str,
-    expected_precision: str,
-    expected_learning_rate: float,
-) -> dict[str, Any]:
-    value = require_exact_keys(
-        value,
-        {"path", "sha256", "samples_per_second", "seconds_per_update"},
-        "Base throughput gate receipt",
-    )
-    path = require_val_only_path(
-        value["path"],
-        "Base throughput gate path",
-    )
-    resolved, report, observed_sha = _verified_json(
-        path,
-        require_sha256(
-            value["sha256"],
-            "Base throughput gate artifact SHA",
-        ),
-        "Base throughput gate",
-    )
-    claimed_receipt_sha = require_sha256(
-        report.get("receipt_sha256"),
-        "Base throughput gate payload SHA",
-    )
-    report_body = dict(report)
-    report_body.pop("receipt_sha256", None)
-    samples_per_second = require_finite_number(
-        report.get("samples_per_second"),
-        "Base throughput samples_per_second",
-    )
-    seconds_per_update = require_finite_number(
-        report.get("seconds_per_update"),
-        "Base throughput seconds_per_update",
-    )
-    elapsed_seconds = require_finite_number(
-        report.get("elapsed_seconds"),
-        "Base throughput elapsed_seconds",
-    )
-    if (
-        canonical_json_sha256(report_body) != claimed_receipt_sha
-        or report.get("format") != THROUGHPUT_GATE_FORMAT
-        or report.get("status") != "pass"
-        or report.get("frozen_receipt_sha256") != frozen_receipt_sha256
-        or require_exact_int(
-            report.get("world_size"),
-            "Base throughput world_size",
-        )
-        != 8
-        or require_exact_int(
-            report.get("local_batch_size"),
-            "Base throughput local_batch_size",
-        )
-        != 64
-        or require_exact_int(
-            report.get("global_batch_size"),
-            "Base throughput global_batch_size",
-        )
-        != 512
-        or require_exact_int(
-            report.get("warmup_updates"),
-            "Base throughput warmup_updates",
-        )
-        != 20
-        or require_exact_int(
-            report.get("timed_updates"),
-            "Base throughput timed_updates",
-        )
-        != 50
-        or report.get("precision") != expected_precision
-        or require_finite_number(
-            report.get("learning_rate"),
-            "Base throughput learning_rate",
-        )
-        != expected_learning_rate
-        or report.get("all_losses_finite") is not True
-        or require_exact_int(
-            report.get("optimizer_updates"),
-            "Base throughput optimizer_updates",
-        )
-        != 70
-        or samples_per_second <= 0.0
-        or seconds_per_update <= 0.0
-        or elapsed_seconds <= 0.0
-        or not math.isclose(
-            seconds_per_update,
-            elapsed_seconds / 50.0,
-            rel_tol=1e-12,
-            abs_tol=0.0,
-        )
-        or not math.isclose(
-            samples_per_second,
-            512.0 * 50.0 / elapsed_seconds,
-            rel_tol=1e-12,
-            abs_tol=0.0,
-        )
-        or require_finite_number(
-            value["samples_per_second"],
-            "Base throughput receipt samples_per_second",
-        )
-        != samples_per_second
-        or require_finite_number(
-            value["seconds_per_update"],
-            "Base throughput receipt seconds_per_update",
-        )
-        != seconds_per_update
-    ):
-        raise SelectionContractError(
-            "Base throughput gate does not bind the exact training protocol"
-        )
-    return {
-        "path": str(resolved),
-        "sha256": observed_sha,
-        "samples_per_second": samples_per_second,
-        "seconds_per_update": seconds_per_update,
-    }
-
-
-def validate_candidate_bundle(
-    *,
-    manifest_path: Path,
-    expected_manifest_sha256: str,
-    status_path: Path,
-    expected_status_sha256: str,
-    frozen_inputs_path: Path,
-    expected_frozen_inputs_sha256: str,
-) -> dict[str, Any]:
-    """Verify the exact seven-candidate producer transaction without torch."""
-
-    frozen_resolved, frozen, frozen_file_sha = _verified_json(
-        frozen_inputs_path,
-        expected_frozen_inputs_sha256,
-        "Base frozen inputs",
-    )
-    frozen_receipt_sha = _validate_frozen_inputs(frozen)
-    manifest_resolved, manifest, manifest_file_sha = _verified_json(
-        manifest_path,
-        expected_manifest_sha256,
-        "Base candidate manifest",
-    )
-    status_resolved, status, status_file_sha = _verified_json(
-        status_path,
-        expected_status_sha256,
-        "Base training status",
-    )
-    if not (
-        frozen_resolved.parent
-        == manifest_resolved.parent
-        == status_resolved.parent
-    ):
-        raise SelectionContractError(
-            "Base manifest, status, and frozen inputs must share one run root"
-        )
-
-    manifest = require_exact_keys(
-        manifest,
-        {
-            "format",
-            "status",
-            "candidate_epochs",
-            "frozen_receipt_sha256",
-            "throughput_gate",
-            "entries",
-            "entries_sha256",
-            "completed_epochs",
-            "optimizer_updates",
-        },
-        "Base candidate manifest",
-    )
-    entries = manifest["entries"]
-    manifest_candidate_epochs = manifest["candidate_epochs"]
-    if (
-        manifest["format"] != CANDIDATE_MANIFEST_FORMAT
-        or manifest["status"] != "complete"
-        or not isinstance(manifest_candidate_epochs, list)
-        or any(type(epoch) is not int for epoch in manifest_candidate_epochs)
-        or manifest_candidate_epochs != list(EXPECTED_CANDIDATE_EPOCHS)
-        or manifest["frozen_receipt_sha256"] != frozen_receipt_sha
-        or require_exact_int(
-            manifest["completed_epochs"],
-            "Base manifest completed_epochs",
-        )
-        != 40
-        or require_exact_int(
-            manifest["optimizer_updates"],
-            "Base manifest optimizer_updates",
-        )
-        != 40 * EXPECTED_UPDATES_PER_EPOCH
-        or not isinstance(entries, list)
-        or len(entries) != len(EXPECTED_CANDIDATE_EPOCHS)
-        or manifest["entries_sha256"] != canonical_json_sha256(entries)
-    ):
-        raise SelectionContractError(
-            "Base candidate manifest is not the exact complete epoch set"
-        )
-    throughput_receipt = _validate_throughput_gate(
-        manifest["throughput_gate"],
-        frozen_receipt_sha256=frozen_receipt_sha,
-        expected_precision=str(frozen["protocol"].get("precision")),
-        expected_learning_rate=require_finite_number(
-            frozen["protocol"].get("optimizer", {}).get("learning_rate"),
-            "Base protocol learning_rate",
-        ),
-    )
-
-    candidate_receipts: dict[int, dict[str, Any]] = {}
-    expected_candidate_paths: set[Path] = set()
-    entry_keys = {
-        "epoch",
-        "optimizer_updates",
-        "checkpoint",
-        "checkpoint_sha256",
-        "checkpoint_bytes",
-        "checkpoint_container_schema",
-        "model_state_tensors",
-        "model_state_schema_sha256",
-        "all_model_state_tensors_finite",
-        "frozen_receipt_sha256",
-    }
-    for expected_epoch, raw_entry in zip(
-        EXPECTED_CANDIDATE_EPOCHS,
-        entries,
-    ):
-        entry = require_exact_keys(
-            raw_entry,
-            entry_keys,
-            f"Base candidate epoch {expected_epoch}",
-        )
-        relative = entry["checkpoint"]
-        entry_epoch = require_exact_int(
-            entry["epoch"],
-            f"epoch {expected_epoch} manifest epoch",
-        )
-        entry_updates = require_exact_int(
-            entry["optimizer_updates"],
-            f"epoch {expected_epoch} optimizer updates",
-        )
-        expected_relative = (
-            f"candidates/base_official_adapt_epoch_{expected_epoch:02d}.bin"
-        )
-        if (
-            entry_epoch != expected_epoch
-            or entry_updates != expected_epoch * EXPECTED_UPDATES_PER_EPOCH
-            or relative != expected_relative
-            or entry["checkpoint_container_schema"]
-            != ["audit", "model_state"]
-            or require_exact_int(
-                entry["model_state_tensors"],
-                f"epoch {expected_epoch} model_state_tensors",
-            )
-            <= 0
-            or entry["all_model_state_tensors_finite"] is not True
-            or entry["frozen_receipt_sha256"] != frozen_receipt_sha
-        ):
-            raise SelectionContractError(
-                f"invalid Base candidate receipt at epoch {expected_epoch}"
-            )
-        require_sha256(
-            entry["model_state_schema_sha256"],
-            f"epoch {expected_epoch} model-state schema SHA",
-        )
-        checkpoint_sha = require_sha256(
-            entry["checkpoint_sha256"],
-            f"epoch {expected_epoch} checkpoint SHA",
-        )
-        reject_forbidden_source_labels(relative)
-        candidate_path = manifest_resolved.parent / relative
-        resolved_checkpoint = _regular_file(
-            candidate_path,
-            f"Base candidate epoch {expected_epoch}",
-        )
-        try:
-            resolved_checkpoint.relative_to(manifest_resolved.parent)
-        except ValueError as error:
-            raise SelectionContractError(
-                "Base candidate escapes its immutable run root"
-            ) from error
-        observed_bytes = resolved_checkpoint.stat().st_size
-        if (
-            require_exact_int(
-                entry["checkpoint_bytes"],
-                f"epoch {expected_epoch} checkpoint bytes",
-            )
-            != observed_bytes
-            or sha256_file(resolved_checkpoint) != checkpoint_sha
-        ):
-            raise SelectionContractError(
-                f"Base candidate bytes changed at epoch {expected_epoch}"
-            )
-        candidate_receipts[expected_epoch] = {
-            "path": str(resolved_checkpoint),
-            "sha256": checkpoint_sha,
-            "bytes": observed_bytes,
-        }
-        expected_candidate_paths.add(resolved_checkpoint)
-
-    candidate_directory = manifest_resolved.parent / "candidates"
-    if candidate_directory.is_symlink() or not candidate_directory.is_dir():
-        raise SelectionContractError(
-            "Base candidate directory is missing or unsafe"
-        )
-    children = list(candidate_directory.iterdir())
-    actual_candidate_paths = {
-        child.resolve()
-        for child in children
-        if child.is_file() and not child.is_symlink()
-    }
-    if (
-        len(children) != len(EXPECTED_CANDIDATE_EPOCHS)
-        or actual_candidate_paths != expected_candidate_paths
-    ):
-        raise SelectionContractError(
-            "Base candidate directory is not the exact seven-epoch cover"
-        )
-
-    status = require_exact_keys(
-        status,
-        {
-            "format",
-            "status",
-            "completed_epochs",
-            "optimizer_updates",
-            "updates_per_epoch",
-            "candidate_manifest_sha256",
-            "frozen_receipt_sha256",
-            "throughput_gate",
-            "world_size",
-            "local_batch_size",
-            "global_batch_size",
-            "all_training_state_finite",
-            "started_unix",
-            "completed_unix",
-        },
-        "Base training status",
-    )
-    completed_epochs = require_exact_int(
-        status["completed_epochs"],
-        "Base status completed_epochs",
-    )
-    optimizer_updates = require_exact_int(
-        status["optimizer_updates"],
-        "Base status optimizer_updates",
-    )
-    updates_per_epoch = require_exact_int(
-        status["updates_per_epoch"],
-        "Base status updates_per_epoch",
-    )
-    world_size = require_exact_int(
-        status["world_size"],
-        "Base status world_size",
-    )
-    local_batch_size = require_exact_int(
-        status["local_batch_size"],
-        "Base status local_batch_size",
-    )
-    global_batch_size = require_exact_int(
-        status["global_batch_size"],
-        "Base status global_batch_size",
-    )
-    if (
-        status["format"] != CANDIDATE_STATUS_FORMAT
-        or status["status"] != "complete"
-        or completed_epochs != 40
-        or optimizer_updates != 40 * EXPECTED_UPDATES_PER_EPOCH
-        or updates_per_epoch != EXPECTED_UPDATES_PER_EPOCH
-        or status["candidate_manifest_sha256"] != manifest_file_sha
-        or status["frozen_receipt_sha256"] != frozen_receipt_sha
-        or world_size != 8
-        or local_batch_size != 64
-        or global_batch_size != 512
-        or status["all_training_state_finite"] is not True
-        or status["throughput_gate"] != throughput_receipt
-    ):
-        raise SelectionContractError(
-            "Base official adaptation did not finalize exactly"
-        )
-    started = require_finite_number(status["started_unix"], "started_unix")
-    completed = require_finite_number(
-        status["completed_unix"],
-        "completed_unix",
-    )
-    if started < 0.0 or completed < started:
-        raise SelectionContractError("invalid Base training timestamps")
-    return {
-        "manifest": {
-            "path": str(manifest_resolved),
-            "sha256": manifest_file_sha,
-        },
-        "status": {
-            "path": str(status_resolved),
-            "sha256": status_file_sha,
-        },
-        "frozen_inputs": {
-            "path": str(frozen_resolved),
-            "sha256": frozen_file_sha,
-            "receipt_sha256": frozen_receipt_sha,
-        },
-        "candidates": candidate_receipts,
-    }
-
-
 def _canonical_coverage(
     payload: bytes,
     label: str,
@@ -1236,7 +573,7 @@ def _canonical_coverage(
         if (
             index < 0
             or index in seen_indices
-            or frames < DIFFSHEG_WINDOW
+            or frames < TALKSHOW_WINDOW
             or not isinstance(clip_id, str)
             or not clip_id
             or clip_id in seen_source_ids
@@ -1271,7 +608,7 @@ def _canonical_coverage(
             "canonical validation coverage is not the four SHOW speakers"
         )
     clip_digest = hashlib.sha256()
-    diffsheg_digest = hashlib.sha256()
+    talkshow_window_digest = hashlib.sha256()
     frame_count = 0
     window_count = 0
     uncovered_tail_frames = 0
@@ -1279,23 +616,23 @@ def _canonical_coverage(
         clip_digest.update(output_id.encode("utf-8"))
         clip_digest.update(b"\n")
         starts = tuple(
-            range(0, frames - DIFFSHEG_WINDOW + 1, DIFFSHEG_STRIDE)
+            range(0, frames - TALKSHOW_WINDOW + 1, TALKSHOW_STRIDE)
         )
         if not starts:
             raise AssertionError("frame lower bound did not provide a window")
         frame_count += frames
         window_count += len(starts)
         uncovered_tail_frames += frames - (
-            starts[-1] + DIFFSHEG_WINDOW
+            starts[-1] + TALKSHOW_WINDOW
         )
-        diffsheg_digest.update(output_id.encode("utf-8"))
-        diffsheg_digest.update(b"\0")
-        diffsheg_digest.update(str(frames).encode("ascii"))
-        diffsheg_digest.update(b"\0")
-        diffsheg_digest.update(
+        talkshow_window_digest.update(output_id.encode("utf-8"))
+        talkshow_window_digest.update(b"\0")
+        talkshow_window_digest.update(str(frames).encode("ascii"))
+        talkshow_window_digest.update(b"\0")
+        talkshow_window_digest.update(
             ",".join(str(value) for value in starts).encode("ascii")
         )
-        diffsheg_digest.update(b"\n")
+        talkshow_window_digest.update(b"\n")
     return seen_source_ids, {
         "split": "val",
         "clip_count": EXPECTED_VAL_CLIPS,
@@ -1303,7 +640,7 @@ def _canonical_coverage(
         "window_count": window_count,
         "uncovered_tail_frames": uncovered_tail_frames,
         "clip_ids_sha256": clip_digest.hexdigest(),
-        "diffsheg_clip_manifest_sha256": diffsheg_digest.hexdigest(),
+        "talkshow_window_manifest_sha256": talkshow_window_digest.hexdigest(),
         "_ordered_clips": ordered_clips,
     }
 
@@ -1318,7 +655,7 @@ def public_val_coverage(coverage: Mapping[str, Any]) -> dict[str, Any]:
             "window_count",
             "uncovered_tail_frames",
             "clip_ids_sha256",
-            "diffsheg_clip_manifest_sha256",
+            "talkshow_window_manifest_sha256",
         )
     }
 
@@ -1377,7 +714,7 @@ def _audio_coverage(
                 f"{clip_id} audio frames",
             )
             if (
-                frames < DIFFSHEG_WINDOW
+                frames < TALKSHOW_WINDOW
                 or row.get("beat_shape") != [frames, 3]
                 or row.get("hubert_shape") != [frames, 1024]
             ):
@@ -1679,7 +1016,7 @@ def validate_val_inputs(
             "audio_summaries",
             "audio_lineages",
             "clip_ids_sha256",
-            "diffsheg_clip_manifest_sha256",
+            "talkshow_window_manifest_sha256",
             "receipt_payload_sha256",
         },
         "Base validation inputs",
@@ -1715,10 +1052,10 @@ def validate_val_inputs(
         )
         != coverage["clip_ids_sha256"]
         or require_sha256(
-            inputs["diffsheg_clip_manifest_sha256"],
-            "validation DiffSHEG clip-manifest SHA",
+            inputs["talkshow_window_manifest_sha256"],
+            "validation TalkSHOW released2 clip-manifest SHA",
         )
-        != coverage["diffsheg_clip_manifest_sha256"]
+        != coverage["talkshow_window_manifest_sha256"]
     ):
         raise SelectionContractError(
             "validation input coverage digest mismatch"
@@ -2031,7 +1368,7 @@ def validate_fresh_pipeline(
     expected_prerequisite_selection: Mapping[str, Any] | None = None,
     expected_source: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Freshly replay the no-DiffSHEG, five-SHOW-checkpoint pipeline."""
+    """Freshly replay the five-SHOW-checkpoint validation pipeline."""
 
     resolved, pipeline, file_sha = _verified_json(
         path, expected_sha256, "fresh Base validation pipeline"
@@ -2073,7 +1410,6 @@ def validate_fresh_pipeline(
         or pipeline["generator_module"] != "models.semtalk.semtalk_base"
         or pipeline["prerequisite_consumption"]
         != FRESH_PREREQUISITE_CONSUMPTION
-        or "diffsheg" in pipeline
     ):
         raise SelectionContractError(
             "fresh Base validation pipeline identity changed"
@@ -2165,133 +1501,6 @@ def validate_fresh_pipeline(
     }, pipeline
 
 
-def validate_pipeline(
-    path: Path,
-    expected_sha256: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    resolved, pipeline, file_sha = _verified_json(
-        path,
-        expected_sha256,
-        "Base validation pipeline",
-    )
-    reject_test_path(resolved, "Base validation pipeline")
-    pipeline = require_exact_keys(
-        pipeline,
-        {
-            "format",
-            "status",
-            "split",
-            "test_visible",
-            "mode",
-            "base_candidate_variable_only",
-            "source",
-            "inference_entrypoint",
-            "inference_helpers",
-            "fixed_checkpoints",
-            "diffsheg",
-            "receipt_payload_sha256",
-        },
-        "Base validation pipeline",
-    )
-    payload_sha = _payload_hash_without(
-        pipeline,
-        "receipt_payload_sha256",
-        "Base validation pipeline",
-    )
-    source = require_exact_keys(
-        pipeline["source"],
-        {"origin", "commit", "tree", "entrypoint", "entrypoint_sha256"},
-        "validation inference source",
-    )
-    if (
-        pipeline["format"] != PIPELINE_FORMAT
-        or pipeline["status"] != "frozen"
-        or pipeline["split"] != "val"
-        or pipeline["test_visible"] is not False
-        or pipeline["mode"] != "official_show_adapt_v1"
-        or pipeline["base_candidate_variable_only"] is not True
-        or pipeline["inference_helpers"] != list(INFERENCE_HELPERS)
-        or pipeline["diffsheg"] != DIFFSHEG_PINNED_RECEIPT
-        or source != VAL_INFERENCE_SOURCE
-    ):
-        raise SelectionContractError(
-            "validation pipeline is not the frozen final-pipeline contract"
-        )
-    entrypoint_artifact, entrypoint_path, _entrypoint_bytes = (
-        _verify_artifact(
-            pipeline["inference_entrypoint"],
-            "validation inference entrypoint",
-        )
-    )
-    if (
-        entrypoint_path.name != "run_base_inference.py"
-        or entrypoint_artifact["sha256"] != source["entrypoint_sha256"]
-    ):
-        raise SelectionContractError(
-            "validation inference entrypoint source/hash mismatch"
-        )
-    fixed = pipeline["fixed_checkpoints"]
-    if not isinstance(fixed, dict) or set(fixed) != {
-        "face",
-        "hands",
-        "upper",
-        "lower",
-        "global",
-    }:
-        raise SelectionContractError(
-            "validation pipeline fixed-checkpoint coverage mismatch"
-        )
-    for stage in ("face", "global"):
-        entry = require_exact_keys(
-            fixed[stage],
-            {"path", "sha256", "selection_split", "test_visible"},
-            f"fixed {stage} checkpoint",
-        )
-        reject_forbidden_source_labels(entry["path"])
-        require_val_only_path(
-            entry["path"],
-            f"fixed {stage} checkpoint path",
-        )
-        require_sha256(entry["sha256"], f"fixed {stage} checkpoint SHA")
-        expected_filename = (
-            "best_face_transfer.bin"
-            if stage == "face"
-            else "best_global_transfer.bin"
-        )
-        if (
-            Path(str(entry["path"])).name != expected_filename
-            or entry["selection_split"] != "val"
-            or entry["test_visible"] is not False
-        ):
-            raise SelectionContractError(
-                f"fixed {stage} is not independently val-selected"
-            )
-    for stage, specification in FIXED_OFFICIAL_CHECKPOINTS.items():
-        entry = require_exact_keys(
-            fixed[stage],
-            {"path", "sha256", "source"},
-            f"fixed {stage} checkpoint",
-        )
-        reject_forbidden_source_labels(entry["path"])
-        require_val_only_path(
-            entry["path"],
-            f"fixed {stage} checkpoint path",
-        )
-        if (
-            Path(str(entry["path"])).name != specification["filename"]
-            or entry["sha256"] != specification["sha256"]
-            or entry["source"] != "released_all_speakers_v1"
-        ):
-            raise SelectionContractError(
-                f"fixed {stage} is not the exact official checkpoint"
-            )
-    return {
-        "path": str(resolved),
-        "sha256": file_sha,
-        "receipt_payload_sha256": payload_sha,
-    }, pipeline
-
-
 def _validate_output_file_receipt(
     value: Any,
     *,
@@ -2370,7 +1579,7 @@ def validate_val_inference_lineage(
             "window_count",
             "uncovered_tail_frames",
             "clip_ids_sha256",
-            "diffsheg_clip_manifest_sha256",
+            "talkshow_window_manifest_sha256",
             "prediction_files",
             "ground_truth_files",
             "exact_once",
@@ -2423,14 +1632,14 @@ def validate_val_inference_lineage(
     )
     clip_artifact, clip_path, clip_payload = _verify_artifact(
         lineage["clip_manifest"],
-        f"epoch {epoch} DiffSHEG clip manifest",
+        f"epoch {epoch} TalkSHOW released2 clip manifest",
     )
     reject_test_path(final_path, "final inference manifest")
-    reject_test_path(clip_path, "DiffSHEG clip manifest")
+    reject_test_path(clip_path, "TalkSHOW released2 clip manifest")
     if final_path.name != "final_manifest.jsonl":
         raise SelectionContractError("final inference manifest basename mismatch")
-    if clip_path.name != "diffsheg_eval_clip_ids.txt":
-        raise SelectionContractError("DiffSHEG clip manifest basename mismatch")
+    if clip_path.name != "talkshow_eval_clip_ids.txt":
+        raise SelectionContractError("TalkSHOW released2 clip manifest basename mismatch")
 
     expected_rows = expected_coverage.get("_ordered_clips")
     if (
@@ -2577,8 +1786,8 @@ def validate_val_inference_lineage(
         != EXPECTED_VAL_CLIPS
         or lineage["clip_ids_sha256"]
         != public_coverage["clip_ids_sha256"]
-        or lineage["diffsheg_clip_manifest_sha256"]
-        != public_coverage["diffsheg_clip_manifest_sha256"]
+        or lineage["talkshow_window_manifest_sha256"]
+        != public_coverage["talkshow_window_manifest_sha256"]
     ):
         raise SelectionContractError(
             f"epoch {epoch} inference lineage does not exactly cover "
@@ -2598,617 +1807,5 @@ def validate_val_inference_lineage(
     }
 
 
-def validate_diffsheg_report(
-    report: Any,
-    *,
-    expected_coverage: Mapping[str, Any],
-    inference_lineage: Mapping[str, Any] | None = None,
-) -> tuple[dict[str, float], dict[str, int]]:
-    if not isinstance(report, dict) or report.get("status") != "ok":
-        raise SelectionContractError("DiffSHEG validation report is incomplete")
-    protocol = report.get("protocol")
-    inputs = report.get("inputs")
-    metrics = report.get("metrics")
-    provenance = report.get("provenance")
-    if not all(
-        isinstance(value, dict)
-        for value in (protocol, inputs, metrics, provenance)
-    ):
-        raise SelectionContractError("DiffSHEG report schema is incomplete")
-    assert isinstance(protocol, dict)
-    assert isinstance(inputs, dict)
-    assert isinstance(metrics, dict)
-    assert isinstance(provenance, dict)
-    pins = DIFFSHEG_PINNED_RECEIPT
-    public_coverage = public_val_coverage(expected_coverage)
-    expected_clip_manifest_path = (
-        inference_lineage["clip_manifest"]["path"]
-        if inference_lineage is not None
-        else None
-    )
-    expected_clip_manifest_sha256 = public_coverage[
-        "diffsheg_clip_manifest_sha256"
-    ]
-    expected_clip_order = (
-        f"explicit_manifest:{expected_clip_manifest_path}"
-        if expected_clip_manifest_path is not None
-        else None
-    )
-    if (
-        protocol.get("name") != pins["protocol"]
-        or protocol.get("version") != pins["protocol_version"]
-        or protocol.get("status")
-        != "reconstructed_from_public_components"
-        or protocol.get("diffsheg_reference_commit")
-        != pins["diffsheg_reference_commit"]
-        or protocol.get("window_length") != DIFFSHEG_WINDOW
-        or protocol.get("window_stride") != DIFFSHEG_STRIDE
-        or protocol.get("precision") != pins["precision"]
-        or protocol.get("ba") is not None
-        or (
-            protocol.get("clip_order") != expected_clip_order
-            if expected_clip_order is not None
-            else not str(protocol.get("clip_order", "")).startswith(
-                "explicit_manifest:"
-            )
-        )
-    ):
-        raise SelectionContractError("DiffSHEG validation protocol mismatch")
-    clip_count = require_exact_int(
-        inputs.get("clip_count"),
-        "DiffSHEG validation clip_count",
-    )
-    frame_count = require_exact_int(
-        inputs.get("frame_count"),
-        "DiffSHEG validation frame_count",
-    )
-    window_count = require_exact_int(
-        inputs.get("window_count"),
-        "DiffSHEG validation window_count",
-    )
-    uncovered = require_exact_int(
-        inputs.get("uncovered_tail_frames"),
-        "DiffSHEG validation uncovered_tail_frames",
-    )
-    if (
-        clip_count != public_coverage["clip_count"]
-        or frame_count != public_coverage["frame_count"]
-        or window_count != public_coverage["window_count"]
-        or uncovered != public_coverage["uncovered_tail_frames"]
-        or inputs.get("clip_manifest_sha256")
-        != expected_clip_manifest_sha256
-        or not isinstance(inputs.get("stats"), dict)
-        or inputs["stats"].get("sha256") != pins["stats_sha256"]
-    ):
-        raise SelectionContractError(
-            "DiffSHEG report does not exactly cover frozen validation"
-        )
-    for field in (
-        "prediction_dir",
-        "ground_truth_dir",
-        "clip_manifest",
-        "weights_dir",
-    ):
-        require_val_only_path(
-            inputs.get(field),
-            f"DiffSHEG inputs.{field}",
-        )
-    if inference_lineage is not None:
-        if (
-            str(
-                require_val_only_path(
-                    inputs["prediction_dir"],
-                    "DiffSHEG inputs.prediction_dir",
-                ).resolve()
-            )
-            != inference_lineage["prediction_dir"]
-            or str(
-                require_val_only_path(
-                    inputs["ground_truth_dir"],
-                    "DiffSHEG inputs.ground_truth_dir",
-                ).resolve()
-            )
-            != inference_lineage["ground_truth_dir"]
-            or str(
-                require_val_only_path(
-                    inputs["clip_manifest"],
-                    "DiffSHEG inputs.clip_manifest",
-                ).resolve()
-            )
-            != expected_clip_manifest_path
-        ):
-            raise SelectionContractError(
-                "DiffSHEG report paths do not bind the candidate inference "
-                "lineage"
-            )
-    require_absolute_path(
-        inputs["stats"].get("path"),
-        "DiffSHEG inputs.stats.path",
-    )
-    if set(metrics) != set(VAL_METRIC_KEYS):
-        raise SelectionContractError(
-            "validation metric coverage must be exactly FGD-only"
-        )
-    validated_metrics = {
-        key: require_finite_number(metrics[key], f"DiffSHEG metric {key}")
-        for key in VAL_METRIC_KEYS
-    }
-    if validated_metrics["fgd"] < 0.0:
-        raise SelectionContractError("DiffSHEG metric fgd is negative")
-
-    evaluator = provenance.get("evaluator")
-    diffsheg_root = provenance.get("diffsheg_root")
-    autoencoders = provenance.get("autoencoders")
-    if (
-        not isinstance(evaluator, dict)
-        or evaluator.get("sha256")
-        != pins["paspa"]["evaluator_sha256"]
-        or evaluator.get("repository_git_head")
-        != pins["paspa"]["commit"]
-        or not isinstance(diffsheg_root, dict)
-        or diffsheg_root.get("git_head")
-        != pins["diffsheg_reference_commit"]
-        or not isinstance(autoencoders, dict)
-        or set(autoencoders) != {"fgd"}
-    ):
-        raise SelectionContractError("DiffSHEG evaluator provenance mismatch")
-    require_absolute_path(
-        evaluator.get("path"),
-        "DiffSHEG evaluator path",
-    )
-    require_absolute_path(
-        evaluator.get("repository_root"),
-        "DiffSHEG evaluator repository root",
-    )
-    require_absolute_path(
-        diffsheg_root.get("path"),
-        "DiffSHEG reference checkout",
-    )
-    for metric_name, specification in pins["autoencoders"].items():
-        observed = autoencoders[metric_name]
-        if (
-            not isinstance(observed, dict)
-            or observed.get("sha256") != specification["sha256"]
-            or observed.get("input_dim") != specification["input_dim"]
-            or Path(str(observed.get("path", ""))).name
-            != specification["filename"]
-        ):
-            raise SelectionContractError(
-                f"DiffSHEG {metric_name} autoencoder provenance mismatch"
-            )
-        require_absolute_path(
-            observed["path"],
-            f"DiffSHEG {metric_name} autoencoder path",
-        )
-    return validated_metrics, {
-        "clip_count": clip_count,
-        "frame_count": frame_count,
-        "window_count": window_count,
-        "uncovered_tail_frames": uncovered,
-    }
-
-
-def select_minimum_fgd(
-    rows: Sequence[Mapping[str, Any]],
-) -> Mapping[str, Any]:
-    """Return the strict minimum ``(fgd, epoch)`` from the exact epoch set."""
-
-    epochs = [
-        require_exact_int(row.get("epoch"), "selection epoch")
-        for row in rows
-    ]
-    if epochs != list(EXPECTED_CANDIDATE_EPOCHS):
-        raise SelectionContractError(
-            "selection rows must exactly cover epochs "
-            "1/2/4/8/16/32/40 in order"
-        )
-    for row in rows:
-        metrics = row.get("metrics")
-        require_exact_keys(
-            dict(metrics) if isinstance(metrics, Mapping) else metrics,
-            {"fgd"},
-            "selection row metrics",
-        )
-        require_finite_number(metrics["fgd"], "selection FGD")
-    return min(
-        rows,
-        key=lambda row: (
-            float(row["metrics"]["fgd"]),
-            int(row["epoch"]),
-        ),
-    )
-
-
-def _measurement_artifact(
-    path: Path,
-    expected_sha256: str,
-    *,
-    candidates: Mapping[int, Mapping[str, Any]],
-    common_val_inputs: dict[str, Any] | None,
-    common_pipeline: dict[str, Any] | None,
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-]:
-    resolved, measurement, file_sha = _verified_json(
-        path,
-        expected_sha256,
-        "Base validation measurement",
-    )
-    reject_test_path(resolved, "Base validation measurement")
-    measurement = require_exact_keys(
-        measurement,
-        {
-            "format",
-            "status",
-            "split",
-            "test_visible",
-            "selection_eligible",
-            "epoch",
-            "candidate_checkpoint",
-            "val_inputs_receipt",
-            "pipeline_receipt",
-            "inference_lineage",
-            "diffsheg_report",
-            "receipt_payload_sha256",
-        },
-        "Base validation measurement",
-    )
-    payload_sha = _payload_hash_without(
-        measurement,
-        "receipt_payload_sha256",
-        "Base validation measurement",
-    )
-    epoch = require_exact_int(measurement["epoch"], "measurement epoch")
-    if (
-        measurement["format"] != MEASUREMENT_FORMAT
-        or measurement["status"] != "complete"
-        or measurement["split"] != "val"
-        or measurement["test_visible"] is not False
-        or measurement["selection_eligible"] is not True
-        or epoch not in candidates
-    ):
-        raise SelectionContractError(
-            "Base measurement is not validation-only and selection-eligible"
-        )
-    candidate_path, candidate_sha, _ = _artifact_fields(
-        measurement["candidate_checkpoint"],
-        f"epoch {epoch} candidate checkpoint",
-    )
-    expected_candidate = candidates[epoch]
-    if (
-        candidate_path.resolve() != Path(expected_candidate["path"])
-        or candidate_sha != expected_candidate["sha256"]
-    ):
-        raise SelectionContractError(
-            f"measurement epoch {epoch} does not bind its candidate"
-        )
-
-    val_path, val_sha, val_payload_sha = _artifact_fields(
-        measurement["val_inputs_receipt"],
-        "measurement val-input receipt",
-        payload_hash=True,
-    )
-    if common_val_inputs is None:
-        val_artifact, val_coverage = validate_val_inputs(val_path, val_sha)
-        if val_artifact["receipt_payload_sha256"] != val_payload_sha:
-            raise SelectionContractError(
-                "measurement val-input payload hash mismatch"
-            )
-        common_val_inputs = {
-            "artifact": val_artifact,
-            "coverage": val_coverage,
-        }
-    elif measurement["val_inputs_receipt"] != common_val_inputs["artifact"]:
-        raise SelectionContractError(
-            "all candidates must use one frozen validation input receipt"
-        )
-
-    pipeline_path, pipeline_sha, pipeline_payload_sha = _artifact_fields(
-        measurement["pipeline_receipt"],
-        "measurement pipeline receipt",
-        payload_hash=True,
-    )
-    if common_pipeline is None:
-        pipeline_artifact, pipeline = validate_pipeline(
-            pipeline_path,
-            pipeline_sha,
-        )
-        if (
-            pipeline_artifact["receipt_payload_sha256"]
-            != pipeline_payload_sha
-        ):
-            raise SelectionContractError(
-                "measurement pipeline payload hash mismatch"
-            )
-        common_pipeline = {
-            "artifact": pipeline_artifact,
-            "payload": pipeline,
-        }
-    elif measurement["pipeline_receipt"] != common_pipeline["artifact"]:
-        raise SelectionContractError(
-            "all candidates must use one frozen validation pipeline"
-        )
-
-    (
-        inference_path,
-        inference_sha,
-        inference_payload_sha,
-    ) = _artifact_fields(
-        measurement["inference_lineage"],
-        f"epoch {epoch} inference lineage",
-        payload_hash=True,
-    )
-    inference_artifact, inference = validate_val_inference_lineage(
-        inference_path,
-        inference_sha,
-        epoch=epoch,
-        expected_candidate=expected_candidate,
-        val_inputs_artifact=common_val_inputs["artifact"],
-        pipeline_artifact=common_pipeline["artifact"],
-        expected_coverage=common_val_inputs["coverage"],
-    )
-    if (
-        inference_artifact["receipt_payload_sha256"]
-        != inference_payload_sha
-    ):
-        raise SelectionContractError(
-            f"epoch {epoch} inference lineage payload hash mismatch"
-        )
-
-    report_artifact, report_path, report_bytes = _verify_artifact(
-        measurement["diffsheg_report"],
-        f"epoch {epoch} DiffSHEG report",
-    )
-    reject_test_path(report_path, f"epoch {epoch} DiffSHEG report")
-    report = _strict_json_bytes(
-        report_bytes,
-        f"epoch {epoch} DiffSHEG report {report_path}",
-    )
-    metrics, coverage = validate_diffsheg_report(
-        report,
-        expected_coverage=common_val_inputs["coverage"],
-        inference_lineage=inference,
-    )
-    row = {
-        "epoch": epoch,
-        "candidate_checkpoint": dict(expected_candidate),
-        "inference_lineage": inference_artifact,
-        "inference_outputs": inference,
-        "diffsheg_report": report_artifact,
-        "metrics": metrics,
-        "coverage": coverage,
-    }
-    artifact = {
-        "path": str(resolved),
-        "sha256": file_sha,
-        "receipt_payload_sha256": payload_sha,
-    }
-    return artifact, row, common_val_inputs, common_pipeline
-
-
-def build_selection(
-    *,
-    candidate_bundle: Mapping[str, Any],
-    measurement_paths: Sequence[Path],
-    expected_measurement_sha256: Sequence[str],
-) -> dict[str, Any]:
-    if (
-        len(measurement_paths) != len(EXPECTED_CANDIDATE_EPOCHS)
-        or len(expected_measurement_sha256)
-        != len(EXPECTED_CANDIDATE_EPOCHS)
-    ):
-        raise SelectionContractError(
-            "exactly seven measurement paths and seven external SHA roots "
-            "are required"
-        )
-    rows: list[dict[str, Any]] = []
-    artifacts: list[dict[str, Any]] = []
-    common_val_inputs: dict[str, Any] | None = None
-    common_pipeline: dict[str, Any] | None = None
-    candidates = candidate_bundle["candidates"]
-    resolved_measurement_paths = []
-    for path in measurement_paths:
-        resolved_path = Path(path).resolve()
-        reject_forbidden_source_labels(resolved_path)
-        if any("test" in piece.casefold() for piece in resolved_path.parts):
-            raise SelectionContractError(
-                "measurement paths must not expose test artifacts"
-            )
-        resolved_measurement_paths.append(str(resolved_path))
-    if (
-        len(set(resolved_measurement_paths))
-        != len(EXPECTED_CANDIDATE_EPOCHS)
-        or len(set(expected_measurement_sha256))
-        != len(EXPECTED_CANDIDATE_EPOCHS)
-    ):
-        raise SelectionContractError(
-            "the seven externally rooted measurement receipts must be distinct"
-        )
-    for path, digest in zip(
-        measurement_paths,
-        expected_measurement_sha256,
-    ):
-        artifact, row, common_val_inputs, common_pipeline = (
-            _measurement_artifact(
-                path,
-                digest,
-                candidates=candidates,
-                common_val_inputs=common_val_inputs,
-                common_pipeline=common_pipeline,
-            )
-        )
-        artifacts.append(artifact)
-        rows.append(row)
-    selected = select_minimum_fgd(rows)
-    coverage_values = [row["coverage"] for row in rows]
-    if any(value != coverage_values[0] for value in coverage_values[1:]):
-        raise SelectionContractError(
-            "candidate DiffSHEG reports do not share exact validation coverage"
-        )
-    if common_val_inputs is None or common_pipeline is None:
-        raise AssertionError("seven measurements did not bind common receipts")
-    unique_fields = (
-        ("inference_lineage", "path"),
-        ("inference_lineage", "sha256"),
-        ("diffsheg_report", "path"),
-        ("diffsheg_report", "sha256"),
-        ("inference_outputs", "prediction_dir"),
-    )
-    for outer, inner in unique_fields:
-        if len({row[outer][inner] for row in rows}) != len(rows):
-            raise SelectionContractError(
-                f"candidate rows must bind seven distinct {outer}.{inner} "
-                "values"
-            )
-    full_coverage = common_val_inputs["coverage"]
-    selection_coverage = {
-        **public_val_coverage(full_coverage),
-        "canonical_manifest": full_coverage["canonical_manifest"],
-        "canonical_summary": full_coverage["canonical_summary"],
-        "canonical_lineage": full_coverage["canonical_lineage"],
-        "audio": full_coverage["audio"],
-    }
-    selection = {
-        "format": SELECTION_FORMAT,
-        "status": "selected",
-        "split": "val",
-        "test_visible": False,
-        "selection_eligible": True,
-        "selection_policy": {
-            "candidate_epochs": list(EXPECTED_CANDIDATE_EPOCHS),
-            "metric": "FGD",
-            "metric_report_key": "fgd",
-            "operator": "min",
-            "tie_break": "lowest_epoch",
-            "ordering": ["fgd", "epoch"],
-            "test_feedback_into_selection": False,
-        },
-        "candidate_bundle": {
-            key: candidate_bundle[key]
-            for key in ("manifest", "status", "frozen_inputs")
-        },
-        "source_roles": {
-            "base_candidate_producer": BASE_PRODUCER_SOURCE,
-            "val_inference_helpers": VAL_INFERENCE_SOURCE,
-        },
-        "val_inputs_receipt": common_val_inputs["artifact"],
-        "val_coverage": selection_coverage,
-        "pipeline_receipt": common_pipeline["artifact"],
-        "diffsheg_pinned_receipt": DIFFSHEG_PINNED_RECEIPT,
-        "measurement_receipts": artifacts,
-        "candidate_metrics": rows,
-        "selected": {
-            "epoch": selected["epoch"],
-            "candidate_checkpoint": selected["candidate_checkpoint"],
-            "fgd": selected["metrics"]["fgd"],
-            "inference_lineage": selected["inference_lineage"],
-            "diffsheg_report": selected["diffsheg_report"],
-        },
-        "test_policy": {
-            "authorized_evaluations": 1,
-            "one_shot_claim_required": True,
-            "selection_feedback": False,
-        },
-    }
-    selection["receipt_payload_sha256"] = canonical_json_sha256(selection)
-    return selection
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Select official-adapt SemTalk Base from frozen SHOW validation "
-            "FGD only"
-        ),
-        allow_abbrev=False,
-    )
-    parser.add_argument("--base-candidate-manifest", type=Path, required=True)
-    parser.add_argument(
-        "--expected-base-candidate-manifest-sha256",
-        required=True,
-    )
-    parser.add_argument("--base-status-json", type=Path, required=True)
-    parser.add_argument(
-        "--expected-base-formal-status-sha256",
-        required=True,
-    )
-    parser.add_argument("--base-frozen-inputs-json", type=Path, required=True)
-    parser.add_argument(
-        "--expected-base-frozen-inputs-sha256",
-        required=True,
-    )
-    parser.add_argument(
-        "--measurement-json",
-        action="append",
-        type=Path,
-        required=True,
-        help=(
-            "repeat exactly seven times in epoch order "
-            "1,2,4,8,16,32,40"
-        ),
-    )
-    parser.add_argument(
-        "--expected-measurement-sha256",
-        action="append",
-        required=True,
-        help="repeat exactly seven times in matching epoch order",
-    )
-    parser.add_argument("--output-json", type=Path, required=True)
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    reject_forbidden_source_labels(args.output_json)
-    resolved_output = args.output_json.resolve()
-    reject_forbidden_source_labels(resolved_output)
-    reject_test_path(resolved_output, "selection output")
-    if args.output_json.is_symlink() or args.output_json.exists():
-        raise SelectionContractError(
-            f"refusing to overwrite existing selection: {args.output_json}"
-        )
-    candidate_bundle = validate_candidate_bundle(
-        manifest_path=args.base_candidate_manifest,
-        expected_manifest_sha256=(
-            args.expected_base_candidate_manifest_sha256
-        ),
-        status_path=args.base_status_json,
-        expected_status_sha256=args.expected_base_formal_status_sha256,
-        frozen_inputs_path=args.base_frozen_inputs_json,
-        expected_frozen_inputs_sha256=(
-            args.expected_base_frozen_inputs_sha256
-        ),
-    )
-    selection = build_selection(
-        candidate_bundle=candidate_bundle,
-        measurement_paths=args.measurement_json,
-        expected_measurement_sha256=args.expected_measurement_sha256,
-    )
-    try:
-        _receipt.atomic_json_new(args.output_json, selection)
-    except (OSError, ValueError, RuntimeError) as error:
-        raise SelectionContractError(str(error)) from error
-    print(
-        json.dumps(
-            {
-                "status": "selected",
-                "split": "val",
-                "test_visible": False,
-                "selected_epoch": selection["selected"]["epoch"],
-                "selected_fgd": selection["selected"]["fgd"],
-                "output": str(args.output_json.resolve()),
-                "receipt_payload_sha256": selection[
-                    "receipt_payload_sha256"
-                ],
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# Formal consumers use the neutral name; there is only one accepted pipeline.
+validate_pipeline = validate_fresh_pipeline

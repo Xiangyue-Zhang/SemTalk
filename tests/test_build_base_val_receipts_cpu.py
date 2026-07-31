@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 from scripts.show_base import build_base_val_receipts as builder
-from scripts.show_base import select_base_official_adapt as selector
+from scripts.show_base import talkshow_base_val_contract as selector
 from utils import show_official_transfer as transfer_contract
 
 
@@ -307,100 +307,13 @@ class BaseValReceiptBuilderTests(unittest.TestCase):
         _write_json(summary_path, summary)
         return checkpoint, summary_path
 
-    def test_pipeline_binds_helper_val_transfers_and_released_all(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
-            root = Path(directory)
-            helper = root / "run_base_inference.py"
-            helper.write_bytes(
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(ROOT),
-                        "show",
-                        (
-                            f"{builder.EXPECTED_HELPER_SOURCE['commit']}:"
-                            "scripts/show_base/run_base_inference.py"
-                        ),
-                    ],
-                    check=True,
-                    capture_output=True,
-                ).stdout
-            )
-            face, face_summary = self._write_transfer(
-                root,
-                stage="face",
-                totals=[0.4, 0.2],
-            )
-            global_checkpoint, global_summary = self._write_transfer(
-                root,
-                stage="global",
-                totals=[0.3, 0.1],
-            )
-            official_specs = {}
-            official_paths = {}
-            for stage, filename in (
-                ("hands", "rvq_hands_500.bin"),
-                ("upper", "rvq_upper_500.bin"),
-                ("lower", "rvq_lower_600.bin"),
-            ):
-                path = root / filename
-                path.write_bytes(stage.encode())
-                official_paths[stage] = path
-                official_specs[stage] = {
-                    "filename": filename,
-                    "sha256": builder._sha256_file(path),
-                }
-            args = argparse.Namespace(
-                output=root / "pipeline.json",
-                pinned_helper=helper,
-                face_checkpoint=face,
-                face_summary=face_summary,
-                global_checkpoint=global_checkpoint,
-                global_summary=global_summary,
-                hands_checkpoint=official_paths["hands"],
-                upper_checkpoint=official_paths["upper"],
-                lower_checkpoint=official_paths["lower"],
-            )
-            class FakeTorch:
-                @staticmethod
-                def load(
-                    path: Path,
-                    *,
-                    map_location: str,
-                    weights_only: bool,
-                ) -> object:
-                    self.assertEqual(map_location, "cpu")
-                    self.assertTrue(weights_only)
-                    return pickle.loads(Path(path).read_bytes())
+    def test_historical_pipeline_builder_is_retired(self) -> None:
+        with self.assertRaisesRegex(
+            builder.ReceiptBuildError,
+            "historical pipeline builder is retired",
+        ):
+            builder.build_pipeline(argparse.Namespace())
 
-            with (
-                mock.patch.object(
-                    selector,
-                    "FIXED_OFFICIAL_CHECKPOINTS",
-                    official_specs,
-                ),
-                mock.patch.dict(sys.modules, {"torch": FakeTorch}),
-            ):
-                report = builder.build_pipeline(args)
-                artifact, pipeline = selector.validate_pipeline(
-                    args.output,
-                    report["sha256"],
-                )
-            self.assertEqual(artifact["path"], str(args.output))
-            self.assertEqual(
-                set(pipeline["diffsheg"]["autoencoders"]),
-                {"fgd"},
-            )
-            self.assertEqual(
-                pipeline["source"],
-                builder.EXPECTED_HELPER_SOURCE,
-            )
-            self.assertFalse(
-                pipeline["fixed_checkpoints"]["face"]["test_visible"]
-            )
 
     def test_rejects_symlink_and_forbidden_labels(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Twenty-two-candidate validation contract for long SHOW Base adaptation.
+"""Twenty-two-candidate TalkSHOW validation contract for Base adaptation.
 
-All validation input, pipeline and inference-lineage helpers remain the
-already-audited implementation in :mod:`select_base_official_adapt`.  This
-module changes only the candidate transaction envelope from the historical
-seven-candidate/e40 run to the complete long e400 trajectory.
+The validation input, five-prerequisite pipeline, and inference-lineage
+helpers come exclusively from the TalkSHOW released2 authority.  Historical
+evaluator selectors are intentionally outside this formal control closure.
 """
 
 from __future__ import annotations
@@ -12,7 +11,83 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from scripts.show_base import select_base_official_adapt as legacy
+from scripts.show_base import talkshow_base_val_contract as talkshow
+
+
+OFFICIAL_BASE_SHA256 = (
+    "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc1d89603"
+)
+TOPOLOGY_SPECS = {
+    "official_w1_b64_reference": {
+        "classification": "exact_official_runtime_topology_reference",
+        "node_count": 1,
+        "local_world_size": 1,
+        "world_size": 1,
+        "local_batch_size": 64,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "fp32",
+        "formal_training_eligible": False,
+    },
+    "official_objective_w8_l8_g64_ddp_adaptation": {
+        "classification": (
+            "official_objective_ddp_adaptation_not_trajectory_equivalent"
+        ),
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 8,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "official_objective_w16_l4_g64_ddp_adaptation": {
+        "classification": (
+            "official_objective_ddp_adaptation_not_trajectory_equivalent"
+        ),
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 4,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "validation_gated_w8_l64_g512_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 64,
+        "global_batch_size": 512,
+        "updates_per_epoch": 248,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "validation_gated_w16_l32_g512_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 32,
+        "global_batch_size": 512,
+        "updates_per_epoch": 248,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+}
 
 
 EXPECTED_CANDIDATE_EPOCHS = (
@@ -39,6 +114,9 @@ EXPECTED_CANDIDATE_EPOCHS = (
     360,
     400,
 )
+# Historical public name retained only for callers that validate archived
+# global512 runs.  Fresh formal validation derives the selected topology from
+# the hash-pinned frozen receipt and never assumes this value.
 EXPECTED_UPDATES_PER_EPOCH = 248
 TOTAL_EPOCHS = 400
 CANDIDATE_MANIFEST_FORMAT = (
@@ -60,27 +138,27 @@ READY_FORMAT = (
 )
 SELECTION_FORMAT = "semtalk_show_base_official_adapt_long_selection_v1"
 
-# Re-export the audited validation-only helpers used by the inference producer.
-EXPECTED_VAL_CLIPS = legacy.EXPECTED_VAL_CLIPS
-INFERENCE_HELPERS = legacy.INFERENCE_HELPERS
-VAL_INFERENCE_LINEAGE_FORMAT = legacy.VAL_INFERENCE_LINEAGE_FORMAT
-VAL_INFERENCE_SOURCE = legacy.VAL_INFERENCE_SOURCE
-canonical_json_sha256 = legacy.canonical_json_sha256
-sha256_file = legacy.sha256_file
-require_sha256 = legacy.require_sha256
-require_exact_int = legacy.require_exact_int
-reject_test_path = legacy.reject_test_path
-canonical_clip_id = legacy.canonical_clip_id
-public_val_coverage = legacy.public_val_coverage
-validate_val_inputs = legacy.validate_val_inputs
-validate_pipeline = legacy.validate_pipeline
-validate_val_inference_lineage = legacy.validate_val_inference_lineage
-_strict_json_bytes = legacy._strict_json_bytes
-_strict_jsonl = legacy._strict_jsonl
-SelectionContractError = legacy.SelectionContractError
+# Re-export the audited TalkSHOW-only validation helpers used by inference.
+EXPECTED_VAL_CLIPS = talkshow.EXPECTED_VAL_CLIPS
+INFERENCE_HELPERS = talkshow.INFERENCE_HELPERS
+VAL_INFERENCE_LINEAGE_FORMAT = talkshow.VAL_INFERENCE_LINEAGE_FORMAT
+VAL_INFERENCE_SOURCE = talkshow.VAL_INFERENCE_SOURCE
+canonical_json_sha256 = talkshow.canonical_json_sha256
+sha256_file = talkshow.sha256_file
+require_sha256 = talkshow.require_sha256
+require_exact_int = talkshow.require_exact_int
+reject_test_path = talkshow.reject_test_path
+canonical_clip_id = talkshow.canonical_clip_id
+public_val_coverage = talkshow.public_val_coverage
+validate_val_inputs = talkshow.validate_val_inputs
+validate_pipeline = talkshow.validate_fresh_pipeline
+validate_val_inference_lineage = talkshow.validate_val_inference_lineage
+_strict_json_bytes = talkshow._strict_json_bytes
+_strict_jsonl = talkshow._strict_jsonl
+SelectionContractError = talkshow.SelectionContractError
 
 
-class LongCandidateContractError(legacy.SelectionContractError):
+class LongCandidateContractError(talkshow.SelectionContractError):
     """Raised when the complete long Base candidate transaction is absent."""
 
 
@@ -89,7 +167,7 @@ def _verified_json(
     expected_sha256: str,
     label: str,
 ) -> tuple[Path, dict[str, Any], str]:
-    return legacy._verified_json(path, expected_sha256, label)
+    return talkshow._verified_json(path, expected_sha256, label)
 
 
 def _artifact(path: Path, sha256: str) -> dict[str, str]:
@@ -98,7 +176,9 @@ def _artifact(path: Path, sha256: str) -> dict[str, str]:
 
 def _validate_frozen(
     frozen: dict[str, Any],
-) -> str:
+    *,
+    expected_selected_prerequisite_sha256: dict[str, str] | None = None,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
     claimed = require_sha256(
         frozen.get("receipt_sha256"),
         "long Base frozen-input payload SHA-256",
@@ -113,6 +193,18 @@ def _validate_frozen(
     dataset = frozen.get("dataset")
     source = frozen.get("source")
     official = frozen.get("official_base")
+    topology_receipt = frozen.get("topology")
+    distributed_topology = (
+        protocol.get("distributed_topology")
+        if isinstance(protocol, dict)
+        else None
+    )
+    topology_mode = (
+        distributed_topology.get("mode")
+        if isinstance(distributed_topology, dict)
+        else None
+    )
+    topology = TOPOLOGY_SPECS.get(topology_mode)
     if (
         frozen.get("format") not in FROZEN_INPUTS_FORMATS
         or not isinstance(protocol, dict)
@@ -122,8 +214,41 @@ def _validate_frozen(
         or protocol.get("candidate_epochs")
         != list(EXPECTED_CANDIDATE_EPOCHS)
         or protocol.get("epochs") != TOTAL_EPOCHS
+        or not isinstance(topology, dict)
         or protocol.get("expected_updates_per_epoch")
-        != EXPECTED_UPDATES_PER_EPOCH
+        != topology["updates_per_epoch"]
+        or protocol.get("expected_unique_samples_per_epoch")
+        != topology["unique_samples_per_epoch"]
+        or protocol.get("node_count") != topology["node_count"]
+        or protocol.get("local_world_size") != topology["local_world_size"]
+        or protocol.get("world_size") != topology["world_size"]
+        or protocol.get("local_batch_size") != topology["local_batch_size"]
+        or protocol.get("global_batch_size") != topology["global_batch_size"]
+        or protocol.get("precision") != topology["precision"]
+        or not isinstance(topology_receipt, dict)
+        or topology_receipt.get("topology_mode") != topology_mode
+        or topology_receipt.get("classification")
+        != topology["classification"]
+        or topology_receipt.get("node_count") != topology["node_count"]
+        or topology_receipt.get("local_world_size")
+        != topology["local_world_size"]
+        or topology_receipt.get("world_size") != topology["world_size"]
+        or topology_receipt.get("local_batch_size")
+        != topology["local_batch_size"]
+        or topology_receipt.get("global_batch_size")
+        != topology["global_batch_size"]
+        or topology_receipt.get("updates_per_epoch")
+        != topology["updates_per_epoch"]
+        or topology_receipt.get("unique_samples_per_epoch")
+        != topology["unique_samples_per_epoch"]
+        or topology_receipt.get("receipt_sha256")
+        != canonical_json_sha256(
+            {
+                key: value
+                for key, value in topology_receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
         or protocol.get("vq_models_in_training_graph") is not False
         or not isinstance(dataset, dict)
         or dataset.get("entries") != 127_286
@@ -139,7 +264,7 @@ def _validate_frozen(
         or source.get("clean") is not True
         or not isinstance(official, dict)
         or official.get("sha256")
-        != legacy.OFFICIAL_BASE_CHECKPOINT["sha256"]
+        != OFFICIAL_BASE_SHA256
         or official.get("speaker_scope") != "All-Speakers"
     ):
         raise LongCandidateContractError(
@@ -148,7 +273,19 @@ def _validate_frozen(
         )
     for stage, digest in dataset["selected_prerequisite_sha256"].items():
         require_sha256(digest, f"selected {stage} checkpoint SHA-256")
-    return claimed
+    selected = dict(dataset["selected_prerequisite_sha256"])
+    if (
+        expected_selected_prerequisite_sha256 is not None
+        and selected != expected_selected_prerequisite_sha256
+    ):
+        raise LongCandidateContractError(
+            "long Base frozen inputs use different selected SHOW prerequisites"
+        )
+    return claimed, selected, {
+        "mode": topology_mode,
+        **dict(topology),
+        "topology_receipt_sha256": topology_receipt["receipt_sha256"],
+    }
 
 
 def validate_candidate_bundle(
@@ -159,6 +296,7 @@ def validate_candidate_bundle(
     expected_status_sha256: str,
     frozen_inputs_path: Path,
     expected_frozen_inputs_sha256: str,
+    expected_selected_prerequisite_sha256: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify the exact complete 22-candidate/e400 producer transaction."""
 
@@ -167,7 +305,16 @@ def validate_candidate_bundle(
         expected_frozen_inputs_sha256,
         "long Base frozen inputs",
     )
-    frozen_receipt_sha = _validate_frozen(frozen)
+    (
+        frozen_receipt_sha,
+        selected_prerequisite_sha256,
+        selected_topology,
+    ) = _validate_frozen(
+        frozen,
+        expected_selected_prerequisite_sha256=(
+            expected_selected_prerequisite_sha256
+        ),
+    )
     manifest_resolved, manifest, manifest_sha = _verified_json(
         manifest_path,
         expected_manifest_sha256,
@@ -187,6 +334,7 @@ def validate_candidate_bundle(
             "long Base manifest/status/frozen inputs must share one run root"
         )
     entries = manifest.get("entries")
+    updates_per_epoch = int(selected_topology["updates_per_epoch"])
     if (
         manifest.get("format") != CANDIDATE_MANIFEST_FORMAT
         or manifest.get("status") != "complete"
@@ -194,7 +342,7 @@ def validate_candidate_bundle(
         != list(EXPECTED_CANDIDATE_EPOCHS)
         or manifest.get("completed_epochs") != TOTAL_EPOCHS
         or manifest.get("optimizer_updates")
-        != TOTAL_EPOCHS * EXPECTED_UPDATES_PER_EPOCH
+        != TOTAL_EPOCHS * updates_per_epoch
         or manifest.get("frozen_receipt_sha256") != frozen_receipt_sha
         or not isinstance(entries, list)
         or len(entries) != len(EXPECTED_CANDIDATE_EPOCHS)
@@ -222,7 +370,7 @@ def validate_candidate_bundle(
         relative = entry.get("checkpoint")
         if (
             epoch != expected_epoch
-            or updates != epoch * EXPECTED_UPDATES_PER_EPOCH
+            or updates != epoch * updates_per_epoch
             or not isinstance(relative, str)
             or Path(relative).is_absolute()
             or ".." in Path(relative).parts
@@ -234,7 +382,7 @@ def validate_candidate_bundle(
             raise LongCandidateContractError(
                 f"long Base candidate e{expected_epoch} protocol mismatch"
             )
-        checkpoint = legacy._regular_file(
+        checkpoint = talkshow._regular_file(
             manifest_resolved.parent / relative,
             f"long Base candidate e{expected_epoch}",
         )
@@ -280,13 +428,15 @@ def validate_candidate_bundle(
         or status.get("status") != "complete"
         or status.get("completed_epochs") != TOTAL_EPOCHS
         or status.get("optimizer_updates")
-        != TOTAL_EPOCHS * EXPECTED_UPDATES_PER_EPOCH
-        or status.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
+        != TOTAL_EPOCHS * updates_per_epoch
+        or status.get("updates_per_epoch") != updates_per_epoch
         or status.get("candidate_manifest_sha256") != manifest_sha
         or status.get("frozen_receipt_sha256") != frozen_receipt_sha
-        or status.get("world_size") != 8
-        or status.get("local_batch_size") != 64
-        or status.get("global_batch_size") != 512
+        or status.get("world_size") != selected_topology["world_size"]
+        or status.get("local_batch_size")
+        != selected_topology["local_batch_size"]
+        or status.get("global_batch_size")
+        != selected_topology["global_batch_size"]
         or status.get("all_training_state_finite") is not True
     ):
         raise LongCandidateContractError(
@@ -301,5 +451,8 @@ def validate_candidate_bundle(
             "receipt_sha256": frozen_receipt_sha,
         },
         "producer_source": dict(frozen["source"]),
+        "selected_prerequisite_sha256": selected_prerequisite_sha256,
+        "selected_topology": selected_topology,
+        "updates_per_epoch": updates_per_epoch,
         "candidates": candidates,
     }

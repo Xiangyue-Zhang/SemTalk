@@ -37,6 +37,43 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
     )
 
+    screen = commands.add_parser("screen", allow_abbrev=False)
+    _metric_arguments(screen)
+    screen.add_argument("--canonical-manifest", type=Path, required=True)
+    screen.add_argument(
+        "--expected-canonical-manifest-sha256", required=True
+    )
+    screen.add_argument(
+        "--expected-canonical-manifest-bytes", type=int, required=True
+    )
+    screen.add_argument("--prediction-manifest", type=Path, required=True)
+    screen.add_argument(
+        "--expected-prediction-manifest-sha256", required=True
+    )
+    screen.add_argument(
+        "--expected-prediction-manifest-bytes", type=int, required=True
+    )
+    screen.add_argument("--distribution-json", type=Path, required=True)
+    screen.add_argument("--expected-distribution-sha256", required=True)
+    screen.add_argument(
+        "--expected-distribution-bytes", type=int, required=True
+    )
+    screen.add_argument(
+        "--expected-distribution-payload-sha256", required=True
+    )
+    screen.add_argument(
+        "--real-feature-cache-json", type=Path, required=True
+    )
+    screen.add_argument(
+        "--expected-real-feature-cache-sha256", required=True
+    )
+    screen.add_argument(
+        "--expected-real-feature-cache-bytes", type=int, required=True
+    )
+    screen.add_argument(
+        "--expected-real-feature-cache-payload-sha256", required=True
+    )
+
     replay = commands.add_parser("replay", allow_abbrev=False)
     _metric_arguments(replay)
     replay.add_argument("--report-json", type=Path, required=True)
@@ -92,6 +129,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             split=args.split,
             expected_clip_count=args.expected_clip_count,
         )
+    elif args.command == "screen":
+        cache_artifact = {
+            "path": str(args.real_feature_cache_json.resolve()),
+            "sha256": args.expected_real_feature_cache_sha256,
+            "bytes": args.expected_real_feature_cache_bytes,
+            "receipt_payload_sha256": (
+                args.expected_real_feature_cache_payload_sha256
+            ),
+        }
+        _cache_artifact, cache = metrics._payload_json_artifact(
+            cache_artifact,
+            label="primary-screen real-feature cache",
+        )
+        distribution_artifact = {
+            "path": str(args.distribution_json.resolve()),
+            "sha256": args.expected_distribution_sha256,
+            "bytes": args.expected_distribution_bytes,
+            "receipt_payload_sha256": (
+                args.expected_distribution_payload_sha256
+            ),
+        }
+        result = metrics.build_released2_primary_screen(
+            backend,
+            canonical_manifest={
+                "path": str(args.canonical_manifest.resolve()),
+                "sha256": args.expected_canonical_manifest_sha256,
+                "bytes": args.expected_canonical_manifest_bytes,
+            },
+            prediction_manifest={
+                "path": str(args.prediction_manifest.resolve()),
+                "sha256": args.expected_prediction_manifest_sha256,
+                "bytes": args.expected_prediction_manifest_bytes,
+            },
+            distribution_receipt=distribution_artifact,
+            real_feature_cache=cache,
+            expected_real_feature_cache_artifact=cache_artifact,
+            expected_selection_protocol={
+                "primary_metric": metrics.PRIMARY_METRIC_PATH,
+                "mode": "min",
+                "validation_only_for_selection": True,
+                "test_evaluations": 0,
+            },
+            expected_split=args.split,
+            expected_clip_count=args.expected_clip_count,
+        )
     else:
         _report_path, report_payload = metrics._verified_file_snapshot(
             args.report_json,
@@ -123,22 +205,66 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sha256": args.expected_prediction_manifest_sha256,
             "bytes": args.expected_prediction_manifest_bytes,
         }
-        result = metrics.fresh_replay_released2_primary(
-            report,
-            backend,
-            real_feature_cache=cache,
-            expected_real_feature_cache_artifact=cache_artifact,
-            expected_prediction_manifest=prediction_artifact,
-            expected_distribution_receipt=report["distribution_receipt"],
-            expected_selection_protocol={
-                "primary_metric": metrics.PRIMARY_METRIC_PATH,
-                "mode": "min",
-                "validation_only_for_selection": True,
-                "test_evaluations": 0,
-            },
-            expected_split=args.split,
-            expected_clip_count=args.expected_clip_count,
-        )
+        selection_protocol = {
+            "primary_metric": metrics.PRIMARY_METRIC_PATH,
+            "mode": "min",
+            "validation_only_for_selection": True,
+            "test_evaluations": 0,
+        }
+        if report.get("format") == metrics.PRIMARY_SCREEN_FORMAT:
+            report_artifact = {
+                "path": str(args.report_json.resolve()),
+                "sha256": args.expected_report_sha256,
+                "bytes": args.expected_report_bytes,
+                "receipt_payload_sha256": report[
+                    "receipt_payload_sha256"
+                ],
+            }
+            screen_validation = (
+                metrics.validate_released2_primary_screen_receipt(
+                    report_artifact,
+                    expected_prediction_manifest=prediction_artifact,
+                    expected_distribution_receipt=report[
+                        "distribution_receipt"
+                    ],
+                    expected_real_feature_cache=cache_artifact,
+                    expected_canonical_manifest=report[
+                        "canonical_manifest"
+                    ],
+                    expected_selection_protocol=selection_protocol,
+                    expected_split=args.split,
+                    expected_clip_count=args.expected_clip_count,
+                )
+            )
+            result = metrics.fresh_replay_released2_primary_screen(
+                report,
+                screen_validation,
+                backend,
+                screen_artifact=report_artifact,
+                real_feature_cache=cache,
+                expected_real_feature_cache_artifact=cache_artifact,
+                expected_prediction_manifest=prediction_artifact,
+                expected_distribution_receipt=report[
+                    "distribution_receipt"
+                ],
+                expected_selection_protocol=selection_protocol,
+                expected_split=args.split,
+                expected_clip_count=args.expected_clip_count,
+            )
+        else:
+            result = metrics.fresh_replay_released2_primary(
+                report,
+                backend,
+                real_feature_cache=cache,
+                expected_real_feature_cache_artifact=cache_artifact,
+                expected_prediction_manifest=prediction_artifact,
+                expected_distribution_receipt=report[
+                    "distribution_receipt"
+                ],
+                expected_selection_protocol=selection_protocol,
+                expected_split=args.split,
+                expected_clip_count=args.expected_clip_count,
+            )
     metrics._atomic_write_new(
         args.output_json,
         metrics.canonical_json_bytes(result),

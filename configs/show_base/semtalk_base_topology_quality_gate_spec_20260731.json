@@ -1,0 +1,40 @@
+{
+  "format": "semtalk_show_base_topology_quality_gate_spec_v1",
+  "scope": "SemTalk Base on SHOW validation only",
+  "split": "val",
+  "test_visible": false,
+  "trajectory_epochs": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "primary_metric": "body.released2.metrics.FGD",
+  "raw_prediction_replay_required": true,
+  "comparison_reference": "official_w1_b64_reference",
+  "g64_preference": {
+    "modes": [
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation"
+    ],
+    "maximum_estimated_training_seconds": 86400,
+    "policy": "fastest_safe_g64_under_24h_before_any_global512_mode"
+  },
+  "candidate_quality_gate": {
+    "modes": [
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration"
+    ],
+    "per_epoch_comparison": "candidate_fgd_lte_reference_fgd_plus_max_of_absolute_or_relative_margin",
+    "maximum_absolute_fgd_regression": 0.01,
+    "maximum_relative_fgd_regression": 0.02,
+    "all_trajectory_epochs_must_pass": true
+  },
+  "selection_tiebreak": [
+    "estimated_training_seconds",
+    "p99_seconds",
+    "topology_matrix_order"
+  ]
+}

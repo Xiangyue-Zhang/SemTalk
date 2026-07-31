@@ -95,11 +95,51 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 authority_payload += b"\n# corrupt\n"
             authority_path.parent.mkdir(parents=True)
             authority_path.write_bytes(authority_payload)
-        pipeline = {
-            "inference_entrypoint": {
-                "path": str(helper_path.resolve()),
-                "sha256": hashlib.sha256(helper_payload).hexdigest(),
+        source = {
+            "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            "source_root": str(root.resolve()),
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+        }
+        helper_entry = {
+            "path": str(helper_path.resolve()),
+            "sha256": hashlib.sha256(helper_payload).hexdigest(),
+            "bytes": len(helper_payload),
+            "git_mode": "100644",
+            "git_blob_sha1": PRODUCER._git_blob_sha1(helper_payload),
+        }
+        source_closure = {
+            "scripts/show_base/run_base_inference.py": helper_entry,
+        }
+        if include_context:
+            source_closure[
+                PRODUCER.PINNED_JOINT_CONTEXT_SOURCE["relative_path"]
+            ] = {
+                "path": str(context_path.resolve()),
+                "sha256": hashlib.sha256(context_payload).hexdigest(),
+                "bytes": len(context_payload),
+                "git_mode": "100644",
+                "git_blob_sha1": PRODUCER._git_blob_sha1(context_payload),
             }
+        if include_authority:
+            source_closure[
+                PRODUCER.PINNED_JOINT_AUTHORITY_SOURCE["relative_path"]
+            ] = {
+                "path": str(authority_path.resolve()),
+                "sha256": hashlib.sha256(authority_payload).hexdigest(),
+                "bytes": len(authority_payload),
+                "git_mode": "100644",
+                "git_blob_sha1": PRODUCER._git_blob_sha1(
+                    authority_payload
+                ),
+            }
+        pipeline = {
+            "source": source,
+            "source_closure": source_closure,
+            "inference_helper": helper_entry,
         }
         return helper_path, context_path, pipeline
 
@@ -359,7 +399,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 )
             self.assertEqual(
                 receipt["source"],
-                PRODUCER.selector.VAL_INFERENCE_SOURCE,
+                pipeline["source"],
             )
             self.assertEqual(receipt["pose_dim"], 165)
             self.assertEqual(receipt["dtype"], "bool")
@@ -401,7 +441,10 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 __file__=str(helper_path),
                 POSE_DIM=PRODUCER.SMPLX_POSE_DIM,
             )
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "joint-mask sources are absent",
+            ):
                 PRODUCER._pinned_joint_mask_arrays(helper, pipeline)
             helper.POSE_DIM = PRODUCER.SMPLX_POSE_DIM - 3
             with self.assertRaisesRegex(
@@ -444,7 +487,10 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 __file__=str(helper_path),
                 POSE_DIM=PRODUCER.SMPLX_POSE_DIM,
             )
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "joint-mask sources are absent",
+            ):
                 PRODUCER._pinned_joint_mask_arrays(helper, pipeline)
 
         with tempfile.TemporaryDirectory(
@@ -467,13 +513,15 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             ):
                 PRODUCER._pinned_joint_mask_arrays(helper, pipeline)
 
-    def test_pinned_schema_prime_precedes_deterministic_seed(self) -> None:
+    def test_fresh_helper_has_no_released_representation_schema_dependency(
+        self,
+    ) -> None:
         helper_source = inspect.getsource(PRODUCER._load_pinned_helper)
-        prime = helper_source.index(
-            "_prime_pinned_released_schema_cache(module)"
+        self.assertNotIn("_prime_pinned_released_schema_cache", helper_source)
+        self.assertNotIn("_load_released_model_state_only", helper_source)
+        self.assertNotIn(
+            "_validate_released_model_state_schema", helper_source
         )
-        self.assertLess(helper_source.index("if missing:"), prime)
-        self.assertLess(prime, helper_source.index("return module"))
         shard_source = inspect.getsource(PRODUCER.run_shard)
         self.assertLess(
             shard_source.index("_load_pinned_helper(pipeline)"),
@@ -663,124 +711,6 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             shard_source,
         )
 
-    def test_pinned_meta_schema_cuda_shim_is_meta_only_and_scoped(
-        self,
-    ) -> None:
-        class FakeTensor:
-            def __init__(self, device_type: str) -> None:
-                self.device = type(
-                    "FakeDevice",
-                    (),
-                    {"type": device_type},
-                )()
-
-            def cuda(self, *args: object, **kwargs: object) -> str:
-                del args, kwargs
-                return "original-cuda"
-
-        fake_torch = type("FakeTorch", (), {"Tensor": FakeTensor})()
-        original_cuda = FakeTensor.cuda
-        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
-            with PRODUCER._pinned_meta_schema_cuda_compat() as intercepted:
-                meta_tensor = FakeTensor("meta")
-                self.assertIs(meta_tensor.cuda(), meta_tensor)
-                with self.assertRaisesRegex(
-                    PRODUCER.ValInferenceContractError,
-                    "non-meta",
-                ):
-                    FakeTensor("cpu").cuda()
-                with self.assertRaisesRegex(
-                    PRODUCER.ValInferenceContractError,
-                    "parameterized",
-                ):
-                    meta_tensor.cuda(0)
-                self.assertEqual(intercepted, {"calls": 1})
-            self.assertIs(FakeTensor.cuda, original_cuda)
-            self.assertEqual(FakeTensor("cpu").cuda(), "original-cuda")
-
-    def test_pinned_meta_schema_cache_is_primed_without_relaxing_stages(
-        self,
-    ) -> None:
-        class FakeTensor:
-            def __init__(self) -> None:
-                self.device = type(
-                    "FakeDevice",
-                    (),
-                    {"type": "meta"},
-                )()
-
-            def cuda(self) -> None:
-                raise RuntimeError("legacy pinned helper meta failure")
-
-        class FakeDType:
-            pass
-
-        fake_torch = type(
-            "FakeTorch",
-            (),
-            {"Tensor": FakeTensor, "dtype": FakeDType},
-        )()
-        original_cuda = FakeTensor.cuda
-        expected_stages = {"face", "global", "hands", "upper", "lower"}
-
-        class FakeHelper:
-            def __init__(
-                self,
-                *,
-                intercepts: int = 24,
-                shape: tuple[int, ...] = (1,),
-                stable: bool = True,
-            ) -> None:
-                self.intercepts = intercepts
-                self.shape = shape
-                self.stable = stable
-                self.cache: dict[
-                    str,
-                    dict[str, tuple[FakeDType, tuple[int, ...]]],
-                ] | None = None
-
-            def _expected_released_representation_schemas(self) -> dict[
-                str,
-                dict[str, tuple[FakeDType, tuple[int, ...]]],
-            ]:
-                if self.cache is None or not self.stable:
-                    for _index in range(self.intercepts):
-                        tensor = FakeTensor()
-                        if tensor.cuda() is not tensor:
-                            raise AssertionError(
-                                "meta shim did not preserve tensor"
-                            )
-                    self.cache = {
-                        stage: {"weight": (FakeDType(), self.shape)}
-                        for stage in expected_stages
-                    }
-                return self.cache
-
-        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
-            PRODUCER._prime_pinned_released_schema_cache(FakeHelper())
-            with self.assertRaisesRegex(
-                PRODUCER.ValInferenceContractError,
-                "invalid released schema cache",
-            ):
-                PRODUCER._prime_pinned_released_schema_cache(
-                    FakeHelper(intercepts=23)
-                )
-            with self.assertRaisesRegex(
-                PRODUCER.ValInferenceContractError,
-                "malformed released schema entry",
-            ):
-                PRODUCER._prime_pinned_released_schema_cache(
-                    FakeHelper(shape=(-1,))
-                )
-            with self.assertRaisesRegex(
-                PRODUCER.ValInferenceContractError,
-                "cache is not stable",
-            ):
-                PRODUCER._prime_pinned_released_schema_cache(
-                    FakeHelper(stable=False)
-                )
-        self.assertIs(FakeTensor.cuda, original_cuda)
-
     def test_directory_tolerates_create_race_but_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory(prefix="semtalk_val_dir_") as raw:
             root = Path(raw)
@@ -849,7 +779,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 "window_count": 1715,
                 "uncovered_tail_frames": 0,
                 "clip_ids_sha256": "9" * 64,
-                "diffsheg_clip_manifest_sha256": "a" * 64,
+                "talkshow_window_manifest_sha256": "a" * 64,
                 "_ordered_clips": [],
             }
             pipeline = {
@@ -859,6 +789,13 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                     "sha256": PRODUCER.selector.VAL_INFERENCE_SOURCE[
                         "entrypoint_sha256"
                     ],
+                },
+                "fixed_checkpoints": {
+                    stage: {"sha256": str(index) * 64}
+                    for index, stage in enumerate(
+                        ("face", "hands", "upper", "lower", "global"),
+                        start=1,
+                    )
                 },
             }
             args = PRODUCER.parse_args(
@@ -963,10 +900,20 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                         for position in range(4)
                     ).encode()
                 ).hexdigest(),
-                "diffsheg_clip_manifest_sha256": "d" * 64,
+                "talkshow_window_manifest_sha256": "d" * 64,
             }
             preflight = {
-                "candidate_bundle": {"candidates": {"1": candidate}},
+                "candidate_bundle": {
+                    "candidates": {"1": candidate},
+                    "updates_per_epoch": (
+                        PRODUCER.selector.EXPECTED_UPDATES_PER_EPOCH
+                    ),
+                    "frozen_inputs": {
+                        "path": str(root / "frozen.json"),
+                        "sha256": "2" * 64,
+                        "receipt_sha256": "3" * 64,
+                    },
+                },
                 "val_inputs_receipt": {
                     "path": str(root / "val.json"),
                     "sha256": "e" * 64,
@@ -979,9 +926,70 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 },
                 "coverage": coverage,
             }
+            prerequisite_selection = {
+                "path": str((root / "prerequisite-selection.json").resolve()),
+                "sha256": "4" * 64,
+                "bytes": 123,
+                "receipt_payload_sha256": "5" * 64,
+            }
+            fixed = {}
+            for stage_index, stage_name in enumerate(
+                ("face", "hands", "upper", "lower", "global"),
+                start=1,
+            ):
+                rate = 1_988 if stage_name == "global" else 497
+                fixed[stage_name] = {
+                    "stage": stage_name,
+                    "path": str((root / f"{stage_name}.pth").resolve()),
+                    "sha256": f"{stage_index}" * 64,
+                    "bytes": 100 + stage_index,
+                    "source": "show_val_selected_v1",
+                    "selection_split": "val",
+                    "test_visible": False,
+                    "epoch": 20,
+                    "optimizer_updates": 20 * rate,
+                    "updates_per_epoch": rate,
+                    "candidate_audit_sha256": "a" * 64,
+                    "selection_metric": f"{stage_name}_metric",
+                    "measurement_receipt": {
+                        "path": str(
+                            (root / f"{stage_name}-measurement.json").resolve()
+                        ),
+                        "sha256": "b" * 64,
+                        "receipt_payload_sha256": "c" * 64,
+                    },
+                }
+            pipeline = {
+                "fixed_checkpoints": fixed,
+                "prerequisite_selection": prerequisite_selection,
+            }
             num_shards = 2
             runtime = {"software": "same"}
-            models = {"base": {"path": str(candidate_path), "sha256": candidate_sha}}
+            models = {
+                "base": {
+                    "path": str(candidate_path.resolve()),
+                    "sha256": candidate_sha,
+                    "bytes": candidate_path.stat().st_size,
+                    "stage": "base",
+                    "candidate_epoch": 1,
+                    "optimizer_updates": PRODUCER.selector.EXPECTED_UPDATES_PER_EPOCH,
+                    "updates_per_epoch": PRODUCER.selector.EXPECTED_UPDATES_PER_EPOCH,
+                    "frozen_receipt_sha256": "3" * 64,
+                    "strict_state_dict_load": True,
+                    "all_model_state_tensors_finite": True,
+                    "frozen_eval": True,
+                }
+            }
+            for stage_name, fixed_row in fixed.items():
+                models[stage_name] = {
+                    **fixed_row,
+                    "prerequisite_selection": prerequisite_selection,
+                    "model_state_tensors": 7,
+                    "model_state_schema_sha256": "d" * 64,
+                    "strict_state_dict_load": True,
+                    "all_model_state_tensors_finite": True,
+                    "frozen_eval": True,
+                }
             for shard_id in range(num_shards):
                 shard_root = (
                     output_root
@@ -1098,7 +1106,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
                 mock.patch.object(
                     PRODUCER,
                     "_load_preflight_children",
-                    return_value=({}, {}, canonical_rows, {}),
+                    return_value=({}, pipeline, canonical_rows, {}),
                 ),
                 mock.patch.object(
                     PRODUCER.selector,

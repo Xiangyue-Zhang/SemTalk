@@ -1121,7 +1121,7 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "format": "semtalk_show_official_rvq_ema_prior_v2",
                 "layers": [
                     {
-                        "name": f"quantizer.{index}",
+                        "name": f"module.quantizer.layers.{index}",
                         "ema_decay": 0.99,
                         "prior_count": 100.0,
                     }
@@ -1134,7 +1134,8 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "code_count": "1 / (1 - ema_decay) per code",
                 "first_forward_codebook_reset": False,
                 "unused_code_grace": (
-                    "legacy reset only after the decay-aware prior falls below one"
+                    "legacy reset only after the decay-aware prior falls "
+                    "below one"
                 ),
             }
             rvq_rank = {
@@ -1207,6 +1208,45 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                         label="fixture candidate",
                         reprove_paths=False,
                     )
+            reordered_prior = copy.deepcopy(audit)
+            reordered_prior["rvq_ema_prior_receipt"]["layers"][0][
+                "name"
+            ], reordered_prior["rvq_ema_prior_receipt"]["layers"][1][
+                "name"
+            ] = (
+                reordered_prior["rvq_ema_prior_receipt"]["layers"][1][
+                    "name"
+                ],
+                reordered_prior["rvq_ema_prior_receipt"]["layers"][0][
+                    "name"
+                ],
+            )
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "invalid RVQ EMA-prior layer",
+            ):
+                contract.validate_representation_candidate_audit(
+                    reordered_prior,
+                    stage=stage,
+                    epoch=epoch,
+                    label="fixture candidate",
+                    reprove_paths=False,
+                )
+            boolean_prior = copy.deepcopy(audit)
+            boolean_prior["rvq_ema_prior_receipt"]["layers"][0][
+                "prior_count"
+            ] = True
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "must be a JSON number",
+            ):
+                contract.validate_representation_candidate_audit(
+                    boolean_prior,
+                    stage=stage,
+                    epoch=epoch,
+                    label="fixture candidate",
+                    reprove_paths=False,
+                )
             for mutation in ("extra", "missing"):
                 broken = copy.deepcopy(audit)
                 if mutation == "extra":

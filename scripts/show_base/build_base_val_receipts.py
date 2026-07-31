@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build the two immutable receipts consumed by Base validation inference.
+"""Build immutable TalkSHOW receipts consumed by Base validation inference.
 
 This entry point is CPU-only and deliberately has no split switch.  It can
 only materialize the frozen 1,715-clip SHOW validation inputs receipt or the
 frozen final-pipeline receipt.  Both outputs are created with new-only
-semantics and are immediately revalidated by
-``select_base_official_adapt.py`` before success is reported.
+semantics and are immediately revalidated by the TalkSHOW released2 contract
+before success is reported.  The historical evaluator selector is not part of
+this formal path.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.show_base import select_base_official_adapt as selector
+from scripts.show_base import talkshow_base_val_contract as selector
 
 
 TRANSFER_FORMAT = "semtalk_show_official_transfer_v1"
@@ -250,8 +251,8 @@ def build_inputs(args: argparse.Namespace) -> dict[str, Any]:
             "audio_summaries": audio["summaries"],
             "audio_lineages": audio["lineages"],
             "clip_ids_sha256": coverage["clip_ids_sha256"],
-            "diffsheg_clip_manifest_sha256": coverage[
-                "diffsheg_clip_manifest_sha256"
+            "talkshow_window_manifest_sha256": coverage[
+                "talkshow_window_manifest_sha256"
             ],
         }
     )
@@ -556,95 +557,41 @@ def _validate_official_checkpoint(
 
 
 def build_pipeline(args: argparse.Namespace) -> dict[str, Any]:
-    if selector.VAL_INFERENCE_SOURCE != EXPECTED_HELPER_SOURCE:
-        raise ReceiptBuildError(
-            "selector validation helper pin does not match the audited "
-            "deterministic inference helper"
-        )
-    helper, resolved_helper, _ = _artifact(
-        args.pinned_helper,
-        "pinned validation inference helper",
+    del args
+    raise ReceiptBuildError(
+        "the historical pipeline builder is retired; use fresh-pipeline "
+        "with five independently SHOW-val-selected prerequisites"
     )
-    if (
-        resolved_helper.name != EXPECTED_HELPER_SOURCE["entrypoint"]
-        or helper["sha256"] != EXPECTED_HELPER_SOURCE[
-            "entrypoint_sha256"
-        ]
-    ):
-        raise ReceiptBuildError(
-            "validation helper is not the exact audited pinned entrypoint"
-        )
-    face = _validate_transfer(
-        stage="face",
-        checkpoint_path=args.face_checkpoint,
-        summary_path=args.face_summary,
-    )
-    global_checkpoint = _validate_transfer(
-        stage="global",
-        checkpoint_path=args.global_checkpoint,
-        summary_path=args.global_summary,
-    )
-    diffsheg = selector.DIFFSHEG_PINNED_RECEIPT
-    if (
-        not isinstance(diffsheg.get("autoencoders"), dict)
-        or set(diffsheg["autoencoders"]) != {"fgd"}
-        or diffsheg.get("selection_metric") != "fgd"
-        or diffsheg.get("ba_during_selection") is not False
-    ):
-        raise ReceiptBuildError("validation DiffSHEG receipt is not FGD-only")
-    pipeline = _payload_receipt(
-        {
-            "format": selector.PIPELINE_FORMAT,
-            "status": "frozen",
-            "split": "val",
-            "test_visible": False,
-            "mode": "official_show_adapt_v1",
-            "base_candidate_variable_only": True,
-            "source": dict(EXPECTED_HELPER_SOURCE),
-            "inference_entrypoint": helper,
-            "inference_helpers": list(selector.INFERENCE_HELPERS),
-            "fixed_checkpoints": {
-                "face": {
-                    **face,
-                    "selection_split": "val",
-                    "test_visible": False,
-                },
-                "global": {
-                    **global_checkpoint,
-                    "selection_split": "val",
-                    "test_visible": False,
-                },
-                "hands": _validate_official_checkpoint(
-                    args.hands_checkpoint,
-                    stage="hands",
-                ),
-                "upper": _validate_official_checkpoint(
-                    args.upper_checkpoint,
-                    stage="upper",
-                ),
-                "lower": _validate_official_checkpoint(
-                    args.lower_checkpoint,
-                    stage="lower",
-                ),
-            },
-            "diffsheg": diffsheg,
-        }
+
+
+def build_fresh_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the only fresh Base pipeline: five SHOW-selected prerequisites."""
+
+    pipeline = selector.build_fresh_pipeline_payload(
+        source_root=args.source_root,
+        prerequisite_selection=args.prerequisite_selection,
+        expected_prerequisite_selection_sha256=(
+            args.expected_prerequisite_selection_sha256
+        ),
     )
     output, output_sha = _atomic_new_json(
         args.output,
         pipeline,
-        label="validation pipeline receipt",
-        validator=selector.validate_pipeline,
+        label="fresh validation pipeline receipt",
+        validator=selector.validate_fresh_pipeline,
     )
     return {
         "status": "complete",
-        "kind": "pipeline",
+        "kind": "fresh-pipeline",
         "path": str(output),
         "sha256": output_sha,
         "receipt_payload_sha256": pipeline["receipt_payload_sha256"],
-        "face_checkpoint_sha256": face["sha256"],
-        "global_checkpoint_sha256": global_checkpoint["sha256"],
-        "diffsheg_selection_metric": "fgd",
+        "source": pipeline["source"],
+        "prerequisite_selection": pipeline["prerequisite_selection"],
+        "fixed_checkpoint_sha256": {
+            stage: pipeline["fixed_checkpoints"][stage]["sha256"]
+            for stage in ("face", "hands", "upper", "lower", "global")
+        },
     }
 
 
@@ -696,6 +643,23 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--upper-checkpoint", type=Path, required=True)
     pipeline.add_argument("--lower-checkpoint", type=Path, required=True)
     pipeline.set_defaults(handler=build_pipeline)
+
+    fresh_pipeline = subparsers.add_parser(
+        "fresh-pipeline",
+        help=(
+            "Build the TalkSHOW released2 pipeline from all five independently "
+            "validation-selected SHOW prerequisites."
+        ),
+    )
+    fresh_pipeline.add_argument("--output", type=Path, required=True)
+    fresh_pipeline.add_argument("--source-root", type=Path, required=True)
+    fresh_pipeline.add_argument(
+        "--prerequisite-selection", type=Path, required=True
+    )
+    fresh_pipeline.add_argument(
+        "--expected-prerequisite-selection-sha256", required=True
+    )
+    fresh_pipeline.set_defaults(handler=build_fresh_pipeline)
     return parser
 
 

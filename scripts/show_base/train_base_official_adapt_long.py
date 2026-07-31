@@ -4,9 +4,12 @@
 This is intentionally separate from ``show_base_train.py``.  The latter is the
 from-scratch reproduction contract and must not accept a warm start.  This
 entry point accepts exactly one warm start: the hash-pinned official
-``best_semtalk_base.bin`` release.  It performs one audio-conditioned Base
-forward and one optimizer update per batch.  Frozen RVQ targets are consumed
-from the already-audited Base LMDB; no VQ model is instantiated here.
+``best_semtalk_base.bin`` release.  Each optimizer update executes the complete
+official Base objective from ``semtalk_base_trainer.py``: the seeded main
+forward, masked self-motion forward, and masked word/audio forward, with one
+latent and one RVQ-code classification loss family for every forward.  Frozen
+RVQ targets are consumed from the already-audited Base LMDB; no VQ model is
+instantiated here.
 
 The executable modes are:
 
@@ -71,6 +74,12 @@ OFFICIAL_BASE_SPEC = {
 OFFICIAL_BASE_EPOCH = 401
 OFFICIAL_BASE_OPTIMIZER_STATE_ENTRIES = 1_655
 OFFICIAL_BASE_OPTIMIZER_PARAMETERS = 1_783
+OFFICIAL_BASE_TRAINER_SHA256 = (
+    "c85765847918a3d41779eaf78472a9b1b351c4bfbe82c1141dd6f0cdb4ef6a6c"
+)
+OFFICIAL_BASE_TRAINER_GIT_BLOB_SHA1 = (
+    "4c4797e6a12fa0fc2e52ee5074b9e3930a97de73"
+)
 OFFICIAL_BASE_LRS = {
     "param_group_field": "lr",
     "_initial_param_group_field": "initial_lr",
@@ -152,9 +161,97 @@ CANDIDATE_EPOCHS = (
 )
 TRAJECTORY_ANCHOR_EPOCHS = (1, 2, 4, 8, 16, 32, 40)
 RESUME_EPOCHS = (40, 80, 120, 160, 200, 240, 280, 320, 360, 400)
-LOCAL_BATCH_SIZE = 64
-WORLD_SIZE = 8
-GLOBAL_BATCH_SIZE = LOCAL_BATCH_SIZE * WORLD_SIZE
+OFFICIAL_W1_REFERENCE_MODE = "official_w1_b64_reference"
+W8_GLOBAL64_MODE = "official_objective_w8_l8_g64_ddp_adaptation"
+W16_GLOBAL64_MODE = "official_objective_w16_l4_g64_ddp_adaptation"
+W8_GLOBAL512_MODE = "validation_gated_w8_l64_g512_empirical_acceleration"
+W16_GLOBAL512_MODE = "validation_gated_w16_l32_g512_empirical_acceleration"
+TOPOLOGY_SPECS = {
+    OFFICIAL_W1_REFERENCE_MODE: {
+        "classification": "exact_official_runtime_topology_reference",
+        "node_count": 1,
+        "local_world_size": 1,
+        "world_size": 1,
+        "local_batch_size": 64,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "fp32",
+        "formal_training_eligible": False,
+    },
+    W8_GLOBAL64_MODE: {
+        "classification": (
+            "official_objective_ddp_adaptation_not_trajectory_equivalent"
+        ),
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 8,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W16_GLOBAL64_MODE: {
+        "classification": (
+            "official_objective_ddp_adaptation_not_trajectory_equivalent"
+        ),
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 4,
+        "global_batch_size": 64,
+        "updates_per_epoch": 1_988,
+        "unique_samples_per_epoch": 127_232,
+        "learning_rate": 5e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W8_GLOBAL512_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 64,
+        "global_batch_size": 512,
+        "updates_per_epoch": 248,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W16_GLOBAL512_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 32,
+        "global_batch_size": 512,
+        "updates_per_epoch": 248,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+}
+# Default aliases describe the intended formal two-node run.  Runtime code
+# always rebinds them to an explicitly selected topology receipt.
+NODE_COUNT = 2
+LOCAL_WORLD_SIZE = 8
+WORLD_SIZE = 16
+LOCAL_BATCH_SIZE = 4
+GLOBAL_BATCH_SIZE = 64
+FORMAL_HOST_BY_NODE_RANK = {
+    0: (
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0"
+    ),
+    1: (
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0"
+    ),
+}
 POSE_LENGTH = 64
 PRE_FRAMES = 4
 CODEBOOK_SIZE = 256
@@ -163,7 +260,8 @@ EXPECTED_TRAIN_SAMPLES = 127_286
 EXPECTED_TRAIN_CLIPS = 13_687
 EXPECTED_SPLIT_COUNTS = {"train": 13_687, "val": 1_715, "test": 1_708}
 EXPECTED_CANONICAL_CLIPS = sum(EXPECTED_SPLIT_COUNTS.values())
-EXPECTED_UPDATES_PER_EPOCH = 248
+EXPECTED_UPDATES_PER_EPOCH = 1_988
+EXPECTED_UNIQUE_SAMPLES_PER_EPOCH = 127_232
 THROUGHPUT_WARMUP_UPDATES = 20
 THROUGHPUT_TIMED_UPDATES = 50
 # Keep the candidate envelope compatible with the already-frozen SemTalk
@@ -174,6 +272,8 @@ CHECKPOINT_FORMAT = "semtalk_show_base_official_adapt_checkpoint_v1"
 MANIFEST_FORMAT = "semtalk_show_base_official_adapt_long_manifest_v1"
 STATUS_FORMAT = "semtalk_show_base_official_adapt_long_status_v1"
 GATE_FORMAT = "semtalk_show_base_official_adapt_long_throughput_gate_v1"
+TOPOLOGY_GATE_SPEC_FORMAT = "semtalk_show_base_topology_gate_spec_v1"
+TOPOLOGY_SELECTION_FORMAT = "semtalk_show_base_topology_selection_v1"
 PROTOCOL_FORMAT = "semtalk_show_base_official_adapt_long_protocol_v1"
 READY_RECEIPT_FORMAT = (
     "semtalk_show_base_official_adapt_long_candidate_ready_v1"
@@ -190,22 +290,43 @@ TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v2"
 TRAJECTORY_PROBE_UPDATES = (
     THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
 )
-LOSS_COMPONENTS = (
-    "zq_face",
-    "zq_upper",
-    "zq_hands",
-    "zq_lower",
-    "ce_face",
-    "ce_upper",
-    "ce_hands",
-    "ce_lower",
-    "hubert_consistency",
-    "beat_consistency",
-)
+OFFICIAL_FORWARD_MODES = ("main", "masked_self", "word_audio")
+LOSS_STAGES = ("face", "upper", "hands", "lower")
+LOSS_COMPONENTS = tuple(
+    f"{kind}_{mode}_{stage}"
+    for mode in OFFICIAL_FORWARD_MODES
+    for kind in ("zq", "ce")
+    for stage in LOSS_STAGES
+) + ("hubert_consistency", "beat_consistency")
 
 
 class AdaptationContractError(RuntimeError):
     """Raised before work begins when an immutable contract is violated."""
+
+
+def _activate_topology(args: argparse.Namespace) -> dict[str, Any]:
+    """Select one explicit runtime topology before any receipt is replayed."""
+
+    mode = getattr(args, "topology_mode", None)
+    if mode not in TOPOLOGY_SPECS:
+        raise AdaptationContractError(
+            "topology mode is not in the immutable Base gate matrix"
+        )
+    specification = dict(TOPOLOGY_SPECS[mode])
+    global NODE_COUNT, LOCAL_WORLD_SIZE, WORLD_SIZE
+    global LOCAL_BATCH_SIZE, GLOBAL_BATCH_SIZE
+    global EXPECTED_UPDATES_PER_EPOCH
+    global EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+    NODE_COUNT = int(specification["node_count"])
+    LOCAL_WORLD_SIZE = int(specification["local_world_size"])
+    WORLD_SIZE = int(specification["world_size"])
+    LOCAL_BATCH_SIZE = int(specification["local_batch_size"])
+    GLOBAL_BATCH_SIZE = int(specification["global_batch_size"])
+    EXPECTED_UPDATES_PER_EPOCH = int(specification["updates_per_epoch"])
+    EXPECTED_UNIQUE_SAMPLES_PER_EPOCH = int(
+        specification["unique_samples_per_epoch"]
+    )
+    return {"mode": mode, **specification}
 
 
 def canonical_json_sha256(payload: Any) -> str:
@@ -1236,11 +1357,114 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
     return receipt
 
 
+def _portable_source_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only Git semantics that must agree between local-SSD clones."""
+
+    portable = {
+        key: receipt[key]
+        for key in (
+            "origin",
+            "commit",
+            "tree",
+            "clean",
+            "entrypoint_sha256",
+        )
+    }
+    if (
+        portable["origin"] != EXPECTED_ORIGIN
+        or portable["clean"] is not True
+    ):
+        raise AdaptationContractError("portable source receipt is invalid")
+    return portable
+
+
+def _portable_dataset_receipt(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Strip only the node-local inode binding for semantic comparison."""
+
+    portable = dict(receipt)
+    binding = portable.pop("lmdb_inode_binding", None)
+    if (
+        not isinstance(binding, dict)
+        or binding.get("format")
+        != "semtalk_show_base_lmdb_inode_binding_v1"
+    ):
+        raise AdaptationContractError("node-local LMDB binding is missing")
+    return portable
+
+
+def _global_dataset_receipt(
+    node_receipts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    semantic = _portable_dataset_receipt(node_receipts[0]["dataset"])
+    for receipt in node_receipts[1:]:
+        if _portable_dataset_receipt(receipt["dataset"]) != semantic:
+            raise AdaptationContractError(
+                "nodes disagree on SHOW feature content/lineage semantics"
+            )
+    global_receipt = dict(semantic)
+    global_receipt["lmdb_binding_scope"] = (
+        "ordered_node_local_inode_bindings_with_global_content_sha256"
+    )
+    global_receipt["node_lmdb_inode_bindings"] = [
+        {
+            "node_rank": node_rank,
+            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "binding": dict(receipt["dataset"]["lmdb_inode_binding"]),
+        }
+        for node_rank, receipt in enumerate(node_receipts)
+    ]
+    return global_receipt
+
+
+def _global_official_base_receipt(
+    rank_receipts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bind equal checkpoint content plus ordered node-local open identities."""
+
+    semantic_receipts: list[dict[str, Any]] = []
+    for receipt in rank_receipts:
+        semantic = dict(receipt)
+        identity = semantic.pop("file_identity", None)
+        path = semantic.pop("path", None)
+        if not isinstance(identity, dict) or not isinstance(path, str):
+            raise AdaptationContractError(
+                "official Base node-local file identity is missing"
+            )
+        semantic_receipts.append(semantic)
+    if any(
+        receipt != semantic_receipts[0]
+        for receipt in semantic_receipts[1:]
+    ):
+        raise AdaptationContractError(
+            "ranks disagree on official Base checkpoint semantics"
+        )
+    result = dict(semantic_receipts[0])
+    result["file_binding_scope"] = (
+        "ordered_node_local_open_identity_with_global_content_sha256"
+    )
+    result["node_local_files"] = [
+        {
+            "node_rank": node_rank,
+            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "path": rank_receipts[node_rank * LOCAL_WORLD_SIZE]["path"],
+            "file_identity": dict(
+                rank_receipts[node_rank * LOCAL_WORLD_SIZE]["file_identity"]
+            ),
+        }
+        for node_rank in range(NODE_COUNT)
+    ]
+    return result
+
+
 def validate_long_contract_receipts(
     args: argparse.Namespace,
     *,
     dataset_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
+    topology = {"mode": args.topology_mode, **TOPOLOGY_SPECS[args.topology_mode]}
+    expected_learning_rate = float(topology["learning_rate"])
     schedule, schedule_path, schedule_sha = _load_json_receipt(
         Path(args.schedule_json),
         args.expected_schedule_sha256,
@@ -1261,13 +1485,16 @@ def validate_long_contract_receipts(
         != {"Speaker2", "SemGate", "Sparse"}
         or not isinstance(training, dict)
         or training.get("total_epochs") != TOTAL_EPOCHS
-        or training.get("world_size") != WORLD_SIZE
-        or training.get("local_batch_size") != LOCAL_BATCH_SIZE
-        or training.get("global_batch_size") != GLOBAL_BATCH_SIZE
-        or training.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
-        or training.get("precision") != args.precision
+        or training.get("topology_source")
+        != "sealed_five_mode_topology_gate_v1"
+        or training.get("topology_matrix") != TOPOLOGY_SPECS
+        or training.get("precision_source")
+        != "selected_topology_matrix_entry"
+        or args.precision != topology["precision"]
         or training.get("optimizer") != "Adam"
-        or training.get("learning_rate") != args.learning_rate
+        or training.get("learning_rate_source")
+        != "selected_topology_matrix_entry"
+        or args.learning_rate != expected_learning_rate
         or training.get("betas") != [0.5, 0.999]
         or training.get("weight_decay") != 0.0
         or training.get("gradient_clip_norm") != 0.99
@@ -1354,7 +1581,7 @@ def validate_long_contract_receipts(
             "schedule_sha256": schedule_sha,
             "official_base_checkpoint_sha256": OFFICIAL_BASE_SPEC["sha256"],
             "dataset_receipt_payload_sha256": canonical_json_sha256(
-                dataset_receipt
+                _portable_dataset_receipt(dataset_receipt)
             ),
             "dataset_split": "train",
             "test_visible": False,
@@ -1362,7 +1589,11 @@ def validate_long_contract_receipts(
             "feature_lineage_sha256": dataset_receipt["lineage_sha256"],
             "data_mdb_sha256": dataset_receipt["data_mdb_sha256"],
             "lock_mdb_sha256": dataset_receipt["lock_mdb_sha256"],
-            "lmdb_inode_binding": lmdb_inode_binding,
+            # Device/inode identities are node-local (EFS presents different
+            # st_dev values in the two pods).  They remain mandatory local
+            # DataLoader evidence, but the cross-node semantic lineage binds
+            # the content hashes and canonical ledger instead.
+            "lmdb_binding_scope": "node_local_inode_content_global_sha256",
             "canonical_dataset_evidence": canonical_evidence,
             "prerequisite_selection_sha256": prerequisite_selection[
                 "sha256"
@@ -1379,9 +1610,15 @@ def validate_long_contract_receipts(
             "seed": args.seed,
             "precision": args.precision,
             "learning_rate": args.learning_rate,
+            "topology_mode": args.topology_mode,
+            "topology_classification": topology["classification"],
             "world_size": WORLD_SIZE,
+            "node_count": NODE_COUNT,
+            "local_world_size": LOCAL_WORLD_SIZE,
+            "local_batch_size": LOCAL_BATCH_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
             "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "unique_samples_per_epoch": EXPECTED_UNIQUE_SAMPLES_PER_EPOCH,
             "loader_workers": args.loader_workers,
         }
         binding_sha = canonical_json_sha256(binding)
@@ -1542,9 +1779,33 @@ def protocol_receipt(
     args: argparse.Namespace,
     *,
     contract_receipts: Mapping[str, Any],
+    topology_gate_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
     trajectory = contract_receipts["trajectory_anchor"]
     fresh_trajectory = trajectory.get("mode") == FRESH_TRAJECTORY_MODE
+    topology = _activate_topology(args)
+    official_trainer = Path(__file__).resolve().parents[2] / (
+        "semtalk_base_trainer.py"
+    )
+    if (
+        sha256_file(official_trainer) != OFFICIAL_BASE_TRAINER_SHA256
+        or subprocess.run(
+            [
+                "git",
+                "-C",
+                str(official_trainer.parent),
+                "hash-object",
+                str(official_trainer),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        != OFFICIAL_BASE_TRAINER_GIT_BLOB_SHA1
+    ):
+        raise AdaptationContractError(
+            "published official Base trainer semantics changed"
+        )
     return {
         "format": PROTOCOL_FORMAT,
         "scope": "SemTalk Base only",
@@ -1565,12 +1826,71 @@ def protocol_receipt(
         "pose_length": POSE_LENGTH,
         "pre_frames": PRE_FRAMES,
         "stride": 20,
+        "node_count": NODE_COUNT,
+        "local_world_size": LOCAL_WORLD_SIZE,
         "world_size": WORLD_SIZE,
         "local_batch_size": LOCAL_BATCH_SIZE,
         "global_batch_size": GLOBAL_BATCH_SIZE,
+        "distributed_topology": {
+            "mode": topology["mode"],
+            "classification": topology["classification"],
+            "backend": "nccl",
+            "node_count": NODE_COUNT,
+            "local_world_size": LOCAL_WORLD_SIZE,
+            "world_size": WORLD_SIZE,
+            "nodes": [
+                {
+                    "node_rank": rank,
+                    "hostname": FORMAL_HOST_BY_NODE_RANK[rank],
+                    "rank_range": list(
+                        range(
+                            rank * LOCAL_WORLD_SIZE,
+                            (rank + 1) * LOCAL_WORLD_SIZE,
+                        )
+                    ),
+                }
+                for rank in range(NODE_COUNT)
+            ],
+            "master_addr": args.formal_master_addr,
+            "master_port": args.formal_master_port,
+            "formal_run_id": args.formal_run_id,
+            "official_reference": {
+                "mode": OFFICIAL_W1_REFERENCE_MODE,
+                **TOPOLOGY_SPECS[OFFICIAL_W1_REFERENCE_MODE],
+                "optimizer_updates_400_epochs": (
+                    TOTAL_EPOCHS
+                    * int(
+                        TOPOLOGY_SPECS[OFFICIAL_W1_REFERENCE_MODE][
+                            "updates_per_epoch"
+                        ]
+                    )
+                ),
+                "adam_learning_rate": 5e-5,
+            },
+            "trajectory_equivalence_to_official_w1": (
+                topology["mode"] == OFFICIAL_W1_REFERENCE_MODE
+            ),
+            "fp32_numeric_equivalence_to_official_w1": (
+                topology["mode"] == OFFICIAL_W1_REFERENCE_MODE
+            ),
+            "ddp_differences": (
+                []
+                if topology["mode"] == OFFICIAL_W1_REFERENCE_MODE
+                else [
+                    "per_rank_batchnorm_statistics",
+                    "dropout_and_rng_streams",
+                    "distributed_sampler_order",
+                    "floating_point_gradient_reduction",
+                ]
+            ),
+        },
+        "topology_gate_spec": dict(topology_gate_spec),
         "loader_workers": args.loader_workers,
         "expected_train_samples": EXPECTED_TRAIN_SAMPLES,
         "expected_updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+        "expected_unique_samples_per_epoch": (
+            EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+        ),
         "epochs": TOTAL_EPOCHS,
         "candidate_epochs": list(CANDIDATE_EPOCHS),
         "trajectory_anchor_epochs": (
@@ -1618,6 +1938,9 @@ def protocol_receipt(
             "numpy_random_seed": args.seed,
             "torch_cpu_seed": args.seed,
             "torch_cuda_seed_all": args.seed,
+            "model_initialization_seed": args.seed,
+            "rank_training_seed": "seed_plus_global_rank_after_strict_load",
+            "dropout_rng_correlated_across_ranks": False,
             "cublas_workspace_config": ":4096:8",
             "deterministic_algorithms": True,
             "cudnn_benchmark": False,
@@ -1634,15 +1957,37 @@ def protocol_receipt(
             ),
         },
         "forward_contract": {
-            "forwards_per_optimizer_step": 1,
+            "reference_entrypoint": "semtalk_base_trainer.py:_g_training",
+            "reference_sha256": OFFICIAL_BASE_TRAINER_SHA256,
+            "reference_git_blob_sha1": OFFICIAL_BASE_TRAINER_GIT_BLOB_SHA1,
+            "forwards_per_optimizer_step": 3,
             "audio_conditioned_main_forward": True,
-            "masked_self_forward": False,
-            "word_auxiliary_forward": False,
+            "masked_self_forward": True,
+            "word_auxiliary_forward": True,
             "use_attentions": True,
             "use_word_in_main_forward": True,
+            "use_word_in_masked_self_forward": False,
+            "use_word_in_word_audio_forward": True,
+            "shared_random_mask_for_auxiliary_forwards": True,
+            "auxiliary_mask_rng": (
+                "torch_cpu_default_generator_then_float_cuda_transfer"
+            ),
+            "mask_ratio_schedule": {
+                "epochs_0_to_129": "epoch / 400 * 0.95 + 0.05",
+                "epochs_130_plus": 0.35875,
+            },
+            "optimizer_steps_per_batch": 1,
+            "masked_self_ce_published_source_semantics": (
+                "repeat_rvq_level_5_six_times_divided_by_6_v1"
+            ),
+            "classification_operator_path": (
+                "log_softmax_dim_2_class_axis_then_reshape_then_nll_loss"
+            ),
         },
         "loss": {
             "components": list(LOSS_COMPONENTS),
+            "forward_families": list(OFFICIAL_FORWARD_MODES),
+            "latent_and_code_ce_per_forward": True,
             "zq_stage_weights": {
                 "face": 3.0,
                 "upper": 3.0,
@@ -1659,6 +2004,7 @@ def protocol_receipt(
             "code_ce_rvq_level_weights": [
                 1.0 / float(level + 1) for level in range(RVQ_LEVELS)
             ],
+            "consistency_losses_from": "main_forward_only",
             "hubert_consistency_weight": 1.0,
             "beat_consistency_weight": 1.0,
         },
@@ -1678,47 +2024,46 @@ def _coerce_target_zq(target: Any, expected_shape: Sequence[int], name: str) -> 
     return target
 
 
-def audio_conditioned_objective(
-    model: Any,
+def _official_forward_loss_family(
+    output: Mapping[str, Any],
     batch: Mapping[str, Any],
     *,
-    torch_module: Any | None = None,
-) -> tuple[Any, dict[str, Any]]:
-    """Execute exactly one official main forward and compute its stock loss."""
+    mode: str,
+    masked_self_published_ce: bool,
+    torch_module: Any,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Return one official latent/CE family without another model call.
 
-    if torch_module is None:
-        import torch as torch_module
+    ``semtalk_base_trainer.py`` accidentally retains ``i == 5`` inside its
+    masked-self ``for j in range(6)`` loop.  Released All-Speakers Base was
+    trained from that published source, so the formal adaptation preserves
+    the observable behavior: level five is repeated six times with divisor
+    six.  Main and word/audio families use levels 0..5 with 1/(level+1).
+    """
 
+    if mode not in OFFICIAL_FORWARD_MODES:
+        raise AdaptationContractError(
+            f"unknown official Base forward family {mode!r}"
+        )
     batch_size = int(batch["latent_all"].shape[0])
-    mask = torch_module.ones_like(batch["latent_all"])
-    mask[:, :PRE_FRAMES, :] = 0.0
-    output = model(
-        batch["beat"],
-        batch["in_word"],
-        mask=mask,
-        in_id=batch["tar_id"],
-        in_motion=batch["latent_all"],
-        use_attentions=True,
-        use_word=True,
-        hubert=batch["hubert"],
-        is_train=True,
-    )
-
     expected_zq_shape = (batch_size, RVQ_LEVELS, 1, 16, 256)
-    latent_losses: dict[str, Any] = {}
-    ce_losses: dict[str, Any] = {}
-    for stage in ("face", "upper", "hands", "lower"):
+    stage_latent: dict[str, Any] = {}
+    stage_ce: dict[str, Any] = {}
+    for stage in LOSS_STAGES:
         reconstruction = output[f"rec_{stage}"]
         target = _coerce_target_zq(
-            batch[f"zq_{stage}"], expected_zq_shape, f"zq_{stage}"
+            batch[f"zq_{stage}"],
+            expected_zq_shape,
+            f"zq_{stage}",
         )
         if tuple(reconstruction.shape) != expected_zq_shape:
             raise AdaptationContractError(
-                f"rec_{stage} shape {tuple(reconstruction.shape)} "
+                f"{mode} rec_{stage} shape {tuple(reconstruction.shape)} "
                 f"!= {expected_zq_shape}"
             )
-        latent_losses[stage] = torch_module.nn.functional.mse_loss(
-            reconstruction, target
+        stage_latent[stage] = torch_module.nn.functional.mse_loss(
+            reconstruction,
+            target,
         )
         logits = output[f"cls_{stage}"]
         target_indices = batch[f"tar_index_value_{stage}_top"]
@@ -1729,44 +2074,164 @@ def audio_conditioned_objective(
             RVQ_LEVELS,
         ):
             raise AdaptationContractError(
-                f"cls_{stage} has invalid shape {tuple(logits.shape)}"
+                f"{mode} cls_{stage} has invalid shape "
+                f"{tuple(logits.shape)}"
             )
-        if tuple(target_indices.shape) != (batch_size, 16, RVQ_LEVELS):
+        if tuple(target_indices.shape) != (
+            batch_size,
+            16,
+            RVQ_LEVELS,
+        ):
             raise AdaptationContractError(
                 f"tar_index_value_{stage}_top has invalid shape "
                 f"{tuple(target_indices.shape)}"
             )
-        stage_ce = logits.new_zeros(())
-        for level in range(RVQ_LEVELS):
-            stage_ce = stage_ce + (
-                torch_module.nn.functional.cross_entropy(
-                    logits[:, :, :, level].reshape(-1, CODEBOOK_SIZE),
-                    target_indices[:, :, level].reshape(-1),
+        ce = logits.new_zeros(())
+        for loop_level in range(RVQ_LEVELS):
+            source_level = RVQ_LEVELS - 1 if masked_self_published_ce else loop_level
+            divisor = float(RVQ_LEVELS if masked_self_published_ce else loop_level + 1)
+            ce = ce + (
+                torch_module.nn.functional.nll_loss(
+                    torch_module.nn.functional.log_softmax(
+                        logits[:, :, :, source_level],
+                        # Official ``semtalk_base_trainer.py`` constructs
+                        # ``nn.LogSoftmax(dim=2)`` and applies it to the
+                        # sliced [B,T,C] classifier tensor.  Dimension two
+                        # is therefore the codebook/class axis; dimension
+                        # one would incorrectly normalize over time.
+                        dim=2,
+                    ).reshape(-1, CODEBOOK_SIZE),
+                    target_indices[:, :, source_level].reshape(-1),
                 )
-                / float(level + 1)
+                / divisor
             )
-        ce_losses[stage] = stage_ce
+        stage_ce[stage] = ce
 
-    latent_total = (
-        3.0
-        * sum(latent_losses.values(), next(iter(latent_losses.values())).new_zeros(()))
-        / 6.0
-    )
-    ce_total = sum(
-        ce_losses.values(), next(iter(ce_losses.values())).new_zeros(())
-    )
-    hubert_consistency = output["hubert_cons_loss"]
-    beat_consistency = output["beat_cons_loss"]
-    total = latent_total + ce_total + hubert_consistency + beat_consistency
+    zero = next(iter(stage_latent.values())).new_zeros(())
+    latent_total = 3.0 * sum(stage_latent.values(), zero) / 6.0
+    ce_total = sum(stage_ce.values(), zero)
     metrics = {
-        **{f"zq_{key}": value for key, value in latent_losses.items()},
-        **{f"ce_{key}": value for key, value in ce_losses.items()},
-        "zq_total": latent_total,
-        "ce_total": ce_total,
+        **{
+            f"zq_{mode}_{stage}": value
+            for stage, value in stage_latent.items()
+        },
+        **{
+            f"ce_{mode}_{stage}": value
+            for stage, value in stage_ce.items()
+        },
+        f"zq_{mode}_total": latent_total,
+        f"ce_{mode}_total": ce_total,
+    }
+    return latent_total, ce_total, metrics
+
+
+def audio_conditioned_objective(
+    model: Any,
+    batch: Mapping[str, Any],
+    *,
+    epoch: int,
+    torch_module: Any | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Execute the published official three-forward Base train objective."""
+
+    if torch_module is None:
+        import torch as torch_module
+    if type(epoch) is not int or epoch < 0 or epoch >= TOTAL_EPOCHS:
+        raise AdaptationContractError(
+            f"official Base objective epoch must be in [0,{TOTAL_EPOCHS})"
+        )
+
+    seed_mask = torch_module.ones_like(batch["latent_all"])
+    seed_mask[:, :PRE_FRAMES, :] = 0.0
+    main_output = model(
+        batch["beat"],
+        batch["in_word"],
+        mask=seed_mask,
+        in_id=batch["tar_id"],
+        in_motion=batch["latent_all"],
+        use_attentions=True,
+        use_word=True,
+        hubert=batch["hubert"],
+        is_train=True,
+    )
+    main_latent, main_ce, metrics = _official_forward_loss_family(
+        main_output,
+        batch,
+        mode="main",
+        masked_self_published_ce=False,
+        torch_module=torch_module,
+    )
+    mask_ratio = (
+        (float(epoch) / 400.0) * 0.95 + 0.05
+        if epoch < 130
+        else 0.35875
+    )
+    # Preserve the published CPU RNG path exactly: torch.rand(bs,n,dims) is
+    # created on CPU, thresholded there, converted to float, then transferred
+    # to the active CUDA device.  rand_like(latent_all) would consume CUDA RNG
+    # and change the official W1 trajectory.
+    auxiliary_mask = (
+        torch_module.rand(tuple(batch["latent_all"].shape), device="cpu")
+        < mask_ratio
+    ).to(
+        device=batch["latent_all"].device,
+        dtype=batch["latent_all"].dtype,
+    )
+    masked_self_output = model(
+        batch["beat"],
+        batch["in_word"],
+        mask=auxiliary_mask,
+        in_id=batch["tar_id"],
+        in_motion=batch["latent_all"],
+        use_attentions=True,
+        use_word=False,
+        hubert=batch["hubert"],
+        is_train=True,
+    )
+    self_latent, self_ce, self_metrics = _official_forward_loss_family(
+        masked_self_output,
+        batch,
+        mode="masked_self",
+        masked_self_published_ce=True,
+        torch_module=torch_module,
+    )
+    word_output = model(
+        batch["beat"],
+        batch["in_word"],
+        mask=auxiliary_mask,
+        in_id=batch["tar_id"],
+        in_motion=batch["latent_all"],
+        use_attentions=True,
+        use_word=True,
+        hubert=batch["hubert"],
+        is_train=True,
+    )
+    word_latent, word_ce, word_metrics = _official_forward_loss_family(
+        word_output,
+        batch,
+        mode="word_audio",
+        masked_self_published_ce=False,
+        torch_module=torch_module,
+    )
+    hubert_consistency = main_output["hubert_cons_loss"]
+    beat_consistency = main_output["beat_cons_loss"]
+    total = (
+        main_latent
+        + main_ce
+        + self_latent
+        + self_ce
+        + word_latent
+        + word_ce
+        + hubert_consistency
+        + beat_consistency
+    )
+    metrics.update(self_metrics)
+    metrics.update(word_metrics)
+    metrics.update({
         "hubert_consistency": hubert_consistency,
         "beat_consistency": beat_consistency,
         "total": total,
-    }
+    })
     return total, metrics
 
 
@@ -1814,8 +2279,9 @@ def one_optimizer_update(
     *,
     device: Any,
     precision: str,
+    epoch: int,
 ) -> dict[str, float]:
-    """One forward, one backward, one optimizer step; never accumulates."""
+    """Three official forwards, one backward and one optimizer step."""
 
     import torch
 
@@ -1825,7 +2291,11 @@ def one_optimizer_update(
         dtype=torch.bfloat16,
         enabled=precision == "bf16",
     ):
-        loss, metric_tensors = audio_conditioned_objective(model, batch)
+        loss, metric_tensors = audio_conditioned_objective(
+            model,
+            batch,
+            epoch=epoch,
+        )
     _assert_distributed_finite(
         _all_finite(metric_tensors.values()), device
     )
@@ -1997,7 +2467,8 @@ def _record_sample_order(
         or int(indices.numel()) != LOCAL_BATCH_SIZE
     ):
         raise AdaptationContractError(
-            "trajectory batches must carry exactly 64 immutable LMDB indices"
+            "trajectory batches must carry exactly the selected local batch "
+            "of immutable LMDB indices"
         )
     values = indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
     digest.update(int(rank).to_bytes(4, "little", signed=False))
@@ -2005,6 +2476,22 @@ def _record_sample_order(
     digest.update(int(values.numel()).to_bytes(4, "little", signed=False))
     digest.update(values.numpy().astype("<i8", copy=False).tobytes(order="C"))
     return int(values.numel())
+
+
+def _batch_sample_indices(batch: Mapping[str, Any]) -> list[int]:
+    import torch
+
+    indices = batch.get("sample_index")
+    if (
+        not torch.is_tensor(indices)
+        or indices.ndim != 1
+        or int(indices.numel()) != LOCAL_BATCH_SIZE
+    ):
+        raise AdaptationContractError("invalid gate sample-index inventory")
+    return [
+        int(value)
+        for value in indices.detach().to(device="cpu", dtype=torch.int64).tolist()
+    ]
 
 
 def _rng_state_hashes(device: Any) -> dict[str, str]:
@@ -2423,6 +2910,62 @@ def _cpu_tree(value: Any) -> Any:
     return value
 
 
+def validate_topology_gate_spec(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Replay the immutable five-mode gate before any GPU probe/train work."""
+
+    payload, path, observed_sha = _load_json_receipt(
+        Path(args.topology_gate_spec),
+        args.expected_topology_gate_spec_sha256,
+        "Base topology gate specification",
+    )
+    expected_candidates = [
+        W8_GLOBAL64_MODE,
+        W16_GLOBAL64_MODE,
+        W8_GLOBAL512_MODE,
+        W16_GLOBAL512_MODE,
+    ]
+    if (
+        payload.get("format") != TOPOLOGY_GATE_SPEC_FORMAT
+        or payload.get("scope") != "SemTalk Base on fresh SHOW five-stage features"
+        or payload.get("reference_mode") != OFFICIAL_W1_REFERENCE_MODE
+        or payload.get("candidate_modes") != expected_candidates
+        or payload.get("topology_matrix") != TOPOLOGY_SPECS
+        or payload.get("warmup_updates") != THROUGHPUT_WARMUP_UPDATES
+        or payload.get("timed_updates") != THROUGHPUT_TIMED_UPDATES
+        or payload.get("optimizer_objective")
+        != "published_three_forward_base_objective_v1"
+        or payload.get("sampler")
+        != "distributed_sampler_drop_last_true_no_padding_duplicates"
+        or payload.get("required_measurements")
+        != [
+            "median_seconds",
+            "p90_seconds",
+            "p99_seconds",
+            "peak_cuda_memory_bytes_all_ranks",
+            "oom",
+            "all_losses_finite",
+            "all_gradients_finite",
+            "data_wait_seconds",
+            "collective_seconds",
+            "batchnorm_inventory",
+            "rng_inventory",
+            "sample_inventory",
+        ]
+        or args.topology_mode not in TOPOLOGY_SPECS
+    ):
+        raise AdaptationContractError(
+            "immutable Base topology gate specification changed"
+        )
+    return {
+        "path": str(path),
+        "sha256": observed_sha,
+        "payload_sha256": canonical_json_sha256(payload),
+        "selected_probe_mode": args.topology_mode,
+    }
+
+
 def _save_latest_resume(
     *,
     optimizer: Any,
@@ -2527,11 +3070,25 @@ def validate_throughput_gate(
     if (
         report.get("format") != GATE_FORMAT
         or report.get("status") != "pass"
+        or report.get("topology_mode") != args.topology_mode
+        or report.get("topology_classification")
+        != TOPOLOGY_SPECS[args.topology_mode]["classification"]
+        or report.get("topology_gate_spec_sha256")
+        != args.expected_topology_gate_spec_sha256
+        or not isinstance(report.get("topology_independent_input_sha256"), str)
+        or len(report["topology_independent_input_sha256"]) != 64
         or report.get("frozen_receipt_sha256")
         != frozen_receipt["receipt_sha256"]
+        or report.get("topology_receipt_sha256")
+        != frozen_receipt["topology"]["receipt_sha256"]
+        or report.get("node_count") != NODE_COUNT
+        or report.get("local_world_size") != LOCAL_WORLD_SIZE
         or report.get("world_size") != WORLD_SIZE
         or report.get("local_batch_size") != LOCAL_BATCH_SIZE
         or report.get("global_batch_size") != GLOBAL_BATCH_SIZE
+        or report.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
+        or report.get("unique_samples_per_epoch")
+        != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
         or report.get("warmup_updates") != THROUGHPUT_WARMUP_UPDATES
         or report.get("timed_updates") != THROUGHPUT_TIMED_UPDATES
         or report.get("optimizer_updates") != TRAJECTORY_PROBE_UPDATES
@@ -2539,8 +3096,43 @@ def validate_throughput_gate(
         or report.get("precision") != args.precision
         or float(report.get("learning_rate", math.nan)) != args.learning_rate
         or report.get("all_losses_finite") is not True
+        or report.get("all_gradients_finite") is not True
+        or report.get("oom") is not False
         or not isinstance(report.get("samples_per_second"), (int, float))
         or float(report["samples_per_second"]) <= 0.0
+        or any(
+            not isinstance(report.get(key), (int, float))
+            or not math.isfinite(float(report[key]))
+            or float(report[key]) <= 0.0
+            for key in ("median_seconds", "p90_seconds", "p99_seconds")
+        )
+        or not (
+            float(report["median_seconds"])
+            <= float(report["p90_seconds"])
+            <= float(report["p99_seconds"])
+        )
+        or not isinstance(report.get("peak_cuda_memory_bytes_all_ranks"), list)
+        or len(report["peak_cuda_memory_bytes_all_ranks"]) != WORLD_SIZE
+        or any(
+            type(value) is not int or value <= 0
+            for value in report["peak_cuda_memory_bytes_all_ranks"]
+        )
+        or not isinstance(report.get("data_wait_seconds"), dict)
+        or not isinstance(report.get("collective_seconds"), dict)
+        or not isinstance(report.get("batchnorm_inventory"), list)
+        or len(report["batchnorm_inventory"]) != WORLD_SIZE
+        or not isinstance(report.get("rng_inventory"), list)
+        or len(report["rng_inventory"]) != WORLD_SIZE
+        or report.get("sample_inventory", {}).get("sampler_drop_last") is not True
+        or report.get("sample_inventory", {}).get("padding_duplicates") != 0
+        or report.get("sample_inventory", {}).get("full_epoch_samples")
+        != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+        or report.get("sample_inventory", {}).get("full_epoch_unique_samples")
+        != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+        or report.get("receipt_sha256")
+        != canonical_json_sha256(
+            {key: value for key, value in report.items() if key != "receipt_sha256"}
+        )
     ):
         raise AdaptationContractError(
             "throughput gate does not bind the exact training protocol"
@@ -2558,10 +3150,128 @@ def validate_throughput_gate(
     return {
         "path": str(path),
         "sha256": observed_sha,
+        "topology_mode": args.topology_mode,
         "samples_per_second": float(report["samples_per_second"]),
         "seconds_per_update": float(report["seconds_per_update"]),
+        "median_seconds": float(report["median_seconds"]),
+        "p90_seconds": float(report["p90_seconds"]),
+        "p99_seconds": float(report["p99_seconds"]),
+        "estimated_training_seconds": float(
+            report["estimated_training_seconds"]
+        ),
         "trajectory_mode": trajectory_mode,
         "trajectory_probe": trajectory_probe,
+    }
+
+
+def validate_topology_selection(
+    args: argparse.Namespace,
+    *,
+    throughput_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind formal training to the sealed result of all five real probes."""
+
+    report, path, observed_sha = _load_json_receipt(
+        Path(args.topology_selection_report),
+        args.expected_topology_selection_sha256,
+        "Base topology selection",
+    )
+    selected = report.get("selected")
+    probes = report.get("probes")
+    quality_reports = report.get("quality_reports")
+    quality_decisions = report.get("quality_decisions")
+    if (
+        report.get("format") != TOPOLOGY_SELECTION_FORMAT
+        or report.get("status") != "pass"
+        or report.get("topology_gate_spec_sha256")
+        != args.expected_topology_gate_spec_sha256
+        or report.get("reference_mode") != OFFICIAL_W1_REFERENCE_MODE
+        or report.get("candidate_modes")
+        != [
+            W8_GLOBAL64_MODE,
+            W16_GLOBAL64_MODE,
+            W8_GLOBAL512_MODE,
+            W16_GLOBAL512_MODE,
+        ]
+        or not isinstance(probes, list)
+        or [probe.get("mode") for probe in probes]
+        != list(TOPOLOGY_SPECS)
+        or any(
+            not isinstance(probe, dict)
+            or probe.get("status") != "pass"
+            or not isinstance(probe.get("report_sha256"), str)
+            or len(probe["report_sha256"]) != 64
+            for probe in probes
+        )
+        or not isinstance(quality_reports, list)
+        or [quality.get("mode") for quality in quality_reports]
+        != list(TOPOLOGY_SPECS)
+        or any(
+            not isinstance(quality, dict)
+            or quality.get("report_sha256") is None
+            or len(str(quality.get("report_sha256"))) != 64
+            or quality.get("candidate_fgd") is None
+            or set(quality["candidate_fgd"]) != {"1", "2", "4", "8"}
+            for quality in quality_reports
+        )
+        or not isinstance(quality_decisions, dict)
+        or set(quality_decisions)
+        != {
+            W8_GLOBAL64_MODE,
+            W16_GLOBAL64_MODE,
+            W8_GLOBAL512_MODE,
+            W16_GLOBAL512_MODE,
+        }
+        or not isinstance(selected, dict)
+        or selected.get("mode") != args.topology_mode
+        or selected.get("mode") == OFFICIAL_W1_REFERENCE_MODE
+        or selected.get("report_sha256") != throughput_gate["sha256"]
+        or selected.get("classification")
+        != TOPOLOGY_SPECS[args.topology_mode]["classification"]
+        or selected.get("precision")
+        != TOPOLOGY_SPECS[args.topology_mode]["precision"]
+        or selected.get("formal_training_eligible") is not True
+        or selected
+        != next(
+            (
+                probe
+                for probe in probes
+                if probe.get("mode") == args.topology_mode
+            ),
+            None,
+        )
+        or report.get("w1_trajectory_equivalence_claimed_for_selected")
+        is not False
+        or report.get("selection_policy")
+        != "g64_under_24h_else_raw_replay_quality_gated_acceleration_v1"
+        or report.get("selection_decision_branch")
+        not in {
+            "fastest_safe_g64_under_24h",
+            "fastest_quality_gated_global512",
+        }
+        or report.get("quality_gate_policy", {}).get(
+            "raw_prediction_replay_required"
+        )
+        is not True
+        or report.get("receipt_sha256")
+        != canonical_json_sha256(
+            {
+                key: value
+                for key, value in report.items()
+                if key != "receipt_sha256"
+            }
+        )
+    ):
+        raise AdaptationContractError(
+            "formal Base topology selection is missing, forged, or stale"
+        )
+    return {
+        "path": str(path),
+        "sha256": observed_sha,
+        "selected": dict(selected),
+        "probe_report_sha256": {
+            probe["mode"]: probe["report_sha256"] for probe in probes
+        },
     }
 
 
@@ -2585,6 +3295,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-prerequisite-selection-sha256")
     parser.add_argument("--schedule-json", required=True)
     parser.add_argument("--expected-schedule-sha256", required=True)
+    parser.add_argument("--topology-gate-spec", required=True)
+    parser.add_argument(
+        "--expected-topology-gate-spec-sha256", required=True
+    )
     parser.add_argument(
         "--trajectory-mode",
         choices=(LEGACY_TRAJECTORY_MODE, FRESH_TRAJECTORY_MODE),
@@ -2598,9 +3312,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--throughput-gate-report")
     parser.add_argument("--expected-throughput-gate-sha256")
-    parser.add_argument("--local-batch-size", type=int, default=LOCAL_BATCH_SIZE)
+    parser.add_argument("--topology-selection-report")
+    parser.add_argument("--expected-topology-selection-sha256")
+    parser.add_argument("--formal-node-rank", type=int, required=True)
+    parser.add_argument("--formal-master-addr", required=True)
+    parser.add_argument("--formal-master-port", type=int, required=True)
+    parser.add_argument("--formal-run-id", required=True)
+    parser.add_argument(
+        "--topology-mode", choices=tuple(TOPOLOGY_SPECS), required=True
+    )
+    parser.add_argument("--local-batch-size", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--loader-workers", type=int, default=4)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--seed", type=int, default=43)
@@ -2608,6 +3331,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    topology = _activate_topology(args)
     reject_forbidden_source_labels(
         args.run_name,
         args.output_root,
@@ -2617,8 +3341,12 @@ def validate_args(args: argparse.Namespace) -> None:
         args.lineage_manifest,
         args.prerequisite_selection_json or "",
         args.schedule_json,
+        args.topology_gate_spec,
         args.trajectory_anchor_json,
         args.throughput_gate_report or "",
+        args.topology_selection_report or "",
+        args.formal_master_addr,
+        args.formal_run_id,
     )
     if (
         not args.run_name
@@ -2649,41 +3377,63 @@ def validate_args(args: argparse.Namespace) -> None:
             "trajectory anchor JSON and external SHA-256 must be supplied "
             "together"
         )
-    if args.trajectory_mode == FRESH_TRAJECTORY_MODE:
-        if anchor_pair_supplied:
-            raise AdaptationContractError(
-                "fresh selected-VQ Base training forbids an external old "
-                "trajectory anchor"
-            )
-        if args.prerequisite_selection_json is None:
-            raise AdaptationContractError(
-                "fresh Base trajectory requires the hash-pinned five-stage "
-                "SHOW prerequisite selection"
-            )
-    elif (
-        not anchor_pair_supplied
-        or args.prerequisite_selection_json is not None
+    if (
+        args.trajectory_mode != FRESH_TRAJECTORY_MODE
+        or anchor_pair_supplied
+        or args.prerequisite_selection_json is None
     ):
         raise AdaptationContractError(
-            "legacy trajectory mode requires its external anchor and cannot "
-            "consume freshly selected SHOW prerequisites"
+            "formal Base training requires the hash-pinned five-stage SHOW "
+            "selection and forbids legacy released-VQ feature authority"
         )
-    if args.local_batch_size != LOCAL_BATCH_SIZE:
-        raise AdaptationContractError("local batch size must be exactly 64")
+    if (
+        args.formal_node_rank not in range(topology["node_count"])
+        or os.uname().nodename
+        != FORMAL_HOST_BY_NODE_RANK[args.formal_node_rank]
+        or not re.fullmatch(r"[A-Za-z0-9.-]+", args.formal_master_addr)
+        or not (1024 <= args.formal_master_port <= 65535)
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,128}", args.formal_run_id)
+        is None
+    ):
+        raise AdaptationContractError(
+            "formal W16 node/host/static-rendezvous identity changed"
+        )
+    if args.local_batch_size != topology["local_batch_size"]:
+        raise AdaptationContractError(
+            "local batch size differs from the selected topology"
+        )
     if args.epochs != TOTAL_EPOCHS:
         raise AdaptationContractError(
             f"long official adaptation must run exactly {TOTAL_EPOCHS} epochs"
         )
-    if not (0.0 < args.learning_rate <= 3e-4):
-        raise AdaptationContractError("learning rate must be in (0, 3e-4]")
+    if args.learning_rate != float(topology["learning_rate"]):
+        raise AdaptationContractError(
+            "Base Adam learning rate differs from the immutable topology "
+            "matrix entry"
+        )
+    if args.precision != topology["precision"]:
+        raise AdaptationContractError(
+            "Base precision differs from the immutable topology matrix entry"
+        )
     if args.loader_workers < 0 or args.loader_workers > 16:
         raise AdaptationContractError("loader workers must be in [0,16]")
     if args.mode == "throughput_gate" and (
         args.throughput_gate_report is not None
         or args.expected_throughput_gate_sha256 is not None
+        or args.topology_selection_report is not None
+        or args.expected_topology_selection_sha256 is not None
     ):
         raise AdaptationContractError(
             "throughput_gate mode cannot consume a previous gate"
+        )
+    if args.mode == "train" and (
+        args.topology_mode == OFFICIAL_W1_REFERENCE_MODE
+        or args.topology_selection_report is None
+        or args.expected_topology_selection_sha256 is None
+    ):
+        raise AdaptationContractError(
+            "formal training requires one non-W1 topology selected by the "
+            "sealed five-mode gate"
         )
 
 
@@ -2738,20 +3488,118 @@ def _configure_deterministic_runtime(
     torch_module.set_float32_matmul_precision("highest")
 
 
-def _distributed_context() -> tuple[int, int, int]:
+def _configure_rank_training_rng(
+    torch_module: Any,
+    *,
+    seed: int,
+    rank: int,
+) -> None:
+    """Give dropout/masking independent deterministic streams per rank."""
+
+    import random
+
+    import numpy as np
+
+    rank_seed = int(seed) + int(rank)
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch_module.manual_seed(rank_seed)
+    torch_module.cuda.manual_seed_all(rank_seed)
+
+
+def _distributed_context(
+    args: argparse.Namespace,
+) -> tuple[int, int, int]:
     try:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        group_rank = int(os.environ["GROUP_RANK"])
+        role_rank = int(os.environ["ROLE_RANK"])
+        role_world_size = int(os.environ["ROLE_WORLD_SIZE"])
+        master_port = int(os.environ["MASTER_PORT"])
     except (KeyError, ValueError) as error:
         raise AdaptationContractError(
-            "launch with torchrun --nproc_per_node=8"
+            "launch through the exact static topology-gate torchrun contract"
         ) from error
-    if world_size != WORLD_SIZE or not (0 <= local_rank < WORLD_SIZE):
+    expected_rank = args.formal_node_rank * LOCAL_WORLD_SIZE + local_rank
+    if (
+        world_size != WORLD_SIZE
+        or local_world_size != LOCAL_WORLD_SIZE
+        or group_rank != args.formal_node_rank
+        or role_rank != rank
+        or role_world_size != WORLD_SIZE
+        or rank != expected_rank
+        or not (0 <= local_rank < LOCAL_WORLD_SIZE)
+        or os.environ.get("MASTER_ADDR") != args.formal_master_addr
+        or master_port != args.formal_master_port
+        or os.uname().nodename
+        != FORMAL_HOST_BY_NODE_RANK[args.formal_node_rank]
+    ):
         raise AdaptationContractError(
-            "official adaptation requires exactly one node with 8 ranks"
+            "official adaptation requires the exact selected rank/node/host topology"
         )
     return rank, local_rank, world_size
+
+
+def _distributed_topology_receipt(
+    args: argparse.Namespace,
+    *,
+    rank: int,
+    local_rank: int,
+) -> dict[str, Any]:
+    import torch.distributed as dist
+
+    local = {
+        "rank": rank,
+        "local_rank": local_rank,
+        "node_rank": args.formal_node_rank,
+        "hostname": os.uname().nodename,
+        "master_addr": os.environ["MASTER_ADDR"],
+        "master_port": int(os.environ["MASTER_PORT"]),
+        "formal_run_id": args.formal_run_id,
+    }
+    gathered: list[Any] = [None for _ in range(WORLD_SIZE)]
+    dist.all_gather_object(gathered, local)
+    expected = [
+        {
+            "rank": node_rank * LOCAL_WORLD_SIZE + local_rank_value,
+            "local_rank": local_rank_value,
+            "node_rank": node_rank,
+            "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+            "master_addr": args.formal_master_addr,
+            "master_port": args.formal_master_port,
+            "formal_run_id": args.formal_run_id,
+        }
+        for node_rank in range(NODE_COUNT)
+        for local_rank_value in range(LOCAL_WORLD_SIZE)
+    ]
+    if gathered != expected:
+        raise AdaptationContractError(
+            "distributed selected rank/node/host evidence is not exact"
+        )
+    receipt = {
+        "format": "semtalk_show_base_topology_receipt_v1",
+        "topology_mode": args.topology_mode,
+        "classification": TOPOLOGY_SPECS[args.topology_mode][
+            "classification"
+        ],
+        "backend": "nccl",
+        "node_count": NODE_COUNT,
+        "local_world_size": LOCAL_WORLD_SIZE,
+        "world_size": WORLD_SIZE,
+        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "local_batch_size": LOCAL_BATCH_SIZE,
+        "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+        "unique_samples_per_epoch": EXPECTED_UNIQUE_SAMPLES_PER_EPOCH,
+        "master_addr": args.formal_master_addr,
+        "master_port": args.formal_master_port,
+        "formal_run_id": args.formal_run_id,
+        "ranks": expected,
+    }
+    receipt["receipt_sha256"] = canonical_json_sha256(receipt)
+    return receipt
 
 
 def _seed_loader_worker(worker_id: int) -> None:
@@ -2796,7 +3644,10 @@ def _create_dataloader(
         rank=rank,
         shuffle=True,
         seed=args.seed,
-        drop_last=False,
+        # Do not let DistributedSampler pad by duplicating samples.  With the
+        # frozen 127286-entry SHOW train LMDB this yields exactly 127232 unique
+        # samples for global batch 64, or 126976 for global batch 512.
+        drop_last=True,
     )
     generator = torch.Generator()
     generator.manual_seed(args.seed)
@@ -2865,6 +3716,7 @@ def _frozen_receipt(
     dataset: Mapping[str, Any],
     protocol: Mapping[str, Any],
     long_contract: Mapping[str, Any],
+    topology: Mapping[str, Any],
 ) -> dict[str, Any]:
     payload = {
         "format": "semtalk_show_base_official_adapt_frozen_inputs_v1",
@@ -2874,9 +3726,97 @@ def _frozen_receipt(
         "dataset": dict(dataset),
         "protocol": dict(protocol),
         "long_contract": dict(long_contract),
+        "topology": dict(topology),
     }
     payload["receipt_sha256"] = canonical_json_sha256(payload)
     return payload
+
+
+def _percentile(values: Sequence[float], probability: float) -> float:
+    if not values or not 0.0 <= probability <= 1.0:
+        raise AdaptationContractError("invalid topology-gate percentile")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * probability
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _batchnorm_inventory(model: Any) -> list[dict[str, Any]]:
+    import torch
+
+    result: list[dict[str, Any]] = []
+    for name, module in _unwrap_model(model).named_modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            result.append(
+                {
+                    "name": name,
+                    "type": type(module).__name__,
+                    "num_features": int(module.num_features),
+                    "training": bool(module.training),
+                    "track_running_stats": bool(module.track_running_stats),
+                    "running_mean_sha256": (
+                        _tensor_sha256(module.running_mean)
+                        if module.running_mean is not None
+                        else None
+                    ),
+                    "running_var_sha256": (
+                        _tensor_sha256(module.running_var)
+                        if module.running_var is not None
+                        else None
+                    ),
+                    "num_batches_tracked": (
+                        int(module.num_batches_tracked.item())
+                        if module.num_batches_tracked is not None
+                        else None
+                    ),
+                }
+            )
+    return result
+
+
+def _topology_independent_gate_semantic_sha256(
+    frozen_receipt: Mapping[str, Any],
+) -> str:
+    official = dict(frozen_receipt["official_base"])
+    official.pop("file_binding_scope", None)
+    official.pop("node_local_files", None)
+    dataset = dict(frozen_receipt["dataset"])
+    dataset.pop("lmdb_binding_scope", None)
+    dataset.pop("node_lmdb_inode_bindings", None)
+    protocol = frozen_receipt["protocol"]
+    long_contract = frozen_receipt["long_contract"]
+    return canonical_json_sha256(
+        {
+            "source": {
+                key: frozen_receipt["source"][key]
+                for key in (
+                    "origin",
+                    "commit",
+                    "tree",
+                    "clean",
+                    "entrypoint_sha256",
+                )
+            },
+            "official_base": official,
+            "speaker_initialization": frozen_receipt[
+                "speaker_initialization"
+            ],
+            "dataset": dataset,
+            "schedule": long_contract["schedule"],
+            "forward_contract": protocol["forward_contract"],
+            "loss": protocol["loss"],
+            "precision": protocol["precision"],
+            "target_dataset": protocol["target_dataset"],
+            "target_speaker_scope": protocol["target_speaker_scope"],
+            "vq_models_in_training_graph": protocol[
+                "vq_models_in_training_graph"
+            ],
+        }
+    )
 
 
 def _run_throughput_gate(
@@ -2895,14 +3835,18 @@ def _run_throughput_gate(
     import torch.distributed as dist
 
     model.train()
+    torch.cuda.reset_peak_memory_stats(device)
     sampler.set_epoch(0)
     iterator = iter(loader)
     last_metrics: dict[str, float] = {}
     sample_order = hashlib.sha256()
     sample_count = 0
+    observed_indices: list[int] = []
     optimizer_update = 0
+    batchnorm_before = _batchnorm_inventory(model)
     for _ in range(THROUGHPUT_WARMUP_UPDATES):
         batch = next(iterator)
+        observed_indices.extend(_batch_sample_indices(batch))
         optimizer_update += 1
         sample_count += _record_sample_order(
             sample_order,
@@ -2916,12 +3860,18 @@ def _run_throughput_gate(
             _move_batch(batch, device),
             device=device,
             precision=args.precision,
+            epoch=0,
         )
     torch.cuda.synchronize(device)
     dist.barrier()
     started = time.perf_counter()
+    update_seconds: list[float] = []
+    data_wait_seconds: list[float] = []
     for _ in range(THROUGHPUT_TIMED_UPDATES):
+        wait_started = time.perf_counter()
         batch = next(iterator)
+        data_wait_seconds.append(time.perf_counter() - wait_started)
+        observed_indices.extend(_batch_sample_indices(batch))
         optimizer_update += 1
         sample_count += _record_sample_order(
             sample_order,
@@ -2929,19 +3879,20 @@ def _run_throughput_gate(
             rank=rank,
             optimizer_update=optimizer_update,
         )
+        update_started = time.perf_counter()
         last_metrics = one_optimizer_update(
             model,
             optimizer,
             _move_batch(batch, device),
             device=device,
             precision=args.precision,
+            epoch=0,
         )
+        torch.cuda.synchronize(device)
+        update_seconds.append(time.perf_counter() - update_started)
     torch.cuda.synchronize(device)
     dist.barrier()
     elapsed = time.perf_counter() - started
-    elapsed_tensor = torch.tensor([elapsed], dtype=torch.float64, device=device)
-    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
-    elapsed = float(elapsed_tensor.item())
     _assert_distributed_finite(_all_finite(model.parameters()), device)
     _distributed_verify_loader_source(
         loader,
@@ -2964,40 +3915,215 @@ def _run_throughput_gate(
         if trajectory_mode == FRESH_TRAJECTORY_MODE
         else None
     )
+    # Measure a small fixed collective separately from the training update so
+    # the gate can diagnose cross-node fabric without inflating the ETA.
+    collective_seconds: list[float] = []
+    collective_tensor = torch.ones(1, dtype=torch.float64, device=device)
+    for _ in range(10):
+        torch.cuda.synchronize(device)
+        collective_started = time.perf_counter()
+        dist.all_reduce(collective_tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize(device)
+        collective_seconds.append(time.perf_counter() - collective_started)
+
+    consumed_per_rank = EXPECTED_UPDATES_PER_EPOCH * LOCAL_BATCH_SIZE
+    full_epoch_indices = list(iter(sampler))[:consumed_per_rank]
+    local_observation = {
+        "rank": rank,
+        "elapsed_seconds": elapsed,
+        "update_seconds": update_seconds,
+        "data_wait_seconds": data_wait_seconds,
+        "collective_seconds": collective_seconds,
+        "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "all_losses_finite": all(
+            math.isfinite(float(value)) for value in last_metrics.values()
+        ),
+        "all_gradients_finite": _all_finite(
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ),
+        "oom": False,
+        "batchnorm_before": batchnorm_before,
+        "batchnorm_after": _batchnorm_inventory(model),
+        "rng_after": _rng_state_hashes(device),
+        "observed_indices": observed_indices,
+        "full_epoch_indices": full_epoch_indices,
+    }
+    gathered_observations: list[Any] = [None for _ in range(WORLD_SIZE)]
+    dist.all_gather_object(gathered_observations, local_observation)
+    if [item.get("rank") for item in gathered_observations] != list(
+        range(WORLD_SIZE)
+    ):
+        raise AdaptationContractError("topology-gate rank inventory changed")
+    critical_update_seconds = [
+        max(
+            float(observation["update_seconds"][update_index])
+            + float(observation["data_wait_seconds"][update_index])
+            for observation in gathered_observations
+        )
+        for update_index in range(THROUGHPUT_TIMED_UPDATES)
+    ]
+    all_observed_indices = [
+        index
+        for observation in gathered_observations
+        for index in observation["observed_indices"]
+    ]
+    all_epoch_indices = [
+        index
+        for observation in gathered_observations
+        for index in observation["full_epoch_indices"]
+    ]
+    expected_probe_samples = TRAJECTORY_PROBE_UPDATES * GLOBAL_BATCH_SIZE
+    if (
+        len(all_observed_indices) != expected_probe_samples
+        or len(set(all_observed_indices)) != expected_probe_samples
+        or len(all_epoch_indices) != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+        or len(set(all_epoch_indices)) != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
+        or any(
+            index < 0 or index >= EXPECTED_TRAIN_SAMPLES
+            for index in all_epoch_indices
+        )
+    ):
+        raise AdaptationContractError(
+            "DistributedSampler sample inventory is padded or duplicated"
+        )
+    median_seconds = _percentile(critical_update_seconds, 0.5)
+    p90_seconds = _percentile(critical_update_seconds, 0.9)
+    p99_seconds = _percentile(critical_update_seconds, 0.99)
+    elapsed = max(
+        float(observation["elapsed_seconds"])
+        for observation in gathered_observations
+    )
     if rank == 0:
         report = {
             "format": GATE_FORMAT,
             "status": "pass",
+            "topology_mode": args.topology_mode,
+            "topology_classification": TOPOLOGY_SPECS[
+                args.topology_mode
+            ]["classification"],
+            "topology_gate_spec_sha256": (
+                args.expected_topology_gate_spec_sha256
+            ),
+            "topology_independent_input_sha256": (
+                _topology_independent_gate_semantic_sha256(frozen_receipt)
+            ),
             "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+            "topology_receipt_sha256": frozen_receipt["topology"][
+                "receipt_sha256"
+            ],
+            "node_count": NODE_COUNT,
+            "local_world_size": LOCAL_WORLD_SIZE,
             "world_size": WORLD_SIZE,
             "local_batch_size": LOCAL_BATCH_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
+            "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "unique_samples_per_epoch": EXPECTED_UNIQUE_SAMPLES_PER_EPOCH,
             "warmup_updates": THROUGHPUT_WARMUP_UPDATES,
             "timed_updates": THROUGHPUT_TIMED_UPDATES,
             "precision": args.precision,
             "learning_rate": args.learning_rate,
             "elapsed_seconds": elapsed,
-            "seconds_per_update": elapsed / THROUGHPUT_TIMED_UPDATES,
+            "seconds_per_update": median_seconds,
+            "median_seconds": median_seconds,
+            "p90_seconds": p90_seconds,
+            "p99_seconds": p99_seconds,
             "samples_per_second": (
-                GLOBAL_BATCH_SIZE * THROUGHPUT_TIMED_UPDATES / elapsed
+                GLOBAL_BATCH_SIZE / median_seconds
             ),
             "estimated_training_seconds": (
-                elapsed
-                / THROUGHPUT_TIMED_UPDATES
-                * EXPECTED_UPDATES_PER_EPOCH
-                * TOTAL_EPOCHS
+                median_seconds * EXPECTED_UPDATES_PER_EPOCH * TOTAL_EPOCHS
             ),
             "estimated_epochs": TOTAL_EPOCHS,
             "last_metrics": last_metrics,
             "all_losses_finite": True,
+            "all_gradients_finite": all(
+                observation["all_gradients_finite"]
+                for observation in gathered_observations
+            ),
+            "oom": any(
+                observation["oom"] for observation in gathered_observations
+            ),
             "optimizer_updates": (
                 THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
             ),
             "trajectory_mode": trajectory_mode,
             "trajectory_probe": trajectory_probe,
-            "peak_cuda_memory_bytes_rank0": int(
-                torch.cuda.max_memory_allocated(device)
-            ),
+            "peak_cuda_memory_bytes_all_ranks": [
+                int(observation["peak_cuda_memory_bytes"])
+                for observation in gathered_observations
+            ],
+            "data_wait_seconds": {
+                "median": _percentile(
+                    [
+                        value
+                        for observation in gathered_observations
+                        for value in observation["data_wait_seconds"]
+                    ],
+                    0.5,
+                ),
+                "p99": _percentile(
+                    [
+                        value
+                        for observation in gathered_observations
+                        for value in observation["data_wait_seconds"]
+                    ],
+                    0.99,
+                ),
+            },
+            "collective_seconds": {
+                "probe": "ten_scalar_nccl_all_reduce_calls",
+                "median": _percentile(
+                    [
+                        value
+                        for observation in gathered_observations
+                        for value in observation["collective_seconds"]
+                    ],
+                    0.5,
+                ),
+                "p99": _percentile(
+                    [
+                        value
+                        for observation in gathered_observations
+                        for value in observation["collective_seconds"]
+                    ],
+                    0.99,
+                ),
+            },
+            "batchnorm_inventory": [
+                {
+                    "rank": observation["rank"],
+                    "before": observation["batchnorm_before"],
+                    "after": observation["batchnorm_after"],
+                }
+                for observation in gathered_observations
+            ],
+            "rng_inventory": [
+                {
+                    "rank": observation["rank"],
+                    **observation["rng_after"],
+                }
+                for observation in gathered_observations
+            ],
+            "sample_inventory": {
+                "sampler_drop_last": True,
+                "padding_duplicates": 0,
+                "probe_samples": expected_probe_samples,
+                "probe_unique_samples": len(set(all_observed_indices)),
+                "full_epoch_samples": len(all_epoch_indices),
+                "full_epoch_unique_samples": len(set(all_epoch_indices)),
+                "dataset_samples": EXPECTED_TRAIN_SAMPLES,
+                "dropped_tail_samples": (
+                    EXPECTED_TRAIN_SAMPLES - len(all_epoch_indices)
+                ),
+                "full_epoch_sorted_indices_sha256": hashlib.sha256(
+                    b"".join(
+                        int(index).to_bytes(8, "little", signed=False)
+                        for index in sorted(all_epoch_indices)
+                    )
+                ).hexdigest(),
+            },
             "completed_unix": time.time(),
         }
         report["receipt_sha256"] = canonical_json_sha256(report)
@@ -3081,6 +4207,7 @@ def _run_training(
                 _move_batch(batch, device),
                 device=device,
                 precision=args.precision,
+                epoch=epoch_index,
             )
             optimizer_updates += 1
             if fresh_trajectory and optimizer_updates == TRAJECTORY_PROBE_UPDATES:
@@ -3291,16 +4418,21 @@ def _run_training(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_args(args)
+    topology_gate_spec_receipt = validate_topology_gate_spec(args)
     _prepare_deterministic_environment(seed=args.seed)
-    rank, local_rank, world_size = _distributed_context()
+    rank, local_rank, world_size = _distributed_context(args)
 
     import torch
     import torch.distributed as dist
     from models.semtalk import semtalk_base
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() != WORLD_SIZE:
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.device_count() < LOCAL_WORLD_SIZE
+    ):
         raise AdaptationContractError(
-            "official Base adaptation requires exactly eight visible CUDA GPUs"
+            "each formal Base node exposes fewer CUDA GPUs than the selected "
+            "local world size"
         )
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise AdaptationContractError("bf16 is not supported by this CUDA device")
@@ -3308,6 +4440,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(backend="nccl", init_method="env://")
     _configure_deterministic_runtime(torch, seed=args.seed)
+    topology_receipt = _distributed_topology_receipt(
+        args,
+        rank=rank,
+        local_rank=local_rank,
+    )
 
     run_dir = Path(args.output_root).resolve() / args.run_name
     try:
@@ -3342,12 +4479,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{failure.get('error')}"
             )
 
-        shared_receipts: list[Any] = [None]
-        if rank == 0:
+        # Each physical node independently replays source/dataset/five-stage
+        # closure on its local rank zero.  Content/lineage semantics must be
+        # identical.  Device/inode identities are node-local and are frozen
+        # as an ordered set instead of compared across pods.
+        local_node_receipt: Any = None
+        if local_rank == 0:
             try:
                 current_source = source_receipt()
                 current_dataset = validate_dataset_receipts(args)
-                shared_receipts[0] = {
+                local_node_receipt = {
                     "status": "complete",
                     "source": current_source,
                     "dataset": current_dataset,
@@ -3357,32 +4498,91 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                 }
             except BaseException as error:
-                shared_receipts[0] = {
+                local_node_receipt = {
                     "status": "failed",
                     "error_type": type(error).__name__,
                     "error": str(error),
                 }
-        dist.broadcast_object_list(shared_receipts, src=0)
-        if (
-            not isinstance(shared_receipts[0], dict)
-            or shared_receipts[0].get("status") != "complete"
+        gathered_node_receipts: list[Any] = [
+            None for _ in range(WORLD_SIZE)
+        ]
+        dist.all_gather_object(gathered_node_receipts, local_node_receipt)
+        node_receipts = [
+            gathered_node_receipts[node_rank * LOCAL_WORLD_SIZE]
+            for node_rank in range(NODE_COUNT)
+        ]
+        if any(
+            not isinstance(receipt, dict)
+            or receipt.get("status") != "complete"
+            for receipt in node_receipts
         ):
             failure = (
-                shared_receipts[0]
-                if isinstance(shared_receipts[0], dict)
+                next(
+                    (
+                        receipt
+                        for receipt in node_receipts
+                        if not isinstance(receipt, dict)
+                        or receipt.get("status") != "complete"
+                    ),
+                    {
+                        "error_type": "NodeReceiptFailure",
+                        "error": "a formal node preflight failed",
+                    },
+                )
+                if node_receipts
                 else {}
             )
             raise AdaptationContractError(
-                "source/dataset preflight failed: "
+                "dual-node source/dataset/five-stage preflight failed: "
                 f"{failure.get('error_type')}: "
                 f"{failure.get('error')}"
             )
-        current_source = shared_receipts[0]["source"]
-        dataset_receipt = shared_receipts[0]["dataset"]
-        contract_receipts = shared_receipts[0]["long_contract"]
-        official_state, official_receipt = read_official_base_checkpoint(
+        source_semantics = [
+            _portable_source_receipt(receipt["source"])
+            for receipt in node_receipts
+        ]
+        contract_semantics = [
+            receipt["long_contract"] for receipt in node_receipts
+        ]
+        if (
+            any(value != source_semantics[0] for value in source_semantics[1:])
+            or any(
+                value != contract_semantics[0]
+                for value in contract_semantics[1:]
+            )
+        ):
+            raise AdaptationContractError(
+                "formal nodes disagree on Git or training-contract semantics"
+            )
+        local_dataset_receipt = node_receipts[
+            args.formal_node_rank
+        ]["dataset"]
+        dataset_receipt = _global_dataset_receipt(node_receipts)
+        current_source = {
+            **source_semantics[0],
+            "node_local_clones": [
+                {
+                    "node_rank": node_rank,
+                    "hostname": FORMAL_HOST_BY_NODE_RANK[node_rank],
+                    "entrypoint": receipt["source"]["entrypoint"],
+                    "branch": receipt["source"]["branch"],
+                }
+                for node_rank, receipt in enumerate(node_receipts)
+            ],
+        }
+        contract_receipts = contract_semantics[0]
+        official_state, local_official_receipt = read_official_base_checkpoint(
             Path(args.official_base_checkpoint),
             torch_module=torch,
+        )
+        gathered_official_receipts: list[Any] = [
+            None for _ in range(WORLD_SIZE)
+        ]
+        dist.all_gather_object(
+            gathered_official_receipts, local_official_receipt
+        )
+        official_receipt = _global_official_base_receipt(
+            gathered_official_receipts
         )
         model = semtalk_base(_model_args())
         speaker_initialization = strict_load_and_initialize_show_speakers(
@@ -3394,6 +4594,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         protocol = protocol_receipt(
             args,
             contract_receipts=contract_receipts,
+            topology_gate_spec=topology_gate_spec_receipt,
         )
         frozen_receipt = _frozen_receipt(
             source=current_source,
@@ -3402,6 +4603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset=dataset_receipt,
             protocol=protocol,
             long_contract=contract_receipts,
+            topology=topology_receipt,
         )
         frozen_hashes: list[Any] = [None for _ in range(world_size)]
         dist.all_gather_object(
@@ -3420,23 +4622,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             throughput_receipt = validate_throughput_gate(
                 args, frozen_receipt=frozen_receipt
             )
+            throughput_receipt["topology_selection"] = (
+                validate_topology_selection(
+                    args,
+                    throughput_gate=throughput_receipt,
+                )
+            )
         loader, sampler = _create_dataloader(
             args,
             rank,
             world_size,
-            dataset_receipt,
+            local_dataset_receipt,
         )
         model = model.to(device)
-        process_group = dist.new_group()
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(
-            model, process_group
-        )
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            broadcast_buffers=False,
-            find_unused_parameters=True,
+        # Preserve the published W1 BatchNorm semantics for the reference
+        # probe.  DDP adaptations intentionally retain per-rank BatchNorm;
+        # they are therefore objective-preserving adaptations, never claimed
+        # to be trajectory-equivalent to W1.
+        if WORLD_SIZE > 1:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
+        _configure_rank_training_rng(
+            torch,
+            seed=args.seed,
+            rank=rank,
         )
         optimizer = torch.optim.Adam(
             model.parameters(),

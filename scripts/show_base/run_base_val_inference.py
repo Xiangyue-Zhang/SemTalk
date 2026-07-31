@@ -27,6 +27,7 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib
 import importlib.util
 import json
 import math
@@ -562,7 +563,12 @@ def _preflight_artifact(path: Path, expected_sha: str) -> tuple[
         or payload["test_visible"] is not False
         or payload["candidate_epochs"]
         != list(selector.EXPECTED_CANDIDATE_EPOCHS)
-        or payload["pipeline_source"] != selector.VAL_INFERENCE_SOURCE
+        or not isinstance(payload["pipeline_source"], dict)
+        or payload["pipeline_source"].get("origin")
+        != "git@github.com:Xiangyue-Zhang/SemTalk.git"
+        or payload["pipeline_source"].get("clean") is not True
+        or payload["pipeline_source"].get("detached") is not True
+        or payload["pipeline_source"].get("local_branches_at_commit") != []
     ):
         raise ValInferenceContractError("preflight is not val-only")
     artifact = {
@@ -577,14 +583,6 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     _reject_path(args.output, "preflight output")
     if os.path.lexists(args.output):
         raise FileExistsError(f"refusing to overwrite {args.output}")
-    bundle = selector.validate_candidate_bundle(
-        manifest_path=args.candidate_manifest,
-        expected_manifest_sha256=args.expected_candidate_manifest_sha256,
-        status_path=args.candidate_status,
-        expected_status_sha256=args.expected_candidate_status_sha256,
-        frozen_inputs_path=args.frozen_inputs,
-        expected_frozen_inputs_sha256=args.expected_frozen_inputs_sha256,
-    )
     val_artifact, coverage = selector.validate_val_inputs(
         args.val_inputs,
         args.expected_val_inputs_sha256,
@@ -592,6 +590,19 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     pipeline_artifact, pipeline = selector.validate_pipeline(
         args.pipeline,
         args.expected_pipeline_sha256,
+    )
+    expected_selected = {
+        stage: pipeline["fixed_checkpoints"][stage]["sha256"]
+        for stage in ("face", "hands", "upper", "lower", "global")
+    }
+    bundle = selector.validate_candidate_bundle(
+        manifest_path=args.candidate_manifest,
+        expected_manifest_sha256=args.expected_candidate_manifest_sha256,
+        status_path=args.candidate_status,
+        expected_status_sha256=args.expected_candidate_status_sha256,
+        frozen_inputs_path=args.frozen_inputs,
+        expected_frozen_inputs_sha256=args.expected_frozen_inputs_sha256,
+        expected_selected_prerequisite_sha256=expected_selected,
     )
     for value in (
         args.output,
@@ -633,7 +644,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 def _load_pinned_helper(
     pipeline: Mapping[str, Any],
 ) -> ModuleType:
-    entrypoint = pipeline["inference_entrypoint"]
+    entrypoint = pipeline["inference_helper"]
     path = _regular_file(
         Path(entrypoint["path"]),
         "pinned validation inference helper",
@@ -643,10 +654,13 @@ def _load_pinned_helper(
         entrypoint["sha256"],
         "pinned validation inference helper",
     )
-    if entrypoint["sha256"] != selector.VAL_INFERENCE_SOURCE[
-        "entrypoint_sha256"
-    ]:
-        raise ValInferenceContractError("unpinned inference helper")
+    expected_helper = pipeline.get("source_closure", {}).get(
+        "scripts/show_base/run_base_inference.py"
+    )
+    if entrypoint != expected_helper:
+        raise ValInferenceContractError(
+            "inference helper differs from the fresh source closure"
+        )
     name = f"_semtalk_val_helper_{entrypoint['sha256']}"
     module = ModuleType(name)
     module.__file__ = str(path)
@@ -665,16 +679,12 @@ def _load_pinned_helper(
             f"cannot execute verified helper snapshot {path}"
         ) from error
     required = set(selector.INFERENCE_HELPERS) | {
-        "_validate_official_transfer_checkpoint",
-        "_load_released_model_state_only",
-        "_validate_released_model_state_schema",
         "_strict_load_freeze_eval",
         "_normalize_data_parallel_state",
         "_read_verified_checkpoint_snapshot",
         "_torch_load_checkpoint",
         "_finite_state_dict",
         "_validate_base_model_state_schema",
-        "_expected_released_representation_schemas",
         "_model_args",
         "_joint_masks",
         "deterministic_npz_bytes",
@@ -688,7 +698,6 @@ def _load_pinned_helper(
         raise ValInferenceContractError(
             f"pinned inference helper lacks {missing}"
         )
-    _prime_pinned_released_schema_cache(module)
     return module
 
 
@@ -697,7 +706,7 @@ def _pinned_helper_root(
     pipeline: Mapping[str, Any],
 ) -> Path:
     entrypoint = _regular_file(
-        Path(pipeline["inference_entrypoint"]["path"]),
+        Path(pipeline["inference_helper"]["path"]),
         "pinned validation inference helper",
     )
     helper_file_value = getattr(helper, "__file__", None)
@@ -741,6 +750,18 @@ def _pinned_joint_mask_arrays(
             "pinned inference helper has unexpected SMPL-X pose dimension"
         )
     root = _pinned_helper_root(helper, pipeline)
+    context_entry = pipeline.get("source_closure", {}).get(
+        PINNED_JOINT_CONTEXT_SOURCE["relative_path"]
+    )
+    authority_entry = pipeline.get("source_closure", {}).get(
+        PINNED_JOINT_AUTHORITY_SOURCE["relative_path"]
+    )
+    if not isinstance(context_entry, dict) or not isinstance(
+        authority_entry, dict
+    ):
+        raise ValInferenceContractError(
+            "joint-mask sources are absent from the fresh source closure"
+        )
     source_path = root / PINNED_JOINT_CONTEXT_SOURCE["relative_path"]
     payload = _verified_bytes(
         source_path,
@@ -749,6 +770,11 @@ def _pinned_joint_mask_arrays(
     )
     if (
         _git_blob_sha1(payload)
+        != PINNED_JOINT_CONTEXT_SOURCE["git_blob_sha1"]
+        or source_path != Path(context_entry.get("path", ""))
+        or context_entry.get("sha256")
+        != PINNED_JOINT_CONTEXT_SOURCE["sha256"]
+        or context_entry.get("git_blob_sha1")
         != PINNED_JOINT_CONTEXT_SOURCE["git_blob_sha1"]
     ):
         raise ValInferenceContractError(
@@ -762,6 +788,11 @@ def _pinned_joint_mask_arrays(
     )
     if (
         _git_blob_sha1(authority_payload)
+        != PINNED_JOINT_AUTHORITY_SOURCE["git_blob_sha1"]
+        or authority_path != Path(authority_entry.get("path", ""))
+        or authority_entry.get("sha256")
+        != PINNED_JOINT_AUTHORITY_SOURCE["sha256"]
+        or authority_entry.get("git_blob_sha1")
         != PINNED_JOINT_AUTHORITY_SOURCE["git_blob_sha1"]
     ):
         raise ValInferenceContractError(
@@ -889,9 +920,9 @@ def _pinned_joint_mask_arrays(
     receipt = _with_payload_sha(
         {
             "format": "semtalk_pinned_joint_masks_v1",
-            "source": dict(selector.VAL_INFERENCE_SOURCE),
-            "context_source": dict(PINNED_JOINT_CONTEXT_SOURCE),
-            "authority_source": dict(PINNED_JOINT_AUTHORITY_SOURCE),
+            "source": dict(pipeline["source"]),
+            "context_source": dict(context_entry),
+            "authority_source": dict(authority_entry),
             "pose_dim": SMPLX_POSE_DIM,
             "dtype": "bool",
             "masks": {
@@ -931,83 +962,6 @@ def _joint_masks_from_arrays(
     return result
 
 
-@contextmanager
-def _pinned_meta_schema_cuda_compat() -> Iterable[dict[str, int]]:
-    """Keep the pinned helper's legacy ``.cuda()`` call on the meta device."""
-
-    import torch
-
-    original_cuda = torch.Tensor.cuda
-    intercepted = {"calls": 0}
-
-    def meta_only_cuda(
-        tensor: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        if (
-            args
-            or kwargs
-            or getattr(getattr(tensor, "device", None), "type", None)
-            != "meta"
-        ):
-            raise ValInferenceContractError(
-                "pinned helper schema construction attempted a non-meta "
-                "or parameterized Tensor.cuda call"
-            )
-        intercepted["calls"] += 1
-        return tensor
-
-    torch.Tensor.cuda = meta_only_cuda
-    try:
-        yield intercepted
-    finally:
-        torch.Tensor.cuda = original_cuda
-
-
-def _prime_pinned_released_schema_cache(helper: ModuleType) -> None:
-    import torch
-
-    with _pinned_meta_schema_cuda_compat() as first_intercepted:
-        schemas = helper._expected_released_representation_schemas()
-    expected_stages = {"face", "global", "hands", "upper", "lower"}
-    if (
-        first_intercepted != {"calls": 24}
-        or not isinstance(schemas, dict)
-        or set(schemas) != expected_stages
-        or any(
-            not isinstance(schemas[stage], dict) or not schemas[stage]
-            for stage in expected_stages
-        )
-    ):
-        raise ValInferenceContractError(
-            "pinned helper returned an invalid released schema cache"
-        )
-    for stage in expected_stages:
-        for key, entry in schemas[stage].items():
-            if (
-                not isinstance(key, str)
-                or not key
-                or not isinstance(entry, tuple)
-                or len(entry) != 2
-                or not isinstance(entry[0], torch.dtype)
-                or not isinstance(entry[1], tuple)
-                or any(
-                    type(dimension) is not int or dimension < 0
-                    for dimension in entry[1]
-                )
-            ):
-                raise ValInferenceContractError(
-                    "pinned helper returned a malformed released schema entry"
-                )
-    with _pinned_meta_schema_cuda_compat() as cached_intercepted:
-        cached_schemas = helper._expected_released_representation_schemas()
-    if cached_schemas is not schemas or cached_intercepted != {"calls": 0}:
-        raise ValInferenceContractError(
-            "pinned helper released schema cache is not stable"
-        )
-
-
 def _load_preflight_children(
     preflight: Mapping[str, Any],
 ) -> tuple[
@@ -1023,10 +977,10 @@ def _load_preflight_children(
         val_artifact["sha256"],
         "frozen val inputs",
     )
-    pipeline = _verified_json(
+    audited_pipeline_artifact, pipeline = selector.validate_pipeline(
         Path(pipeline_artifact["path"]),
         pipeline_artifact["sha256"],
-        "frozen validation pipeline",
+        expected_source=preflight["pipeline_source"],
     )
     if (
         val_inputs.get("split") != "val"
@@ -1036,6 +990,10 @@ def _load_preflight_children(
         or pipeline.get("source") != preflight["pipeline_source"]
         or pipeline.get("inference_entrypoint")
         != preflight["inference_entrypoint"]
+        or any(
+            audited_pipeline_artifact.get(key) != pipeline_artifact.get(key)
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        )
     ):
         raise ValInferenceContractError("preflight child is not val-only")
 
@@ -1112,53 +1070,39 @@ def _load_preflight_children(
     return val_inputs, pipeline, canonical_rows, audio_by_id
 
 
-def _transfer_payload_expectations(
-    helper: ModuleType,
-    checkpoint: Path,
-    _expected_sha: str,
-    stage: str,
-) -> tuple[dict[str, Any], dict[str, Any], Path, str]:
-    resolved = _regular_file(
-        checkpoint,
-        f"official-adapt {stage} checkpoint",
-    )
-    summary = _regular_file(
-        resolved.parent / "summary.json",
-        f"{stage} transfer summary",
-    )
-    (
-        summary,
-        summary_snapshot,
-        summary_sha,
-        _summary_metadata,
-    ) = _safe_file_snapshot(
-        summary,
-        f"{stage} transfer summary",
-    )
-    summary_payload = _strict_json_bytes(
-        summary_snapshot,
-        f"{stage} transfer summary",
-    )
-    if not isinstance(summary_payload, dict):
+def _pinned_project_module(
+    pipeline: Mapping[str, Any],
+    *,
+    module_name: str,
+    relative_path: str,
+) -> ModuleType:
+    """Import one project module only from the fresh pinned checkout."""
+
+    entry = pipeline.get("source_closure", {}).get(relative_path)
+    if not isinstance(entry, dict):
         raise ValInferenceContractError(
-            f"{stage} transfer summary must be an object"
+            f"{relative_path} is absent from the fresh source closure"
         )
-    _reject_absolute_paths_in_tree(
-        summary_payload,
-        f"{stage} transfer summary",
+    module = importlib.import_module(module_name)
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str) or not module_file:
+        raise ValInferenceContractError(
+            f"{module_name} has no auditable source path"
+        )
+    resolved = _regular_file(Path(module_file), f"pinned {module_name}")
+    snapshot = _verified_bytes(
+        resolved,
+        entry.get("sha256"),
+        f"pinned {module_name}",
     )
-    source = summary_payload.get("source_receipt")
-    cache = summary_payload.get("cache_receipt")
-    if not isinstance(source, dict) or not isinstance(cache, dict):
+    if (
+        resolved != Path(str(entry.get("path", "")))
+        or len(snapshot) != entry.get("bytes")
+    ):
         raise ValInferenceContractError(
-            f"{stage} transfer source/cache receipt is missing"
+            f"{module_name} was imported from another checkout"
         )
-    canonical = cache.get("canonical_receipt")
-    if not isinstance(canonical, dict):
-        raise ValInferenceContractError(
-            f"{stage} transfer canonical receipt is missing"
-        )
-    return source, canonical, summary, summary_sha
+    return module
 
 
 def _load_models(
@@ -1170,12 +1114,28 @@ def _load_models(
     device: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     import torch
-    from models.motion_representation import VAEConvZero
-    from models.rvq import RVQVAE
-    from models.semtalk import semtalk_base
+
+    feature_builder = _pinned_project_module(
+        pipeline,
+        module_name="scripts.show_base.build_base_features",
+        relative_path="scripts/show_base/build_base_features.py",
+    )
+    semtalk_module = _pinned_project_module(
+        pipeline,
+        module_name="models.semtalk",
+        relative_path="models/semtalk.py",
+    )
 
     candidate = preflight["candidate_bundle"]["candidates"][str(epoch)]
     bundle = preflight["candidate_bundle"]
+    updates_per_epoch = selector.require_exact_int(
+        bundle.get("updates_per_epoch"),
+        "selected Base topology updates per epoch",
+    )
+    if updates_per_epoch not in {248, 1988}:
+        raise ValInferenceContractError(
+            "selected Base topology updates per epoch changed"
+        )
     for label, artifact in (
         ("Base candidate", candidate),
         ("Base candidate manifest", bundle["manifest"]),
@@ -1221,7 +1181,7 @@ def _load_models(
         != helper.OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT
         or audit.get("completed_epochs") != epoch
         or audit.get("optimizer_updates")
-        != epoch * selector.EXPECTED_UPDATES_PER_EPOCH
+        != epoch * updates_per_epoch
         or audit.get("frozen_receipt_sha256")
         != bundle["frozen_inputs"]["receipt_sha256"]
         or audit.get("official_base_checkpoint_sha256")
@@ -1234,7 +1194,7 @@ def _load_models(
         raise ValInferenceContractError(
             "Base candidate audit is not preflight/frozen-input bound"
         )
-    base = semtalk_base(helper._model_args()).to(device)
+    base = semtalk_module.semtalk_base(helper._model_args()).to(device)
     helper._strict_load_freeze_eval(
         base,
         helper._normalize_data_parallel_state(
@@ -1248,100 +1208,120 @@ def _load_models(
         "base": {
             "path": str(candidate_resolved),
             "sha256": observed_candidate_sha,
+            "bytes": len(candidate_snapshot),
+            "stage": "base",
             "candidate_epoch": epoch,
+            "optimizer_updates": audit["optimizer_updates"],
+            "updates_per_epoch": updates_per_epoch,
             "frozen_receipt_sha256": audit["frozen_receipt_sha256"],
+            "strict_state_dict_load": True,
+            "all_model_state_tensors_finite": True,
+            "frozen_eval": True,
         }
     }
     fixed = pipeline["fixed_checkpoints"]
-
-    for stage in ("face", "global"):
-        checkpoint = Path(fixed[stage]["path"])
-        source, canonical, summary, summary_sha = (
-            _transfer_payload_expectations(
-                helper,
-                checkpoint,
-                fixed[stage]["sha256"],
-                stage,
+    selection = pipeline["prerequisite_selection"]
+    try:
+        selected_models, selected_records, bridge = (
+            feature_builder.load_val_selected_models(
+                SimpleNamespace(
+                    prerequisite_selection_json=Path(selection["path"]),
+                    expected_prerequisite_selection_sha256=selection[
+                        "sha256"
+                    ],
+                    device=device,
+                ),
+                retain_global=True,
             )
         )
-        payload, receipt = helper._validate_official_transfer_checkpoint(
-            path=checkpoint,
-            formal_stage=stage,
-            expected_sha256=fixed[stage]["sha256"],
-            status_path=summary,
-            expected_status_sha256=summary_sha,
-            expected_source_receipt=source,
-            expected_canonical_receipt=canonical,
+    except Exception as error:
+        raise ValInferenceContractError(
+            "cannot strict-load the five validation-selected SHOW models"
+        ) from error
+    expected_stages = {"face", "hands", "upper", "lower", "global"}
+    if (
+        set(selected_models) != expected_stages
+        or set(selected_records) != expected_stages
+        or bridge.get("selection")
+        != {
+            key: selection[key]
+            for key in ("path", "sha256", "receipt_payload_sha256")
+        }
+    ):
+        raise ValInferenceContractError(
+            "five-model validation selection bridge changed"
         )
-        if stage == "face":
-            specification = helper.RELEASED_ALL_SPEAKERS_MODELS["face"]
-            model = RVQVAE(
-                SimpleNamespace(
-                    vae_test_dim=specification["vae_test_dim"],
-                    vae_layer=specification["vae_layer"],
-                    vae_length=256,
-                )
-            ).to(device)
-        else:
-            model = VAEConvZero(
-                SimpleNamespace(
-                    vae_test_dim=61,
-                    vae_layer=4,
-                    vae_length=256,
-                )
-            ).to(device)
-        helper._strict_load_freeze_eval(
-            model,
-            helper._normalize_data_parallel_state(
-                payload["model_state"],
-                checkpoint,
+    for stage in ("face", "hands", "upper", "lower", "global"):
+        record = selected_records[stage]
+        actual = {
+            "stage": record.get("formal_stage"),
+            "path": record.get("path"),
+            "sha256": record.get("sha256"),
+            "bytes": record.get("bytes"),
+            "source": record.get("prerequisite_source"),
+            "selection_split": record.get("selection_split"),
+            "test_visible": record.get("test_visible"),
+            "epoch": record.get("selected_epoch"),
+            "optimizer_updates": record.get(
+                "selected_optimizer_updates"
             ),
-            path=checkpoint,
-        )
-        models[stage] = model
+            "updates_per_epoch": record.get(
+                "selected_updates_per_epoch"
+            ),
+            "candidate_audit_sha256": record.get(
+                "candidate_audit_sha256"
+            ),
+            "selection_metric": record.get("selection_metric"),
+            "measurement_receipt": record.get("measurement_receipt"),
+        }
+        if actual != fixed[stage]:
+            raise ValInferenceContractError(
+                f"actual-loaded {stage} model differs from fresh fixed five"
+            )
+        models[stage] = selected_models[stage]
         receipts[stage] = {
-            "path": receipt["path"],
-            "sha256": receipt["sha256"],
-            "summary": {
-                "path": receipt["formal_training_status"],
-                "sha256": receipt["formal_training_status_sha256"],
-            },
+            **actual,
+            "prerequisite_selection": dict(selection),
+            "model_state_tensors": record.get("model_state_tensors"),
+            "model_state_schema_sha256": record.get(
+                "model_state_schema_sha256"
+            ),
+            "strict_state_dict_load": record.get(
+                "strict_state_dict_load"
+            ),
+            "all_model_state_tensors_finite": record.get(
+                "all_model_state_tensors_finite"
+            ),
+            "frozen_eval": record.get("frozen_eval"),
         }
 
-    for stage in ("hands", "upper", "lower"):
-        entry = fixed[stage]
-        specification = helper.RELEASED_ALL_SPEAKERS_MODELS[stage]
-        state, resolved, snapshot, observed = (
-            helper._load_released_model_state_only(
-                Path(entry["path"]),
-                expected_filename=specification["filename"],
-                expected_sha256=entry["sha256"],
-            )
+    # Reject an already-imported shadow package even when the checkpoint
+    # loader itself returned plausible receipt dictionaries.
+    for module_name, relative in (
+        ("models.motion_representation", "models/motion_representation.py"),
+        ("models.motion_encoder", "models/motion_encoder.py"),
+        ("models.rvq", "models/rvq.py"),
+        ("models.encdec", "models/encdec.py"),
+        ("models.residual_vq", "models/residual_vq.py"),
+        ("models.quantizer", "models/quantizer.py"),
+        ("models.resnet", "models/resnet.py"),
+    ):
+        _pinned_project_module(
+            pipeline,
+            module_name=module_name,
+            relative_path=relative,
         )
-        helper._validate_released_model_state_schema(
-            state,
-            formal_stage=stage,
-            path=resolved,
-        )
-        model = RVQVAE(
-            SimpleNamespace(
-                vae_test_dim=specification["vae_test_dim"],
-                vae_layer=specification["vae_layer"],
-                vae_length=256,
-            )
-        ).to(device)
-        helper._strict_load_freeze_eval(model, state, path=resolved)
-        models[stage] = model
-        receipts[stage] = {
-            "path": str(resolved),
-            "sha256": observed,
-            "bytes": len(snapshot),
-            "source": "released_all_speakers_v1",
-        }
 
     for model in models.values():
         model.eval()
         model.requires_grad_(False)
+    if set(models) != {"base", *expected_stages} or set(receipts) != {
+        "base",
+        *expected_stages,
+    }:
+        raise ValInferenceContractError(
+            "runtime model set is not Base plus five SHOW prerequisites"
+        )
     torch.cuda.empty_cache()
     return models, receipts
 
@@ -1630,6 +1610,8 @@ def _validate_shard(
     epoch: int,
     candidate: Mapping[str, Any],
     preflight_artifact: Mapping[str, Any],
+    preflight: Mapping[str, Any],
+    pipeline: Mapping[str, Any],
     canonical_rows: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     root = output_root / SHARDS_DIRECTORY / _shard_name(shard_id, num_shards)
@@ -1705,6 +1687,113 @@ def _validate_shard(
         != _payload_sha(receipt.get("runtime_contract", {}))
     ):
         raise ValInferenceContractError(f"invalid shard receipt {shard_id}")
+    model_receipts = receipt.get("model_receipts")
+    expected_model_stages = {
+        "base",
+        "face",
+        "hands",
+        "upper",
+        "lower",
+        "global",
+    }
+    if not isinstance(model_receipts, dict) or set(model_receipts) != (
+        expected_model_stages
+    ):
+        raise ValInferenceContractError(
+            f"shard {shard_id} model receipt coverage changed"
+        )
+    base_receipt = model_receipts["base"]
+    updates_per_epoch = selector.require_exact_int(
+        preflight.get("candidate_bundle", {}).get("updates_per_epoch"),
+        "selected Base topology updates per epoch",
+    )
+    expected_base_keys = {
+        "path",
+        "sha256",
+        "bytes",
+        "stage",
+        "candidate_epoch",
+        "optimizer_updates",
+        "updates_per_epoch",
+        "frozen_receipt_sha256",
+        "strict_state_dict_load",
+        "all_model_state_tensors_finite",
+        "frozen_eval",
+    }
+    if (
+        not isinstance(base_receipt, dict)
+        or set(base_receipt) != expected_base_keys
+        or {
+            key: base_receipt[key]
+            for key in ("path", "sha256", "bytes")
+        }
+        != {
+            key: candidate[key]
+            for key in ("path", "sha256", "bytes")
+        }
+        or base_receipt["stage"] != "base"
+        or base_receipt["candidate_epoch"] != epoch
+        or base_receipt["updates_per_epoch"]
+        != updates_per_epoch
+        or base_receipt["optimizer_updates"]
+        != epoch * updates_per_epoch
+        or base_receipt["frozen_receipt_sha256"]
+        != preflight["candidate_bundle"]["frozen_inputs"][
+            "receipt_sha256"
+        ]
+        or base_receipt["strict_state_dict_load"] is not True
+        or base_receipt["all_model_state_tensors_finite"] is not True
+        or base_receipt["frozen_eval"] is not True
+    ):
+        raise ValInferenceContractError(
+            f"shard {shard_id} Base actual-load receipt changed"
+        )
+    fixed = pipeline["fixed_checkpoints"]
+    expected_prerequisite_keys = {
+        "stage",
+        "path",
+        "sha256",
+        "bytes",
+        "source",
+        "selection_split",
+        "test_visible",
+        "epoch",
+        "optimizer_updates",
+        "updates_per_epoch",
+        "candidate_audit_sha256",
+        "selection_metric",
+        "measurement_receipt",
+        "prerequisite_selection",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "strict_state_dict_load",
+        "all_model_state_tensors_finite",
+        "frozen_eval",
+    }
+    fixed_keys = set(next(iter(fixed.values())))
+    for model_stage in ("face", "hands", "upper", "lower", "global"):
+        actual = model_receipts[model_stage]
+        if (
+            not isinstance(actual, dict)
+            or set(actual) != expected_prerequisite_keys
+            or {key: actual[key] for key in fixed_keys}
+            != fixed[model_stage]
+            or actual["prerequisite_selection"]
+            != pipeline["prerequisite_selection"]
+            or type(actual["model_state_tensors"]) is not int
+            or actual["model_state_tensors"] <= 0
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(actual["model_state_schema_sha256"]),
+            )
+            or actual["strict_state_dict_load"] is not True
+            or actual["all_model_state_tensors_finite"] is not True
+            or actual["frozen_eval"] is not True
+        ):
+            raise ValInferenceContractError(
+                f"shard {shard_id} {model_stage} actual-load receipt "
+                "differs from the fresh fixed five"
+            )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, dict) or set(manifest) != {"path", "sha256"}:
         raise ValInferenceContractError("invalid shard manifest receipt")
@@ -1846,7 +1935,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     )
     candidate = preflight["candidate_bundle"]["candidates"][str(args.epoch)]
     _reject_forbidden(candidate, "Base candidate")
-    _val_inputs, _pipeline, canonical_rows, _audio = (
+    _val_inputs, pipeline, canonical_rows, _audio = (
         _load_preflight_children(preflight)
     )
     output_root = _validate_output_root(args.output_root)
@@ -1867,6 +1956,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                 epoch=args.epoch,
                 candidate=candidate,
                 preflight_artifact=preflight_artifact,
+                preflight=preflight,
+                pipeline=pipeline,
                 canonical_rows=canonical_rows,
             )
             if common_model_sha is None:
@@ -1942,7 +2033,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             clip_payload = "".join(
                 f"{row['canonical_clip_id']}\n" for row in final_rows
             ).encode("utf-8")
-            clip_stage = stage / "diffsheg_eval_clip_ids.txt"
+            clip_stage = stage / "talkshow_eval_clip_ids.txt"
             manifest_stage = stage / "final_manifest.jsonl"
             _write_inside_generation(clip_stage, clip_payload)
             _write_inside_generation(
@@ -1982,8 +2073,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                         "uncovered_tail_frames"
                     ],
                     "clip_ids_sha256": coverage["clip_ids_sha256"],
-                    "diffsheg_clip_manifest_sha256": coverage[
-                        "diffsheg_clip_manifest_sha256"
+                    "talkshow_window_manifest_sha256": coverage[
+                        "talkshow_window_manifest_sha256"
                     ],
                     "prediction_files": selector.EXPECTED_VAL_CLIPS,
                     "ground_truth_files": selector.EXPECTED_VAL_CLIPS,

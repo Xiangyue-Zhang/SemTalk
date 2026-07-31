@@ -34,16 +34,45 @@ FRESH_SCHEDULE = (
     / "show_base"
     / "semtalk_base_fresh_lineage_schedule_20260731.json"
 )
+TOPOLOGY_GATE_SPEC = (
+    REPOSITORY
+    / "configs"
+    / "show_base"
+    / "semtalk_base_topology_gate_spec_20260731.json"
+)
+TOPOLOGY_QUALITY_GATE_SPEC = (
+    REPOSITORY
+    / "configs"
+    / "show_base"
+    / "semtalk_base_topology_quality_gate_spec_20260731.json"
+)
+OFFICIAL_TRAINER = REPOSITORY / "semtalk_base_trainer.py"
 SPEC = importlib.util.spec_from_file_location(
     "train_base_official_adapt_long", SCRIPT
 )
 assert SPEC is not None and SPEC.loader is not None
 ADAPT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ADAPT)
+SELECTOR_SCRIPT = (
+    REPOSITORY
+    / "scripts"
+    / "show_base"
+    / "select_base_training_topology.py"
+)
+SELECTOR_SPEC = importlib.util.spec_from_file_location(
+    "select_base_training_topology", SELECTOR_SCRIPT
+)
+assert SELECTOR_SPEC is not None and SELECTOR_SPEC.loader is not None
+SELECTOR = importlib.util.module_from_spec(SELECTOR_SPEC)
+SELECTOR_SPEC.loader.exec_module(SELECTOR)
 
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _activate(mode: str = "validation_gated_w8_l64_g512_empirical_acceleration") -> None:
+    ADAPT._activate_topology(argparse.Namespace(topology_mode=mode))
 
 
 def _probe(seed: str = "a") -> dict[str, object]:
@@ -75,11 +104,157 @@ def _probe(seed: str = "a") -> dict[str, object]:
     )
 
 
+def _gate_report(
+    *,
+    frozen_sha256: str,
+    topology_receipt_sha256: str,
+    trajectory_mode: str,
+    trajectory_probe: object,
+) -> dict[str, object]:
+    mode = ADAPT.W8_GLOBAL512_MODE
+    _activate(mode)
+    spec = ADAPT.TOPOLOGY_SPECS[mode]
+    world = int(spec["world_size"])
+    before = [{"name": "hubert", "running_mean_sha256": "1" * 64}]
+    report: dict[str, object] = {
+        "format": ADAPT.GATE_FORMAT,
+        "status": "pass",
+        "topology_mode": mode,
+        "topology_classification": spec["classification"],
+        "topology_gate_spec_sha256": _sha(TOPOLOGY_GATE_SPEC),
+        "topology_independent_input_sha256": "9" * 64,
+        "frozen_receipt_sha256": frozen_sha256,
+        "topology_receipt_sha256": topology_receipt_sha256,
+        "node_count": spec["node_count"],
+        "local_world_size": spec["local_world_size"],
+        "world_size": world,
+        "local_batch_size": spec["local_batch_size"],
+        "global_batch_size": spec["global_batch_size"],
+        "updates_per_epoch": spec["updates_per_epoch"],
+        "unique_samples_per_epoch": spec["unique_samples_per_epoch"],
+        "warmup_updates": ADAPT.THROUGHPUT_WARMUP_UPDATES,
+        "timed_updates": ADAPT.THROUGHPUT_TIMED_UPDATES,
+        "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+        "trajectory_mode": trajectory_mode,
+        "trajectory_probe": trajectory_probe,
+        "precision": "bf16",
+        "learning_rate": spec["learning_rate"],
+        "all_losses_finite": True,
+        "all_gradients_finite": True,
+        "oom": False,
+        "samples_per_second": 1024.0,
+        "seconds_per_update": 0.5,
+        "median_seconds": 0.5,
+        "p90_seconds": 0.6,
+        "p99_seconds": 0.7,
+        "estimated_training_seconds": 1000.0,
+        "last_metrics": {"total": 1.0},
+        "peak_cuda_memory_bytes_all_ranks": [1024] * world,
+        "data_wait_seconds": {"median": 0.01, "p99": 0.02},
+        "collective_seconds": {
+            "probe": "ten_scalar_nccl_all_reduce_calls",
+            "median": 0.001,
+            "p99": 0.002,
+        },
+        "batchnorm_inventory": [
+            {"rank": rank, "before": before, "after": before}
+            for rank in range(world)
+        ],
+        "rng_inventory": [
+            {"rank": rank, "torch_cuda_rng_state_sha256": f"{rank:064x}"}
+            for rank in range(world)
+        ],
+        "sample_inventory": {
+            "sampler_drop_last": True,
+            "padding_duplicates": 0,
+            "probe_samples": ADAPT.TRAJECTORY_PROBE_UPDATES
+            * int(spec["global_batch_size"]),
+            "probe_unique_samples": ADAPT.TRAJECTORY_PROBE_UPDATES
+            * int(spec["global_batch_size"]),
+            "full_epoch_samples": spec["unique_samples_per_epoch"],
+            "full_epoch_unique_samples": spec["unique_samples_per_epoch"],
+            "dataset_samples": ADAPT.EXPECTED_TRAIN_SAMPLES,
+            "dropped_tail_samples": ADAPT.EXPECTED_TRAIN_SAMPLES
+            - int(spec["unique_samples_per_epoch"]),
+            "full_epoch_sorted_indices_sha256": "8" * 64,
+        },
+    }
+    report["receipt_sha256"] = ADAPT.canonical_json_sha256(report)
+    return report
+
+
+def _base_cli() -> list[str]:
+    return [
+        "--mode", "throughput_gate",
+        "--official-base-checkpoint", "/weights/all/best_semtalk_base.bin",
+        "--train-lmdb", "/cache/current-selected/base.lmdb",
+        "--dataset-summary", "/cache/current-selected/summary.json",
+        "--expected-dataset-summary-sha256", "a" * 64,
+        "--lineage-manifest", "/cache/current-selected/lineage.json",
+        "--expected-lineage-sha256", "b" * 64,
+        "--prerequisite-selection-json", "/selection/current-five.json",
+        "--expected-prerequisite-selection-sha256", "c" * 64,
+        "--schedule-json", str(FRESH_SCHEDULE),
+        "--expected-schedule-sha256", _sha(FRESH_SCHEDULE),
+        "--topology-gate-spec", str(TOPOLOGY_GATE_SPEC),
+        "--expected-topology-gate-spec-sha256", _sha(TOPOLOGY_GATE_SPEC),
+        "--trajectory-mode", ADAPT.FRESH_TRAJECTORY_MODE,
+        "--output-root", "/runs/base",
+        "--run-name", "selected_all_show",
+        "--formal-node-rank", "0",
+        "--formal-master-addr", "master.example",
+        "--formal-master-port", "29601",
+        "--formal-run-id", "formal-run-001",
+        "--topology-mode", ADAPT.W8_GLOBAL512_MODE,
+        "--local-batch-size", "64",
+        "--learning-rate", "0.00003",
+    ]
+
+
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
-    def test_launcher_binds_hash_seed_before_eight_rank_startup(self) -> None:
+    def test_formal_val_control_is_talkshow_only_and_topology_exact(self) -> None:
+        from scripts.show_base import base_long_val_contract as base_long
+        from scripts.show_base import talkshow_base_val_contract as talkshow
+
+        self.assertEqual(base_long.TOPOLOGY_SPECS, ADAPT.TOPOLOGY_SPECS)
+        self.assertIs(talkshow.validate_pipeline, talkshow.validate_fresh_pipeline)
+        self.assertEqual(
+            talkshow.VAL_INFERENCE_LINEAGE_FORMAT,
+            "semtalk_show_base_talkshow_val_inference_lineage_v2",
+        )
+        self.assertIn(
+            "talkshow_window_manifest_sha256",
+            talkshow.public_val_coverage(
+                {
+                    "split": "val",
+                    "clip_count": 1_715,
+                    "frame_count": 1,
+                    "window_count": 1,
+                    "uncovered_tail_frames": 0,
+                    "clip_ids_sha256": "a" * 64,
+                    "talkshow_window_manifest_sha256": "b" * 64,
+                }
+            ),
+        )
+        for relative in (
+            "scripts/show_base/talkshow_base_val_contract.py",
+            "scripts/show_base/base_long_val_contract.py",
+            "scripts/show_base/base_final_authority.py",
+            "scripts/show_base/run_base_val_inference.py",
+            "scripts/show_base/published_test_winner_claim.py",
+            "scripts/show_base/evaluate_talkshow_show_metrics.py",
+        ):
+            source = (REPOSITORY / relative).read_text(encoding="utf-8")
+            self.assertNotIn("select_base_official_adapt", source, relative)
+            self.assertNotIn("diffsheg", source.casefold(), relative)
+
+    def test_launcher_binds_hash_seed_and_all_gate_topologies(self) -> None:
         source = LAUNCHER.read_text(encoding="utf-8")
         self.assertIn("export PYTHONHASHSEED=43", source)
-        self.assertIn("--nproc_per_node=8", source)
+        self.assertIn('nproc_per_node=1', source)
+        self.assertIn('nproc_per_node=8', source)
+        for mode in ADAPT.TOPOLOGY_SPECS:
+            self.assertIn(mode, source)
         self.assertIn('"$script_dir/train_base_official_adapt_long.py"', source)
 
     def test_scratch_entrypoint_is_untouched_by_the_new_entrypoint(self) -> None:
@@ -92,7 +267,99 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         self.assertNotIn("from models.rvq", source)
         self.assertNotIn("import models.rvq", source)
 
-    def test_objective_contains_exactly_one_model_forward(self) -> None:
+    def test_base_objective_cannot_import_or_call_semgate_or_sparse(self) -> None:
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT))
+        objective = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "audio_conditioned_objective"
+        )
+        identifiers = {
+            node.id.lower()
+            for node in ast.walk(objective)
+            if isinstance(node, ast.Name)
+        }
+        self.assertFalse(any("semgate" in name for name in identifiers))
+        self.assertFalse(any("sparse" in name for name in identifiers))
+        self.assertEqual(len(ADAPT.LOSS_COMPONENTS), 26)
+
+    def test_masked_self_preserves_published_retained_i_bug(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "source_level = RVQ_LEVELS - 1 if masked_self_published_ce",
+            source,
+        )
+        self.assertIn(
+            "divisor = float(RVQ_LEVELS if masked_self_published_ce",
+            source,
+        )
+        self.assertIn(
+            "repeat_rvq_level_5_six_times_divided_by_6_v1",
+            source,
+        )
+
+    def test_official_cpu_mask_rng_and_nll_operator_path_are_preserved(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'torch_module.rand(tuple(batch["latent_all"].shape), device="cpu")',
+            source,
+        )
+        self.assertNotIn('torch_module.rand_like(batch["latent_all"])', source)
+        self.assertIn("torch_module.nn.functional.log_softmax(", source)
+        self.assertIn("dim=2,", source)
+        self.assertIn("torch_module.nn.functional.nll_loss(", source)
+        self.assertNotIn("torch_module.nn.functional.cross_entropy(", source)
+
+    def test_class_axis_matches_official_logsoftmax_nll_source(self) -> None:
+        official_source = OFFICIAL_TRAINER.read_text(encoding="utf-8")
+        official_tree = ast.parse(official_source, str(OFFICIAL_TRAINER))
+        logsoftmax_initializers = [
+            node
+            for node in ast.walk(official_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "LogSoftmax"
+        ]
+        self.assertEqual(len(logsoftmax_initializers), 1)
+        self.assertEqual(
+            [
+                keyword.value.value
+                for keyword in logsoftmax_initializers[0].keywords
+                if keyword.arg == "dim"
+                and isinstance(keyword.value, ast.Constant)
+            ],
+            [2],
+        )
+        self.assertIn("self.log_softmax(net_out_val[\"cls_face\"][:,:,:,i])", official_source)
+        self.assertIn("self.cls_loss(rec_index_face_val", official_source)
+
+        adapted = ast.parse(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT))
+        family = next(
+            node
+            for node in adapted.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_official_forward_loss_family"
+        )
+        logsoftmax_calls = [
+            node
+            for node in ast.walk(family)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "log_softmax"
+        ]
+        self.assertEqual(len(logsoftmax_calls), 1)
+        self.assertEqual(
+            [
+                keyword.value.value
+                for keyword in logsoftmax_calls[0].keywords
+                if keyword.arg == "dim"
+                and isinstance(keyword.value, ast.Constant)
+            ],
+            [2],
+        )
+
+    def test_objective_contains_exactly_three_official_model_forwards(self) -> None:
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT))
         objective = next(
             node
@@ -107,12 +374,44 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "model"
         ]
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [
+                next(
+                    (
+                        keyword.value.value
+                        for keyword in call.keywords
+                        if keyword.arg == "use_word"
+                        and isinstance(keyword.value, ast.Constant)
+                    ),
+                    None,
+                )
+                for call in calls
+            ],
+            [True, False, True],
+        )
 
-    def test_fixed_parallelism_candidates_and_gate_lengths(self) -> None:
-        self.assertEqual(ADAPT.WORLD_SIZE, 8)
-        self.assertEqual(ADAPT.LOCAL_BATCH_SIZE, 64)
-        self.assertEqual(ADAPT.GLOBAL_BATCH_SIZE, 512)
+    def test_five_mode_parallelism_candidates_and_gate_lengths(self) -> None:
+        self.assertEqual(len(ADAPT.TOPOLOGY_SPECS), 5)
+        self.assertEqual(
+            {
+                (
+                    value["world_size"],
+                    value["local_batch_size"],
+                    value["global_batch_size"],
+                    value["updates_per_epoch"],
+                    value["learning_rate"],
+                )
+                for value in ADAPT.TOPOLOGY_SPECS.values()
+            },
+            {
+                (1, 64, 64, 1988, 5e-5),
+                (8, 8, 64, 1988, 5e-5),
+                (16, 4, 64, 1988, 5e-5),
+                (8, 64, 512, 248, 3e-5),
+                (16, 32, 512, 248, 3e-5),
+            },
+        )
         self.assertEqual(
             ADAPT.CANDIDATE_EPOCHS,
             (
@@ -127,7 +426,6 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertEqual(ADAPT.THROUGHPUT_WARMUP_UPDATES, 20)
         self.assertEqual(ADAPT.THROUGHPUT_TIMED_UPDATES, 50)
-        self.assertEqual(ADAPT.EXPECTED_UPDATES_PER_EPOCH, 248)
         self.assertEqual(
             ADAPT.CHECKPOINT_FORMAT,
             "semtalk_show_base_official_adapt_checkpoint_v1",
@@ -178,12 +476,16 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertEqual(
             _sha(FRESH_SCHEDULE),
-            "87ffea4de0b28cbd9b41eb0e935b74d93355e1c1b9a21fb570c98c5ba7cfbbd8",
+            "f82c54000df22d6a329e9e7c0dce39e0aba5b53b8d62fe8c4adfc3b6cc06eacf",
+        )
+        self.assertEqual(
+            _sha(TOPOLOGY_GATE_SPEC),
+            "e45e561f10ddb6a8d1d7ee3c2986e34cfecf4aa0cfb0e715db171a658edb0a43",
         )
 
-    def test_protocol_is_main_forward_only_and_vq_free(self) -> None:
+    def test_protocol_is_three_forward_and_vq_free(self) -> None:
         args = argparse.Namespace(
-            learning_rate=3e-5,
+            learning_rate=5e-5,
             precision="bf16",
             schedule_json="/frozen/schedule.json",
             expected_schedule_sha256="a" * 64,
@@ -192,6 +494,10 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
             loader_workers=4,
             seed=43,
+            topology_mode=ADAPT.W16_GLOBAL64_MODE,
+            formal_master_addr="master.example",
+            formal_master_port=29601,
+            formal_run_id="formal-run-001",
         )
         protocol = ADAPT.protocol_receipt(
             args,
@@ -202,18 +508,28 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                     "sha256": "b" * 64,
                 }
             },
+            topology_gate_spec={
+                "path": str(TOPOLOGY_GATE_SPEC),
+                "sha256": _sha(TOPOLOGY_GATE_SPEC),
+            },
         )
         self.assertEqual(
-            protocol["forward_contract"]["forwards_per_optimizer_step"], 1
+            protocol["forward_contract"]["forwards_per_optimizer_step"], 3
         )
         self.assertTrue(
             protocol["forward_contract"]["audio_conditioned_main_forward"]
         )
-        self.assertFalse(
+        self.assertTrue(
             protocol["forward_contract"]["masked_self_forward"]
         )
-        self.assertFalse(
+        self.assertTrue(
             protocol["forward_contract"]["word_auxiliary_forward"]
+        )
+        self.assertEqual(
+            protocol["forward_contract"][
+                "masked_self_ce_published_source_semantics"
+            ],
+            "repeat_rvq_level_5_six_times_divided_by_6_v1",
         )
         self.assertFalse(protocol["vq_models_in_training_graph"])
         self.assertEqual(
@@ -426,38 +742,15 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
 
     def test_argument_contract_rejects_wrong_batch_or_epochs(self) -> None:
         parser = ADAPT.build_parser()
-        base = [
-            "--mode",
-            "throughput_gate",
-            "--official-base-checkpoint",
-            "/weights/all/best_semtalk_base.bin",
-            "--train-lmdb",
-            "/cache/base.lmdb",
-            "--dataset-summary",
-            "/cache/summary.json",
-            "--expected-dataset-summary-sha256",
-            "a" * 64,
-            "--lineage-manifest",
-            "/cache/lineage.json",
-            "--expected-lineage-sha256",
-            "b" * 64,
-            "--schedule-json",
-            "/frozen/schedule.json",
-            "--expected-schedule-sha256",
-            "c" * 64,
-            "--trajectory-mode",
-            ADAPT.LEGACY_TRAJECTORY_MODE,
-            "--trajectory-anchor-json",
-            "/frozen/anchor.json",
-            "--expected-trajectory-anchor-sha256",
-            "d" * 64,
-            "--output-root",
-            "/runs/base",
-            "--run-name",
-            "official_all_show",
-        ]
-        args = parser.parse_args(base)
-        ADAPT.validate_args(args)
+        args = parser.parse_args(_base_cli())
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+            ),
+        ):
+            ADAPT.validate_args(args)
         args.local_batch_size = 32
         with self.assertRaises(ADAPT.AdaptationContractError):
             ADAPT.validate_args(args)
@@ -468,31 +761,241 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
 
     def test_fresh_selected_vq_args_forbid_external_anchor(self) -> None:
         parser = ADAPT.build_parser()
-        base = [
-            "--mode", "throughput_gate",
-            "--official-base-checkpoint", "/weights/all/best_semtalk_base.bin",
-            "--train-lmdb", "/cache/current-selected/base.lmdb",
-            "--dataset-summary", "/cache/current-selected/summary.json",
-            "--expected-dataset-summary-sha256", "a" * 64,
-            "--lineage-manifest", "/cache/current-selected/lineage.json",
-            "--expected-lineage-sha256", "b" * 64,
-            "--prerequisite-selection-json", "/selection/current-five.json",
-            "--expected-prerequisite-selection-sha256", "c" * 64,
-            "--schedule-json", str(FRESH_SCHEDULE),
-            "--expected-schedule-sha256", _sha(FRESH_SCHEDULE),
-            "--trajectory-mode", ADAPT.FRESH_TRAJECTORY_MODE,
-            "--output-root", "/runs/base",
-            "--run-name", "selected_all_show",
-        ]
-        args = parser.parse_args(base)
-        ADAPT.validate_args(args)
+        args = parser.parse_args(_base_cli())
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+            ),
+        ):
+            ADAPT.validate_args(args)
         args.trajectory_anchor_json = "/frozen/old-anchor.json"
         args.expected_trajectory_anchor_sha256 = "d" * 64
         with self.assertRaisesRegex(
             ADAPT.AdaptationContractError,
-            "forbids an external old trajectory anchor",
+            "requires the hash-pinned five-stage SHOW selection",
         ):
             ADAPT.validate_args(args)
+
+
+class OfficialBaseTopologyGateContracts(unittest.TestCase):
+    def test_gate_spec_is_immutable_and_w1_is_fp32_only(self) -> None:
+        receipt = ADAPT.validate_topology_gate_spec(
+            argparse.Namespace(
+                topology_gate_spec=TOPOLOGY_GATE_SPEC,
+                expected_topology_gate_spec_sha256=_sha(
+                    TOPOLOGY_GATE_SPEC
+                ),
+                topology_mode=ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            )
+        )
+        self.assertEqual(receipt["selected_probe_mode"], ADAPT.OFFICIAL_W1_REFERENCE_MODE)
+        self.assertEqual(
+            ADAPT.TOPOLOGY_SPECS[ADAPT.OFFICIAL_W1_REFERENCE_MODE][
+                "precision"
+            ],
+            "fp32",
+        )
+        self.assertTrue(
+            all(
+                spec["precision"] == "bf16"
+                for mode, spec in ADAPT.TOPOLOGY_SPECS.items()
+                if mode != ADAPT.OFFICIAL_W1_REFERENCE_MODE
+            )
+        )
+
+    def test_selection_prefers_fastest_g64_under_24h(self) -> None:
+        probes = []
+        for index, (mode, spec) in enumerate(ADAPT.TOPOLOGY_SPECS.items()):
+            probes.append(
+                {
+                    "mode": mode,
+                    "status": "pass",
+                    "report_path": f"/gate/{mode}.json",
+                    "report_sha256": str(index + 1) * 64,
+                    "classification": spec["classification"],
+                    "precision": spec["precision"],
+                    "formal_training_eligible": spec[
+                        "formal_training_eligible"
+                    ],
+                    "topology_independent_input_sha256": "a" * 64,
+                    "median_seconds": 1.0 + index,
+                    "p90_seconds": 1.1 + index,
+                    "p99_seconds": 1.2 + index,
+                    "estimated_training_seconds": {
+                        ADAPT.OFFICIAL_W1_REFERENCE_MODE: 100.0,
+                        ADAPT.W8_GLOBAL64_MODE: 80.0,
+                        ADAPT.W16_GLOBAL64_MODE: 60.0,
+                        ADAPT.W8_GLOBAL512_MODE: 30.0,
+                        ADAPT.W16_GLOBAL512_MODE: 20.0,
+                    }[mode],
+                    "samples_per_second": 1000.0,
+                }
+            )
+        quality = []
+        for index, mode in enumerate(ADAPT.TOPOLOGY_SPECS):
+            fgd = {
+                str(epoch): 0.5 for epoch in SELECTOR.QUALITY_EPOCHS
+            }
+            # The faster W16/g64 candidate is ineligible because one raw
+            # replay epoch breaches the preregistered quality margin.
+            if mode == ADAPT.W16_GLOBAL64_MODE:
+                fgd["4"] = 0.7
+            quality.append({
+                "mode": mode,
+                "report_path": f"/quality/{mode}.json",
+                "report_sha256": str(index + 5) * 64,
+                "topology_independent_input_sha256": "a" * 64,
+                "short_trajectory_receipt": {},
+                "canonical_manifest": {
+                    "path": "/val/canonical.jsonl",
+                    "sha256": "c" * 64,
+                    "bytes": 10,
+                },
+                "real_feature_cache": {
+                    "path": "/val/cache.json",
+                    "sha256": "d" * 64,
+                    "bytes": 10,
+                    "receipt_payload_sha256": "e" * 64,
+                },
+                "candidate_fgd": fgd,
+                "candidates": [],
+            })
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(
+            selection["selected"]["mode"],
+            ADAPT.W8_GLOBAL64_MODE,
+        )
+        self.assertEqual(
+            selection["selection_decision_branch"],
+            "fastest_safe_g64_under_24h",
+        )
+        self.assertFalse(
+            selection["w1_trajectory_equivalence_claimed_for_selected"]
+        )
+
+    def test_quality_margin_formula_is_max_not_sum(self) -> None:
+        # At low FGD the absolute margin dominates; at high FGD the relative
+        # margin dominates.  The two margins are never added together.
+        self.assertEqual(SELECTOR.maximum_allowed_fgd(0.1), 0.11)
+        self.assertEqual(SELECTOR.maximum_allowed_fgd(1.0), 1.02)
+        self.assertNotEqual(SELECTOR.maximum_allowed_fgd(1.0), 1.03)
+
+    def test_acceleration_requires_all_raw_replay_quality_epochs(self) -> None:
+        probes = []
+        quality = []
+        for index, (mode, spec) in enumerate(ADAPT.TOPOLOGY_SPECS.items()):
+            probes.append(
+                {
+                    "mode": mode,
+                    "status": "pass",
+                    "report_path": f"/gate/{mode}.json",
+                    "report_sha256": f"{index + 1:x}" * 64,
+                    "classification": spec["classification"],
+                    "precision": spec["precision"],
+                    "formal_training_eligible": spec[
+                        "formal_training_eligible"
+                    ],
+                    "topology_independent_input_sha256": "a" * 64,
+                    "median_seconds": 1.0 + index,
+                    "p90_seconds": 1.1 + index,
+                    "p99_seconds": 1.2 + index,
+                    "estimated_training_seconds": (
+                        200000.0 if "g64" in mode else 1000.0 + index
+                    ),
+                    "samples_per_second": 1000.0,
+                }
+            )
+            fgd = {str(epoch): 0.5 for epoch in SELECTOR.QUALITY_EPOCHS}
+            if mode == ADAPT.W8_GLOBAL512_MODE:
+                fgd["4"] = 0.7
+            quality.append(
+                {
+                    "mode": mode,
+                    "report_path": f"/quality/{mode}.json",
+                    "report_sha256": f"{index + 6:x}" * 64,
+                    "topology_independent_input_sha256": "a" * 64,
+                    "short_trajectory_receipt": {},
+                    "canonical_manifest": {
+                        "path": "/val/canonical.jsonl",
+                        "sha256": "c" * 64,
+                        "bytes": 10,
+                    },
+                    "real_feature_cache": {
+                        "path": "/val/cache.json",
+                        "sha256": "d" * 64,
+                        "bytes": 10,
+                        "receipt_payload_sha256": "e" * 64,
+                    },
+                    "candidate_fgd": fgd,
+                    "candidates": [],
+                }
+            )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(
+            selection["selected"]["mode"], ADAPT.W16_GLOBAL512_MODE
+        )
+        self.assertFalse(
+            selection["quality_decisions"][ADAPT.W8_GLOBAL512_MODE][
+                "all_trajectory_epochs_pass"
+            ]
+        )
+
+    def test_quality_gate_spec_is_hash_pinned_and_preregistered(self) -> None:
+        receipt = SELECTOR.validate_quality_gate_spec(
+            TOPOLOGY_QUALITY_GATE_SPEC,
+            _sha(TOPOLOGY_QUALITY_GATE_SPEC),
+        )
+        self.assertEqual(
+            receipt["payload"]["trajectory_epochs"], [1, 2, 4, 8]
+        )
+        self.assertTrue(receipt["payload"]["raw_prediction_replay_required"])
+
+    def test_node_local_inode_differences_are_preserved_not_compared(self) -> None:
+        semantic = {
+            "format": "semtalk_show_base_selected_feature_dataset_receipt_v1",
+            "data_mdb_sha256": "a" * 64,
+            "lock_mdb_sha256": "b" * 64,
+            "lineage_sha256": "c" * 64,
+        }
+        nodes = []
+        for node_rank, device in enumerate((243, 1_048_582)):
+            nodes.append(
+                {
+                    "dataset": {
+                        **semantic,
+                        "lmdb_inode_binding": {
+                            "format": "semtalk_show_base_lmdb_inode_binding_v1",
+                            "directory_identity": {
+                                "device": device,
+                                "inode": 100 + node_rank,
+                            },
+                        },
+                    }
+                }
+            )
+        receipt = ADAPT._global_dataset_receipt(nodes)
+        self.assertEqual(
+            [
+                item["binding"]["directory_identity"]["device"]
+                for item in receipt["node_lmdb_inode_bindings"]
+            ],
+            [243, 1_048_582],
+        )
+        nodes[1]["dataset"]["data_mdb_sha256"] = "9" * 64
+        with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT._global_dataset_receipt(nodes)
 
 
 class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
@@ -577,6 +1080,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             learning_rate=3e-5,
             seed=43,
             loader_workers=4,
+            topology_mode=ADAPT.W16_GLOBAL512_MODE,
         )
 
     def test_fresh_trajectory_binds_exact_selected_feature_lineage(self) -> None:
@@ -651,7 +1155,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
         args.expected_trajectory_anchor_sha256 = _sha(anchor)
         with self.assertRaisesRegex(
             ADAPT.AdaptationContractError,
-            "cannot be used with freshly selected SHOW prerequisites",
+            "does not match the frozen e400 contract",
         ):
             ADAPT.validate_long_contract_receipts(
                 args,
@@ -1053,24 +1557,12 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
     def test_throughput_gate_must_bind_exact_frozen_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = {
-                "format": ADAPT.GATE_FORMAT,
-                "status": "pass",
-                "frozen_receipt_sha256": "a" * 64,
-                "world_size": 8,
-                "local_batch_size": 64,
-                "global_batch_size": 512,
-                "warmup_updates": 20,
-                "timed_updates": 50,
-                "precision": "bf16",
-                "learning_rate": 3e-5,
-                "all_losses_finite": True,
-                "samples_per_second": 512.0,
-                "seconds_per_update": 1.0,
-                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
-                "trajectory_mode": ADAPT.LEGACY_TRAJECTORY_MODE,
-                "trajectory_probe": None,
-            }
+            report = _gate_report(
+                frozen_sha256="a" * 64,
+                topology_receipt_sha256="t" * 64,
+                trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
+                trajectory_probe=None,
+            )
             path = root / "gate.json"
             path.write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -1081,11 +1573,16 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 expected_throughput_gate_sha256=_sha(path),
                 precision="bf16",
                 learning_rate=3e-5,
+                topology_mode=ADAPT.W8_GLOBAL512_MODE,
+                expected_topology_gate_spec_sha256=_sha(
+                    TOPOLOGY_GATE_SPEC
+                ),
             )
             receipt = ADAPT.validate_throughput_gate(
                 args,
                 frozen_receipt={
                     "receipt_sha256": "a" * 64,
+                    "topology": {"receipt_sha256": "t" * 64},
                     "long_contract": {
                         "trajectory_anchor": {
                             "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
@@ -1093,12 +1590,13 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                     },
                 },
             )
-            self.assertEqual(receipt["samples_per_second"], 512.0)
+            self.assertEqual(receipt["samples_per_second"], 1024.0)
             with self.assertRaises(ADAPT.AdaptationContractError):
                 ADAPT.validate_throughput_gate(
                     args,
                     frozen_receipt={
                         "receipt_sha256": "b" * 64,
+                        "topology": {"receipt_sha256": "t" * 64},
                         "long_contract": {
                             "trajectory_anchor": {
                                 "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
@@ -1136,25 +1634,14 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
 
     def test_fresh_throughput_gate_carries_lineage_bound_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            _activate(ADAPT.W8_GLOBAL512_MODE)
             probe = _probe()
-            report = {
-                "format": ADAPT.GATE_FORMAT,
-                "status": "pass",
-                "frozen_receipt_sha256": "c" * 64,
-                "world_size": ADAPT.WORLD_SIZE,
-                "local_batch_size": ADAPT.LOCAL_BATCH_SIZE,
-                "global_batch_size": ADAPT.GLOBAL_BATCH_SIZE,
-                "warmup_updates": ADAPT.THROUGHPUT_WARMUP_UPDATES,
-                "timed_updates": ADAPT.THROUGHPUT_TIMED_UPDATES,
-                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
-                "trajectory_mode": ADAPT.FRESH_TRAJECTORY_MODE,
-                "trajectory_probe": probe,
-                "precision": "bf16",
-                "learning_rate": 3e-5,
-                "all_losses_finite": True,
-                "samples_per_second": 1024.0,
-                "seconds_per_update": 0.5,
-            }
+            report = _gate_report(
+                frozen_sha256="c" * 64,
+                topology_receipt_sha256="u" * 64,
+                trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
+                trajectory_probe=probe,
+            )
             path = Path(temporary) / "fresh-gate.json"
             path.write_text(
                 json.dumps(report, sort_keys=True) + "\n",
@@ -1165,11 +1652,16 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 expected_throughput_gate_sha256=_sha(path),
                 precision="bf16",
                 learning_rate=3e-5,
+                topology_mode=ADAPT.W8_GLOBAL512_MODE,
+                expected_topology_gate_spec_sha256=_sha(
+                    TOPOLOGY_GATE_SPEC
+                ),
             )
             receipt = ADAPT.validate_throughput_gate(
                 args,
                 frozen_receipt={
                     "receipt_sha256": "c" * 64,
+                    "topology": {"receipt_sha256": "u" * 64},
                     "long_contract": {
                         "trajectory_anchor": {
                             "mode": ADAPT.FRESH_TRAJECTORY_MODE,
@@ -1181,6 +1673,13 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             report["trajectory_probe"]["ranks"][2][
                 "torch_cuda_rng_state_sha256"
             ] = "9" * 64
+            report["receipt_sha256"] = ADAPT.canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key != "receipt_sha256"
+                }
+            )
             changed_path = Path(temporary) / "changed-gate.json"
             changed_path.write_text(
                 json.dumps(report, sort_keys=True) + "\n",
@@ -1192,6 +1691,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 args,
                 frozen_receipt={
                     "receipt_sha256": "c" * 64,
+                    "topology": {"receipt_sha256": "u" * 64},
                     "long_contract": {
                         "trajectory_anchor": {
                             "mode": ADAPT.FRESH_TRAJECTORY_MODE,
@@ -1260,7 +1760,7 @@ class OfficialBaseAdaptTorchContracts(unittest.TestCase):
         self.assertTrue(torch.equal(state["other.bias"], official["other.bias"]))
         self.assertTrue(receipt["other_state_unchanged"])
 
-    def test_audio_objective_calls_model_once_and_is_finite(self) -> None:
+    def test_audio_objective_calls_model_three_times_and_is_finite(self) -> None:
         import torch
 
         class Fake:
@@ -1291,9 +1791,9 @@ class OfficialBaseAdaptTorchContracts(unittest.TestCase):
             )
         model = Fake()
         loss, metrics = ADAPT.audio_conditioned_objective(
-            model, batch, torch_module=torch
+            model, batch, epoch=0, torch_module=torch
         )
-        self.assertEqual(model.calls, 1)
+        self.assertEqual(model.calls, 3)
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(set(ADAPT.LOSS_COMPONENTS) - set(metrics), set())
 

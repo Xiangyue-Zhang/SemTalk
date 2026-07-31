@@ -643,7 +643,17 @@ class ClaimFixture:
         if name == "evaluate_talkshow_show_metrics":
             return adapter
         if name == "prerequisite_val_contract":
-            return PREREQUISITE_CONTRACT
+            return SimpleNamespace(
+                REQUIRED_CANDIDATE_EPOCHS=(
+                    PREREQUISITE_CONTRACT.REQUIRED_CANDIDATE_EPOCHS
+                ),
+                validate_candidate_epochs=(
+                    PREREQUISITE_CONTRACT.validate_candidate_epochs
+                ),
+                updates_per_epoch=lambda stage: (
+                    CLAIM.PREREQUISITE_UPDATES_PER_EPOCH_BY_STAGE[stage]
+                ),
+            )
         raise AssertionError(f"unexpected local module {name}")
 
     def rewrite_claim(self, mutate) -> None:
@@ -871,11 +881,19 @@ class PublishedWinnerClaimTests(unittest.TestCase):
             Path(fixture.prerequisite_artifact["path"]),
             fixture.prerequisite_payload,
         )
-        prerequisite_artifact, prerequisite, _fixed = (
-            CLAIM._validate_prerequisite_selection(
-                fixture.prerequisite_artifact
+        with mock.patch.object(
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: fixture.source_module(
+                name,
+                fixture.adapter(),
+            ),
+        ):
+            prerequisite_artifact, prerequisite, _fixed = (
+                CLAIM._validate_prerequisite_selection(
+                    fixture.prerequisite_artifact
+                )
             )
-        )
         fixture.continuation_payload = fixture._continuation_payload("stop")
         for stage in fixture.continuation_payload["stages"]:
             stage["recent_candidate_epochs"] = [180, 200, 220]
@@ -943,20 +961,29 @@ class PublishedWinnerClaimTests(unittest.TestCase):
         face = fixture.prerequisite_payload["stages"][0]
         face["epoch"] = 220
         face["optimizer_updates"] = (
-            220 * CLAIM.PREREQUISITE_UPDATES_PER_EPOCH
+            220
+            * CLAIM.PREREQUISITE_UPDATES_PER_EPOCH_BY_STAGE["face"]
         )
         # The forged receipt is rehashed but still claims candidate slot zero.
         fixture.prerequisite_artifact = _write_receipt(
             Path(fixture.prerequisite_artifact["path"]),
             fixture.prerequisite_payload,
         )
-        with self.assertRaisesRegex(
-            CLAIM.PublishedWinnerClaimError,
-            "face selection changed",
+        with mock.patch.object(
+            CLAIM,
+            "_fresh_local_module",
+            side_effect=lambda name: fixture.source_module(
+                name,
+                fixture.adapter(),
+            ),
         ):
-            CLAIM._validate_prerequisite_selection(
-                fixture.prerequisite_artifact
-            )
+            with self.assertRaisesRegex(
+                CLAIM.PublishedWinnerClaimError,
+                "face selection changed",
+            ):
+                CLAIM._validate_prerequisite_selection(
+                    fixture.prerequisite_artifact
+                )
 
     def test_continuation_wave_intermediate_tamper_is_rejected(self) -> None:
         root = Path(self.temporary.name) / "wave-chain"
