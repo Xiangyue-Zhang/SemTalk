@@ -6,7 +6,8 @@ after it has been proven for the exact source, checkpoint bundle, runtime and
 frozen SHOW validation inputs used by a formal run.  This module merges two
 *independent-process* validation runs (seeds 0 and 15), verifies that:
 
-* four frozen clips cover Oliver/Chemistry/Seth/Conan and multiple lengths;
+* the complete 1,715-row frozen SHOW validation authority is replayed in
+  canonical order (a four-clip path exists only for explicit CPU fixtures);
 * every forward leaves Python/NumPy/Torch CPU/Torch CUDA RNG states unchanged;
 * the two runs produce byte-identical NPZ files and array-identical fields;
 * source call-closure, eval/argmax/deterministic flags, Base checkpoint and the
@@ -35,12 +36,15 @@ import numpy as np
 
 sys.dont_write_bytecode = True
 
-FORMAT = "semtalk_show_deterministic_replication_gate_v1"
+FORMAT = "semtalk_show_deterministic_replication_gate_v2"
 SEED_RUN_FORMAT = "semtalk_show_deterministic_seed_run_v1"
-DISTRIBUTION_FORMAT = "semtalk_show_deterministic_distribution_receipt_v1"
+DISTRIBUTION_FORMAT = "semtalk_show_deterministic_distribution_receipt_v2"
 PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_v1"
 PROTOCOL = "deterministic_replication_of_single_prediction_v1"
 REPLICATION_ALGORITHM = "logical_reference_v1"
+VARIATION_POLICY_FORMAT = (
+    "raw_primitive_with_deterministic_delta_integrity_v1"
+)
 EXPECTED_SEEDS = (0, 15)
 EXPECTED_SPEAKERS = ("oliver", "chemistry", "seth", "conan")
 EXPECTED_VAL_CLIPS = 1_715
@@ -61,7 +65,6 @@ LOGICAL_SLOTS = tuple(range(16))
 RELEASED2_SLOTS = (0, 1)
 PAPER16_SLOTS = LOGICAL_SLOTS
 FACE_SLOT = 0
-DIFFSHEG_SLOT = 0
 RNG_FIELDS = ("python", "numpy", "torch_cpu", "torch_cuda")
 FORBIDDEN_RANDOM_SYMBOLS = (
     "bernoulli",
@@ -80,6 +83,34 @@ FORBIDDEN_RANDOM_SYMBOLS = (
 
 class ReplicationGateError(RuntimeError):
     """Raised when deterministic replication cannot be proven."""
+
+
+def variation_policy_receipt() -> dict[str, Any]:
+    """Return the exact Variation reporting/integrity contract.
+
+    Logical replication proves a delta distribution, but finite-precision
+    feature and SMPL-X arithmetic can still yield a tiny non-zero Variation
+    primitive.  Consumers must report that raw primitive unchanged.  A
+    separately reported tolerance may only decide whether the observed
+    primitive is consistent with deterministic-delta roundoff; it must never
+    replace, clamp, or round the public metric value.
+    """
+
+    return {
+        "format": VARIATION_POLICY_FORMAT,
+        "reported_statistic": "raw_metric_primitive_v1",
+        "reported_value_path_template": (
+            "body.<protocol>.metrics.Variation"
+        ),
+        "exact_zero_claim": False,
+        "delta_integrity_check": (
+            "variation_sum_lte_integrity_tolerance_sum_v1"
+        ),
+        "integrity_tolerance_source": (
+            "metric_report_float64_roundoff_bound_v1"
+        ),
+        "public_value_transform": "identity_no_clamp_no_round_v1",
+    }
 
 
 def canonical_json_sha256(value: Any) -> str:
@@ -468,6 +499,8 @@ def _validate_model_bundle(value: Any) -> dict[str, Any]:
 
 def _validate_subset_manifest(
     artifact_value: Any,
+    *,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     artifact, path = _artifact(
         artifact_value,
@@ -490,14 +523,18 @@ def _validate_subset_manifest(
         "gate subset manifest",
     )
     _payload_hash(subset, "gate subset manifest")
+    expected_algorithm = (
+        "first_per_speaker_prefer_distinct_frame_length_v1"
+        if test_only_allow_four_clip_subset
+        else "full_frozen_val_canonical_order_v1"
+    )
     if (
         subset["format"] != SUBSET_FORMAT
         or subset["payload_hash_algorithm"] != PAYLOAD_HASH_ALGORITHM
         or subset["status"] != "frozen"
         or subset["split"] != "val"
         or subset["test_visible"] is not False
-        or subset["selection_algorithm"]
-        != "first_per_speaker_prefer_distinct_frame_length_v1"
+        or subset["selection_algorithm"] != expected_algorithm
     ):
         raise ReplicationGateError(
             "gate subset is not the frozen validation-only protocol"
@@ -619,12 +656,16 @@ def _validate_subset_manifest(
                 "row or leaves the exact validation global-index domain"
             )
     payload_rows = subset["rows"]
-    if (
-        not isinstance(payload_rows, list)
-        or len(payload_rows) != len(EXPECTED_SPEAKERS)
-    ):
+    expected_rows = (
+        len(EXPECTED_SPEAKERS)
+        if test_only_allow_four_clip_subset
+        else EXPECTED_VAL_CLIPS
+    )
+    if not isinstance(payload_rows, list) or len(payload_rows) != expected_rows:
         raise ReplicationGateError(
-            "gate subset must contain exactly four validation clips"
+            "formal gate authority must contain all 1715 frozen validation "
+            "clips; four clips are accepted only by the explicit CPU-test "
+            "fixture path"
         )
     expected_keys = {
         "gate_position",
@@ -644,13 +685,18 @@ def _validate_subset_manifest(
             expected_keys,
             f"gate subset row {expected_position}",
         )
+        expected_speaker = (
+            EXPECTED_SPEAKERS[expected_position]
+            if test_only_allow_four_clip_subset
+            else str(row.get("source_clip_id", "")).split("/", 1)[0]
+        )
         if (
             _require_int(
                 item["gate_position"],
                 "gate position",
             )
             != expected_position
-            or item["speaker"] != EXPECTED_SPEAKERS[expected_position]
+            or item["speaker"] != expected_speaker
             or _require_int(
                 item["canonical_position"],
                 "canonical position",
@@ -672,6 +718,13 @@ def _validate_subset_manifest(
         )
         _require_sha256(item["audio_row_sha256"], "audio row SHA-256")
         canonical_position = item["canonical_position"]
+        if (
+            not test_only_allow_four_clip_subset
+            and canonical_position != expected_position
+        ):
+            raise ReplicationGateError(
+                "formal gate rows must follow complete canonical val order"
+            )
         if canonical_position >= len(canonical_rows):
             raise ReplicationGateError(
                 "gate subset canonical position is outside parent manifest"
@@ -704,6 +757,8 @@ def _validate_subset_manifest(
 def _validate_seed_run(
     path: Path,
     expected_sha256: str,
+    *,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = _regular_file(path, "seed-run receipt")
     expected = _require_sha256(expected_sha256, "seed-run receipt SHA-256")
@@ -722,6 +777,7 @@ def _validate_seed_run(
             "split",
             "test_visible",
             "seed",
+            "coverage_mode",
             "run_nonce",
             "process_identity",
             "independent_process",
@@ -742,6 +798,12 @@ def _validate_seed_run(
         or run["split"] != "val"
         or run["test_visible"] is not False
         or run["seed"] not in EXPECTED_SEEDS
+        or run["coverage_mode"]
+        != (
+            "test_only_four_clip_subset"
+            if test_only_allow_four_clip_subset
+            else "full_frozen_val_1715"
+        )
         or run["independent_process"] is not True
         or not isinstance(run["run_nonce"], str)
         or len(run["run_nonce"]) < 16
@@ -752,7 +814,10 @@ def _validate_seed_run(
             "seed-run is not an independent frozen validation run"
         )
     subset_artifact, subset = _validate_subset_manifest(
-        run["subset_manifest"]
+        run["subset_manifest"],
+        test_only_allow_four_clip_subset=(
+            test_only_allow_four_clip_subset
+        ),
     )
     source = _validate_source_closure(run["source_closure"])
     model_bundle = _validate_model_bundle(run["model_bundle"])
@@ -766,10 +831,11 @@ def _validate_seed_run(
             "models_eval",
             "requires_grad_false",
             "discrete_decoding",
-            "device",
+            "devices",
         },
         "seed-run runtime",
     )
+    devices = runtime["devices"]
     if (
         runtime["torch_inference_mode"] is not True
         or runtime["deterministic_algorithms"] is not True
@@ -778,8 +844,14 @@ def _validate_seed_run(
         or runtime["models_eval"] is not True
         or runtime["requires_grad_false"] is not True
         or runtime["discrete_decoding"] != "logits.argmax(dim=2)"
-        or not isinstance(runtime["device"], str)
-        or not runtime["device"].startswith("cuda")
+        or not isinstance(devices, list)
+        or not devices
+        or devices != sorted(set(devices))
+        or any(
+            not isinstance(device, str)
+            or not device.startswith("cuda")
+            for device in devices
+        )
     ):
         raise ReplicationGateError(
             "seed-run runtime is not deterministic eval/argmax inference"
@@ -788,6 +860,7 @@ def _validate_seed_run(
     if not isinstance(clips, list) or len(clips) != len(subset):
         raise ReplicationGateError("seed-run clip coverage mismatch")
     normalized_clips: list[dict[str, Any]] = []
+    prediction_paths: set[Path] = set()
     for expected_row, value in zip(subset, clips):
         clip = _exact_mapping(
             value,
@@ -824,6 +897,11 @@ def _validate_seed_run(
             clip["prediction"],
             "gate prediction",
         )
+        if prediction_path in prediction_paths:
+            raise ReplicationGateError(
+                "seed-run predictions must be distinct physical files"
+            )
+        prediction_paths.add(prediction_path)
         field_receipts = prediction.get("field_sha256")
         # ``_artifact`` intentionally validates only the file envelope.  The
         # field receipt is carried beside it in seed-run schema below.
@@ -904,6 +982,7 @@ def build_gate(
     seed_run_paths: Sequence[Path],
     expected_seed_run_sha256: Sequence[str],
     scope: str,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> dict[str, Any]:
     if scope not in {"validation_candidate_family", "final_winner"}:
         raise ReplicationGateError("unsupported replication-gate scope")
@@ -912,7 +991,13 @@ def build_gate(
             "exactly two independently rooted seed runs are required"
         )
     loaded = [
-        _validate_seed_run(path, digest)
+        _validate_seed_run(
+            path,
+            digest,
+            test_only_allow_four_clip_subset=(
+                test_only_allow_four_clip_subset
+            ),
+        )
         for path, digest in zip(
             seed_run_paths,
             expected_seed_run_sha256,
@@ -940,6 +1025,18 @@ def build_gate(
             raise ReplicationGateError(
                 f"seed runs differ in frozen {field}"
             )
+    first_prediction_paths = {
+        Path(clip["prediction"]["path"]).resolve(strict=True)
+        for clip in runs[0]["clips"]
+    }
+    second_prediction_paths = {
+        Path(clip["prediction"]["path"]).resolve(strict=True)
+        for clip in runs[1]["clips"]
+    }
+    if first_prediction_paths & second_prediction_paths:
+        raise ReplicationGateError(
+            "seed 0 and seed 15 must write disjoint prediction artifacts"
+        )
     compared_clips: list[dict[str, Any]] = []
     for first, second in zip(runs[0]["clips"], runs[1]["clips"]):
         comparable_keys = {
@@ -1010,6 +1107,11 @@ def build_gate(
         "split": "val",
         "test_visible": False,
         "scope": scope,
+        "coverage_mode": (
+            "test_only_four_clip_subset"
+            if test_only_allow_four_clip_subset
+            else "full_frozen_val_1715"
+        ),
         "gate_protocol": PROTOCOL,
         "seeds": list(EXPECTED_SEEDS),
         "seed_runs": artifacts,
@@ -1017,13 +1119,14 @@ def build_gate(
         "source_closure": runs[0]["source_closure"],
         "model_bundle": runs[0]["model_bundle"],
         "proof": {
+            "clip_count": len(subset),
             "independent_processes": True,
             "static_no_random_ops": True,
             "runtime_no_rng_consumption": True,
             "byte_exact": True,
             "array_exact": True,
-            "speakers": [row["speaker"] for row in subset],
-            "frame_lengths": [row["frames"] for row in subset],
+            "speakers": sorted({row["speaker"] for row in subset}),
+            "frame_lengths": sorted({row["frames"] for row in subset}),
             "multi_length": True,
             "clips": compared_clips,
         },
@@ -1038,8 +1141,16 @@ def build_gate(
             "released2_slots": list(RELEASED2_SLOTS),
             "paper16_slots": list(PAPER16_SLOTS),
             "face_slot": FACE_SLOT,
-            "diffsheg_slot": DIFFSHEG_SLOT,
-            "variation_exact_zero": True,
+            "variation_policy": variation_policy_receipt(),
+            "metric_input_materialization": {
+                "generator_inferences_per_clip": 1,
+                "feature_extractor_batches": [2, 16],
+                "smplx_body_batch": 16,
+                "face_smplx_batch": 2,
+                "materialization_operation": (
+                    "repeat_prediction_before_metric_model_v1"
+                ),
+            },
             "failure_fallback": "sixteen_independent_physical_inferences",
         },
     }
@@ -1052,6 +1163,7 @@ def load_gate(
     expected_sha256: str,
     *,
     expected_scope: str | None = None,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved = _regular_file(path, "replication gate")
     expected = _require_sha256(expected_sha256, "replication gate SHA-256")
@@ -1068,6 +1180,7 @@ def load_gate(
             "split",
             "test_visible",
             "scope",
+            "coverage_mode",
             "gate_protocol",
             "seeds",
             "seed_runs",
@@ -1089,6 +1202,12 @@ def load_gate(
         or gate["test_visible"] is not False
         or gate["gate_protocol"] != PROTOCOL
         or gate["seeds"] != list(EXPECTED_SEEDS)
+        or gate["coverage_mode"]
+        != (
+            "test_only_four_clip_subset"
+            if test_only_allow_four_clip_subset
+            else "full_frozen_val_1715"
+        )
         or (
             expected_scope is not None
             and gate["scope"] != expected_scope
@@ -1103,6 +1222,9 @@ def load_gate(
             item["sha256"] for item in gate["seed_runs"]
         ],
         scope=gate["scope"],
+        test_only_allow_four_clip_subset=(
+            test_only_allow_four_clip_subset
+        ),
     )
     if rebuilt != gate:
         raise ReplicationGateError(
@@ -1166,11 +1288,15 @@ def build_distribution_receipt(
     prediction_manifest_artifact: Mapping[str, Any],
     prediction_records: Sequence[Mapping[str, Any]],
     expected_scope: str,
+    test_only_allow_four_clip_subset: bool = False,
 ) -> dict[str, Any]:
     gate_artifact, _gate = load_gate(
         gate_path,
         expected_gate_sha256,
         expected_scope=expected_scope,
+        test_only_allow_four_clip_subset=(
+            test_only_allow_four_clip_subset
+        ),
     )
     manifest_artifact, _manifest_path = _artifact(
         prediction_manifest_artifact,
@@ -1251,13 +1377,21 @@ def build_distribution_receipt_from_validated_artifacts(
         "released2_slots": list(RELEASED2_SLOTS),
         "paper16_slots": list(PAPER16_SLOTS),
         "face_slot": FACE_SLOT,
-        "diffsheg_slot": DIFFSHEG_SLOT,
         "slot_artifact_policy": "same_prediction_sha256",
+        "metric_input_materialization": {
+            "generator_inferences_per_clip": 1,
+            "feature_extractor_batches": [2, 16],
+            "smplx_body_batch": 16,
+            "face_smplx_batch": 2,
+            "materialization_operation": (
+                "repeat_prediction_before_metric_model_v1"
+            ),
+        },
         "prediction_manifest": normalized_manifest,
         "prediction_artifact_manifest_sha256": prediction_digest,
         "logical_slot_bindings": logical_bindings,
         "validation_gate": normalized_gate,
-        "variation_exact_zero": True,
+        "variation_policy": variation_policy_receipt(),
     }
     result["receipt_payload_sha256"] = canonical_json_sha256(result)
     return result
@@ -1285,13 +1419,13 @@ def validate_distribution_receipt(
             "released2_slots",
             "paper16_slots",
             "face_slot",
-            "diffsheg_slot",
             "slot_artifact_policy",
+            "metric_input_materialization",
             "prediction_manifest",
             "prediction_artifact_manifest_sha256",
             "logical_slot_bindings",
             "validation_gate",
-            "variation_exact_zero",
+            "variation_policy",
             "receipt_payload_sha256",
         },
         "distribution receipt",
@@ -1322,15 +1456,23 @@ def validate_distribution_receipt(
         "released2_slots": list(RELEASED2_SLOTS),
         "paper16_slots": list(PAPER16_SLOTS),
         "face_slot": FACE_SLOT,
-        "diffsheg_slot": DIFFSHEG_SLOT,
         "slot_artifact_policy": "same_prediction_sha256",
+        "metric_input_materialization": {
+            "generator_inferences_per_clip": 1,
+            "feature_extractor_batches": [2, 16],
+            "smplx_body_batch": 16,
+            "face_smplx_batch": 2,
+            "materialization_operation": (
+                "repeat_prediction_before_metric_model_v1"
+            ),
+        },
         "prediction_manifest": dict(expected_prediction_manifest),
         "prediction_artifact_manifest_sha256": (
             expected_prediction_digest
         ),
         "logical_slot_bindings": expected_bindings,
         "validation_gate": dict(expected_gate_artifact),
-        "variation_exact_zero": True,
+        "variation_policy": variation_policy_receipt(),
     }
     unsigned = dict(receipt)
     unsigned.pop("receipt_payload_sha256")

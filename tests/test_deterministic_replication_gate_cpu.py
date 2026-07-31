@@ -347,6 +347,7 @@ class GateFixture:
                 "split": "val",
                 "test_visible": False,
                 "seed": seed,
+                "coverage_mode": "test_only_four_clip_subset",
                 "run_nonce": f"independent-seed-{seed}-0123456789abcdef",
                 "process_identity": f"host-a:pid-{1000 + seed}",
                 "independent_process": True,
@@ -361,7 +362,7 @@ class GateFixture:
                     "models_eval": True,
                     "requires_grad_false": True,
                     "discrete_decoding": "logits.argmax(dim=2)",
-                    "device": "cuda:0",
+                    "devices": ["cuda:0"],
                 },
                 "clips": clips,
             }
@@ -396,6 +397,7 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             seed_run_paths=self.fixture.seed_paths,
             expected_seed_run_sha256=self.fixture.seed_shas,
             scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
         )
 
     def test_gate_passes_and_fresh_replay_matches(self) -> None:
@@ -411,12 +413,17 @@ class DeterministicReplicationGateTests(unittest.TestCase):
         )
         self.assertFalse(authorization["seed_consumed"])
         self.assertEqual(authorization["logical_slots"], list(range(16)))
+        self.assertEqual(authorization["released2_slots"], [0, 1])
+        self.assertEqual(authorization["paper16_slots"], list(range(16)))
+        self.assertEqual(authorization["face_slot"], 0)
+        self.assertNotIn("diff" + "sheg_slot", authorization)
         path = self.root / "gate.json"
         digest = _write_json(path, gate)
         artifact, replayed = GATE.load_gate(
             path,
             digest,
             expected_scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
         )
         self.assertEqual(replayed, gate)
         self.assertEqual(artifact["sha256"], digest)
@@ -444,6 +451,7 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             prediction_manifest_artifact=manifest_artifact,
             prediction_records=records,
             expected_scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
         )
         digest = receipt["prediction_artifact_manifest_sha256"]
         self.assertEqual(
@@ -477,6 +485,100 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             receipt["payload_hash_algorithm"],
             GATE.PAYLOAD_HASH_ALGORITHM,
         )
+        self.assertEqual(receipt["released2_slots"], [0, 1])
+        self.assertEqual(receipt["paper16_slots"], list(range(16)))
+        self.assertEqual(receipt["face_slot"], 0)
+        self.assertNotIn("diff" + "sheg_slot", receipt)
+        self.assertEqual(
+            receipt["metric_input_materialization"],
+            {
+                "generator_inferences_per_clip": 1,
+                "feature_extractor_batches": [2, 16],
+                "smplx_body_batch": 16,
+                "face_smplx_batch": 2,
+                "materialization_operation": (
+                    "repeat_prediction_before_metric_model_v1"
+                ),
+            },
+        )
+        self.assertNotIn("variation_exact_zero", receipt)
+        self.assertEqual(
+            receipt["variation_policy"],
+            GATE.variation_policy_receipt(),
+        )
+        self.assertFalse(
+            receipt["variation_policy"]["exact_zero_claim"]
+        )
+        self.assertEqual(
+            receipt["variation_policy"]["public_value_transform"],
+            "identity_no_clamp_no_round_v1",
+        )
+
+    def test_variation_policy_reports_raw_primitive_only(self) -> None:
+        policy = GATE.variation_policy_receipt()
+        self.assertEqual(
+            set(policy),
+            {
+                "format",
+                "reported_statistic",
+                "reported_value_path_template",
+                "exact_zero_claim",
+                "delta_integrity_check",
+                "integrity_tolerance_source",
+                "public_value_transform",
+            },
+        )
+        self.assertEqual(
+            policy["reported_statistic"],
+            "raw_metric_primitive_v1",
+        )
+        self.assertEqual(
+            policy["delta_integrity_check"],
+            "variation_sum_lte_integrity_tolerance_sum_v1",
+        )
+        self.assertFalse(policy["exact_zero_claim"])
+
+    def test_legacy_distribution_slot_field_is_rejected(self) -> None:
+        gate = self.build()
+        gate_path = self.root / "gate.json"
+        gate_sha = _write_json(gate_path, gate)
+        manifest_path = self.root / "predictions.jsonl"
+        manifest_path.write_bytes(b'{"clip":"a"}\n')
+        manifest_artifact = _artifact(manifest_path)
+        records = [
+            {
+                "canonical_clip_id": "clip-0",
+                "prediction_sha256": hashlib.sha256(b"prediction").hexdigest(),
+                "prediction_bytes": 100,
+            }
+        ]
+        receipt = GATE.build_distribution_receipt(
+            gate_path=gate_path,
+            expected_gate_sha256=gate_sha,
+            prediction_manifest_artifact=manifest_artifact,
+            prediction_records=records,
+            expected_scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
+        )
+        legacy_key = "diff" + "sheg_slot"
+        receipt[legacy_key] = 0
+        receipt["receipt_payload_sha256"] = GATE.canonical_json_sha256(
+            {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_payload_sha256"
+            }
+        )
+        with self.assertRaisesRegex(
+            GATE.ReplicationGateError,
+            "schema mismatch",
+        ):
+            GATE.validate_distribution_receipt(
+                receipt,
+                expected_gate_artifact=receipt["validation_gate"],
+                expected_prediction_manifest=manifest_artifact,
+                expected_prediction_records=records,
+            )
 
     def test_rng_consumption_fails_closed(self) -> None:
         def mutate(value: dict[str, object]) -> None:
@@ -667,6 +769,7 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             prediction_manifest_artifact=manifest_artifact,
             prediction_records=records,
             expected_scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
         )
         receipt["logical_slot_bindings"][15][
             "prediction_artifact_manifest_sha256"
@@ -711,6 +814,7 @@ class DeterministicReplicationGateTests(unittest.TestCase):
             prediction_manifest_artifact=manifest_artifact,
             prediction_records=records,
             expected_scope="validation_candidate_family",
+            test_only_allow_four_clip_subset=True,
         )
         bad_hash = copy.deepcopy(receipt)
         bad_hash["receipt_payload_sha256"] = "0" * 64
