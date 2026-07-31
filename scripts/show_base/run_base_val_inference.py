@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Produce frozen SemTalk Base predictions for the SHOW validation split.
 
-This entry point is intentionally separate from ``run_base_inference.py``.
-The latter is a test-only eight-shard program; this program accepts only an
-explicit ``--split val`` and never exposes a test input.
+This entry point uses the neutral ``semtalk_base_inference_core.py`` callable
+closure.  It accepts only an explicit ``--split val`` and never exposes a test
+input.
 
 The transaction has three small, explicit phases:
 
@@ -655,13 +655,13 @@ def _load_pinned_helper(
         "pinned validation inference helper",
     )
     expected_helper = pipeline.get("source_closure", {}).get(
-        "scripts/show_base/run_base_inference.py"
+        "scripts/show_base/semtalk_base_inference_core.py"
     )
     if entrypoint != expected_helper:
         raise ValInferenceContractError(
             "inference helper differs from the fresh source closure"
         )
-    name = f"_semtalk_val_helper_{entrypoint['sha256']}"
+    name = f"_semtalk_base_inference_core_{entrypoint['sha256']}"
     module = ModuleType(name)
     module.__file__ = str(path)
     module.__package__ = ""
@@ -723,7 +723,7 @@ def _pinned_helper_root(
             "loaded pinned inference helper path mismatch"
         )
     if (
-        helper_file.name != "run_base_inference.py"
+        helper_file.name != "semtalk_base_inference_core.py"
         or helper_file.parent.name != "show_base"
         or helper_file.parent.parent.name != "scripts"
     ):

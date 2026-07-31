@@ -164,7 +164,7 @@ class CandidateTransactionFixture:
             "inference_helper": {
                 "path": str(
                     pipeline_source_root
-                    / "scripts/show_base/run_base_inference.py"
+                    / "scripts/show_base/semtalk_base_inference_core.py"
                 ),
                 "sha256": "5" * 64,
                 "bytes": 1,

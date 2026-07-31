@@ -56,12 +56,7 @@ INFERENCE_HELPERS = (
 )
 VAL_INFERENCE_SOURCE = {
     "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
-    "commit": "94e33213455d3c3b1fe71ac87a3b16334e63c479",
-    "tree": "8f4ba28543b49cb1e04b3e8aaaaf4ee932ecf6d8",
-    "entrypoint": "run_base_inference.py",
-    "entrypoint_sha256": (
-        "ff4c86f065a2924ab1a7088584507f2163d4afba25ae7fb024d137df23204e0c"
-    ),
+    "entrypoint": "semtalk_base_inference_core.py",
 }
 FRESH_PREREQUISITE_CONSUMPTION = {
     "base_training_feature_graph": {
@@ -97,7 +92,7 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/talkshow_base_val_contract.py",
     "scripts/show_base/base_long_val_contract.py",
     "scripts/show_base/run_base_val_inference.py",
-    "scripts/show_base/run_base_inference.py",
+    "scripts/show_base/semtalk_base_inference_core.py",
     "scripts/show_base/evaluate_talkshow_show_metrics.py",
     "scripts/show_base/replay_released2_primary.py",
     "scripts/show_base/build_base_features.py",
@@ -1350,7 +1345,7 @@ def build_fresh_pipeline_payload(
             "scripts/show_base/run_base_val_inference.py"
         ],
         "inference_helper": files[
-            "scripts/show_base/run_base_inference.py"
+            "scripts/show_base/semtalk_base_inference_core.py"
         ],
         "generator_module": "models.semtalk.semtalk_base",
         "prerequisite_consumption": FRESH_PREREQUISITE_CONSUMPTION,
@@ -1437,7 +1432,9 @@ def validate_fresh_pipeline(
             "scripts/show_base/run_base_val_inference.py"
         ]
         or pipeline["inference_helper"]
-        != live_source["files"]["scripts/show_base/run_base_inference.py"]
+        != live_source["files"][
+            "scripts/show_base/semtalk_base_inference_core.py"
+        ]
     ):
         raise SelectionContractError(
             "fresh Base validation pipeline mixed source checkouts"

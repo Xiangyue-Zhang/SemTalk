@@ -109,6 +109,10 @@ class AuthorityFixture:
             cwd=self.source,
             check=True,
         )
+        entrypoint = (
+            self.source
+            / "scripts/show_base/semtalk_base_inference_core.py"
+        )
         local_refs = subprocess.check_output(
             [
                 "git",
@@ -130,7 +134,6 @@ class AuthorityFixture:
             cwd=self.source,
             check=True,
         )
-        entrypoint = self.source / "scripts/show_base/run_base_inference.py"
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=self.source,
@@ -147,7 +150,9 @@ class AuthorityFixture:
             "commit": commit,
             "tree": tree,
             "clean": True,
-            "entrypoint": "scripts/show_base/run_base_inference.py",
+            "entrypoint": (
+                "scripts/show_base/semtalk_base_inference_core.py"
+            ),
             "entrypoint_sha256": hashlib.sha256(
                 entrypoint.read_bytes()
             ).hexdigest(),

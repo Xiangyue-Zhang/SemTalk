@@ -432,7 +432,8 @@ def _validate_source(value: Any) -> dict[str, Any]:
     if (
         value["origin"] != ORIGIN
         or value["clean"] is not True
-        or value["entrypoint"] != "scripts/show_base/run_base_inference.py"
+        or value["entrypoint"]
+        != "scripts/show_base/semtalk_base_inference_core.py"
     ):
         raise BaseFinalAuthorityError(
             "test authority is not SemTalk official Base inference"

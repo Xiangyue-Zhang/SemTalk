@@ -957,7 +957,9 @@ def validate_measurement_contract(
         label="measurement inference entrypoint",
         expected_commit=expected_source_commit,
         expected_tree=expected_source_tree,
-        expected_script_relative="scripts/show_base/run_base_inference.py",
+        expected_script_relative=(
+            "scripts/show_base/semtalk_base_inference_core.py"
+        ),
     )
     validate_entrypoint_source_receipt(
         gate_source,
@@ -1496,7 +1498,9 @@ def _measure(args: argparse.Namespace) -> int:
     inference_source = git_source_receipt(
         args.expected_source_commit,
         args.expected_source_tree,
-        script=Path(__file__).resolve().with_name("run_base_inference.py"),
+        script=Path(__file__).resolve().with_name(
+            "semtalk_base_inference_core.py"
+        ),
     )
     input_artifact_source = {
         "format": "semtalk_show_input_artifact_source_v1",

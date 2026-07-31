@@ -8,7 +8,6 @@ import inspect
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -42,20 +41,7 @@ def _write(path: Path, payload: bytes) -> str:
 class ValInferenceProducerCpuTest(unittest.TestCase):
     @staticmethod
     def _pinned_source_bytes(path: str) -> bytes:
-        return subprocess.run(
-            [
-                "git",
-                "-C",
-                str(Path(__file__).resolve().parents[1]),
-                "show",
-                (
-                    f"{PRODUCER.selector.VAL_INFERENCE_SOURCE['commit']}:"
-                    f"{path}"
-                ),
-            ],
-            check=True,
-            capture_output=True,
-        ).stdout
+        return (Path(__file__).resolve().parents[1] / path).read_bytes()
 
     def _write_pinned_joint_fixture(
         self,
@@ -66,13 +52,12 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
         include_authority: bool = True,
         corrupt_authority: bool = False,
     ) -> tuple[Path, Path, dict[str, object]]:
-        helper_path = root / "scripts" / "show_base" / "run_base_inference.py"
+        helper_relative = "scripts/show_base/semtalk_base_inference_core.py"
+        helper_path = root / helper_relative
         context_path = (
             root / PRODUCER.PINNED_JOINT_CONTEXT_SOURCE["relative_path"]
         )
-        helper_payload = self._pinned_source_bytes(
-            "scripts/show_base/run_base_inference.py"
-        )
+        helper_payload = self._pinned_source_bytes(helper_relative)
         helper_path.parent.mkdir(parents=True)
         helper_path.write_bytes(helper_payload)
         if include_context:
@@ -112,7 +97,7 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             "git_blob_sha1": PRODUCER._git_blob_sha1(helper_payload),
         }
         source_closure = {
-            "scripts/show_base/run_base_inference.py": helper_entry,
+            helper_relative: helper_entry,
         }
         if include_context:
             source_closure[
@@ -676,6 +661,8 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
 
     def test_pinned_helper_executes_the_verified_byte_snapshot(self) -> None:
         source = inspect.getsource(PRODUCER._load_pinned_helper)
+        self.assertIn("semtalk_base_inference_core.py", source)
+        self.assertNotIn("run_base_" + "inference.py", source)
         self.assertIn("compile(source_snapshot", source)
         self.assertIn("exec(code, module.__dict__)", source)
         self.assertNotIn("exec_module(module)", source)
@@ -785,10 +772,13 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             pipeline = {
                 "source": PRODUCER.selector.VAL_INFERENCE_SOURCE,
                 "inference_entrypoint": {
-                    "path": str(root / "run_base_inference.py"),
-                    "sha256": PRODUCER.selector.VAL_INFERENCE_SOURCE[
-                        "entrypoint_sha256"
-                    ],
+                    "path": str(root / "semtalk_base_inference_core.py"),
+                    "sha256": hashlib.sha256(
+                        self._pinned_source_bytes(
+                            "scripts/show_base/"
+                            "semtalk_base_inference_core.py"
+                        )
+                    ).hexdigest(),
                 },
                 "fixed_checkpoints": {
                     stage: {"sha256": str(index) * 64}

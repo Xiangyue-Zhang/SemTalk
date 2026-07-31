@@ -11,7 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "show_base" / "gate_released_all_speakers_on_show.py"
-INFERENCE_SCRIPT = ROOT / "scripts" / "show_base" / "run_base_inference.py"
+INFERENCE_SCRIPT = (
+    ROOT / "scripts" / "show_base" / "semtalk_base_inference_core.py"
+)
 SPEC = importlib.util.spec_from_file_location("released_show_gate", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 gate = importlib.util.module_from_spec(SPEC)
