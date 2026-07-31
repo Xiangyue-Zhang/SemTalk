@@ -30,6 +30,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -46,6 +47,13 @@ REPORT_FORMAT = "semtalk_show_talkshow_metrics_v1"
 PRIMARY_REAL_FEATURE_CACHE_FORMAT = (
     "semtalk_show_released2_real_feature_cache_v1"
 )
+PRIMARY_REAL_FEATURE_CACHE_PRODUCTION_AUTHORITY_FORMAT = (
+    "semtalk_show_released2_real_feature_cache_production_authority_v1"
+)
+PRIMARY_REAL_FEATURE_CACHE_ENTRYPOINT = (
+    "scripts/show_base/replay_released2_primary.py"
+)
+SEMTALK_OFFICIAL_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 PRIMARY_REPLAY_FORMAT = (
     "semtalk_show_released2_primary_fresh_replay_v1"
 )
@@ -5237,6 +5245,212 @@ def _metric_runtime_signature(runtime: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_real_feature_cache_production_authority(
+    value: Any,
+    *,
+    canonical_manifest: Mapping[str, Any],
+    split: str,
+    clip_count: int,
+) -> dict[str, Any]:
+    """Validate the immutable producer/input binding of a formal cache."""
+
+    if type(value) is not dict or set(value) != {
+        "format",
+        "status",
+        "source",
+        "validation_inputs",
+        "receipt_payload_sha256",
+    }:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache production authority schema mismatch"
+        )
+    claimed = _require_sha256(
+        value["receipt_payload_sha256"],
+        "released2 real-feature cache production authority payload",
+    )
+    authority_body = dict(value)
+    authority_body.pop("receipt_payload_sha256")
+    if compact_canonical_json_sha256(authority_body) != claimed:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache production authority payload mismatch"
+        )
+    if (
+        value["format"]
+        != PRIMARY_REAL_FEATURE_CACHE_PRODUCTION_AUTHORITY_FORMAT
+        or value["status"] != "frozen"
+    ):
+        raise MetricAdapterContractError(
+            "released2 real-feature cache production authority mismatch"
+        )
+
+    source = value["source"]
+    if type(source) is not dict or set(source) != {
+        "origin",
+        "source_root",
+        "commit",
+        "tree",
+        "clean",
+        "detached",
+        "local_branches_at_commit",
+        "entrypoint",
+    }:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache producer source schema mismatch"
+        )
+    source_root = source["source_root"]
+    if (
+        source["origin"] != SEMTALK_OFFICIAL_ORIGIN
+        or type(source_root) is not str
+        or not Path(source_root).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{40}", str(source["commit"])) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(source["tree"])) is None
+        or source["clean"] is not True
+        or source["detached"] is not True
+        or source["local_branches_at_commit"] != []
+    ):
+        raise MetricAdapterContractError(
+            "released2 real-feature cache producer source mismatch"
+        )
+    entrypoint = source["entrypoint"]
+    if type(entrypoint) is not dict or set(entrypoint) != {
+        "path",
+        "relative",
+        "sha256",
+        "bytes",
+        "git_mode",
+        "git_blob_sha1",
+    }:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache producer entrypoint schema mismatch"
+        )
+    entrypoint_path = entrypoint["path"]
+    if (
+        entrypoint["relative"] != PRIMARY_REAL_FEATURE_CACHE_ENTRYPOINT
+        or type(entrypoint_path) is not str
+        or not Path(entrypoint_path).is_absolute()
+        or Path(entrypoint_path)
+        != Path(source_root) / PRIMARY_REAL_FEATURE_CACHE_ENTRYPOINT
+        or _require_exact_int(
+            entrypoint["bytes"],
+            "released2 real-feature cache producer entrypoint bytes",
+            minimum=1,
+        )
+        != entrypoint["bytes"]
+        or entrypoint["git_mode"] not in {"100644", "100755"}
+        or re.fullmatch(
+            r"[0-9a-f]{40}", str(entrypoint["git_blob_sha1"])
+        )
+        is None
+    ):
+        raise MetricAdapterContractError(
+            "released2 real-feature cache producer entrypoint mismatch"
+        )
+    _require_sha256(
+        entrypoint["sha256"],
+        "released2 real-feature cache producer entrypoint",
+    )
+
+    inputs = value["validation_inputs"]
+    input_keys = {
+        "format",
+        "status",
+        "split",
+        "test_visible",
+        "expected_clip_count",
+        "canonical_manifest",
+        "canonical_summary",
+        "canonical_lineage",
+        "audio_manifests",
+        "audio_summaries",
+        "audio_lineages",
+        "clip_ids_sha256",
+        "talkshow_window_manifest_sha256",
+        "receipt_payload_sha256",
+    }
+    if type(inputs) is not dict or set(inputs) != input_keys:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache validation-input authority schema "
+            "mismatch"
+        )
+    input_claimed = _require_sha256(
+        inputs["receipt_payload_sha256"],
+        "released2 real-feature cache validation-input payload",
+    )
+    input_body = dict(inputs)
+    input_body.pop("receipt_payload_sha256")
+    if compact_canonical_json_sha256(input_body) != input_claimed:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache validation-input payload mismatch"
+        )
+    if (
+        inputs["format"] != "semtalk_show_base_talkshow_val_inputs_v2"
+        or inputs["status"] != "frozen"
+        or inputs["split"] != split
+        or inputs["test_visible"] is not False
+        or inputs["expected_clip_count"] != clip_count
+    ):
+        raise MetricAdapterContractError(
+            "released2 real-feature cache validation-input authority mismatch"
+        )
+
+    def compact_artifact(item: Any, label: str) -> dict[str, str]:
+        if type(item) is not dict or set(item) != {"path", "sha256"}:
+            raise MetricAdapterContractError(f"{label} schema mismatch")
+        path = item["path"]
+        if type(path) is not str or not Path(path).is_absolute():
+            raise MetricAdapterContractError(f"{label} path mismatch")
+        return {
+            "path": path,
+            "sha256": _require_sha256(item["sha256"], f"{label} SHA-256"),
+        }
+
+    canonical = compact_artifact(
+        inputs["canonical_manifest"],
+        "released2 real-feature cache canonical authority",
+    )
+    if canonical != {
+        "path": canonical_manifest.get("path"),
+        "sha256": canonical_manifest.get("sha256"),
+    }:
+        raise MetricAdapterContractError(
+            "released2 real-feature cache canonical authority mismatch"
+        )
+    compact_artifact(
+        inputs["canonical_summary"],
+        "released2 real-feature cache canonical summary authority",
+    )
+    compact_artifact(
+        inputs["canonical_lineage"],
+        "released2 real-feature cache canonical lineage authority",
+    )
+    for key in ("audio_manifests", "audio_summaries", "audio_lineages"):
+        receipts = inputs[key]
+        if type(receipts) is not list or len(receipts) != 8:
+            raise MetricAdapterContractError(
+                f"released2 real-feature cache {key} must bind eight shards"
+            )
+        normalized = [
+            compact_artifact(
+                item,
+                f"released2 real-feature cache {key}[{index}]",
+            )
+            for index, item in enumerate(receipts)
+        ]
+        if len({item["path"] for item in normalized}) != 8:
+            raise MetricAdapterContractError(
+                f"released2 real-feature cache {key} paths are not unique"
+            )
+    _require_sha256(
+        inputs["clip_ids_sha256"],
+        "released2 real-feature cache validation clip IDs",
+    )
+    _require_sha256(
+        inputs["talkshow_window_manifest_sha256"],
+        "released2 real-feature cache TalkSHOW window manifest",
+    )
+    return dict(value)
+
+
 def build_released2_real_feature_cache(
     *,
     canonical_manifest: str | Path,
@@ -5246,6 +5460,7 @@ def build_released2_real_feature_cache(
     expected_clip_count: int,
     formal_mode: bool = True,
     test_only_allow_four_clip_subset: bool = False,
+    production_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freshly compute the candidate-independent released2 real moments."""
 
@@ -5283,6 +5498,27 @@ def build_released2_real_feature_cache(
             test_only_allow_four_clip_subset
         ),
     )
+    canonical_receipt = {
+        "path": str(canonical_path),
+        "sha256": sha256_bytes(canonical_payload),
+        "bytes": len(canonical_payload),
+        "rows": len(canonical_rows),
+        "selected_rows": len(canonical_by_id),
+    }
+    normalized_production_authority: dict[str, Any] | None = None
+    if formal_mode:
+        normalized_production_authority = (
+            _validate_real_feature_cache_production_authority(
+                production_authority,
+                canonical_manifest=canonical_receipt,
+                split=split,
+                clip_count=expected_clip_count,
+            )
+        )
+    elif production_authority is not None:
+        raise MetricAdapterContractError(
+            "fixture real-feature cache cannot claim production authority"
+        )
     moments = FeatureMoments()
     for output_id, row in canonical_by_id.items():
         arrays = _load_canonical_npz(
@@ -5308,19 +5544,16 @@ def build_released2_real_feature_cache(
         "status": "complete",
         "split": split,
         "clip_count": expected_clip_count,
-        "canonical_manifest": {
-            "path": str(canonical_path),
-            "sha256": sha256_bytes(canonical_payload),
-            "bytes": len(canonical_payload),
-            "rows": len(canonical_rows),
-            "selected_rows": len(canonical_by_id),
-        },
+        "canonical_manifest": canonical_receipt,
         "metric_assets": assets,
         "runtime": runtime,
         "real_feature_statistics": moments.to_json(),
         "formal_mode": formal_mode,
         "test_only_mode": fixture_mode,
     }
+    if formal_mode:
+        assert normalized_production_authority is not None
+        result["production_authority"] = normalized_production_authority
     result["receipt_payload_sha256"] = canonical_json_sha256(result)
     return result
 
@@ -5342,7 +5575,7 @@ def _validate_released2_real_feature_cache(
         raise MetricAdapterContractError(
             "released2 real-feature cache object/file mismatch"
         )
-    if type(decoded) is not dict or set(decoded) != {
+    expected_keys = {
         "format",
         "status",
         "split",
@@ -5354,7 +5587,10 @@ def _validate_released2_real_feature_cache(
         "formal_mode",
         "test_only_mode",
         "receipt_payload_sha256",
-    }:
+    }
+    if not fixture_mode:
+        expected_keys.add("production_authority")
+    if type(decoded) is not dict or set(decoded) != expected_keys:
         raise MetricAdapterContractError(
             "released2 real-feature cache schema mismatch"
         )
@@ -5376,6 +5612,13 @@ def _validate_released2_real_feature_cache(
         decoded["runtime"],
         fixture_mode=fixture_mode,
     )
+    if not fixture_mode:
+        _validate_real_feature_cache_production_authority(
+            decoded["production_authority"],
+            canonical_manifest=decoded["canonical_manifest"],
+            split=expected_split,
+            clip_count=expected_clip_count,
+        )
     statistics = decoded["real_feature_statistics"]
     if type(statistics) is not dict:
         raise MetricAdapterContractError(

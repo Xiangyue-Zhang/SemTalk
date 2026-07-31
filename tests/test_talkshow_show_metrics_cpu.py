@@ -38,6 +38,92 @@ INTERNAL_RELEASED2_MODULES = frozenset(
 )
 
 
+def source_bound_cache_authority() -> tuple[dict[str, object], dict[str, object]]:
+    canonical: dict[str, object] = {
+        "path": "/authority/canonical/manifest.jsonl",
+        "sha256": "1" * 64,
+        "bytes": 100,
+        "rows": 1715,
+        "selected_rows": 1715,
+    }
+    inputs: dict[str, object] = {
+        "format": "semtalk_show_base_talkshow_val_inputs_v2",
+        "status": "frozen",
+        "split": "val",
+        "test_visible": False,
+        "expected_clip_count": 1715,
+        "canonical_manifest": {
+            "path": canonical["path"],
+            "sha256": canonical["sha256"],
+        },
+        "canonical_summary": {
+            "path": "/authority/canonical/summary.json",
+            "sha256": "2" * 64,
+        },
+        "canonical_lineage": {
+            "path": "/authority/canonical/lineage.json",
+            "sha256": "3" * 64,
+        },
+        "audio_manifests": [
+            {
+                "path": f"/authority/audio/shard_{index}/manifest.jsonl",
+                "sha256": "4" * 64,
+            }
+            for index in range(8)
+        ],
+        "audio_summaries": [
+            {
+                "path": f"/authority/audio/shard_{index}/summary.json",
+                "sha256": "5" * 64,
+            }
+            for index in range(8)
+        ],
+        "audio_lineages": [
+            {
+                "path": f"/authority/audio/shard_{index}/lineage.json",
+                "sha256": "6" * 64,
+            }
+            for index in range(8)
+        ],
+        "clip_ids_sha256": "7" * 64,
+        "talkshow_window_manifest_sha256": "8" * 64,
+    }
+    inputs["receipt_payload_sha256"] = (
+        METRICS.compact_canonical_json_sha256(inputs)
+    )
+    authority: dict[str, object] = {
+        "format": (
+            METRICS.PRIMARY_REAL_FEATURE_CACHE_PRODUCTION_AUTHORITY_FORMAT
+        ),
+        "status": "frozen",
+        "source": {
+            "origin": METRICS.SEMTALK_OFFICIAL_ORIGIN,
+            "source_root": "/authority/source",
+            "commit": "9" * 40,
+            "tree": "a" * 40,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+            "entrypoint": {
+                "path": (
+                    "/authority/source/"
+                    + METRICS.PRIMARY_REAL_FEATURE_CACHE_ENTRYPOINT
+                ),
+                "relative": METRICS.PRIMARY_REAL_FEATURE_CACHE_ENTRYPOINT,
+                "sha256": "b" * 64,
+                "bytes": 1234,
+                "git_mode": "100755",
+                "git_blob_sha1": "c" * 40,
+            },
+        },
+        "validation_inputs": inputs,
+    }
+    authority["receipt_payload_sha256"] = (
+        METRICS.compact_canonical_json_sha256(authority)
+    )
+    return authority, canonical
+
+
 def local_show_base_imports(relative: str) -> set[str]:
     tree = ast.parse(
         (ROOT / relative).read_text(encoding="utf-8"),
@@ -719,7 +805,7 @@ class OfflineAdapterTest(unittest.TestCase):
 
     def test_primary_cli_is_wired_and_create_new_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             output = root / "cache.json"
             canonical = root / "canonical.jsonl"
             canonical.write_bytes(b"fixture\n")
@@ -747,7 +833,38 @@ class OfflineAdapterTest(unittest.TestCase):
                 str(canonical),
                 "--expected-canonical-manifest-sha256",
                 "2" * 64,
+                "--canonical-summary",
+                str(root / "summary.json"),
+                "--expected-canonical-summary-sha256",
+                "3" * 64,
+                "--canonical-lineage",
+                str(root / "lineage.json"),
+                "--expected-canonical-lineage-sha256",
+                "4" * 64,
+                "--source-root",
+                str(ROOT),
+                "--expected-source-commit",
+                "5" * 40,
+                "--expected-source-tree",
+                "6" * 40,
+                "--expected-entrypoint-sha256",
+                "7" * 64,
             ]
+            for name, digit in (
+                ("manifest", "8"),
+                ("summary", "9"),
+                ("lineage", "a"),
+            ):
+                for index in range(8):
+                    argv.extend(
+                        [
+                            f"--audio-{name}",
+                            str(root / f"shard-{index}-{name}.json"),
+                            f"--expected-audio-{name}-sha256",
+                            digit * 64,
+                        ]
+                    )
+            authority = {"source_bound": True}
             with (
                 mock.patch.object(
                     PRIMARY_CLI,
@@ -755,19 +872,122 @@ class OfflineAdapterTest(unittest.TestCase):
                     return_value=object(),
                 ),
                 mock.patch.object(
+                    PRIMARY_CLI,
+                    "_production_authority",
+                    return_value=authority,
+                ) as authority_builder,
+                mock.patch.object(
                     METRICS,
                     "build_released2_real_feature_cache",
                     return_value=result,
                 ) as builder,
+                mock.patch.object(
+                    PRIMARY_CLI,
+                    "_validate_written_cache",
+                ) as validator,
             ):
                 self.assertEqual(PRIMARY_CLI.main(argv), 0)
                 self.assertEqual(
                     json.loads(output.read_bytes()),
                     result,
                 )
-                builder.assert_called_once()
+                self.assertEqual(authority_builder.call_count, 2)
+                builder.assert_called_once_with(
+                    canonical_manifest=canonical,
+                    expected_canonical_manifest_sha256="2" * 64,
+                    backend=mock.ANY,
+                    split="val",
+                    expected_clip_count=1715,
+                    formal_mode=True,
+                    test_only_allow_four_clip_subset=False,
+                    production_authority=authority,
+                )
+                validator.assert_called_once()
                 with self.assertRaises(FileExistsError):
                     PRIMARY_CLI.main(argv)
+
+    def test_formal_cache_authority_binds_source_and_all_audio_receipts(
+        self,
+    ) -> None:
+        authority, canonical = source_bound_cache_authority()
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "production authority schema",
+        ):
+            METRICS._validate_real_feature_cache_production_authority(
+                None,
+                canonical_manifest=canonical,
+                split="val",
+                clip_count=1715,
+            )
+        validated = (
+            METRICS._validate_real_feature_cache_production_authority(
+                authority,
+                canonical_manifest=canonical,
+                split="val",
+                clip_count=1715,
+            )
+        )
+        self.assertEqual(validated, authority)
+
+        missing_shard = copy.deepcopy(authority)
+        missing_shard["validation_inputs"]["audio_lineages"].pop()
+        inputs = missing_shard["validation_inputs"]
+        inputs.pop("receipt_payload_sha256")
+        inputs["receipt_payload_sha256"] = (
+            METRICS.compact_canonical_json_sha256(inputs)
+        )
+        missing_shard.pop("receipt_payload_sha256")
+        missing_shard["receipt_payload_sha256"] = (
+            METRICS.compact_canonical_json_sha256(missing_shard)
+        )
+        with self.assertRaisesRegex(
+            METRICS.MetricAdapterContractError,
+            "eight shards",
+        ):
+            METRICS._validate_real_feature_cache_production_authority(
+                missing_shard,
+                canonical_manifest=canonical,
+                split="val",
+                clip_count=1715,
+            )
+
+    def test_cache_source_authority_rejects_commit_tree_substitution(
+        self,
+    ) -> None:
+        entrypoint = {
+            "path": str(ROOT / PRIMARY_CLI.ENTRYPOINT_RELATIVE),
+            "sha256": "3" * 64,
+            "bytes": 123,
+            "git_mode": "100755",
+            "git_blob_sha1": "4" * 40,
+        }
+        source = {
+            "origin": METRICS.SEMTALK_OFFICIAL_ORIGIN,
+            "source_root": str(ROOT),
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+            "files": {PRIMARY_CLI.ENTRYPOINT_RELATIVE: entrypoint},
+        }
+        args = types.SimpleNamespace(
+            source_root=ROOT,
+            expected_source_commit="1" * 40,
+            expected_source_tree="5" * 40,
+            expected_entrypoint_sha256="3" * 64,
+        )
+        with mock.patch.object(
+            PRIMARY_CLI.val_contract,
+            "build_fresh_pipeline_source_receipt",
+            return_value=source,
+        ):
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "commit/tree mismatch",
+            ):
+                PRIMARY_CLI._source_authority(args)
 
     def test_final_npz_provenance_rejects_relocation_and_unrelated_shard(
         self,
