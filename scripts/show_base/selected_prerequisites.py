@@ -35,7 +35,7 @@ STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
 )
 SHARD_FORMAT = "semtalk_show_prerequisite_val_shard_v1"
-TRAINING_SOURCE_FREEZE_FORMAT = "semtalk_show_training_source_freeze_v1"
+TRAINING_SOURCE_FREEZE_FORMAT = raw_contract.TRAINING_SOURCE_FREEZE_FORMAT
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = ("face", "hands", "upper", "lower")
 EXPECTED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
@@ -437,80 +437,18 @@ def _validate_frozen_training_source(
     value: Any,
     label: str,
 ) -> dict[str, Any]:
-    source = exact_keys(
-        _verify_self_hash(value, label),
-        {
-            "format",
-            "training_audit",
-            "source_root",
-            "origin",
-            "commit",
-            "tree",
-            "clean",
-            "detached",
-            "local_branch_count",
-            "entrypoint_relative",
-            "entrypoint_sha256",
-            "receipt_payload_sha256",
-        },
-        label,
-    )
-    audit = exact_keys(
-        source["training_audit"],
-        {
-            "commit",
-            "tree",
-            "origin",
-            "entrypoint",
-            "entrypoint_sha256",
-        },
-        f"{label}.training_audit",
-    )
-    if (
-        source["format"] != TRAINING_SOURCE_FREEZE_FORMAT
-        or source["origin"] != EXPECTED_ORIGIN
-        or audit["origin"] != EXPECTED_ORIGIN
-        or source["origin"] != audit["origin"]
-        or source["commit"] != audit["commit"]
-        or source["tree"] != audit["tree"]
-        or source["clean"] is not True
-        or source["detached"] is not True
-        or source["local_branch_count"] != 0
-        or source["entrypoint_sha256"] != audit["entrypoint_sha256"]
-    ):
-        raise SelectedPrerequisiteError(
-            f"{label} frozen training source binding mismatch"
-        )
-    require_git_oid(source["commit"], f"{label}.commit")
-    require_git_oid(source["tree"], f"{label}.tree")
-    root = Path(source["source_root"])
-    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
-        raise SelectedPrerequisiteError(f"{label}.source_root is invalid")
-    root = root.resolve(strict=True)
-    entrypoint = regular_file(
-        audit["entrypoint"],
-        f"{label}.entrypoint",
-        val_only=False,
-    )
     try:
-        relative = str(entrypoint.relative_to(root))
-    except ValueError as error:
+        source = raw_contract.validate_frozen_training_source(
+            value,
+            label,
+            reprove_checkout=False,
+        )
+    except raw_contract.ContractError as error:
         raise SelectedPrerequisiteError(
-            f"{label}.entrypoint escapes source root"
+            f"{label} frozen training source validation failed: {error}"
         ) from error
-    if (
-        relative != source["entrypoint_relative"]
-        or sha256_file(entrypoint)
-        != require_sha256(
-            source["entrypoint_sha256"],
-            f"{label}.entrypoint SHA-256",
-        )
-    ):
-        raise SelectedPrerequisiteError(
-            f"{label} frozen entrypoint binding changed"
-        )
     reject_absolute_paths_in_tree(source, label)
-    return dict(source)
+    return source
 
 
 def _validate_producer_source(value: Any, label: str) -> dict[str, Any]:
@@ -537,6 +475,40 @@ def _validate_producer_source(value: Any, label: str) -> dict[str, Any]:
     ):
         raise SelectedPrerequisiteError(f"{label} script binding changed")
     return dict(source)
+
+
+def _portable_producer_source_identity(
+    value: Any,
+    label: str,
+) -> dict[str, str]:
+    source = exact_keys(value, PRODUCER_SOURCE_KEYS, label)
+    _validate_training_source(source, label)
+    root = Path(source["source_root"])
+    script = Path(source["script"])
+    if not root.is_absolute() or not script.is_absolute():
+        raise SelectedPrerequisiteError(
+            f"{label} source paths must be absolute"
+        )
+    try:
+        relative = script.relative_to(root).as_posix()
+    except ValueError as error:
+        raise SelectedPrerequisiteError(
+            f"{label}.script escapes source root"
+        ) from error
+    if relative != source["script_relative"]:
+        raise SelectedPrerequisiteError(
+            f"{label}.script_relative mismatch"
+        )
+    return {
+        "origin": source["origin"],
+        "commit": source["commit"],
+        "tree": source["tree"],
+        "script_relative": source["script_relative"],
+        "script_sha256": require_sha256(
+            source["script_sha256"],
+            f"{label}.script_sha256",
+        ),
+    }
 
 
 def _validate_canonical_view(
@@ -670,6 +642,16 @@ def _validate_candidate_index(
     )
     assert index is not None
     exact_keys(index, CANDIDATE_INDEX_KEYS, "candidate index")
+    try:
+        replayed_index = raw_contract.validate_candidate_index(index)
+    except raw_contract.ContractError as error:
+        raise SelectedPrerequisiteError(
+            f"candidate index contract replay failed: {error}"
+        ) from error
+    if replayed_index != index:
+        raise SelectedPrerequisiteError(
+            "candidate index contract replay changed its payload"
+        )
     if (
         index["format"] != CANDIDATE_INDEX_FORMAT
         or index["status"] != "complete"
@@ -931,7 +913,13 @@ def _validate_shard_receipts(
                 f"{stage} e{epoch} shard {expected_index} public receipt "
                 "differs from raw replay"
             )
-        if replayed["source"] != evaluator_source:
+        if _portable_producer_source_identity(
+            replayed["source"],
+            f"{stage} e{epoch} shard {expected_index} evaluator source",
+        ) != _portable_producer_source_identity(
+            evaluator_source,
+            "measurement evaluator source",
+        ):
             raise SelectedPrerequisiteError(
                 f"{stage} e{epoch} shard {expected_index} evaluator source "
                 "changed"
