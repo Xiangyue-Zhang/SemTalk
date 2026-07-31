@@ -282,6 +282,7 @@ def _validate_stage_measurement(
     measurement_index: Mapping[str, Any],
     candidate_index: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    candidate_epochs = contract.candidate_epochs(candidate_index)
     if set(payload) != STAGE_MEASUREMENT_KEYS:
         raise contract.ContractError(f"{stage} measurement schema mismatch")
     if (
@@ -319,7 +320,7 @@ def _validate_stage_measurement(
     if protocol != {
         "per_stage_independent": True,
         "candidate_variable_only": True,
-        "candidate_epochs": list(contract.EXPECTED_CANDIDATE_EPOCHS),
+        "candidate_epochs": list(candidate_epochs),
         "window_length": contract.WINDOW_LENGTH,
         "window_stride": contract.WINDOW_STRIDE,
         "full_base_fgd_used": False,
@@ -349,10 +350,10 @@ def _validate_stage_measurement(
         coverage["split"] != "val"
         or coverage["test_visible"] is not False
         or coverage["clips_per_candidate"] != contract.EXPECTED_VAL_CLIPS
-        or coverage["candidates"] != len(contract.EXPECTED_CANDIDATE_EPOCHS)
+        or coverage["candidates"] != len(candidate_epochs)
         or coverage["shards_per_candidate"] != contract.EXPECTED_SHARDS
         or coverage["shard_jobs"]
-        != len(contract.EXPECTED_CANDIDATE_EPOCHS)
+        != len(candidate_epochs)
         * contract.EXPECTED_SHARDS
         or expected_windows <= 0
         or coverage["exact_once_per_candidate"] is not True
@@ -361,12 +362,12 @@ def _validate_stage_measurement(
         raise contract.ContractError(f"{stage} measurement coverage changed")
     candidates = payload["candidates"]
     if not isinstance(candidates, list) or len(candidates) != len(
-        contract.EXPECTED_CANDIDATE_EPOCHS
+        candidate_epochs
     ):
         raise contract.ContractError(f"{stage} candidate count mismatch")
     validated = []
     for expected_index, (expected_epoch, candidate) in enumerate(
-        zip(contract.EXPECTED_CANDIDATE_EPOCHS, candidates)
+        zip(candidate_epochs, candidates)
     ):
         if not isinstance(candidate, dict) or set(candidate) != CANDIDATE_KEYS:
             raise contract.ContractError(f"{stage} candidate schema mismatch")
@@ -442,21 +443,26 @@ def select(
     candidate_index_sha256: str,
     measurement_index_path: Path,
     measurement_index_sha256: str,
-    output_json: Path,
+    output_json: Path | None,
     selector_source: Mapping[str, Any],
+    reprove_selector_source: bool = True,
 ) -> dict[str, Any]:
-    if not output_json.is_absolute():
-        raise contract.ContractError("selection output must be absolute")
-    output_json = output_json.parent.resolve(strict=True) / output_json.name
+    if output_json is not None:
+        if not output_json.is_absolute():
+            raise contract.ContractError("selection output must be absolute")
+        output_json = (
+            output_json.parent.resolve(strict=True) / output_json.name
+        )
     selector_source = merger._validate_source_receipt(
         selector_source,
         "selector source",
-        reprove_local=True,
+        reprove_local=reprove_selector_source,
     )
     candidate_index, candidate_artifact = contract.load_candidate_index(
         candidate_index_path,
         candidate_index_sha256,
     )
+    candidate_epochs = contract.candidate_epochs(candidate_index)
     measurement_path, measurement_index, measurement_sha = (
         _load_receipt_json(
             measurement_index_path,
@@ -502,8 +508,8 @@ def select(
     )
     if index_protocol != {
         "per_stage_independent": True,
-        "candidate_epochs": list(contract.EXPECTED_CANDIDATE_EPOCHS),
-        "candidates_per_stage": len(contract.EXPECTED_CANDIDATE_EPOCHS),
+        "candidate_epochs": list(candidate_epochs),
+        "candidates_per_stage": len(candidate_epochs),
         "shards_per_candidate": contract.EXPECTED_SHARDS,
         "full_base_fgd_used": False,
         "test_feedback_into_selection": False,
@@ -557,10 +563,10 @@ def select(
     )
     if index_coverage != {
         "stages": len(contract.STAGES),
-        "candidates_per_stage": len(contract.EXPECTED_CANDIDATE_EPOCHS),
+        "candidates_per_stage": len(candidate_epochs),
         "shards_per_candidate": contract.EXPECTED_SHARDS,
         "total_shard_jobs": len(contract.STAGES)
-        * len(contract.EXPECTED_CANDIDATE_EPOCHS)
+        * len(candidate_epochs)
         * contract.EXPECTED_SHARDS,
         "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
         "windows_per_candidate": expected_windows,
@@ -679,12 +685,8 @@ def select(
             "test_visible": False,
             "protocol": {
                 "name": "five_independent_show_prerequisite_validation_v1",
-                "candidate_epochs": list(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
-                ),
-                "candidates_per_stage": len(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
-                ),
+                "candidate_epochs": list(candidate_epochs),
+                "candidates_per_stage": len(candidate_epochs),
                 "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
                 "shards_per_candidate": contract.EXPECTED_SHARDS,
                 "window_length": contract.WINDOW_LENGTH,
@@ -762,8 +764,68 @@ def select(
         ):
             raise AssertionError("selection bridge nested schema drift")
     contract.validate_selection_receipt(result)
-    contract.atomic_json_new(output_json, result)
+    if output_json is not None:
+        contract.atomic_json_new(output_json, result)
     return result
+
+
+def replay_selection(
+    *,
+    selection_path: Path,
+    expected_selection_sha256: str,
+) -> dict[str, Any]:
+    """Freshly recompute an externally supplied selected-five receipt.
+
+    Merely replacing ``receipt_payload_sha256`` is not sufficient: replay
+    opens and rehashes the frozen candidate index, measurement index, every
+    per-stage measurement, all shard receipts, and candidate checkpoints,
+    then reruns the exact winner ordering before accepting the external file.
+    """
+
+    resolved, payload_bytes, observed_sha = contract.read_verified_file(
+        selection_path,
+        expected_selection_sha256,
+        "selected-five external receipt",
+    )
+    observed = contract.verify_receipt_payload(
+        contract.strict_json_bytes(payload_bytes, str(resolved)),
+        "selected-five external receipt",
+    )
+    contract.validate_selection_receipt(observed)
+    candidate_receipt = contract.exact_keys(
+        observed["candidate_index_receipt"],
+        ("path", "sha256", "receipt_payload_sha256"),
+        "selected-five candidate index receipt",
+    )
+    measurement_receipt = contract.exact_keys(
+        observed["measurement_index_receipt"],
+        ("path", "sha256", "receipt_payload_sha256"),
+        "selected-five measurement index receipt",
+    )
+    producer_sources = observed.get("producer_sources")
+    if (
+        not isinstance(producer_sources, dict)
+        or set(producer_sources) != {"evaluator", "merge", "selector"}
+    ):
+        raise contract.ContractError(
+            "selected-five producer source coverage mismatch"
+        )
+    recomputed = select(
+        candidate_index_path=Path(candidate_receipt["path"]),
+        candidate_index_sha256=candidate_receipt["sha256"],
+        measurement_index_path=Path(measurement_receipt["path"]),
+        measurement_index_sha256=measurement_receipt["sha256"],
+        output_json=None,
+        selector_source=producer_sources["selector"],
+        reprove_selector_source=False,
+    )
+    if recomputed != observed:
+        raise contract.ContractError(
+            "selected-five external receipt does not equal fresh replay"
+        )
+    if observed_sha != expected_selection_sha256:
+        raise AssertionError("selected-five external SHA drift")
+    return observed
 
 
 def build_parser() -> argparse.ArgumentParser:

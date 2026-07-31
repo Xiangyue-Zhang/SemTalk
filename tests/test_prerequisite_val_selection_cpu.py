@@ -947,6 +947,20 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             contract.EXPECTED_CANDIDATE_EPOCHS,
             (20, 40, 60, 80, 100, 120, 140, 160, 180, 200),
         )
+        self.assertEqual(
+            contract.validate_candidate_epochs(
+                [*contract.EXPECTED_CANDIDATE_EPOCHS, 220, 240]
+            ),
+            (*contract.EXPECTED_CANDIDATE_EPOCHS, 220, 240),
+        )
+        for invalid in (
+            list(contract.EXPECTED_CANDIDATE_EPOCHS[:-1]),
+            [*contract.EXPECTED_CANDIDATE_EPOCHS, 200],
+            [*contract.EXPECTED_CANDIDATE_EPOCHS, 221],
+            [*contract.EXPECTED_CANDIDATE_EPOCHS, 240, 220],
+        ):
+            with self.assertRaises(contract.ContractError):
+                contract.validate_candidate_epochs(invalid)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = self.training_source_receipt(

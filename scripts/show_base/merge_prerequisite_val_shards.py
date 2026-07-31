@@ -170,14 +170,16 @@ def _repository_identity(
     }
 
 
-def _expected_shard_paths() -> set[Path]:
+def _expected_shard_paths(
+    candidate_epochs: Sequence[int],
+) -> set[Path]:
     return {
         Path("shards")
         / stage
         / f"epoch_{epoch:04d}"
         / f"shard_{shard_index:02d}.json"
         for stage in contract.STAGES
-        for epoch in contract.EXPECTED_CANDIDATE_EPOCHS
+        for epoch in candidate_epochs
         for shard_index in range(contract.EXPECTED_SHARDS)
     }
 
@@ -664,6 +666,7 @@ def merge(
         candidate_index_path,
         candidate_index_sha256,
     )
+    candidate_epochs = contract.candidate_epochs(candidate_index)
     rows, canonical_receipt = contract.load_val_canonical(
         manifest_path=canonical_manifest,
         manifest_sha256=canonical_manifest_sha256,
@@ -690,7 +693,7 @@ def merge(
         if shard_root in resolved_shard_roots:
             raise contract.ContractError("shard root is duplicated")
         resolved_shard_roots.append(shard_root)
-    expected_shard_paths = _expected_shard_paths()
+    expected_shard_paths = _expected_shard_paths(candidate_epochs)
     shard_locations: dict[Path, Path] = {}
     for shard_root in resolved_shard_roots:
         observed = _inventory_shard_subtree(
@@ -708,7 +711,8 @@ def merge(
         missing = sorted(expected_shard_paths - observed_shard_paths)
         extra = sorted(observed_shard_paths - expected_shard_paths)
         raise contract.ContractError(
-            "shard subtree inventory is not the exact expected 400 files; "
+            "shard subtree inventory is not the exact expected "
+            f"{len(expected_shard_paths)} files; receipt-driven "
             f"missing={missing[:5]}, extra={extra[:5]}"
         )
     candidate_receipt = {
@@ -725,7 +729,7 @@ def merge(
     for stage in contract.STAGES:
         candidates = []
         for candidate_index_number, epoch in enumerate(
-            contract.EXPECTED_CANDIDATE_EPOCHS
+            candidate_epochs
         ):
             candidate = contract.candidate_lookup(
                 candidate_index,
@@ -858,7 +862,7 @@ def merge(
                     "per_stage_independent": True,
                     "candidate_variable_only": True,
                     "candidate_epochs": list(
-                        contract.EXPECTED_CANDIDATE_EPOCHS
+                        candidate_epochs
                     ),
                     "window_length": contract.WINDOW_LENGTH,
                     "window_stride": contract.WINDOW_STRIDE,
@@ -880,9 +884,9 @@ def merge(
                     "split": "val",
                     "test_visible": False,
                     "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
-                    "candidates": len(contract.EXPECTED_CANDIDATE_EPOCHS),
+                    "candidates": len(candidate_epochs),
                     "shards_per_candidate": contract.EXPECTED_SHARDS,
-                    "shard_jobs": len(contract.EXPECTED_CANDIDATE_EPOCHS)
+                    "shard_jobs": len(candidate_epochs)
                     * contract.EXPECTED_SHARDS,
                     "windows_per_candidate": total_windows,
                     "exact_once_per_candidate": True,
@@ -930,11 +934,9 @@ def merge(
             "protocol": {
                 "per_stage_independent": True,
                 "candidate_epochs": list(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
+                    candidate_epochs
                 ),
-                "candidates_per_stage": len(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
-                ),
+                "candidates_per_stage": len(candidate_epochs),
                 "shards_per_candidate": contract.EXPECTED_SHARDS,
                 "full_base_fgd_used": False,
                 "test_feedback_into_selection": False,
@@ -950,12 +952,10 @@ def merge(
             "stages": final_stage_receipts,
             "coverage": {
                 "stages": len(contract.STAGES),
-                "candidates_per_stage": len(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
-                ),
+                "candidates_per_stage": len(candidate_epochs),
                 "shards_per_candidate": contract.EXPECTED_SHARDS,
                 "total_shard_jobs": len(contract.STAGES)
-                * len(contract.EXPECTED_CANDIDATE_EPOCHS)
+                * len(candidate_epochs)
                 * contract.EXPECTED_SHARDS,
                 "clips_per_candidate": contract.EXPECTED_VAL_CLIPS,
                 "windows_per_candidate": total_windows,

@@ -103,6 +103,7 @@ def _audit_final_checkpoint(
     status: dict[str, Any],
     run: Path,
     stage: str,
+    final_epoch: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     final_path = contract.regular_file(
         status.get("final_checkpoint"),
@@ -133,7 +134,7 @@ def _audit_final_checkpoint(
         or audit.get("format") != "semtalk_show_model_v2"
         or audit.get("formal_stage") != stage
         or audit.get("optimizer_updates")
-        != 200 * contract.EXPECTED_UPDATES_PER_EPOCH
+        != final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
     ):
         raise RuntimeError(f"{stage} final checkpoint audit mismatch")
     source = contract.validate_training_audit_source(
@@ -243,7 +244,12 @@ def _validate_latest_candidate_receipt(
     stage: str,
     candidate: dict[str, Any],
     label: str,
+    final_epoch: int | None = None,
 ) -> dict[str, Any]:
+    if final_epoch is None:
+        # Backward-compatible helper default for the mandatory frozen prefix.
+        # Dynamic/continued schedules always pass their explicit boundary.
+        final_epoch = contract.REQUIRED_CANDIDATE_EPOCHS[-1]
     value = contract.exact_keys(
         value,
         (
@@ -258,8 +264,10 @@ def _validate_latest_candidate_receipt(
     if value != {
         "path": candidate["checkpoint"],
         "sha256": candidate["checkpoint_sha256"],
-        "completed_epochs": 200,
-        "optimizer_updates": 200 * contract.EXPECTED_UPDATES_PER_EPOCH,
+        "completed_epochs": final_epoch,
+        "optimizer_updates": (
+            final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
+        ),
         "selection_status": "offline_validation_pending",
     }:
         raise RuntimeError(f"{stage} latest representation candidate mismatch")
@@ -280,6 +288,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
     runs = _parse_stage_runs(args.stage_run)
+    requested_epochs = getattr(args, "candidate_epoch", None)
+    schedule = contract.validate_candidate_epochs(
+        list(requested_epochs)
+        if requested_epochs
+        else list(contract.REQUIRED_CANDIDATE_EPOCHS)
+    )
+    final_epoch = schedule[-1]
     stages: dict[str, list[dict[str, Any]]] = {}
     source_receipts: dict[str, Any] = {}
     config_sha256: dict[str, str] = {}
@@ -297,11 +312,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             not isinstance(status, dict)
             or status.get("status") != "complete"
             or status.get("formal_stage") != stage
-            or status.get("completed_epochs") != 200
+            or status.get("completed_epochs") != final_epoch
             or status.get("updates_per_epoch")
             != contract.EXPECTED_UPDATES_PER_EPOCH
             or status.get("optimizer_updates")
-            != 200 * contract.EXPECTED_UPDATES_PER_EPOCH
+            != final_epoch * contract.EXPECTED_UPDATES_PER_EPOCH
         ):
             raise RuntimeError(f"{stage} formal training is not complete")
         status_source = contract.validate_training_audit_source(
@@ -394,6 +409,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             status=status,
             run=run,
             stage=stage,
+            final_epoch=final_epoch,
         )
         expected_common = {
             "source_receipt": status_source,
@@ -458,7 +474,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 f"{stage}_epoch_{epoch:04d}_step_"
                 f"{epoch * contract.EXPECTED_UPDATES_PER_EPOCH:09d}.bin"
             )
-            for epoch in contract.EXPECTED_CANDIDATE_EPOCHS
+            for epoch in schedule
         ]
         actual_paths = list(candidate_dir.iterdir())
         if (
@@ -476,7 +492,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         final_candidate_model_state: dict[str, Any] | None = None
         final_candidate_audit: dict[str, Any] | None = None
         for epoch, path in zip(
-            contract.EXPECTED_CANDIDATE_EPOCHS,
+            schedule,
             expected_paths,
         ):
             resolved = contract.regular_file(
@@ -528,7 +544,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                 }
             )
-            if epoch == 200:
+            if epoch == final_epoch:
                 final_candidate_model_state = candidate_model_state
                 final_candidate_audit = audit
         assert stage_audit is not None
@@ -541,12 +557,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             status.get("latest_representation_candidate"),
             stage=stage,
             candidate=final_candidate,
+            final_epoch=final_epoch,
             label=f"{stage} status latest representation candidate",
         )
         _validate_latest_candidate_receipt(
             final_audit.get("latest_representation_candidate"),
             stage=stage,
             candidate=final_candidate,
+            final_epoch=final_epoch,
             label=f"{stage} final latest representation candidate",
         )
         if (
@@ -554,13 +572,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             != status_rvq_rank
         ):
             raise RuntimeError(
-                f"{stage} epoch 200/status/final RVQ rank binding mismatch"
+                f"{stage} epoch {final_epoch}/status/final RVQ rank "
+                "binding mismatch"
             )
         _assert_tensor_states_equal(
             torch,
             final_candidate_model_state,
             final_model_state,
-            f"{stage} epoch 200/final model state",
+            f"{stage} epoch {final_epoch}/final model state",
         )
         source_receipts[stage] = contract.freeze_training_audit_source(
             stage_audit["source_receipt"],
@@ -594,7 +613,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "target_speaker_scope": contract.TARGET_SPEAKER_SCOPE,
             "selection_split": "val",
             "test_visible": False,
-            "candidate_epochs": list(contract.EXPECTED_CANDIDATE_EPOCHS),
+            "candidate_epochs": list(schedule),
             "updates_per_epoch": contract.EXPECTED_UPDATES_PER_EPOCH,
             "source_receipts": source_receipts,
             "config_sha256": config_sha256,
@@ -618,6 +637,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="repeat exactly five times as STAGE=/absolute/run/path",
     )
+    parser.add_argument(
+        "--candidate-epoch",
+        action="append",
+        type=int,
+        help=(
+            "optional append-only formal inventory; repeat for every epoch. "
+            "It must contain the mandatory e20..e200 prefix"
+        ),
+    )
     parser.add_argument("--output-json", type=Path, required=True)
     return parser
 
@@ -630,7 +658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": result["status"],
                 "stages": list(contract.STAGES),
                 "candidates_per_stage": len(
-                    contract.EXPECTED_CANDIDATE_EPOCHS
+                    result["candidate_epochs"]
                 ),
                 "receipt_payload_sha256": result[
                     "receipt_payload_sha256"

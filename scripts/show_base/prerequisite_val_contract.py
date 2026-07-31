@@ -29,7 +29,12 @@ EXPECTED_VAL_GLOBAL_INDEX_STOP = (
     EXPECTED_VAL_GLOBAL_INDEX_START + EXPECTED_VAL_CLIPS
 )
 EXPECTED_SHARDS = 8
-EXPECTED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
+REQUIRED_CANDIDATE_EPOCHS = tuple(range(20, 201, 20))
+# Backwards-compatible name for callers that only need the mandatory
+# production schedule.  Receipt consumers must use ``candidate_epochs()``
+# so a later formal run can append e220, e240, ... without weakening the
+# required e20..e200 prefix.
+EXPECTED_CANDIDATE_EPOCHS = REQUIRED_CANDIDATE_EPOCHS
 EXPECTED_UPDATES_PER_EPOCH = 497
 TARGET_SPEAKER_SCOPE = "all_speakers_0_1_2_3"
 FPS = 30
@@ -39,6 +44,51 @@ RVQ_LEVELS = 6
 CODEBOOK_SIZE = 256
 STAGES = ("face", "hands", "upper", "lower", "global")
 RVQ_STAGES = ("face", "hands", "upper", "lower")
+
+
+def validate_candidate_epochs(value: Any) -> tuple[int, ...]:
+    """Validate the receipt-driven candidate inventory.
+
+    Every formal receipt must contain the complete e20..e200 schedule.
+    Future training may append strictly increasing 20-epoch boundaries, but
+    may never remove, reorder, or insert candidates into the mandatory
+    prefix.
+    """
+
+    if not isinstance(value, list):
+        raise ContractError("candidate epochs must be a JSON list")
+    epochs = tuple(
+        require_exact_int(epoch, "candidate epoch") for epoch in value
+    )
+    required = REQUIRED_CANDIDATE_EPOCHS
+    if (
+        len(epochs) < len(required)
+        or epochs[: len(required)] != required
+        or any(
+            epoch <= 0
+            or epoch % 20 != 0
+            or (index and epoch <= epochs[index - 1])
+            for index, epoch in enumerate(epochs)
+        )
+        or any(epoch <= required[-1] for epoch in epochs[len(required) :])
+    ):
+        raise ContractError(
+            "candidate epochs must be the e20..e200 prefix followed by "
+            "strictly increasing 20-epoch append-only boundaries"
+        )
+    return epochs
+
+
+def candidate_epochs(candidate_index: Mapping[str, Any]) -> tuple[int, ...]:
+    return validate_candidate_epochs(candidate_index.get("candidate_epochs"))
+
+
+def is_candidate_epoch(epoch: Any) -> bool:
+    return (
+        type(epoch) is int
+        and epoch >= REQUIRED_CANDIDATE_EPOCHS[0]
+        and epoch % 20 == 0
+    )
 
 VAL_CANONICAL_SUMMARY_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_summary_v1"
@@ -828,7 +878,7 @@ def validate_representation_candidate_audit(
     updates = epoch * EXPECTED_UPDATES_PER_EPOCH
     if (
         stage not in STAGES
-        or epoch not in EXPECTED_CANDIDATE_EPOCHS
+        or not is_candidate_epoch(epoch)
         or value["format"] != "semtalk_show_representation_candidate_v1"
         or value["formal_stage"] != stage
         or require_exact_int(
@@ -1222,11 +1272,10 @@ def validate_candidate_index(
         or payload.get("target_speaker_scope") != TARGET_SPEAKER_SCOPE
         or payload.get("selection_split") != "val"
         or payload.get("test_visible") is not False
-        or payload.get("candidate_epochs")
-        != list(EXPECTED_CANDIDATE_EPOCHS)
         or payload.get("updates_per_epoch") != EXPECTED_UPDATES_PER_EPOCH
     ):
         raise ContractError("candidate index protocol mismatch")
+    schedule = validate_candidate_epochs(payload.get("candidate_epochs"))
     stages = payload.get("stages")
     if not isinstance(stages, dict) or set(stages) != set(STAGES):
         raise ContractError("candidate index stage coverage mismatch")
@@ -1255,11 +1304,9 @@ def validate_candidate_index(
     observed_paths: set[Path] = set()
     for stage in STAGES:
         entries = stages[stage]
-        if not isinstance(entries, list) or len(entries) != len(
-            EXPECTED_CANDIDATE_EPOCHS
-        ):
+        if not isinstance(entries, list) or len(entries) != len(schedule):
             raise ContractError(f"{stage} candidate coverage mismatch")
-        for expected_epoch, entry in zip(EXPECTED_CANDIDATE_EPOCHS, entries):
+        for expected_epoch, entry in zip(schedule, entries):
             if not isinstance(entry, dict) or set(entry) != {
                 "epoch",
                 "optimizer_updates",
@@ -1326,7 +1373,7 @@ def candidate_lookup(
     stage: str,
     epoch: int,
 ) -> dict[str, Any]:
-    if stage not in STAGES or epoch not in EXPECTED_CANDIDATE_EPOCHS:
+    if stage not in STAGES or epoch not in candidate_epochs(candidate_index):
         raise ContractError("candidate lookup outside the frozen schedule")
     matches = [
         entry
@@ -1371,6 +1418,32 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
         or payload["test_visible"] is not False
     ):
         raise ContractError("selection receipt protocol mismatch")
+    protocol = exact_keys(
+        payload["protocol"],
+        (
+            "name",
+            "candidate_epochs",
+            "candidates_per_stage",
+            "clips_per_candidate",
+            "shards_per_candidate",
+            "window_length",
+            "window_stride",
+            "full_base_fgd_used",
+        ),
+        "selection receipt protocol",
+    )
+    epochs = validate_candidate_epochs(protocol["candidate_epochs"])
+    if protocol != {
+        "name": "five_independent_show_prerequisite_validation_v1",
+        "candidate_epochs": list(epochs),
+        "candidates_per_stage": len(epochs),
+        "clips_per_candidate": EXPECTED_VAL_CLIPS,
+        "shards_per_candidate": EXPECTED_SHARDS,
+        "window_length": WINDOW_LENGTH,
+        "window_stride": WINDOW_STRIDE,
+        "full_base_fgd_used": False,
+    }:
+        raise ContractError("selection receipt candidate protocol mismatch")
     stages = payload["stages"]
     if (
         not isinstance(stages, list)
@@ -1399,7 +1472,8 @@ def validate_selection_receipt(value: Any) -> dict[str, Any]:
         if (
             result["stage"] != stage
             or result["selection_metric"] != SELECTION_METRICS[stage]
-            or epoch not in EXPECTED_CANDIDATE_EPOCHS
+            or epoch not in epochs
+            or result["candidate_index"] != epochs.index(epoch)
             or result["optimizer_updates"]
             != epoch * EXPECTED_UPDATES_PER_EPOCH
         ):

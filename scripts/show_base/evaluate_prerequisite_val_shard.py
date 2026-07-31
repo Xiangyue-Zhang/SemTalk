@@ -347,7 +347,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.stage not in contract.STAGES:
         raise ValueError("--stage is invalid")
-    if args.epoch not in contract.EXPECTED_CANDIDATE_EPOCHS:
+    if not contract.is_candidate_epoch(args.epoch):
         raise ValueError("--epoch is outside the frozen schedule")
     if (
         args.optimizer_updates
