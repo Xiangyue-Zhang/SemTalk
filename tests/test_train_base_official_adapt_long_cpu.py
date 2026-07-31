@@ -19,6 +19,12 @@ SCRIPT = (
     / "show_base"
     / "train_base_official_adapt_long.py"
 )
+FRESH_SCHEDULE = (
+    REPOSITORY
+    / "configs"
+    / "show_base"
+    / "semtalk_base_fresh_lineage_schedule_20260731.json"
+)
 SPEC = importlib.util.spec_from_file_location(
     "train_base_official_adapt_long", SCRIPT
 )
@@ -108,7 +114,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                 1,
             )
 
-    def test_committed_schedule_and_anchor_are_pinned(self) -> None:
+    def test_committed_schedules_and_legacy_anchor_are_pinned(self) -> None:
         schedule = (
             REPOSITORY
             / "configs/show_base/semtalk_base_long_schedule_20260731.json"
@@ -126,6 +132,10 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             _sha(anchor),
             "e27c27a0da2793f44608b618d08356df0b60f55ae039434a228c50ff73028cf2",
         )
+        self.assertEqual(
+            _sha(FRESH_SCHEDULE),
+            "87ffea4de0b28cbd9b41eb0e935b74d93355e1c1b9a21fb570c98c5ba7cfbbd8",
+        )
 
     def test_protocol_is_main_forward_only_and_vq_free(self) -> None:
         args = argparse.Namespace(
@@ -135,8 +145,19 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             expected_schedule_sha256="a" * 64,
             trajectory_anchor_json="/frozen/anchor.json",
             expected_trajectory_anchor_sha256="b" * 64,
+            trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
+            loader_workers=4,
         )
-        protocol = ADAPT.protocol_receipt(args)
+        protocol = ADAPT.protocol_receipt(
+            args,
+            contract_receipts={
+                "trajectory_anchor": {
+                    "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
+                    "path": "/frozen/anchor.json",
+                    "sha256": "b" * 64,
+                }
+            },
+        )
         self.assertEqual(
             protocol["forward_contract"]["forwards_per_optimizer_step"], 1
         )
@@ -193,6 +214,8 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             "/frozen/schedule.json",
             "--expected-schedule-sha256",
             "c" * 64,
+            "--trajectory-mode",
+            ADAPT.LEGACY_TRAJECTORY_MODE,
             "--trajectory-anchor-json",
             "/frozen/anchor.json",
             "--expected-trajectory-anchor-sha256",
@@ -210,6 +233,34 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         args.local_batch_size = 64
         args.epochs = 200
         with self.assertRaises(ADAPT.AdaptationContractError):
+            ADAPT.validate_args(args)
+
+    def test_fresh_selected_vq_args_forbid_external_anchor(self) -> None:
+        parser = ADAPT.build_parser()
+        base = [
+            "--mode", "throughput_gate",
+            "--official-base-checkpoint", "/weights/all/best_semtalk_base.bin",
+            "--train-lmdb", "/cache/current-selected/base.lmdb",
+            "--dataset-summary", "/cache/current-selected/summary.json",
+            "--expected-dataset-summary-sha256", "a" * 64,
+            "--lineage-manifest", "/cache/current-selected/lineage.json",
+            "--expected-lineage-sha256", "b" * 64,
+            "--prerequisite-selection-json", "/selection/current-five.json",
+            "--expected-prerequisite-selection-sha256", "c" * 64,
+            "--schedule-json", str(FRESH_SCHEDULE),
+            "--expected-schedule-sha256", _sha(FRESH_SCHEDULE),
+            "--trajectory-mode", ADAPT.FRESH_TRAJECTORY_MODE,
+            "--output-root", "/runs/base",
+            "--run-name", "selected_all_show",
+        ]
+        args = parser.parse_args(base)
+        ADAPT.validate_args(args)
+        args.trajectory_anchor_json = "/frozen/old-anchor.json"
+        args.expected_trajectory_anchor_sha256 = "d" * 64
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "forbids an external old trajectory anchor",
+        ):
             ADAPT.validate_args(args)
 
 
@@ -235,6 +286,133 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
         def is_tensor(value: object) -> bool:
             return isinstance(
                 value, OfficialBaseAdaptReceiptContracts._FakeTensor
+            )
+
+    def _fresh_dataset_receipt(self) -> dict[str, object]:
+        return {
+            "format": (
+                "semtalk_show_base_selected_feature_dataset_receipt_v1"
+            ),
+            "lmdb": "/cache/current-selected/base.lmdb",
+            "entries": ADAPT.EXPECTED_TRAIN_SAMPLES,
+            "train_clips": ADAPT.EXPECTED_TRAIN_CLIPS,
+            "split": "train",
+            "test_visible": False,
+            "data_mdb_sha256": "1" * 64,
+            "lock_mdb_sha256": "2" * 64,
+            "summary": "/cache/current-selected/summary.json",
+            "summary_sha256": "3" * 64,
+            "lineage": "/cache/current-selected/lineage.json",
+            "lineage_sha256": "4" * 64,
+            "prerequisite_source": ADAPT.SHOW_VAL_SELECTED_SOURCE,
+            "formal_checkpoints": {},
+            "vq_models_in_training_graph": False,
+            "vq_targets": "precomputed_frozen_lmdb_tensors",
+            "prerequisite_selection": {
+                "path": "/selection/current-five.json",
+                "sha256": "5" * 64,
+                "receipt_payload_sha256": "6" * 64,
+            },
+            "selected_prerequisite_sha256": {
+                stage: str(index + 10) * 32
+                for index, stage in enumerate(ADAPT.selected_contract.STAGES)
+            },
+            "global_verified_not_consumed": True,
+        }
+
+    def _fresh_long_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            schedule_json=str(FRESH_SCHEDULE),
+            expected_schedule_sha256=_sha(FRESH_SCHEDULE),
+            trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
+            trajectory_anchor_json=None,
+            expected_trajectory_anchor_sha256=None,
+            expected_prerequisite_selection_sha256="5" * 64,
+            expected_dataset_summary_sha256="3" * 64,
+            expected_lineage_sha256="4" * 64,
+            precision="bf16",
+            learning_rate=3e-5,
+            seed=43,
+            loader_workers=4,
+        )
+
+    def test_fresh_trajectory_binds_exact_selected_feature_lineage(self) -> None:
+        dataset = self._fresh_dataset_receipt()
+        receipt = ADAPT.validate_long_contract_receipts(
+            self._fresh_long_args(),
+            dataset_receipt=dataset,
+        )
+        trajectory = receipt["trajectory_anchor"]
+        self.assertEqual(
+            trajectory["mode"],
+            ADAPT.FRESH_TRAJECTORY_MODE,
+        )
+        self.assertIsNone(trajectory["path"])
+        self.assertEqual(trajectory["entries"], {})
+        self.assertEqual(
+            trajectory["feature_lineage_sha256"],
+            dataset["lineage_sha256"],
+        )
+        self.assertEqual(
+            trajectory["prerequisite_selection_sha256"],
+            dataset["prerequisite_selection"]["sha256"],
+        )
+        self.assertEqual(
+            trajectory["probe_optimizer_updates"],
+            ADAPT.TRAJECTORY_PROBE_UPDATES,
+        )
+
+    def test_fresh_trajectory_rejects_feature_lineage_mismatch(self) -> None:
+        dataset = self._fresh_dataset_receipt()
+        dataset["lineage_sha256"] = "7" * 64
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "exact selected SHOW prerequisite/feature lineage",
+        ):
+            ADAPT.validate_long_contract_receipts(
+                self._fresh_long_args(),
+                dataset_receipt=dataset,
+            )
+
+    def test_fresh_trajectory_rejects_test_visible_features(self) -> None:
+        dataset = self._fresh_dataset_receipt()
+        dataset["split"] = "test"
+        dataset["test_visible"] = True
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "exact selected SHOW prerequisite/feature lineage",
+        ):
+            ADAPT.validate_long_contract_receipts(
+                self._fresh_long_args(),
+                dataset_receipt=dataset,
+            )
+
+    def test_legacy_anchor_is_rejected_for_selected_show_vqs(self) -> None:
+        schedule = (
+            REPOSITORY
+            / "configs"
+            / "show_base"
+            / "semtalk_base_long_schedule_20260731.json"
+        )
+        anchor = (
+            REPOSITORY
+            / "configs"
+            / "show_base"
+            / "semtalk_base_long_trajectory_anchor_20260731.json"
+        )
+        args = self._fresh_long_args()
+        args.schedule_json = str(schedule)
+        args.expected_schedule_sha256 = _sha(schedule)
+        args.trajectory_mode = ADAPT.LEGACY_TRAJECTORY_MODE
+        args.trajectory_anchor_json = str(anchor)
+        args.expected_trajectory_anchor_sha256 = _sha(anchor)
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "cannot be used with freshly selected SHOW prerequisites",
+        ):
+            ADAPT.validate_long_contract_receipts(
+                args,
+                dataset_receipt=self._fresh_dataset_receipt(),
             )
 
     def test_official_checkpoint_filename_sha_envelope_and_normalization(
@@ -439,6 +617,9 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 "all_losses_finite": True,
                 "samples_per_second": 512.0,
                 "seconds_per_update": 1.0,
+                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+                "trajectory_mode": ADAPT.LEGACY_TRAJECTORY_MODE,
+                "trajectory_probe": None,
             }
             path = root / "gate.json"
             path.write_text(
@@ -453,13 +634,126 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             )
             receipt = ADAPT.validate_throughput_gate(
                 args,
-                frozen_receipt={"receipt_sha256": "a" * 64},
+                frozen_receipt={
+                    "receipt_sha256": "a" * 64,
+                    "long_contract": {
+                        "trajectory_anchor": {
+                            "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
+                        }
+                    },
+                },
             )
             self.assertEqual(receipt["samples_per_second"], 512.0)
             with self.assertRaises(ADAPT.AdaptationContractError):
                 ADAPT.validate_throughput_gate(
                     args,
-                    frozen_receipt={"receipt_sha256": "b" * 64},
+                    frozen_receipt={
+                        "receipt_sha256": "b" * 64,
+                        "long_contract": {
+                            "trajectory_anchor": {
+                                "mode": ADAPT.LEGACY_TRAJECTORY_MODE,
+                            }
+                        },
+                    },
+                )
+
+    def test_fresh_trajectory_probe_is_byte_exact(self) -> None:
+        expected = {
+            "format": ADAPT.TRAJECTORY_PROBE_FORMAT,
+            "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+            "model_state_tensors": 1790,
+            "model_state_schema_sha256": "a" * 64,
+            "model_state_semantic_sha256": "b" * 64,
+            "optimizer_state_semantic_sha256": "e" * 64,
+        }
+        self.assertEqual(
+            ADAPT._require_matching_trajectory_probe(expected, dict(expected)),
+            expected,
+        )
+        changed = dict(expected)
+        changed["model_state_semantic_sha256"] = "c" * 64
+        with self.assertRaisesRegex(
+            ADAPT.AdaptationContractError,
+            "does not reproduce",
+        ):
+            ADAPT._require_matching_trajectory_probe(expected, changed)
+
+    def test_fresh_throughput_gate_carries_lineage_bound_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            probe = {
+                "format": ADAPT.TRAJECTORY_PROBE_FORMAT,
+                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+                "model_state_tensors": 1790,
+                "model_state_schema_sha256": "a" * 64,
+                "model_state_semantic_sha256": "b" * 64,
+                "optimizer_state_semantic_sha256": "e" * 64,
+            }
+            report = {
+                "format": ADAPT.GATE_FORMAT,
+                "status": "pass",
+                "frozen_receipt_sha256": "c" * 64,
+                "world_size": ADAPT.WORLD_SIZE,
+                "local_batch_size": ADAPT.LOCAL_BATCH_SIZE,
+                "global_batch_size": ADAPT.GLOBAL_BATCH_SIZE,
+                "warmup_updates": ADAPT.THROUGHPUT_WARMUP_UPDATES,
+                "timed_updates": ADAPT.THROUGHPUT_TIMED_UPDATES,
+                "optimizer_updates": ADAPT.TRAJECTORY_PROBE_UPDATES,
+                "trajectory_mode": ADAPT.FRESH_TRAJECTORY_MODE,
+                "trajectory_probe": probe,
+                "precision": "bf16",
+                "learning_rate": 3e-5,
+                "all_losses_finite": True,
+                "samples_per_second": 1024.0,
+                "seconds_per_update": 0.5,
+            }
+            path = Path(temporary) / "fresh-gate.json"
+            path.write_text(
+                json.dumps(report, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                throughput_gate_report=str(path),
+                expected_throughput_gate_sha256=_sha(path),
+                precision="bf16",
+                learning_rate=3e-5,
+            )
+            receipt = ADAPT.validate_throughput_gate(
+                args,
+                frozen_receipt={
+                    "receipt_sha256": "c" * 64,
+                    "long_contract": {
+                        "trajectory_anchor": {
+                            "mode": ADAPT.FRESH_TRAJECTORY_MODE,
+                        }
+                    },
+                },
+            )
+            self.assertEqual(receipt["trajectory_probe"], probe)
+            report["trajectory_probe"][
+                "model_state_semantic_sha256"
+            ] = "d" * 64
+            changed_path = Path(temporary) / "changed-gate.json"
+            changed_path.write_text(
+                json.dumps(report, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            args.throughput_gate_report = str(changed_path)
+            args.expected_throughput_gate_sha256 = _sha(changed_path)
+            changed = ADAPT.validate_throughput_gate(
+                args,
+                frozen_receipt={
+                    "receipt_sha256": "c" * 64,
+                    "long_contract": {
+                        "trajectory_anchor": {
+                            "mode": ADAPT.FRESH_TRAJECTORY_MODE,
+                        }
+                    },
+                },
+            )
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT._require_matching_trajectory_probe(
+                    receipt["trajectory_probe"],
+                    changed["trajectory_probe"],
                 )
 
     def test_source_receipt_supports_detached_head(self) -> None:

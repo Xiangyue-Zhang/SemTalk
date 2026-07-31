@@ -12,10 +12,14 @@ The executable modes are:
 
 ``throughput_gate``
     Run exactly 20 warm-up and 50 measured updates, then write a gate receipt.
+    For fresh SHOW prerequisite lineages, the receipt also contains a
+    byte-exact semantic hash of the resulting model state.
 
 ``train``
     Require the matching throughput receipt and train one uninterrupted
-    400-epoch trajectory on a sparse, pre-registered candidate grid.
+    400-epoch trajectory on a sparse, pre-registered candidate grid.  A fresh
+    lineage repeats the first 70 updates and must reproduce the gate's model
+    state before any candidate may be published.
 """
 
 from __future__ import annotations
@@ -173,7 +177,17 @@ READY_RECEIPT_FORMAT = (
     "semtalk_show_base_official_adapt_long_candidate_ready_v1"
 )
 SCHEDULE_FORMAT = "semtalk_show_base_long_schedule_v1"
+FRESH_SCHEDULE_FORMAT = "semtalk_show_base_fresh_lineage_schedule_v1"
 ANCHOR_FORMAT = "semtalk_show_base_long_trajectory_anchor_v1"
+LEGACY_TRAJECTORY_MODE = "legacy_external_anchor_v1"
+FRESH_TRAJECTORY_MODE = "fresh_lineage_gate_v1"
+FRESH_TRAJECTORY_FORMAT = (
+    "semtalk_show_base_fresh_lineage_trajectory_contract_v1"
+)
+TRAJECTORY_PROBE_FORMAT = "semtalk_show_base_trajectory_probe_v1"
+TRAJECTORY_PROBE_UPDATES = (
+    THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
+)
 LOSS_COMPONENTS = (
     "zq_face",
     "zq_upper",
@@ -709,6 +723,8 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
         "lmdb": str(lmdb_path),
         "entries": EXPECTED_TRAIN_SAMPLES,
         "train_clips": EXPECTED_TRAIN_CLIPS,
+        "split": "train",
+        "test_visible": False,
         "data_mdb_sha256": observed_data_sha,
         "lock_mdb_sha256": observed_lock_sha,
         "summary": str(summary_path),
@@ -748,6 +764,8 @@ def validate_dataset_receipts(args: argparse.Namespace) -> dict[str, Any]:
 
 def validate_long_contract_receipts(
     args: argparse.Namespace,
+    *,
+    dataset_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     schedule, schedule_path, schedule_sha = _load_json_receipt(
         Path(args.schedule_json),
@@ -758,8 +776,7 @@ def validate_long_contract_receipts(
     selection = schedule.get("selection")
     initialization = schedule.get("initialization")
     if (
-        schedule.get("format") != SCHEDULE_FORMAT
-        or schedule.get("scope") != "SemTalk Base only"
+        schedule.get("scope") != "SemTalk Base only"
         or schedule.get("target_dataset") != "SHOW"
         or schedule.get("target_speaker_scope") != "All"
         or not isinstance(initialization, dict)
@@ -784,8 +801,6 @@ def validate_long_contract_receipts(
         or training.get("seed") != args.seed
         or training.get("vq_models_in_training_graph") is not False
         or schedule.get("candidate_epochs") != list(CANDIDATE_EPOCHS)
-        or schedule.get("trajectory_anchor_epochs")
-        != list(TRAJECTORY_ANCHOR_EPOCHS)
         or not isinstance(selection, dict)
         or selection.get("split") != "val"
         or selection.get("test_visible") is not False
@@ -795,6 +810,114 @@ def validate_long_contract_receipts(
     ):
         raise AdaptationContractError(
             "long-training schedule does not match the frozen e400 contract"
+        )
+
+    schedule_receipt = {
+        "path": str(schedule_path),
+        "sha256": schedule_sha,
+        "payload_sha256": canonical_json_sha256(schedule),
+    }
+    if args.trajectory_mode == FRESH_TRAJECTORY_MODE:
+        expected_trajectory_contract = {
+            "mode": FRESH_TRAJECTORY_MODE,
+            "external_anchor": False,
+            "probe_optimizer_updates": TRAJECTORY_PROBE_UPDATES,
+            "probe_source": "matching_frozen_receipt_throughput_gate",
+            "comparison": "byte_exact_model_state_semantic_sha256",
+            "restart_from_official_initialization": True,
+        }
+        prerequisite_selection = dataset_receipt.get(
+            "prerequisite_selection"
+        )
+        selected_sha256 = dataset_receipt.get(
+            "selected_prerequisite_sha256"
+        )
+        if (
+            schedule.get("format") != FRESH_SCHEDULE_FORMAT
+            or schedule.get("trajectory_contract")
+            != expected_trajectory_contract
+            or training.get("loader_workers") != args.loader_workers
+            or schedule.get("trajectory_anchor_epochs") is not None
+            or dataset_receipt.get("format")
+            != "semtalk_show_base_selected_feature_dataset_receipt_v1"
+            or dataset_receipt.get("prerequisite_source")
+            != SHOW_VAL_SELECTED_SOURCE
+            or dataset_receipt.get("split") != "train"
+            or dataset_receipt.get("test_visible") is not False
+            or dataset_receipt.get("summary_sha256")
+            != args.expected_dataset_summary_sha256
+            or dataset_receipt.get("lineage_sha256")
+            != args.expected_lineage_sha256
+            or not isinstance(prerequisite_selection, dict)
+            or prerequisite_selection.get("sha256")
+            != args.expected_prerequisite_selection_sha256
+            or not isinstance(selected_sha256, dict)
+            or set(selected_sha256) != set(selected_contract.STAGES)
+            or dataset_receipt.get("global_verified_not_consumed") is not True
+        ):
+            raise AdaptationContractError(
+                "fresh Base trajectory is not bound to the exact selected "
+                "SHOW prerequisite/feature lineage"
+            )
+        binding = {
+            "format": FRESH_TRAJECTORY_FORMAT,
+            "mode": FRESH_TRAJECTORY_MODE,
+            "schedule_sha256": schedule_sha,
+            "official_base_checkpoint_sha256": OFFICIAL_BASE_SPEC["sha256"],
+            "dataset_receipt_payload_sha256": canonical_json_sha256(
+                dataset_receipt
+            ),
+            "dataset_split": "train",
+            "test_visible": False,
+            "dataset_summary_sha256": dataset_receipt["summary_sha256"],
+            "feature_lineage_sha256": dataset_receipt["lineage_sha256"],
+            "data_mdb_sha256": dataset_receipt["data_mdb_sha256"],
+            "lock_mdb_sha256": dataset_receipt["lock_mdb_sha256"],
+            "prerequisite_selection_sha256": prerequisite_selection[
+                "sha256"
+            ],
+            "selected_prerequisite_sha256": {
+                stage: selected_sha256[stage]
+                for stage in sorted(selected_sha256)
+            },
+            "probe_optimizer_updates": TRAJECTORY_PROBE_UPDATES,
+            "probe_source": "matching_frozen_receipt_throughput_gate",
+            "comparison": "byte_exact_model_state_semantic_sha256",
+            "seed": args.seed,
+            "precision": args.precision,
+            "learning_rate": args.learning_rate,
+            "world_size": WORLD_SIZE,
+            "global_batch_size": GLOBAL_BATCH_SIZE,
+            "updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
+            "loader_workers": args.loader_workers,
+        }
+        binding_sha = canonical_json_sha256(binding)
+        return {
+            "format": "semtalk_show_base_long_contract_receipts_v1",
+            "schedule": schedule_receipt,
+            # Keep the outer key stable for checkpoint/receipt consumers.  In
+            # fresh mode this is a lineage binding, never an old checkpoint
+            # manifest masquerading as an applicable trajectory anchor.
+            "trajectory_anchor": {
+                **binding,
+                "path": None,
+                "sha256": binding_sha,
+                "payload_sha256": binding_sha,
+                "entries": {},
+            },
+        }
+
+    if (
+        args.trajectory_mode != LEGACY_TRAJECTORY_MODE
+        or schedule.get("format") != SCHEDULE_FORMAT
+        or schedule.get("trajectory_anchor_epochs")
+        != list(TRAJECTORY_ANCHOR_EPOCHS)
+        or dataset_receipt.get("format")
+        == "semtalk_show_base_selected_feature_dataset_receipt_v1"
+    ):
+        raise AdaptationContractError(
+            "legacy trajectory anchors cannot be used with freshly selected "
+            "SHOW prerequisites"
         )
 
     anchor, anchor_path, anchor_sha = _load_json_receipt(
@@ -864,12 +987,9 @@ def validate_long_contract_receipts(
             )
     return {
         "format": "semtalk_show_base_long_contract_receipts_v1",
-        "schedule": {
-            "path": str(schedule_path),
-            "sha256": schedule_sha,
-            "payload_sha256": canonical_json_sha256(schedule),
-        },
+        "schedule": schedule_receipt,
         "trajectory_anchor": {
+            "mode": LEGACY_TRAJECTORY_MODE,
             "path": str(anchor_path),
             "sha256": anchor_sha,
             "payload_sha256": canonical_json_sha256(anchor),
@@ -932,7 +1052,13 @@ def source_receipt() -> dict[str, Any]:
     }
 
 
-def protocol_receipt(args: argparse.Namespace) -> dict[str, Any]:
+def protocol_receipt(
+    args: argparse.Namespace,
+    *,
+    contract_receipts: Mapping[str, Any],
+) -> dict[str, Any]:
+    trajectory = contract_receipts["trajectory_anchor"]
+    fresh_trajectory = trajectory.get("mode") == FRESH_TRAJECTORY_MODE
     return {
         "format": PROTOCOL_FORMAT,
         "scope": "SemTalk Base only",
@@ -956,18 +1082,39 @@ def protocol_receipt(args: argparse.Namespace) -> dict[str, Any]:
         "world_size": WORLD_SIZE,
         "local_batch_size": LOCAL_BATCH_SIZE,
         "global_batch_size": GLOBAL_BATCH_SIZE,
+        "loader_workers": args.loader_workers,
         "expected_train_samples": EXPECTED_TRAIN_SAMPLES,
         "expected_updates_per_epoch": EXPECTED_UPDATES_PER_EPOCH,
         "epochs": TOTAL_EPOCHS,
         "candidate_epochs": list(CANDIDATE_EPOCHS),
-        "trajectory_anchor_epochs": list(TRAJECTORY_ANCHOR_EPOCHS),
+        "trajectory_anchor_epochs": (
+            [] if fresh_trajectory else list(TRAJECTORY_ANCHOR_EPOCHS)
+        ),
         "schedule": {
             "path": str(Path(args.schedule_json).resolve()),
             "sha256": args.expected_schedule_sha256,
         },
         "trajectory_anchor": {
-            "path": str(Path(args.trajectory_anchor_json).resolve()),
-            "sha256": args.expected_trajectory_anchor_sha256,
+            "mode": trajectory["mode"],
+            "path": trajectory["path"],
+            "sha256": trajectory["sha256"],
+            "external": not fresh_trajectory,
+        },
+        "trajectory_gate": {
+            "required": fresh_trajectory,
+            "probe_optimizer_updates": (
+                TRAJECTORY_PROBE_UPDATES if fresh_trajectory else None
+            ),
+            "probe_source": (
+                "matching_frozen_receipt_throughput_gate"
+                if fresh_trajectory
+                else None
+            ),
+            "comparison": (
+                "byte_exact_model_state_semantic_sha256"
+                if fresh_trajectory
+                else None
+            ),
         },
         "optimizer": {
             "name": "Adam",
@@ -1287,6 +1434,121 @@ def _unwrap_model(model: Any) -> Any:
     return model.module if hasattr(model, "module") else model
 
 
+def _state_tree_semantic_sha256(value: Any) -> str:
+    import torch
+
+    def normalize(item: Any) -> Any:
+        if torch.is_tensor(item):
+            return {
+                "type": "tensor",
+                "shape": list(item.shape),
+                "dtype": str(item.dtype),
+                "sha256": _tensor_sha256(item),
+            }
+        if isinstance(item, Mapping):
+            normalized_items = [
+                [normalize(key), normalize(child)]
+                for key, child in item.items()
+            ]
+            normalized_items.sort(
+                key=lambda row: json.dumps(
+                    row[0],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return {"type": "mapping", "items": normalized_items}
+        if isinstance(item, list):
+            return {"type": "list", "items": [normalize(child) for child in item]}
+        if isinstance(item, tuple):
+            return {"type": "tuple", "items": [normalize(child) for child in item]}
+        if item is None or type(item) in {bool, int, str}:
+            return {"type": type(item).__name__, "value": item}
+        if type(item) is float and math.isfinite(item):
+            return {"type": "float", "value": item}
+        raise AdaptationContractError(
+            f"unsupported or non-finite trajectory state value: {type(item)}"
+        )
+
+    return canonical_json_sha256(normalize(value))
+
+
+def _trajectory_probe(
+    model: Any,
+    optimizer: Any,
+    optimizer_updates: int,
+) -> dict[str, Any]:
+    state = _unwrap_model(model).state_dict()
+    return {
+        "format": TRAJECTORY_PROBE_FORMAT,
+        "optimizer_updates": optimizer_updates,
+        "model_state_tensors": len(state),
+        "model_state_schema_sha256": _state_schema_sha256(state),
+        "model_state_semantic_sha256": _model_state_semantic_sha256(state),
+        "optimizer_state_semantic_sha256": _state_tree_semantic_sha256(
+            optimizer.state_dict()
+        ),
+    }
+
+
+def _validate_trajectory_probe(
+    probe: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    expected_keys = {
+        "format",
+        "optimizer_updates",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "optimizer_state_semantic_sha256",
+    }
+    if not isinstance(probe, dict) or set(probe) != expected_keys:
+        raise AdaptationContractError(f"{label} schema mismatch")
+    if (
+        probe.get("format") != TRAJECTORY_PROBE_FORMAT
+        or type(probe.get("optimizer_updates")) is not int
+        or probe["optimizer_updates"] != TRAJECTORY_PROBE_UPDATES
+        or type(probe.get("model_state_tensors")) is not int
+        or probe["model_state_tensors"] <= 0
+    ):
+        raise AdaptationContractError(f"{label} metadata mismatch")
+    for key in (
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "optimizer_state_semantic_sha256",
+    ):
+        value = probe.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise AdaptationContractError(f"{label} {key} is invalid")
+    return dict(probe)
+
+
+def _require_matching_trajectory_probe(
+    expected: Any,
+    observed: Any,
+) -> dict[str, Any]:
+    expected_probe = _validate_trajectory_probe(
+        expected,
+        label="throughput trajectory probe",
+    )
+    observed_probe = _validate_trajectory_probe(
+        observed,
+        label="training trajectory probe",
+    )
+    if observed_probe != expected_probe:
+        raise AdaptationContractError(
+            "fresh Base trajectory probe does not reproduce the exact "
+            "matching-lineage throughput gate"
+        )
+    return observed_probe
+
+
 def _finite_model_and_optimizer(model: Any, optimizer: Any) -> None:
     import torch
 
@@ -1329,7 +1591,16 @@ def _save_candidate(
         for key, value in _unwrap_model(model).state_dict().items()
     }
     semantic_sha = _model_state_semantic_sha256(model_state)
-    expected_anchor = contract_receipts["trajectory_anchor"]["entries"].get(
+    trajectory_contract = contract_receipts["trajectory_anchor"]
+    fresh_trajectory = (
+        trajectory_contract.get("mode") == FRESH_TRAJECTORY_MODE
+    )
+    if fresh_trajectory and manifest.get("trajectory_probe_verified") is not True:
+        raise AdaptationContractError(
+            "fresh Base candidate publication precedes trajectory-gate "
+            "verification"
+        )
+    expected_anchor = trajectory_contract["entries"].get(
         str(epoch)
     )
     anchor_match: bool | None = None
@@ -1357,6 +1628,9 @@ def _save_candidate(
         "all_model_state_tensors_finite": True,
         "model_state_semantic_sha256": semantic_sha,
         "trajectory_anchor_match": anchor_match,
+        "trajectory_probe_verified": (
+            True if fresh_trajectory else None
+        ),
     }
     _atomic_torch_save(
         checkpoint_path,
@@ -1380,6 +1654,9 @@ def _save_candidate(
             "all_model_state_tensors_finite": True,
             "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
             "trajectory_anchor_match": anchor_match,
+            "trajectory_probe_verified": (
+                True if fresh_trajectory else None
+            ),
         }
     )
     manifest["entries_sha256"] = canonical_json_sha256(manifest["entries"])
@@ -1509,6 +1786,11 @@ def _save_latest_resume(
         "trajectory_anchor_sha256": contract_receipts[
             "trajectory_anchor"
         ]["sha256"],
+        "trajectory_mode": contract_receipts["trajectory_anchor"]["mode"],
+        "trajectory_probe_verified": manifest.get(
+            "trajectory_probe_verified"
+        ),
+        "trajectory_probe": manifest.get("trajectory_probe"),
     }
     _atomic_torch_save(resume_path, payload)
     _atomic_json(
@@ -1528,6 +1810,10 @@ def _save_latest_resume(
             "trajectory_anchor_sha256": contract_receipts[
                 "trajectory_anchor"
             ]["sha256"],
+            "trajectory_mode": payload["trajectory_mode"],
+            "trajectory_probe_verified": payload[
+                "trajectory_probe_verified"
+            ],
             "completed_unix": time.time(),
         },
     )
@@ -1547,6 +1833,9 @@ def validate_throughput_gate(
         args.expected_throughput_gate_sha256,
         "Base throughput gate",
     )
+    trajectory_mode = frozen_receipt["long_contract"][
+        "trajectory_anchor"
+    ]["mode"]
     if (
         report.get("format") != GATE_FORMAT
         or report.get("status") != "pass"
@@ -1557,6 +1846,8 @@ def validate_throughput_gate(
         or report.get("global_batch_size") != GLOBAL_BATCH_SIZE
         or report.get("warmup_updates") != THROUGHPUT_WARMUP_UPDATES
         or report.get("timed_updates") != THROUGHPUT_TIMED_UPDATES
+        or report.get("optimizer_updates") != TRAJECTORY_PROBE_UPDATES
+        or report.get("trajectory_mode") != trajectory_mode
         or report.get("precision") != args.precision
         or float(report.get("learning_rate", math.nan)) != args.learning_rate
         or report.get("all_losses_finite") is not True
@@ -1566,11 +1857,23 @@ def validate_throughput_gate(
         raise AdaptationContractError(
             "throughput gate does not bind the exact training protocol"
         )
+    trajectory_probe = report.get("trajectory_probe")
+    if trajectory_mode == FRESH_TRAJECTORY_MODE:
+        trajectory_probe = _validate_trajectory_probe(
+            trajectory_probe,
+            label="throughput trajectory probe",
+        )
+    elif trajectory_probe is not None:
+        raise AdaptationContractError(
+            "legacy throughput gate must not claim a fresh trajectory probe"
+        )
     return {
         "path": str(path),
         "sha256": observed_sha,
         "samples_per_second": float(report["samples_per_second"]),
         "seconds_per_update": float(report["seconds_per_update"]),
+        "trajectory_mode": trajectory_mode,
+        "trajectory_probe": trajectory_probe,
     }
 
 
@@ -1594,10 +1897,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-prerequisite-selection-sha256")
     parser.add_argument("--schedule-json", required=True)
     parser.add_argument("--expected-schedule-sha256", required=True)
-    parser.add_argument("--trajectory-anchor-json", required=True)
+    parser.add_argument(
+        "--trajectory-mode",
+        choices=(LEGACY_TRAJECTORY_MODE, FRESH_TRAJECTORY_MODE),
+        required=True,
+    )
+    parser.add_argument("--trajectory-anchor-json")
     parser.add_argument(
         "--expected-trajectory-anchor-sha256",
-        required=True,
     )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--run-name", required=True)
@@ -1642,6 +1949,36 @@ def validate_args(args: argparse.Namespace) -> None:
         selected_contract.require_sha256(
             args.expected_prerequisite_selection_sha256,
             "prerequisite selection expected SHA-256",
+        )
+    anchor_pair_supplied = (
+        args.trajectory_anchor_json is not None
+        and args.expected_trajectory_anchor_sha256 is not None
+    )
+    if (args.trajectory_anchor_json is None) != (
+        args.expected_trajectory_anchor_sha256 is None
+    ):
+        raise AdaptationContractError(
+            "trajectory anchor JSON and external SHA-256 must be supplied "
+            "together"
+        )
+    if args.trajectory_mode == FRESH_TRAJECTORY_MODE:
+        if anchor_pair_supplied:
+            raise AdaptationContractError(
+                "fresh selected-VQ Base training forbids an external old "
+                "trajectory anchor"
+            )
+        if args.prerequisite_selection_json is None:
+            raise AdaptationContractError(
+                "fresh Base trajectory requires the hash-pinned five-stage "
+                "SHOW prerequisite selection"
+            )
+    elif (
+        not anchor_pair_supplied
+        or args.prerequisite_selection_json is not None
+    ):
+        raise AdaptationContractError(
+            "legacy trajectory mode requires its external anchor and cannot "
+            "consume freshly selected SHOW prerequisites"
         )
     if args.local_batch_size != LOCAL_BATCH_SIZE:
         raise AdaptationContractError("local batch size must be exactly 64")
@@ -1797,6 +2134,18 @@ def _run_throughput_gate(
     elapsed = float(elapsed_tensor.item())
     _assert_distributed_finite(_all_finite(model.parameters()), device)
     if rank == 0:
+        trajectory_mode = frozen_receipt["long_contract"][
+            "trajectory_anchor"
+        ]["mode"]
+        trajectory_probe = (
+            _trajectory_probe(
+                model,
+                optimizer,
+                TRAJECTORY_PROBE_UPDATES,
+            )
+            if trajectory_mode == FRESH_TRAJECTORY_MODE
+            else None
+        )
         report = {
             "format": GATE_FORMAT,
             "status": "pass",
@@ -1825,6 +2174,8 @@ def _run_throughput_gate(
             "optimizer_updates": (
                 THROUGHPUT_WARMUP_UPDATES + THROUGHPUT_TIMED_UPDATES
             ),
+            "trajectory_mode": trajectory_mode,
+            "trajectory_probe": trajectory_probe,
             "peak_cuda_memory_bytes_rank0": int(
                 torch.cuda.max_memory_allocated(device)
             ),
@@ -1854,6 +2205,16 @@ def _run_training(
     import torch
     import torch.distributed as dist
 
+    trajectory_mode = contract_receipts["trajectory_anchor"]["mode"]
+    fresh_trajectory = trajectory_mode == FRESH_TRAJECTORY_MODE
+    expected_trajectory_probe = throughput_receipt.get(
+        "trajectory_probe"
+    )
+    if fresh_trajectory:
+        expected_trajectory_probe = _validate_trajectory_probe(
+            expected_trajectory_probe,
+            label="throughput trajectory probe",
+        )
     manifest: dict[str, Any] = {
         "format": MANIFEST_FORMAT,
         "status": "running",
@@ -1864,6 +2225,9 @@ def _run_training(
             "trajectory_anchor"
         ]["sha256"],
         "throughput_gate": dict(throughput_receipt),
+        "trajectory_mode": trajectory_mode,
+        "trajectory_probe_verified": False if fresh_trajectory else None,
+        "trajectory_probe": None,
         "entries": [],
         "entries_sha256": canonical_json_sha256([]),
     }
@@ -1891,6 +2255,53 @@ def _run_training(
                 precision=args.precision,
             )
             optimizer_updates += 1
+            if fresh_trajectory and optimizer_updates == TRAJECTORY_PROBE_UPDATES:
+                dist.barrier()
+                probe_result: list[Any] = [None]
+                if rank == 0:
+                    try:
+                        observed_probe = _trajectory_probe(
+                            model,
+                            optimizer,
+                            optimizer_updates,
+                        )
+                        matched_probe = _require_matching_trajectory_probe(
+                            expected_trajectory_probe,
+                            observed_probe,
+                        )
+                        probe_result[0] = {
+                            "status": "verified",
+                            "probe": matched_probe,
+                        }
+                    except BaseException as error:
+                        probe_result[0] = {
+                            "status": "failed",
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        }
+                dist.broadcast_object_list(probe_result, src=0)
+                if (
+                    not isinstance(probe_result[0], dict)
+                    or probe_result[0].get("status") != "verified"
+                ):
+                    failure = (
+                        probe_result[0]
+                        if isinstance(probe_result[0], dict)
+                        else {}
+                    )
+                    raise AdaptationContractError(
+                        "fresh trajectory probe failed: "
+                        f"{failure.get('error_type')}: "
+                        f"{failure.get('error')}"
+                    )
+                if rank == 0:
+                    manifest["trajectory_probe_verified"] = True
+                    manifest["trajectory_probe"] = probe_result[0]["probe"]
+                    _atomic_json(
+                        run_dir / "candidate_manifest.json",
+                        manifest,
+                    )
+                dist.barrier()
             for key in epoch_sums:
                 metric_key = key
                 if key == "hubert_consistency":
@@ -1997,6 +2408,10 @@ def _run_training(
             )
     _assert_distributed_finite(_all_finite(model.parameters()), device)
     if rank == 0:
+        if fresh_trajectory and manifest["trajectory_probe_verified"] is not True:
+            raise AdaptationContractError(
+                "fresh Base trajectory gate was not verified"
+            )
         if [entry["epoch"] for entry in manifest["entries"]] != list(
             CANDIDATE_EPOCHS
         ):
@@ -2034,6 +2449,11 @@ def _run_training(
                 "trajectory_anchor_sha256": contract_receipts[
                     "trajectory_anchor"
                 ]["sha256"],
+                "trajectory_mode": trajectory_mode,
+                "trajectory_probe_verified": manifest[
+                    "trajectory_probe_verified"
+                ],
+                "trajectory_probe": manifest["trajectory_probe"],
                 "resume_receipt": str(
                     (
                         run_dir / "resume" / "latest_resume.json"
@@ -2107,11 +2527,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         shared_receipts: list[Any] = [None]
         if rank == 0:
             try:
+                current_source = source_receipt()
+                current_dataset = validate_dataset_receipts(args)
                 shared_receipts[0] = {
                     "status": "complete",
-                    "source": source_receipt(),
-                    "dataset": validate_dataset_receipts(args),
-                    "long_contract": validate_long_contract_receipts(args),
+                    "source": current_source,
+                    "dataset": current_dataset,
+                    "long_contract": validate_long_contract_receipts(
+                        args,
+                        dataset_receipt=current_dataset,
+                    ),
                 }
             except BaseException as error:
                 shared_receipts[0] = {
@@ -2148,7 +2573,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             torch_module=torch,
         )
         del official_state
-        protocol = protocol_receipt(args)
+        protocol = protocol_receipt(
+            args,
+            contract_receipts=contract_receipts,
+        )
         frozen_receipt = _frozen_receipt(
             source=current_source,
             official_base=official_receipt,
