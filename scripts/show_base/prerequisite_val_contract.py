@@ -97,6 +97,9 @@ VAL_CANONICAL_LINEAGE_FORMAT = (
     "semtalk_show_base_official_adapt_val_canonical_lineage_v1"
 )
 CANDIDATE_INDEX_FORMAT = "semtalk_show_prerequisite_candidate_index_v1"
+PARTIAL_CANDIDATE_INDEX_FORMAT = (
+    "semtalk_show_prerequisite_nonglobal_candidate_index_v1"
+)
 SHARD_FORMAT = "semtalk_show_prerequisite_val_shard_v1"
 STAGE_MEASUREMENT_FORMAT = (
     "semtalk_show_prerequisite_val_stage_measurement_v1"
@@ -1263,10 +1266,15 @@ def validate_candidate_index(
     value: Any,
     *,
     path: Path | None = None,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     payload = verify_receipt_payload(value, "candidate index")
+    is_partial = payload.get("format") == PARTIAL_CANDIDATE_INDEX_FORMAT
+    expected_stages = STAGES[:-1] if is_partial else STAGES
     if (
-        payload.get("format") != CANDIDATE_INDEX_FORMAT
+        payload.get("format")
+        not in {CANDIDATE_INDEX_FORMAT, PARTIAL_CANDIDATE_INDEX_FORMAT}
+        or (is_partial and not allow_partial)
         or payload.get("status") != "complete"
         or payload.get("target_dataset") != "SHOW"
         or payload.get("target_speaker_scope") != TARGET_SPEAKER_SCOPE
@@ -1277,14 +1285,14 @@ def validate_candidate_index(
         raise ContractError("candidate index protocol mismatch")
     schedule = validate_candidate_epochs(payload.get("candidate_epochs"))
     stages = payload.get("stages")
-    if not isinstance(stages, dict) or set(stages) != set(STAGES):
+    if not isinstance(stages, dict) or set(stages) != set(expected_stages):
         raise ContractError("candidate index stage coverage mismatch")
     source_receipts = payload.get("source_receipts")
     if not isinstance(source_receipts, dict) or set(source_receipts) != set(
-        STAGES
+        expected_stages
     ):
         raise ContractError("candidate index training source coverage mismatch")
-    for stage in STAGES:
+    for stage in expected_stages:
         validate_frozen_training_source(
             source_receipts[stage],
             f"{stage} frozen training source",
@@ -1297,12 +1305,12 @@ def validate_candidate_index(
                 f"{stage} portable training source",
             )
         )
-        for stage in STAGES
+        for stage in expected_stages
     }
     if len(portable_sources) != 1:
         raise ContractError("candidate index portable training sources differ")
     observed_paths: set[Path] = set()
-    for stage in STAGES:
+    for stage in expected_stages:
         entries = stages[stage]
         if not isinstance(entries, list) or len(entries) != len(schedule):
             raise ContractError(f"{stage} candidate coverage mismatch")
@@ -1358,6 +1366,8 @@ def validate_candidate_index(
 def load_candidate_index(
     path: Path,
     expected_sha256: str,
+    *,
+    allow_partial: bool = False,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     resolved, payload, sha = read_verified_file(
         path,
@@ -1365,7 +1375,14 @@ def load_candidate_index(
         "candidate index",
     )
     value = strict_json_bytes(payload, str(resolved))
-    return validate_candidate_index(value, path=resolved), _artifact(resolved, sha)
+    return (
+        validate_candidate_index(
+            value,
+            path=resolved,
+            allow_partial=allow_partial,
+        ),
+        _artifact(resolved, sha),
+    )
 
 
 def candidate_lookup(
@@ -1373,7 +1390,11 @@ def candidate_lookup(
     stage: str,
     epoch: int,
 ) -> dict[str, Any]:
-    if stage not in STAGES or epoch not in candidate_epochs(candidate_index):
+    if (
+        stage not in STAGES
+        or stage not in candidate_index.get("stages", {})
+        or epoch not in candidate_epochs(candidate_index)
+    ):
         raise ContractError("candidate lookup outside the frozen schedule")
     matches = [
         entry

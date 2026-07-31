@@ -15,13 +15,16 @@ from typing import Any, Sequence
 from scripts.show_base import prerequisite_val_contract as contract
 
 
-def _parse_stage_runs(values: Sequence[str]) -> dict[str, Path]:
+def _parse_stage_runs(
+    values: Sequence[str],
+    expected_stages: Sequence[str] = contract.STAGES,
+) -> dict[str, Path]:
     result: dict[str, Path] = {}
     for raw in values:
         if "=" not in raw:
             raise ValueError("--stage-run must be STAGE=/absolute/run/path")
         stage, path_value = raw.split("=", 1)
-        if stage not in contract.STAGES or stage in result:
+        if stage not in expected_stages or stage in result:
             raise ValueError(f"invalid or duplicate stage-run {stage!r}")
         path = Path(path_value)
         if not path.is_absolute():
@@ -30,8 +33,10 @@ def _parse_stage_runs(values: Sequence[str]) -> dict[str, Path]:
         if path.is_symlink() or not path.is_dir():
             raise ValueError(f"invalid {stage} stage run directory")
         result[stage] = path.resolve(strict=True)
-    if set(result) != set(contract.STAGES):
-        raise ValueError("exactly five stage runs are required")
+    if set(result) != set(expected_stages):
+        raise ValueError(
+            f"exactly {len(expected_stages)} requested stage runs are required"
+        )
     return result
 
 
@@ -287,7 +292,13 @@ def _require_common_audit_binding(
 def build(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
-    runs = _parse_stage_runs(args.stage_run)
+    scope = getattr(args, "stage_scope", "full")
+    if scope not in {"full", "nonglobal"}:
+        raise ValueError("stage scope must be full or nonglobal")
+    expected_stages = (
+        contract.STAGES if scope == "full" else contract.STAGES[:-1]
+    )
+    runs = _parse_stage_runs(args.stage_run, expected_stages)
     requested_epochs = getattr(args, "candidate_epoch", None)
     schedule = contract.validate_candidate_epochs(
         list(requested_epochs)
@@ -300,7 +311,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     config_sha256: dict[str, str] = {}
     dataset_receipt_sha256: dict[str, str] = {}
     status_receipts: dict[str, dict[str, Any]] = {}
-    for stage in contract.STAGES:
+    for stage in expected_stages:
         run = runs[stage]
         status_path = contract.regular_file(
             run / "formal_training_status.json",
@@ -604,10 +615,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         for value in source_receipts.values()
     }
     if len(source_core) != 1:
-        raise RuntimeError("five prerequisite candidate sources differ")
+        raise RuntimeError("prerequisite candidate sources differ")
     payload = contract.receipt_payload(
         {
-            "format": contract.CANDIDATE_INDEX_FORMAT,
+            "format": (
+                contract.CANDIDATE_INDEX_FORMAT
+                if scope == "full"
+                else contract.PARTIAL_CANDIDATE_INDEX_FORMAT
+            ),
             "status": "complete",
             "target_dataset": "SHOW",
             "target_speaker_scope": contract.TARGET_SPEAKER_SCOPE,
@@ -622,7 +637,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "stages": stages,
         }
     )
-    contract.validate_candidate_index(payload)
+    contract.validate_candidate_index(
+        payload,
+        allow_partial=scope == "nonglobal",
+    )
     contract.atomic_json_new(args.output_json, payload)
     return payload
 
@@ -632,10 +650,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build the immutable five-prerequisite candidate index"
     )
     parser.add_argument(
+        "--stage-scope",
+        choices=("full", "nonglobal"),
+        default="full",
+        help="freeze all five stages or the four RVQ stages only",
+    )
+    parser.add_argument(
         "--stage-run",
         action="append",
         required=True,
-        help="repeat exactly five times as STAGE=/absolute/run/path",
+        help="repeat for every stage in --stage-scope",
     )
     parser.add_argument(
         "--candidate-epoch",
@@ -656,7 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "status": result["status"],
-                "stages": list(contract.STAGES),
+                "stages": list(result["stages"]),
                 "candidates_per_stage": len(
                     result["candidate_epochs"]
                 ),

@@ -4,9 +4,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 # This launcher is valid only as the direct workload of
 # /tmp/globaldiff_guarded_runner.py --gpus 0,1,2,3,4,5,6,7.  For each of the
-# 50 independent stage/candidate measurements it launches exactly eight
-# modulo shards, one per physical GPU, then performs a CPU-only strict merge
-# and selection.  No test data and no complete-Base FGD enter this protocol.
+# independent stage/candidate measurements it launches exactly eight modulo
+# shards, one per physical GPU.  Up to four candidates may share the eight
+# GPUs concurrently (four evaluator processes per GPU); every candidate keeps
+# the unchanged eight-shard numeric protocol and merge order.  No test data
+# and no complete-Base FGD enter this protocol.
 
 usage() {
     printf '%s\n' \
@@ -36,26 +38,30 @@ source_commit=${15}
 source_tree=${16}
 batch_size=${SEMTALK_PREREQ_VAL_BATCH_SIZE:-32}
 partition=${SEMTALK_PREREQ_VAL_PARTITION:-all}
+candidates_per_wave=${SEMTALK_PREREQ_VAL_CANDIDATES_PER_WAVE:-4}
+gate_receipt=${SEMTALK_PREREQ_VAL_MULTICANDIDATE_GATE_RECEIPT:-}
+gate_receipt_sha256=${SEMTALK_PREREQ_VAL_MULTICANDIDATE_GATE_SHA256:-}
 
 case "$partition" in
     all)
         partition_modulus=1
         partition_remainder=0
-        expected_waves=50
         ;;
     0of2)
         partition_modulus=2
         partition_remainder=0
-        expected_waves=25
         ;;
     1of2)
         partition_modulus=2
         partition_remainder=1
-        expected_waves=25
+        ;;
+    nonglobal|global|gate)
+        partition_modulus=1
+        partition_remainder=0
         ;;
     *)
         printf '%s\n' \
-            "SEMTALK_PREREQ_VAL_PARTITION must be all, 0of2, or 1of2" >&2
+            "SEMTALK_PREREQ_VAL_PARTITION must be all, 0of2, 1of2, nonglobal, global, or gate" >&2
         exit 2
         ;;
 esac
@@ -66,6 +72,10 @@ if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 if [[ ! "$batch_size" =~ ^[1-9][0-9]*$ ]]; then
     printf 'SEMTALK_PREREQ_VAL_BATCH_SIZE must be positive\n' >&2
+    exit 2
+fi
+if [[ ! "$candidates_per_wave" =~ ^[1-4]$ ]]; then
+    printf 'SEMTALK_PREREQ_VAL_CANDIDATES_PER_WAVE must be 1..4\n' >&2
     exit 2
 fi
 for oid in "$source_commit" "$source_tree"; do
@@ -85,9 +95,10 @@ done
 evaluator="$repo_root/scripts/show_base/evaluate_prerequisite_val_shard.py"
 merger="$repo_root/scripts/show_base/merge_prerequisite_val_shards.py"
 selector="$repo_root/scripts/show_base/select_prerequisite_candidates.py"
+gate_checker="$repo_root/scripts/show_base/check_prerequisite_val_multicandidate_gate.py"
 for required in "$python_bin" "$candidate_index" "$canonical_manifest" \
     "$canonical_summary" "$canonical_lineage" "$evaluator" "$merger" \
-    "$selector"; do
+    "$selector" "$gate_checker"; do
     if [[ ! -f "$required" || -L "$required" ]]; then
         printf 'required regular input is missing: %s\n' "$required" >&2
         exit 1
@@ -155,6 +166,7 @@ if [[ "$(git -C "$repo_root" remote get-url origin)" != \
 fi
 for tracked in \
     scripts/show_base/evaluate_prerequisite_val_shard.py \
+    scripts/show_base/check_prerequisite_val_multicandidate_gate.py \
     scripts/show_base/merge_prerequisite_val_shards.py \
     scripts/show_base/select_prerequisite_candidates.py; do
     if [[ "$(git -C "$repo_root" ls-files --error-unmatch "$tracked")" != \
@@ -163,6 +175,51 @@ for tracked in \
         exit 1
     fi
 done
+
+if [[ "$partition" != gate && "$candidates_per_wave" -gt 1 ]]; then
+    if [[ ! "$gate_receipt" = /* || \
+          ! "$gate_receipt_sha256" =~ ^[0-9a-f]{64}$ || \
+          ! -f "$gate_receipt" || -L "$gate_receipt" ]]; then
+        printf 'multi-candidate formal run requires an absolute frozen gate receipt and SHA-256\n' >&2
+        exit 1
+    fi
+    "$python_bin" - "$gate_receipt" "$gate_receipt_sha256" \
+        "$candidate_index" "$candidate_index_sha256" "$manifest_sha256" \
+        "$summary_sha256" "$lineage_sha256" "$source_commit" "$source_tree" \
+        "$batch_size" <<'PY'
+from pathlib import Path
+import sys
+
+from scripts.show_base import check_prerequisite_val_multicandidate_gate as gate
+
+receipt = gate.replay_gate(Path(sys.argv[1]), sys.argv[2])
+common = receipt["inputs"]["common"]
+expected = {
+    "candidate_index": str(Path(sys.argv[3]).resolve(strict=True)),
+    "candidate_index_sha256": sys.argv[4],
+    "canonical_manifest_sha256": sys.argv[5],
+    "canonical_summary_sha256": sys.argv[6],
+    "canonical_lineage_sha256": sys.argv[7],
+    "source_commit": sys.argv[8],
+    "source_tree": sys.argv[9],
+    "multi_candidate_gate": None,
+}
+if common != expected:
+    raise SystemExit("multi-candidate gate input binding mismatch")
+serial = receipt["inputs"]["serial_partition"]
+concurrent = receipt["inputs"]["concurrent_partition"]
+if (
+    receipt["protocol"]["concurrent_candidates_per_wave"] != 4
+    or receipt["protocol"]["shards_per_candidate"] != 8
+    or receipt["protocol"]["batch_size"] != int(sys.argv[10])
+    or receipt["throughput"]["pass"] is not True
+):
+    raise SystemExit("multi-candidate gate protocol mismatch")
+for binding in (serial, concurrent):
+    if set(binding) != {"path", "sha256", "receipt_payload_sha256"}:
+        raise SystemExit("multi-candidate gate binding schema mismatch")
+PY
+fi
 
 mkdir "$shard_root"
 mkdir "$shard_root/logs" "$shard_root/shards"
@@ -178,7 +235,11 @@ import sys
 
 from scripts.show_base import prerequisite_val_contract as contract
 
-index, _ = contract.load_candidate_index(Path(sys.argv[1]), sys.argv[2])
+index, _ = contract.load_candidate_index(
+    Path(sys.argv[1]),
+    sys.argv[2],
+    allow_partial=True,
+)
 rows, _ = contract.load_val_canonical(
     manifest_path=Path(sys.argv[3]),
     manifest_sha256=sys.argv[4],
@@ -190,8 +251,19 @@ rows, _ = contract.load_val_canonical(
 if len(rows) != contract.EXPECTED_VAL_CLIPS:
     raise SystemExit("canonical validation coverage mismatch")
 lines = []
-for stage in contract.STAGES:
-    for epoch in contract.EXPECTED_CANDIDATE_EPOCHS:
+index_stages = tuple(
+    stage for stage in contract.STAGES if stage in index["stages"]
+)
+is_partial = (
+    index["format"] == contract.PARTIAL_CANDIDATE_INDEX_FORMAT
+)
+if set(index_stages) not in (
+    set(contract.STAGES),
+    set(contract.STAGES[:-1]),
+):
+    raise SystemExit("candidate index stage authority is invalid")
+for stage in index_stages:
+    for epoch in contract.candidate_epochs(index):
         item = contract.candidate_lookup(index, stage, epoch)
         fields = (
             stage,
@@ -203,22 +275,110 @@ for stage in contract.STAGES:
         if any("\t" in field or "\n" in field for field in fields):
             raise SystemExit("candidate plan contains unsafe text")
         lines.append("\t".join(fields))
-if len(lines) != 50:
+expected = len(index_stages) * len(contract.candidate_epochs(index))
+if len(lines) != expected:
     raise SystemExit("candidate plan is not exact")
 path = Path(sys.argv[9])
 with path.open("x", encoding="utf-8", newline="\n") as handle:
     handle.write("\n".join(lines) + "\n")
 PY
 
+candidate_index_format=$(
+    "$python_bin" - "$candidate_index" "$candidate_index_sha256" <<'PY'
+from pathlib import Path
+import sys
+from scripts.show_base import prerequisite_val_contract as contract
+value, _ = contract.load_candidate_index(
+    Path(sys.argv[1]), sys.argv[2], allow_partial=True
+)
+print(value["format"])
+PY
+)
+if [[ "$candidate_index_format" == \
+      semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+    case "$partition" in
+        nonglobal|gate) ;;
+        *)
+            printf 'partial candidate index is authorized only for nonglobal/gate partitions\n' >&2
+            exit 1
+            ;;
+    esac
+else
+    case "$partition" in
+        nonglobal)
+            printf 'nonglobal partition requires the frozen partial authority\n' >&2
+            exit 1
+            ;;
+    esac
+fi
+
 if [[ ! -f "$plan_path" || -L "$plan_path" ]]; then
     printf 'candidate plan was not created as a regular file\n' >&2
     exit 1
 fi
 mapfile -t candidate_plan <"$plan_path"
-if [[ ${#candidate_plan[@]} -ne 50 ]]; then
-    printf 'candidate plan must contain exactly 50 jobs\n' >&2
+minimum_plan_jobs=50
+plan_stage_modulus=5
+if [[ "$candidate_index_format" == \
+      semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+    minimum_plan_jobs=40
+    plan_stage_modulus=4
+fi
+if [[ ${#candidate_plan[@]} -lt "$minimum_plan_jobs" || \
+      $((${#candidate_plan[@]} % plan_stage_modulus)) -ne 0 ]]; then
+    printf 'candidate plan lacks its required complete stage/schedule authority\n' >&2
     exit 1
 fi
+
+selected_plan=()
+gate_jobs_selected=0
+for ((plan_index = 0; plan_index < ${#candidate_plan[@]}; plan_index++)); do
+    current_plan_index=$plan_index
+    plan_line=${candidate_plan[$plan_index]}
+    IFS=$'\t' read -r plan_stage _ <<<"$plan_line"
+    include=false
+    case "$partition" in
+        all)
+            include=true
+            ;;
+        0of2|1of2)
+            if ((current_plan_index % partition_modulus == partition_remainder)); then
+                include=true
+            fi
+            ;;
+        nonglobal)
+            [[ "$plan_stage" != global ]] && include=true
+            ;;
+        global)
+            [[ "$plan_stage" == global ]] && include=true
+            ;;
+        gate)
+            gate_stage=face
+            if [[ "$candidate_index_format" != \
+                  semtalk_show_prerequisite_nonglobal_candidate_index_v1 ]]; then
+                gate_stage=global
+            fi
+            # Four deterministic same-stage candidates prove byte-exact
+            # equivalence and measure 1-vs-4 throughput for each authority.
+            if [[ "$plan_stage" == "$gate_stage" && \
+                  "$gate_jobs_selected" -lt 4 ]]; then
+                include=true
+                ((gate_jobs_selected += 1))
+            fi
+            ;;
+    esac
+    if [[ "$include" == true ]]; then
+        selected_plan+=("$plan_line")
+    fi
+done
+expected_jobs=${#selected_plan[@]}
+if [[ "$expected_jobs" -le 0 ]]; then
+    printf 'partition selected no candidate jobs\n' >&2
+    exit 1
+fi
+expected_waves=$(( \
+    (expected_jobs + candidates_per_wave - 1) / candidates_per_wave \
+))
 
 if (( BASH_VERSINFO[0] < 5 )); then
     printf 'bash >= 5 is required\n' >&2
@@ -451,51 +611,61 @@ wait_registered() {
     return "$rc"
 }
 
+started_unix=$(date +%s)
 job_number=0
-plan_index=0
-for plan_line in "${candidate_plan[@]}"; do
-    current_plan_index=$plan_index
-    ((plan_index += 1))
-    if ((current_plan_index % partition_modulus != partition_remainder)); then
-        continue
-    fi
-    IFS=$'\t' read -r stage epoch updates checkpoint checkpoint_sha \
-        <<<"$plan_line"
-    if [[ -z "$stage" || -z "$epoch" || -z "$updates" || \
-          -z "$checkpoint" || -z "$checkpoint_sha" ]]; then
-        printf 'malformed candidate plan line\n' >&2
-        exit 1
-    fi
-    epoch_dir="$shard_root/shards/$stage/epoch_$(printf '%04d' "$epoch")"
-    mkdir -p "$epoch_dir"
+wave_number=0
+for ((wave_start = 0; wave_start < expected_jobs; \
+      wave_start += candidates_per_wave)); do
     wave_pids=()
-    for shard_index in 0 1 2 3 4 5 6 7; do
-        output_json="$epoch_dir/shard_$(printf '%02d' "$shard_index").json"
-        log_path="$shard_root/logs/${stage}_e$(printf '%04d' "$epoch")_s$(printf '%02d' "$shard_index").log"
-        shard_argv=(
-            "$python_bin" "$evaluator"
-            --stage "$stage"
-            --epoch "$epoch"
-            --optimizer-updates "$updates"
-            --checkpoint "$checkpoint"
-            --expected-checkpoint-sha256 "$checkpoint_sha"
-            --canonical-manifest "$canonical_manifest"
-            --expected-manifest-sha256 "$manifest_sha256"
-            --canonical-summary "$canonical_summary"
-            --expected-summary-sha256 "$summary_sha256"
-            --canonical-lineage "$canonical_lineage"
-            --expected-lineage-sha256 "$lineage_sha256"
-            --shard-index "$shard_index"
-            --shard-count 8
-            --device cuda:0
-            --batch-size "$batch_size"
-            --seed 20260731
-            --expected-source-commit "$source_commit"
-            --expected-source-tree "$source_tree"
-            --output-json "$output_json"
-        )
-        launch_registered "$shard_index" "$log_path" "${shard_argv[@]}"
-        wave_pids+=("$LAST_CHILD_PID")
+    wave_labels=()
+    wave_jobs=0
+    wave_stop=$((wave_start + candidates_per_wave))
+    if ((wave_stop > expected_jobs)); then
+        wave_stop=$expected_jobs
+    fi
+    for ((candidate_offset = wave_start; \
+          candidate_offset < wave_stop; candidate_offset++)); do
+        plan_line=${selected_plan[$candidate_offset]}
+        IFS=$'\t' read -r stage epoch updates checkpoint checkpoint_sha \
+            <<<"$plan_line"
+        if [[ -z "$stage" || -z "$epoch" || -z "$updates" || \
+              -z "$checkpoint" || -z "$checkpoint_sha" ]]; then
+            printf 'malformed candidate plan line\n' >&2
+            exit 1
+        fi
+        epoch_dir="$shard_root/shards/$stage/epoch_$(printf '%04d' "$epoch")"
+        mkdir -p "$epoch_dir"
+        wave_labels+=("${stage}:e${epoch}")
+        ((wave_jobs += 1))
+        for shard_index in 0 1 2 3 4 5 6 7; do
+            output_json="$epoch_dir/shard_$(printf '%02d' "$shard_index").json"
+            log_path="$shard_root/logs/${stage}_e$(printf '%04d' "$epoch")_s$(printf '%02d' "$shard_index").log"
+            shard_argv=(
+                "$python_bin" "$evaluator"
+                --stage "$stage"
+                --epoch "$epoch"
+                --optimizer-updates "$updates"
+                --checkpoint "$checkpoint"
+                --expected-checkpoint-sha256 "$checkpoint_sha"
+                --canonical-manifest "$canonical_manifest"
+                --expected-manifest-sha256 "$manifest_sha256"
+                --canonical-summary "$canonical_summary"
+                --expected-summary-sha256 "$summary_sha256"
+                --canonical-lineage "$canonical_lineage"
+                --expected-lineage-sha256 "$lineage_sha256"
+                --shard-index "$shard_index"
+                --shard-count 8
+                --device cuda:0
+                --batch-size "$batch_size"
+                --seed 20260731
+                --expected-source-commit "$source_commit"
+                --expected-source-tree "$source_tree"
+                --output-json "$output_json"
+            )
+            launch_registered \
+                "$shard_index" "$log_path" "${shard_argv[@]}"
+            wave_pids+=("$LAST_CHILD_PID")
+        done
     done
     wave_rc=0
     for pid in "${wave_pids[@]}"; do
@@ -504,23 +674,121 @@ for plan_line in "${candidate_plan[@]}"; do
         fi
     done
     if [[ "$wave_rc" -ne 0 ]]; then
-        printf 'validation wave failed: stage=%s epoch=%s\n' \
-            "$stage" "$epoch" >&2
+        printf 'validation wave failed: %s\n' "${wave_labels[*]}" >&2
         exit 1
     fi
-    ((job_number += 1))
-    printf 'completed prerequisite validation wave %d/%d: %s e%s\n' \
-        "$job_number" "$expected_waves" "$stage" "$epoch"
+    ((job_number += wave_jobs))
+    ((wave_number += 1))
+    printf 'completed prerequisite validation wave %d/%d jobs=%d/%d: %s\n' \
+        "$wave_number" "$expected_waves" "$job_number" "$expected_jobs" \
+        "${wave_labels[*]}"
 done
 
-if [[ "$job_number" -ne "$expected_waves" ]]; then
-    printf 'partition wave coverage mismatch: %s != %s\n' \
-        "$job_number" "$expected_waves" >&2
+if [[ "$job_number" -ne "$expected_jobs" || \
+      "$wave_number" -ne "$expected_waves" ]]; then
+    printf 'partition coverage mismatch: jobs=%s/%s waves=%s/%s\n' \
+        "$job_number" "$expected_jobs" "$wave_number" "$expected_waves" >&2
     exit 1
 fi
+ended_unix=$(date +%s)
+partition_receipt="$shard_root/partition_receipt.json"
+"$python_bin" - "$partition_receipt" "$partition" \
+    "$candidates_per_wave" "$batch_size" "$job_number" "$wave_number" \
+    "$started_unix" "$ended_unix" "$candidate_index" \
+    "$candidate_index_sha256" "$manifest_sha256" "$summary_sha256" \
+    "$lineage_sha256" "$source_commit" "$source_tree" \
+    "$gate_receipt" "$gate_receipt_sha256" \
+    "${selected_plan[@]}" <<'PY'
+from pathlib import Path
+import sys
+
+from scripts.show_base import prerequisite_val_contract as contract
+
+(
+    output,
+    partition,
+    candidates_per_wave,
+    batch_size,
+    candidate_jobs,
+    waves,
+    started_unix,
+    ended_unix,
+    candidate_index,
+    candidate_index_sha256,
+    manifest_sha256,
+    summary_sha256,
+    lineage_sha256,
+    source_commit,
+    source_tree,
+    gate_receipt,
+    gate_receipt_sha256,
+    *plan,
+) = sys.argv[1:]
+jobs = []
+for row in plan:
+    fields = row.split("\t")
+    if len(fields) != 5:
+        raise SystemExit("partition receipt plan is malformed")
+    stage, epoch, updates, checkpoint, checkpoint_sha256 = fields
+    jobs.append(
+        {
+            "stage": stage,
+            "epoch": int(epoch),
+            "optimizer_updates": int(updates),
+            "checkpoint": checkpoint,
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+    )
+started = int(started_unix)
+ended = int(ended_unix)
+payload = contract.receipt_payload(
+    {
+        "format": "semtalk_show_prerequisite_val_partition_v1",
+        "status": "complete",
+        "partition": partition,
+        "test_visible": False,
+        "protocol": {
+            "candidates_per_wave": int(candidates_per_wave),
+            "shards_per_candidate": contract.EXPECTED_SHARDS,
+            "batch_size": int(batch_size),
+            "candidate_jobs": int(candidate_jobs),
+            "waves": int(waves),
+        },
+        "timing": {
+            "started_unix": started,
+            "ended_unix": ended,
+            "elapsed_seconds": ended - started,
+        },
+        "inputs": {
+            "candidate_index": str(Path(candidate_index).resolve(strict=True)),
+            "candidate_index_sha256": candidate_index_sha256,
+            "canonical_manifest_sha256": manifest_sha256,
+            "canonical_summary_sha256": summary_sha256,
+            "canonical_lineage_sha256": lineage_sha256,
+            "source_commit": source_commit,
+            "source_tree": source_tree,
+            "multi_candidate_gate": (
+                {
+                    "path": str(Path(gate_receipt).resolve(strict=True)),
+                    "sha256": gate_receipt_sha256,
+                }
+                if gate_receipt
+                else None
+            ),
+        },
+        "jobs": jobs,
+        "coverage": {
+            "candidate_jobs": len(jobs),
+            "shard_jobs": len(jobs) * contract.EXPECTED_SHARDS,
+            "exact_once": True,
+        },
+    }
+)
+contract.atomic_json_new(Path(output), payload)
+PY
 if [[ "$partition" != all ]]; then
-    printf 'SHOW prerequisite shard partition complete: partition=%s waves=%s root=%s\n' \
-        "$partition" "$job_number" "$shard_root"
+    printf 'SHOW prerequisite shard partition complete: partition=%s jobs=%s waves=%s root=%s\n' \
+        "$partition" "$job_number" "$wave_number" "$shard_root"
     exit 0
 fi
 

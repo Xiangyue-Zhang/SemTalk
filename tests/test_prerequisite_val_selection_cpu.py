@@ -968,6 +968,43 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
                 "show_base_train.py",
             )
             _, _, payload = self.candidate_fixture(root, source)
+            partial = {
+                key: copy.deepcopy(value)
+                for key, value in payload.items()
+                if key != "receipt_payload_sha256"
+            }
+            partial["format"] = contract.PARTIAL_CANDIDATE_INDEX_FORMAT
+            for key in (
+                "source_receipts",
+                "config_sha256",
+                "dataset_receipt_sha256",
+                "formal_training_status",
+                "stages",
+            ):
+                partial[key].pop("global")
+            partial = contract.receipt_payload(partial)
+            contract.validate_candidate_index(
+                partial,
+                allow_partial=True,
+            )
+            with self.assertRaisesRegex(
+                contract.ContractError,
+                "protocol",
+            ):
+                contract.validate_candidate_index(partial)
+            for missing_stage in contract.STAGES[:-1]:
+                broken_partial = copy.deepcopy(partial)
+                broken_partial.pop("receipt_payload_sha256")
+                broken_partial["stages"].pop(missing_stage)
+                broken_partial = contract.receipt_payload(broken_partial)
+                with self.assertRaisesRegex(
+                    contract.ContractError,
+                    "stage coverage",
+                ):
+                    contract.validate_candidate_index(
+                        broken_partial,
+                        allow_partial=True,
+                    )
             broken = dict(payload)
             broken.pop("receipt_payload_sha256")
             broken["stages"] = dict(broken["stages"])
@@ -1554,6 +1591,10 @@ class PrerequisiteValidationSelectionTest(unittest.TestCase):
             "0of2",
             "1of2",
             "current_plan_index % partition_modulus",
+            "SEMTALK_PREREQ_VAL_CANDIDATES_PER_WAVE",
+            "SEMTALK_PREREQ_VAL_MULTICANDIDATE_GATE_RECEIPT",
+            "nonglobal|global|gate",
+            "PARTIAL_CANDIDATE_INDEX_FORMAT",
             'if [[ "$partition" != all ]]',
             "--shard-root",
         ):
