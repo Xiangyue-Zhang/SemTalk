@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run canonical SHOW validation for provisional Base e1/e2/e4/e8/e16/e32.
+"""Run canonical SHOW validation for provisional v3 Base quality points.
 
 This adapter is deliberately separate from the formal 22-candidate/e400
 producer.  It validates the trainer-owned short-quality publications and then
@@ -34,9 +34,8 @@ from scripts.show_base import run_base_val_inference as engine
 from scripts.show_base import select_base_training_topology as topology
 from scripts.show_base import train_base_official_adapt_long as training
 
-FORMAT = "semtalk_show_base_short_quality_val_preflight_v2"
-COMPLETION_FORMAT = "semtalk_show_base_short_quality_val_completion_v2"
-QUALITY_EPOCHS = topology.QUALITY_EPOCHS
+FORMAT = engine.SHORT_QUALITY_PREFLIGHT_FORMAT
+COMPLETION_FORMAT = "semtalk_show_base_short_quality_val_completion_v3"
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SOURCE_FILES = (
     "scripts/show_base/base_short_quality_val_adapter.py",
@@ -44,6 +43,8 @@ SOURCE_FILES = (
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/semtalk_base_inference_core.py",
     "scripts/show_base/base_long_val_contract.py",
+    "scripts/show_base/select_base_training_topology.py",
+    "scripts/show_base/train_base_official_adapt_long.py",
     "scripts/show_base/select_base_official_adapt.py",
     "scripts/show_base/evaluate_diffsheg_val_fgd.py",
 )
@@ -97,8 +98,10 @@ def _epoch(value: str) -> int:
         parsed = int(value, 10)
     except ValueError as error:
         raise argparse.ArgumentTypeError("epoch must be an integer") from error
-    if parsed not in QUALITY_EPOCHS:
-        choices = ",".join(str(epoch) for epoch in QUALITY_EPOCHS)
+    if parsed not in topology.CANDIDATE_QUALITY_EPOCHS:
+        choices = ",".join(
+            str(epoch) for epoch in topology.CANDIDATE_QUALITY_EPOCHS
+        )
         raise argparse.ArgumentTypeError(f"epoch must be one of {choices}")
     return parsed
 
@@ -228,7 +231,10 @@ def _selected_five(
     return expected
 
 
-def _normalize_ready(values: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
+def _normalize_ready(
+    values: Sequence[Sequence[str]], mode: str
+) -> list[dict[str, Any]]:
+    quality_epochs = topology.quality_epochs_for_mode(mode)
     epochs: list[int] = []
     result: list[dict[str, Any]] = []
     for raw_epoch, raw_path, raw_sha in values:
@@ -250,9 +256,11 @@ def _normalize_ready(values: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
                 ),
             }
         )
-    if tuple(epochs) != QUALITY_EPOCHS:
+    if tuple(epochs) != quality_epochs:
         raise ShortQualityValError(
-            "candidate-ready epochs must be e1/e2/e4/e8/e16/e32 in order"
+            "candidate-ready epochs must be "
+            + "/".join(f"e{epoch}" for epoch in quality_epochs)
+            + " in order"
         )
     return result
 
@@ -285,6 +293,9 @@ def _build_bound_payload(
     pipeline_path: Path,
     pipeline_sha: str,
 ) -> dict[str, Any]:
+    quality_epochs = topology.quality_epochs_for_mode(mode)
+    quality_role = topology.quality_role_for_mode(mode)
+    reference_only = mode == training.OFFICIAL_W1_REFERENCE_MODE
     topology_gate = training.validate_topology_gate_spec(
         SimpleNamespace(
             topology_gate_spec=topology_gate_path,
@@ -336,6 +347,20 @@ def _build_bound_payload(
         raise ShortQualityValError("training source is not the official SemTalk origin")
     frozen_value = first["frozen_inputs"]
     status_payload = json.loads(Path(status["path"]).read_text(encoding="utf-8"))
+    checkpoint_audit_contract = {
+        "format": training.SHORT_QUALITY_CHECKPOINT_FORMAT,
+        "run_purpose": training.RUN_PURPOSE_SHORT_QUALITY,
+        "target_epochs": list(quality_epochs),
+        "quality_protocol_version": topology.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": status_payload["artifact_root"],
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
+    }
     bundle = {
         "manifest": dict(status_payload["candidate_manifest"]),
         "status": dict(status),
@@ -345,8 +370,9 @@ def _build_bound_payload(
             "receipt_sha256": frozen_value["receipt_payload_sha256"],
         },
         "updates_per_epoch": int(training.TOPOLOGY_SPECS[mode]["updates_per_epoch"]),
+        "checkpoint_audit_contract": checkpoint_audit_contract,
         "candidates": {
-            str(epoch): dict(checkpoints[epoch]) for epoch in QUALITY_EPOCHS
+            str(epoch): dict(checkpoints[epoch]) for epoch in quality_epochs
         },
     }
     authority = {
@@ -366,6 +392,15 @@ def _build_bound_payload(
         "selected_prerequisite_sha256": selected,
         "throughput_gate": dict(ready_manifest["throughput_gate"]),
         "training_source": dict(frozen_source),
+        "quality_protocol_version": topology.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": status_payload["artifact_root"],
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
     }
     binding_sha = training.canonical_json_sha256(
         {
@@ -379,9 +414,18 @@ def _build_bound_payload(
     return {
         "format": FORMAT,
         "status": "complete",
+        "quality_protocol_version": topology.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": status_payload["artifact_root"],
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "split": "val",
         "test_visible": False,
-        "candidate_epochs": list(QUALITY_EPOCHS),
+        "candidate_epochs": list(quality_epochs),
         "candidate_bundle": bundle,
         "val_inputs_receipt": val_artifact,
         "pipeline_receipt": pipeline_artifact,
@@ -397,7 +441,7 @@ def _build_bound_payload(
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if not args.output.is_absolute() or os.path.lexists(args.output):
         raise FileExistsError(f"refusing non-new absolute output {args.output}")
-    ready = _normalize_ready(args.candidate_ready_receipt)
+    ready = _normalize_ready(args.candidate_ready_receipt, args.mode)
     status = _status_artifact(
         args.short_quality_status, args.expected_short_quality_status_sha256
     )
@@ -437,6 +481,13 @@ def _preflight_artifact(
     expected_keys = {
         "format",
         "status",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "split",
         "test_visible",
         "candidate_epochs",
@@ -453,11 +504,48 @@ def _preflight_artifact(
     }
     if set(payload) != expected_keys or payload.get("format") != FORMAT:
         raise ShortQualityValError("short-quality preflight schema mismatch")
+    authority = payload.get("short_quality_authority")
+    mode = authority.get("topology_mode") if isinstance(authority, dict) else None
+    quality_epochs = (
+        topology.quality_epochs_for_mode(mode)
+        if mode in training.TOPOLOGY_SPECS
+        else ()
+    )
+    quality_role = (
+        topology.quality_role_for_mode(mode)
+        if mode in training.TOPOLOGY_SPECS
+        else None
+    )
+    reference_only = mode == training.OFFICIAL_W1_REFERENCE_MODE
+    artifact_root = Path(str(payload.get("artifact_root", "")))
     if (
         payload.get("status") != "complete"
+        or payload.get("quality_protocol_version")
+        != topology.QUALITY_PROTOCOL_VERSION
+        or payload.get("artifact_root_namespace")
+        != topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or not artifact_root.is_absolute()
+        or not artifact_root.is_dir()
+        or artifact_root.is_symlink()
+        or artifact_root.resolve(strict=True) != artifact_root
+        or payload.get("quality_role") != quality_role
+        or payload.get("reference_only") is not reference_only
+        or payload.get("late_w1_status") != "not_measured"
+        or payload.get("w1_tail_equivalence_claimed") is not False
         or payload.get("split") != "val"
         or payload.get("test_visible") is not False
-        or payload.get("candidate_epochs") != list(QUALITY_EPOCHS)
+        or payload.get("candidate_epochs") != list(quality_epochs)
+        or not isinstance(authority, dict)
+        or authority.get("quality_protocol_version")
+        != payload.get("quality_protocol_version")
+        or authority.get("artifact_root_namespace")
+        != payload.get("artifact_root_namespace")
+        or authority.get("artifact_root") != payload.get("artifact_root")
+        or authority.get("quality_role") != payload.get("quality_role")
+        or authority.get("reference_only")
+        is not payload.get("reference_only")
+        or authority.get("late_w1_status") != "not_measured"
+        or authority.get("w1_tail_equivalence_claimed") is not False
         or _payload_sha(payload) != payload.get("receipt_payload_sha256")
     ):
         raise ShortQualityValError("short-quality preflight is not frozen val-only")
@@ -500,11 +588,27 @@ def _engine_adapter() -> Iterable[None]:
 
 
 def run_shard(args: argparse.Namespace) -> dict[str, Any]:
+    _artifact, preflight = _preflight_artifact(
+        args.preflight, args.expected_preflight_sha256
+    )
+    if args.epoch not in preflight["candidate_epochs"]:
+        raise ShortQualityValError(
+            f"e{args.epoch} is not measured for "
+            f"{preflight['short_quality_authority']['topology_mode']}"
+        )
     with _engine_adapter():
         return engine.run_shard(args)
 
 
 def finalize(args: argparse.Namespace) -> dict[str, Any]:
+    _artifact, preflight = _preflight_artifact(
+        args.preflight, args.expected_preflight_sha256
+    )
+    if args.epoch not in preflight["candidate_epochs"]:
+        raise ShortQualityValError(
+            f"e{args.epoch} is not measured for "
+            f"{preflight['short_quality_authority']['topology_mode']}"
+        )
     with _engine_adapter():
         return engine.finalize(args)
 

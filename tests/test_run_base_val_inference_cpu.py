@@ -244,6 +244,298 @@ class ValInferenceProducerCpuTest(unittest.TestCase):
             shard_source,
         )
 
+    def test_model_loader_isolates_v3_short_and_formal_checkpoint_audits(
+        self,
+    ) -> None:
+        class AuditAccepted(Exception):
+            pass
+
+        class FakeTensor:
+            def __init__(self, values: list[float]) -> None:
+                self._array = np.asarray(values, dtype=np.float32)
+                self.shape = self._array.shape
+                self.dtype = self._array.dtype
+
+            def detach(self) -> "FakeTensor":
+                return self
+
+            def to(self, *args: object, **kwargs: object) -> "FakeTensor":
+                del args, kwargs
+                return self
+
+            def contiguous(self) -> "FakeTensor":
+                self._array = np.ascontiguousarray(self._array)
+                return self
+
+            def numpy(self) -> np.ndarray:
+                return self._array
+
+        epoch = 4
+        updates_per_epoch = 124
+        candidate_snapshot = b"short-quality-candidate"
+        candidate_sha = hashlib.sha256(candidate_snapshot).hexdigest()
+        frozen_receipt_sha = "f" * 64
+        official_base_sha = "a" * 64
+        state = {"weight": FakeTensor([1.0, 2.0])}
+        semantic_sha = PRODUCER._model_state_semantic_sha256(state)
+
+        def common_audit(checkpoint_format: str) -> dict[str, object]:
+            return {
+                "format": checkpoint_format,
+                "completed_epochs": epoch,
+                "optimizer_updates": epoch * updates_per_epoch,
+                "frozen_receipt_sha256": frozen_receipt_sha,
+                "official_base_checkpoint_sha256": official_base_sha,
+                "speaker_scope": "SHOW_All",
+                "speaker_rows": [0, 1, 2, 3],
+                "vq_models_in_training_graph": False,
+                "all_model_state_tensors_finite": True,
+                "model_state_semantic_sha256": semantic_sha,
+                "trajectory_anchor_match": None,
+                "trajectory_probe_verified": True,
+            }
+
+        def short_contract(
+            *,
+            epochs: list[int],
+            artifact_root: str,
+            quality_role: str,
+            reference_only: bool,
+        ) -> dict[str, object]:
+            return {
+                "format": PRODUCER.SHORT_QUALITY_CHECKPOINT_FORMAT,
+                "run_purpose": "topology_short_quality",
+                "target_epochs": epochs,
+                "quality_protocol_version": (
+                    PRODUCER.SHORT_QUALITY_PROTOCOL_VERSION
+                ),
+                "artifact_root_namespace": (
+                    PRODUCER.SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE
+                ),
+                "artifact_root": artifact_root,
+                "quality_role": quality_role,
+                "reference_only": reference_only,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
+            }
+
+        def preflight(
+            *,
+            preflight_format: str,
+            epochs: list[int],
+            artifact_root: str,
+            quality_role: str,
+            reference_only: bool,
+            contract: dict[str, object] | None,
+        ) -> dict[str, object]:
+            bundle: dict[str, object] = {
+                "updates_per_epoch": updates_per_epoch,
+                "manifest": {
+                    "path": "/frozen/base/manifest.json",
+                    "sha256": "1" * 64,
+                },
+                "status": {
+                    "path": "/frozen/base/status.json",
+                    "sha256": "2" * 64,
+                },
+                "frozen_inputs": {
+                    "path": "/frozen/base/frozen-inputs.json",
+                    "sha256": "3" * 64,
+                    "receipt_sha256": frozen_receipt_sha,
+                },
+                "candidates": {
+                    str(epoch): {
+                        "path": "/frozen/base/epoch-4.pth",
+                        "sha256": candidate_sha,
+                        "bytes": len(candidate_snapshot),
+                    }
+                },
+            }
+            if contract is not None:
+                bundle["checkpoint_audit_contract"] = contract
+            return {
+                "format": preflight_format,
+                "candidate_epochs": epochs,
+                "artifact_root": artifact_root,
+                "quality_role": quality_role,
+                "reference_only": reference_only,
+                "candidate_bundle": bundle,
+            }
+
+        def invoke(
+            payload: dict[str, object],
+            audit: dict[str, object],
+        ) -> None:
+            helper = SimpleNamespace(
+                OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT=(
+                    "semtalk_show_base_official_adapt_checkpoint_v1"
+                ),
+                RELEASED_ALL_SPEAKERS_MODELS={
+                    "base": {"sha256": official_base_sha}
+                },
+                _read_verified_checkpoint_snapshot=(
+                    lambda *args, **kwargs: (
+                        Path("/frozen/base/epoch-4.pth"),
+                        candidate_snapshot,
+                        candidate_sha,
+                    )
+                ),
+                _torch_load_checkpoint=(
+                    lambda *args, **kwargs: {
+                        "model_state": state,
+                        "audit": audit,
+                    }
+                ),
+                _finite_state_dict=lambda *args, **kwargs: None,
+                _validate_base_model_state_schema=(
+                    lambda *args, **kwargs: None
+                ),
+                _model_args=lambda: {},
+            )
+
+            def accept_after_audit(_args: object) -> object:
+                raise AuditAccepted
+
+            fake_torch = ModuleType("torch")
+            with (
+                mock.patch.dict(sys.modules, {"torch": fake_torch}),
+                mock.patch.object(
+                    PRODUCER,
+                    "_pinned_project_module",
+                    side_effect=[
+                        SimpleNamespace(),
+                        SimpleNamespace(semtalk_base=accept_after_audit),
+                    ],
+                ),
+                mock.patch.object(PRODUCER, "_reject_path"),
+                mock.patch.object(
+                    PRODUCER,
+                    "_verified_json",
+                    return_value={},
+                ),
+            ):
+                PRODUCER._load_models(
+                    helper,
+                    epoch=epoch,
+                    preflight=payload,
+                    pipeline={},
+                    device="cuda:0",
+                )
+
+        candidate_epochs = [1, 2, 4, 8, 16, 32]
+        candidate_root = "/frozen/quality/candidate"
+        candidate_contract = short_contract(
+            epochs=candidate_epochs,
+            artifact_root=candidate_root,
+            quality_role="candidate_quality",
+            reference_only=False,
+        )
+        candidate_preflight = preflight(
+            preflight_format=PRODUCER.SHORT_QUALITY_PREFLIGHT_FORMAT,
+            epochs=candidate_epochs,
+            artifact_root=candidate_root,
+            quality_role="candidate_quality",
+            reference_only=False,
+            contract=dict(candidate_contract),
+        )
+        candidate_audit = {
+            **common_audit(PRODUCER.SHORT_QUALITY_CHECKPOINT_FORMAT),
+            **candidate_contract,
+        }
+        with self.assertRaises(AuditAccepted):
+            invoke(candidate_preflight, candidate_audit)
+
+        reference_epochs = [1, 2, 4, 8]
+        reference_root = "/frozen/quality/reference-w1"
+        reference_contract = short_contract(
+            epochs=reference_epochs,
+            artifact_root=reference_root,
+            quality_role="w1_reference",
+            reference_only=True,
+        )
+        reference_preflight = preflight(
+            preflight_format=PRODUCER.SHORT_QUALITY_PREFLIGHT_FORMAT,
+            epochs=reference_epochs,
+            artifact_root=reference_root,
+            quality_role="w1_reference",
+            reference_only=True,
+            contract=dict(reference_contract),
+        )
+        reference_audit = {
+            **common_audit(PRODUCER.SHORT_QUALITY_CHECKPOINT_FORMAT),
+            **reference_contract,
+        }
+        with self.assertRaises(AuditAccepted):
+            invoke(reference_preflight, reference_audit)
+
+        formal_audit = common_audit(
+            "semtalk_show_base_official_adapt_checkpoint_v1"
+        )
+        formal_preflight = preflight(
+            preflight_format=PRODUCER.PREFLIGHT_FORMAT,
+            epochs=[epoch],
+            artifact_root="/frozen/formal",
+            quality_role="formal_training",
+            reference_only=False,
+            contract=None,
+        )
+        with self.assertRaises(AuditAccepted):
+            invoke(formal_preflight, formal_audit)
+
+        invalid_cases: list[
+            tuple[str, dict[str, object], dict[str, object]]
+        ] = [
+            (
+                "long audit under short preflight",
+                candidate_preflight,
+                formal_audit,
+            ),
+            (
+                "short audit under formal preflight",
+                formal_preflight,
+                candidate_audit,
+            ),
+        ]
+        for field, invalid_value in (
+            ("target_epochs", reference_epochs),
+            ("artifact_root", "/frozen/quality/other"),
+            ("quality_role", "w1_reference"),
+            ("model_state_semantic_sha256", "0" * 64),
+        ):
+            invalid_audit = dict(candidate_audit)
+            invalid_audit[field] = invalid_value
+            invalid_cases.append(
+                (f"short audit {field} drift", candidate_preflight, invalid_audit)
+            )
+        extra_key_audit = dict(candidate_audit)
+        extra_key_audit["unbound_note"] = "forbidden"
+        invalid_cases.append(
+            ("short audit extra key", candidate_preflight, extra_key_audit)
+        )
+        mismatched_bundle_preflight = {
+            **candidate_preflight,
+            "candidate_bundle": {
+                **candidate_preflight["candidate_bundle"],
+                "checkpoint_audit_contract": {
+                    **candidate_contract,
+                    "target_epochs": reference_epochs,
+                },
+            },
+        }
+        invalid_cases.append(
+            (
+                "preflight checkpoint contract drift",
+                mismatched_bundle_preflight,
+                candidate_audit,
+            )
+        )
+        for label, invalid_preflight, invalid_audit in invalid_cases:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                PRODUCER.ValInferenceContractError,
+                "candidate audit",
+            ):
+                invoke(invalid_preflight, invalid_audit)
+
     def test_shard_expected_call_arithmetic_has_runtime_math_dependency(
         self,
     ) -> None:

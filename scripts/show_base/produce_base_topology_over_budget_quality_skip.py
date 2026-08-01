@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Seal one immutable SemTalk Base over-ETA quality-skip receipt.
 
-All five real throughput probes remain mandatory.  This CPU-only producer is
+All nine real throughput probes remain mandatory.  This CPU-only producer is
 usable only for a non-W1 topology whose validated 400-epoch ETA is strictly
 greater than 24 hours.  It binds the skip to the frozen source authority, both
 gate specifications, the exact probe artifact, and the shared five-stage SHOW
-input identity.  W1 and every within-budget topology still require the formal
+input identity.  W1 still requires its honest reference-only e1/e2/e4/e8
+measurements, while every within-budget candidate requires the formal
 e1/e2/e4/e8/e16/e32 quality trajectory.
 """
 

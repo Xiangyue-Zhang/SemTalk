@@ -46,7 +46,7 @@ TOPOLOGY_QUALITY_GATE_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_20260731.json"
+    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
 )
 OFFICIAL_TRAINER = REPOSITORY / "semtalk_base_trainer.py"
 SPEC = importlib.util.spec_from_file_location(
@@ -328,12 +328,29 @@ def _topology_selection_inputs(
                 "samples_per_second": 1000.0,
             }
         )
-        fgd = {str(epoch): 0.5 for epoch in SELECTOR.QUALITY_EPOCHS}
+        reference_only = mode == ADAPT.OFFICIAL_W1_REFERENCE_MODE
+        fgd = {
+            str(epoch): 0.5
+            for epoch in SELECTOR.quality_epochs_for_mode(mode)
+        }
         if mode in failing_quality_modes:
             fgd["4"] = 0.7
         quality.append(
             {
                 "mode": mode,
+                "quality_protocol_version": SELECTOR.QUALITY_PROTOCOL_VERSION,
+                "artifact_root_namespace": (
+                    SELECTOR.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                ),
+                "artifact_root": f"/quality/{mode}-short-quality-v3",
+                "quality_role": (
+                    "w1_reference_only"
+                    if reference_only
+                    else "candidate_quality"
+                ),
+                "reference_only": reference_only,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
                 "report_path": f"/quality/{mode}.json",
                 "report_sha256": f"{index + 6:x}" * 64,
                 "topology_independent_input_sha256": "a" * 64,
@@ -366,6 +383,15 @@ def _over_budget_quality_skip(
     return {
         "mode": mode,
         "status": "skipped_over_eta_budget",
+        "quality_protocol_version": SELECTOR.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            SELECTOR.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root_semantics": "not_applicable_eta_skip",
+        "quality_role": "candidate_quality",
+        "reference_only": False,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "receipt_path": f"/quality-skips/{mode}.json",
         "receipt_sha256": f"{position + 10:x}" * 64,
         "receipt_payload_sha256": f"{position + 11:x}" * 64,
@@ -1209,7 +1235,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                 specification = ADAPT.TOPOLOGY_SPECS[mode]
                 args = parser.parse_args(_base_cli())
                 args.mode = ADAPT.SHORT_QUALITY_MODE
-                args.epochs = ADAPT.SHORT_QUALITY_TOTAL_EPOCHS
+                args.epochs = ADAPT.short_quality_total_epochs(mode)
                 args.topology_mode = mode
                 args.local_batch_size = specification["local_batch_size"]
                 args.learning_rate = specification["learning_rate"]
@@ -1232,7 +1258,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                 )
                 self.assertEqual(
                     ADAPT._target_epochs(args),
-                    list(ADAPT.SHORT_QUALITY_EPOCHS),
+                    list(ADAPT.short_quality_epochs(mode)),
                 )
 
     def test_throughput_probe_passes_sampler_epoch_to_every_update(self) -> None:
@@ -1252,7 +1278,9 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         parser = ADAPT.build_parser()
         args = parser.parse_args(_base_cli())
         args.mode = ADAPT.SHORT_QUALITY_MODE
-        args.epochs = ADAPT.SHORT_QUALITY_TOTAL_EPOCHS
+        args.epochs = ADAPT.short_quality_total_epochs(
+            args.topology_mode
+        )
         args.throughput_gate_report = "/sealed/throughput.json"
         args.expected_throughput_gate_sha256 = "d" * 64
         args.topology_selection_report = "/forbidden/selection.json"
@@ -1307,7 +1335,9 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             long_contract={"contract": True},
             topology={"topology": True},
             run_purpose=ADAPT.RUN_PURPOSE_SHORT_QUALITY,
-            target_epochs=ADAPT.SHORT_QUALITY_EPOCHS,
+            target_epochs=ADAPT.short_quality_epochs(
+                ADAPT.W8_GLOBAL512_MODE
+            ),
         )
         self.assertEqual(
             receipt["run_purpose"],
@@ -1315,7 +1345,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertEqual(
             receipt["target_epochs"],
-            list(ADAPT.SHORT_QUALITY_EPOCHS),
+            list(ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)),
         )
         self.assertEqual(
             receipt["receipt_sha256"],
@@ -1443,7 +1473,12 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
 
     def test_every_registered_topology_lr_pair_can_win_by_measured_eta(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
-        for expected in modes:
+        candidate_modes = [
+            mode
+            for mode in modes
+            if mode != ADAPT.OFFICIAL_W1_REFERENCE_MODE
+        ]
+        for expected in candidate_modes:
             with self.subTest(expected=expected):
                 eta = {
                     mode: 10_000.0 + index
@@ -1458,22 +1493,48 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                     quality_gate_spec_sha256="f" * 64,
                 )
                 self.assertEqual(selection["selected"]["mode"], expected)
-                self.assertEqual(selection["candidate_modes"], modes)
+                self.assertEqual(
+                    selection["candidate_modes"], candidate_modes
+                )
                 self.assertEqual(
                     selection["selection_decision_branch"],
                     "fastest_quality_safe_finite_under_24h",
                 )
 
-    def test_training_consumer_accepts_a_sealed_w1_selection(self) -> None:
+    def test_w1_reference_is_never_selection_eligible(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
         eta = {mode: 1_000.0 + index for index, mode in enumerate(modes)}
-        eta[ADAPT.OFFICIAL_W1_REFERENCE_MODE] = 10.0
+        eta[ADAPT.OFFICIAL_W1_REFERENCE_MODE] = (
+            SELECTOR.MAX_TRAINING_SECONDS + 1.0
+        )
         probes, quality = _topology_selection_inputs(eta)
         selection = SELECTOR.select_topology(
             probes,
             quality,
             gate_spec_sha256="b" * 64,
             quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertNotEqual(
+            selection["selected"]["mode"],
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+        )
+        self.assertEqual(
+            selection["quality_decisions"][
+                ADAPT.OFFICIAL_W1_REFERENCE_MODE
+            ]["status"],
+            "reference_only",
+        )
+        self.assertIs(
+            selection["quality_decisions"][
+                ADAPT.OFFICIAL_W1_REFERENCE_MODE
+            ]["selection_eligible"],
+            False,
+        )
+        self.assertIs(
+            selection["quality_decisions"][
+                ADAPT.OFFICIAL_W1_REFERENCE_MODE
+            ]["full400_eta_over_24h"],
+            True,
         )
         with tempfile.TemporaryDirectory(
             prefix="semtalk-w1-selection-", dir="/private/tmp"
@@ -1489,18 +1550,18 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            receipt = _consume_topology_selection(
-                selection=selection,
-                path=path,
-                topology_mode=ADAPT.OFFICIAL_W1_REFERENCE_MODE,
-                throughput_gate=_validated_throughput_projection(
-                    selection["selected"]
-                ),
-            )
-        self.assertEqual(
-            receipt["selected"]["mode"],
-            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
-        )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    path=path,
+                    topology_mode=ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
 
     def test_training_consumer_replays_cross_mode_validation_authority(
         self,
@@ -1651,7 +1712,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         measured = quality[1:]
         with self.assertRaisesRegex(
             SELECTOR.TopologySelectionError,
-            "W1 full e1/e2/e4/e8/e16/e32 quality reference is mandatory",
+            "W1 reference-only e1/e2/e4/e8 quality report is mandatory",
         ):
             SELECTOR.select_topology(
                 probes,
@@ -1748,7 +1809,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         self.assertEqual(
             selection["selected"]["mode"],
-            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            ADAPT.W8_GLOBAL64_MODE,
         )
 
     def test_p99_total_updates_is_a_hard_22_hour_gate(self) -> None:
@@ -2194,12 +2255,13 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         fast_decision = selection["quality_decisions"][fast]
         epoch_four = next(
             item
-            for item in fast_decision["comparisons"]
+            for item in fast_decision["same_epoch_comparisons"]
             if item["epoch"] == 4
         )
         epoch_four["candidate_fgd"] = 999.0
         epoch_four["pass"] = False
-        fast_decision["all_trajectory_epochs_pass"] = False
+        fast_decision["all_same_epoch_comparisons_pass"] = False
+        fast_decision["all_quality_epochs_pass"] = False
         selection["selected"] = next(
             item for item in selection["probes"] if item["mode"] == second
         )
@@ -2240,6 +2302,57 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         self.assertEqual(SELECTOR.maximum_allowed_fgd(1.0), 1.02)
         self.assertNotEqual(SELECTOR.maximum_allowed_fgd(1.0), 1.03)
 
+    def test_tail_uses_minimum_early_w1_envelope_without_extrapolation(
+        self,
+    ) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        target = ADAPT.W8_GLOBAL512_MODE
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        eta[target] = 1.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        early_reference = {"1": 1.0, "2": 0.8, "4": 0.6, "8": 0.4}
+        quality[0]["candidate_fgd"] = dict(early_reference)
+        for report in quality[1:]:
+            report["candidate_fgd"] = {
+                **early_reference,
+                "16": 0.41,
+                "32": 0.41,
+            }
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        decision = selection["quality_decisions"][target]
+        self.assertEqual(decision["tail_reference_epochs"], [1, 2, 4, 8])
+        self.assertEqual(decision["tail_reference_reducer"], "minimum")
+        self.assertEqual(decision["tail_reference_fgd"], 0.4)
+        self.assertEqual(
+            decision["tail_maximum_allowed_fgd"],
+            SELECTOR.maximum_allowed_fgd(0.4),
+        )
+        self.assertTrue(decision["all_tail_comparisons_pass"])
+        self.assertEqual(selection["selected"]["mode"], target)
+
+        target_report = next(
+            report for report in quality if report["mode"] == target
+        )
+        target_report["candidate_fgd"]["32"] = 0.411
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        decision = selection["quality_decisions"][target]
+        self.assertFalse(decision["all_tail_comparisons_pass"])
+        self.assertFalse(decision["all_quality_epochs_pass"])
+        self.assertNotEqual(selection["selected"]["mode"], target)
+
     def test_acceleration_requires_all_raw_replay_quality_epochs(self) -> None:
         probes, quality = _topology_selection_inputs(
             {
@@ -2266,7 +2379,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         self.assertFalse(
             selection["quality_decisions"][ADAPT.W8_GLOBAL512_MODE][
-                "all_trajectory_epochs_pass"
+                "all_quality_epochs_pass"
             ]
         )
 
@@ -2276,7 +2389,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.OFFICIAL_W1_REFERENCE_MODE: 10_000.0,
                 ADAPT.W8_GLOBAL64_MODE: 1_000.0,
                 ADAPT.W16_GLOBAL64_MODE: 2_000.0,
-                ADAPT.W8_GLOBAL512_MODE: 90_000.0,
+                ADAPT.W8_GLOBAL512_MODE: 3_000.0,
                 ADAPT.W16_GLOBAL512_MODE: 90_001.0,
                 ADAPT.W8_GLOBAL1024_MODE: 90_002.0,
                 ADAPT.W8_GLOBAL2048_MODE: 90_003.0,
@@ -2296,14 +2409,23 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         self.assertEqual(
             selection["selected"]["mode"],
-            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            ADAPT.W8_GLOBAL512_MODE,
         )
         for mode in (ADAPT.W8_GLOBAL64_MODE, ADAPT.W16_GLOBAL64_MODE):
             decision = selection["quality_decisions"][mode]
-            self.assertFalse(decision["all_trajectory_epochs_pass"])
+            self.assertFalse(decision["all_quality_epochs_pass"])
+            self.assertFalse(decision["all_same_epoch_comparisons_pass"])
+            self.assertTrue(decision["all_tail_comparisons_pass"])
             self.assertEqual(
-                [row["epoch"] for row in decision["comparisons"]],
-                list(SELECTOR.QUALITY_EPOCHS),
+                [
+                    row["epoch"]
+                    for row in decision["same_epoch_comparisons"]
+                ],
+                list(SELECTOR.W1_REFERENCE_EPOCHS),
+            )
+            self.assertEqual(
+                [row["epoch"] for row in decision["tail_comparisons"]],
+                list(SELECTOR.TAIL_EPOCHS),
             )
 
     def test_nonfinite_eta_is_never_ranked(self) -> None:
@@ -2336,12 +2458,16 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             _sha(TOPOLOGY_QUALITY_GATE_SPEC),
         )
         self.assertEqual(
-            receipt["payload"]["trajectory_epochs"],
-            list(SELECTOR.QUALITY_EPOCHS),
+            receipt["payload"]["w1_reference_epochs"],
+            list(SELECTOR.W1_REFERENCE_EPOCHS),
+        )
+        self.assertEqual(
+            receipt["payload"]["candidate_quality_epochs"],
+            list(SELECTOR.CANDIDATE_QUALITY_EPOCHS),
         )
         self.assertEqual(
             receipt["payload"]["format"],
-            "semtalk_show_base_topology_quality_gate_spec_v2",
+            "semtalk_show_base_topology_quality_gate_spec_v3",
         )
         self.assertNotIn(
             "raw_prediction_replay_required",
@@ -2360,7 +2486,25 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         self.assertEqual(
             receipt["payload"]["candidate_quality_gate"]["modes"],
-            list(ADAPT.TOPOLOGY_SPECS),
+            [
+                mode
+                for mode in ADAPT.TOPOLOGY_SPECS
+                if mode != ADAPT.OFFICIAL_W1_REFERENCE_MODE
+            ],
+        )
+        self.assertIs(
+            receipt["payload"]["w1_reference_gate"]["selection_eligible"],
+            False,
+        )
+        self.assertEqual(
+            receipt["payload"]["w1_reference_gate"]["late_w1_status"],
+            "not_measured",
+        )
+        self.assertIs(
+            receipt["payload"]["w1_reference_gate"][
+                "w1_tail_equivalence_claimed"
+            ],
+            False,
         )
         self.assertEqual(
             receipt["payload"]["measured_eta_constraint"][
@@ -3006,7 +3150,9 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 **gate_frozen,
                 "receipt_sha256": "b" * 64,
                 "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(ADAPT.SHORT_QUALITY_EPOCHS),
+                "target_epochs": list(
+                    ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
+                ),
             }
             report = _gate_report(
                 frozen_sha256="a" * 64,
@@ -3092,7 +3238,9 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 **gate_frozen,
                 "receipt_sha256": "b" * 64,
                 "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(ADAPT.SHORT_QUALITY_EPOCHS),
+                "target_epochs": list(
+                    ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
+                ),
             }
             report = _gate_report(
                 frozen_sha256="a" * 64,

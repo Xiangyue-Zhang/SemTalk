@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Seal one formal SemTalk Base short-trajectory SHOW quality report.
 
-This CPU-only producer accepts immutable e1/e2/e4/e8/e16/e32 checkpoints and
-their already-computed full-SHOW validation artifacts.  It freshly reuses the
-formal long-run validators for checkpoint -> val inference lineage -> pinned
-DiffSHEG FGD, then publishes one immutable report consumable by
+This CPU-only producer accepts immutable mode-specific v3 checkpoints (W1
+reference e1/e2/e4/e8; candidates e1/e2/e4/e8/e16/e32) and their
+already-computed full-SHOW validation artifacts.  It freshly reuses the formal
+long-run validators for checkpoint -> val inference lineage -> pinned DiffSHEG
+FGD, then publishes one immutable report consumable by
 ``select_base_training_topology.py``.
 """
 
@@ -77,6 +78,7 @@ def _epoch_artifacts(
     *,
     label: str,
     payload: bool,
+    expected_epochs: Sequence[int],
 ) -> dict[int, dict[str, Any]]:
     epochs: list[int] = []
     normalized: dict[int, dict[str, Any]] = {}
@@ -98,9 +100,11 @@ def _epoch_artifacts(
             if payload
             else _artifact3(artifact_values, f"e{epoch} {label}")
         )
-    if epochs != list(selector.QUALITY_EPOCHS):
+    if epochs != list(expected_epochs):
         raise selector.TopologySelectionError(
-            f"{label} must name e1/e2/e4/e8/e16/e32 exactly in order"
+            f"{label} must name "
+            + "/".join(f"e{epoch}" for epoch in expected_epochs)
+            + " exactly in order"
         )
     return normalized
 
@@ -171,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def produce(args: argparse.Namespace) -> dict[str, Any]:
+    quality_epochs = selector.quality_epochs_for_mode(args.mode)
+    quality_role = selector.quality_role_for_mode(args.mode)
+    reference_only = args.mode == contract.OFFICIAL_W1_REFERENCE_MODE
     output = args.output.expanduser().resolve()
     short_output = args.short_trajectory_output.expanduser().resolve()
     if output == short_output:
@@ -202,26 +209,43 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         args.candidate_ready_receipt,
         label="candidate-ready receipt",
         payload=True,
+        expected_epochs=quality_epochs,
     )
-    _status, ready, semantic_sha, short_checkpoints = (
+    status_artifact, ready, semantic_sha, short_checkpoints = (
         selector.validate_short_quality_training_bundle(
             args.mode,
             _artifact4(
                 args.short_quality_status,
                 "short-quality status",
             ),
-            [candidate_ready[epoch] for epoch in selector.QUALITY_EPOCHS],
+            [candidate_ready[epoch] for epoch in quality_epochs],
             topology_gate_spec_sha256=topology_gate["sha256"],
             quality_gate_spec_sha256=quality_gate["sha256"],
         )
     )
+    _status_identity, status_payload = selector._artifact(
+        status_artifact,
+        f"{args.mode} validated short-quality status root authority",
+        payload=True,
+    )
+    assert status_payload is not None
+    artifact_root = status_payload["artifact_root"]
     short_body: dict[str, Any] = {
         "format": selector.SHORT_TRAJECTORY_FORMAT,
         "status": "complete",
         "topology_mode": args.mode,
         "topology_gate_spec_sha256": topology_gate["sha256"],
         "quality_gate_spec_sha256": quality_gate["sha256"],
-        "candidate_epochs": list(selector.QUALITY_EPOCHS),
+        "quality_protocol_version": selector.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": artifact_root,
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
+        "candidate_epochs": list(quality_epochs),
         "split": "val",
         "test_visible": False,
         "topology_independent_input_sha256": semantic_sha,
@@ -237,7 +261,7 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "candidate_checkpoint": short_checkpoints[epoch],
             }
-            for epoch in selector.QUALITY_EPOCHS
+            for epoch in quality_epochs
         ],
     }
     short_body["receipt_payload_sha256"] = (
@@ -277,16 +301,18 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         args.inference_lineage,
         label="inference lineage",
         payload=True,
+        expected_epochs=quality_epochs,
     )
     reports = _epoch_artifacts(
         args.diffsheg_report,
         label="DiffSHEG report",
         payload=False,
+        expected_epochs=quality_epochs,
     )
 
     candidates: list[dict[str, Any]] = []
     semantic_sha = short_payload["topology_independent_input_sha256"]
-    for epoch in selector.QUALITY_EPOCHS:
+    for epoch in quality_epochs:
         validated = selector.validate_quality_candidate_provenance(
             args.mode,
             epoch,
@@ -319,9 +345,18 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         "status": "pass",
         "mode": args.mode,
         "quality_gate_spec_sha256": quality_gate["sha256"],
+        "quality_protocol_version": selector.QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": artifact_root,
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "split": "val",
         "test_visible": False,
-        "trajectory_epochs": list(selector.QUALITY_EPOCHS),
+        "trajectory_epochs": list(quality_epochs),
         "topology_independent_input_sha256": semantic_sha,
         "short_trajectory_receipt": short,
         "val_inputs_receipt": val_inputs_source,

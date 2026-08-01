@@ -6,7 +6,8 @@ export PYTHONDONTWRITEBYTECODE=1
 #   /tmp/globaldiff_guarded_runner.py --gpus 0,1,2,3,4,5,6,7 -- ...
 #
 # The preflight is produced by base_short_quality_val_adapter.py and contains
-# exactly e1/e2/e4/e8/e16/e32.  Each candidate uses eight exact modulo shards.
+# the exact mode-specific v3 epochs.  Each measured point uses eight exact
+# modulo shards.
 # launcher publishes the formal inference lineage and pinned DiffSHEG SHOW
 # validation FGD report; it never accepts a test path.
 
@@ -107,6 +108,26 @@ mkdir "$run_root/logs" "$run_root/candidates"
 "$python_bin" "$adapter" validate --split val \
     --preflight "$preflight" --expected-preflight-sha256 "$preflight_sha" \
     >"$run_root/logs/preflight-replay.log" 2>&1
+
+mapfile -t quality_epochs < <(
+    "$python_bin" - "$repo_root" "$preflight" "$preflight_sha" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from scripts.show_base import base_short_quality_val_adapter as adapter
+
+_artifact, payload = adapter._preflight_artifact(
+    Path(sys.argv[2]), sys.argv[3]
+)
+for epoch in payload["candidate_epochs"]:
+    print(epoch)
+PY
+)
+if [[ ${#quality_epochs[@]} -eq 0 ]]; then
+    printf 'validated preflight exposed no quality epochs\n' >&2
+    exit 1
+fi
 
 artifact_fields() {
     local path=$1
@@ -253,7 +274,7 @@ launch_registered() {
     LAST_CHILD_PID=$pid
 }
 
-for epoch in 1 2 4 8 16 32; do
+for epoch in "${quality_epochs[@]}"; do
     candidate_root="$run_root/candidates/e$epoch"
     mkdir "$candidate_root"
     shard_pids=()
@@ -315,8 +336,13 @@ import sys
 
 root = Path(sys.argv[1])
 preflight = Path(sys.argv[2])
+preflight_data = preflight.read_bytes()
+if hashlib.sha256(preflight_data).hexdigest() != sys.argv[3]:
+    raise SystemExit("preflight changed before completion")
+preflight_payload = json.loads(preflight_data)
+epochs = preflight_payload["candidate_epochs"]
 rows = []
-for epoch in (1, 2, 4, 8, 16, 32):
+for epoch in epochs:
     candidate = root / "candidates" / f"e{epoch}"
     artifacts = {}
     for name, relative in (
@@ -331,12 +357,24 @@ for epoch in (1, 2, 4, 8, 16, 32):
         artifacts[name] = artifact
     rows.append({"epoch": epoch, **artifacts})
 body = {
-    "format": "semtalk_show_base_short_quality_val_completion_v2",
+    "format": "semtalk_show_base_short_quality_val_completion_v3",
     "status": "complete",
+    "quality_protocol_version": preflight_payload["quality_protocol_version"],
+    "artifact_root_namespace": preflight_payload["artifact_root_namespace"],
+    "artifact_root": preflight_payload["artifact_root"],
+    "validation_artifact_root": str(root),
+    "quality_role": preflight_payload["quality_role"],
+    "reference_only": preflight_payload["reference_only"],
+    "late_w1_status": preflight_payload["late_w1_status"],
+    "w1_tail_equivalence_claimed": preflight_payload["w1_tail_equivalence_claimed"],
     "split": "val",
     "test_visible": False,
-    "candidate_epochs": [1, 2, 4, 8, 16, 32],
-    "preflight": {"path": str(preflight), "sha256": sys.argv[3]},
+    "candidate_epochs": epochs,
+    "preflight": {
+        "path": str(preflight),
+        "sha256": sys.argv[3],
+        "receipt_payload_sha256": preflight_payload["receipt_payload_sha256"],
+    },
     "candidates": rows,
 }
 raw = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()

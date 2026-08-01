@@ -25,7 +25,7 @@ QUALITY_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_20260731.json"
+    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
 )
 
 
@@ -180,6 +180,22 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
             )
             self.assertEqual(validated["status"], "skipped_over_eta_budget")
             self.assertEqual(
+                validated["quality_protocol_version"],
+                selector.QUALITY_PROTOCOL_VERSION,
+            )
+            self.assertEqual(
+                validated["artifact_root_namespace"],
+                selector.QUALITY_ARTIFACT_ROOT_NAMESPACE,
+            )
+            self.assertEqual(
+                validated["artifact_root_semantics"],
+                "not_applicable_eta_skip",
+            )
+            self.assertEqual(validated["quality_role"], "candidate_quality")
+            self.assertIs(validated["reference_only"], False)
+            self.assertEqual(validated["late_w1_status"], "not_measured")
+            self.assertIs(validated["w1_tail_equivalence_claimed"], False)
+            self.assertEqual(
                 validated["probe_report"]["sha256"], _sha(probe)
             )
             self.assertEqual(
@@ -297,6 +313,19 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                     {
                         "mode": mode,
                         "status": "skipped_over_eta_budget",
+                        "quality_protocol_version": (
+                            selector.QUALITY_PROTOCOL_VERSION
+                        ),
+                        "artifact_root_namespace": (
+                            selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                        ),
+                        "artifact_root_semantics": (
+                            "not_applicable_eta_skip"
+                        ),
+                        "quality_role": "candidate_quality",
+                        "reference_only": False,
+                        "late_w1_status": "not_measured",
+                        "w1_tail_equivalence_claimed": False,
                         "receipt_path": f"/skips/{mode}.json",
                         "receipt_sha256": "b" * 64,
                         "receipt_payload_sha256": "c" * 64,
@@ -319,9 +348,27 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                     }
                 )
             else:
+                reference_only = (
+                    mode == contract.OFFICIAL_W1_REFERENCE_MODE
+                )
                 reports.append(
                     {
                         "mode": mode,
+                        "quality_protocol_version": (
+                            selector.QUALITY_PROTOCOL_VERSION
+                        ),
+                        "artifact_root_namespace": (
+                            selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                        ),
+                        "artifact_root": f"/quality/{mode}-short-quality-v3",
+                        "quality_role": (
+                            "w1_reference_only"
+                            if reference_only
+                            else "candidate_quality"
+                        ),
+                        "reference_only": reference_only,
+                        "late_w1_status": "not_measured",
+                        "w1_tail_equivalence_claimed": False,
                         "report_path": f"/quality/{mode}.json",
                         "report_sha256": "f" * 64,
                         "topology_independent_input_sha256": "a" * 64,
@@ -340,7 +387,7 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                         },
                         "candidate_fgd": {
                             str(epoch): 0.5
-                            for epoch in selector.QUALITY_EPOCHS
+                            for epoch in selector.quality_epochs_for_mode(mode)
                         },
                         "candidates": [],
                     }
@@ -400,6 +447,16 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
         self.assertEqual(
             [item["mode"] for item in published[0]["quality_skips"]],
             [modes[2], modes[4]],
+        )
+        self.assertNotEqual(
+            published[0]["selected"]["mode"],
+            contract.OFFICIAL_W1_REFERENCE_MODE,
+        )
+        self.assertEqual(
+            published[0]["quality_decisions"][
+                contract.OFFICIAL_W1_REFERENCE_MODE
+            ]["status"],
+            "reference_only",
         )
 
 

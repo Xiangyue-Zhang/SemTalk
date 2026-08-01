@@ -23,7 +23,7 @@ QUALITY_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_20260731.json"
+    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
 )
 
 
@@ -274,7 +274,7 @@ class QualityFixture:
         self.short_status_by_mode: dict[str, dict[str, object]] = {}
         val_artifact = selector._formal_artifact_projection(self.val_inputs)
         pipeline_artifact = selector._formal_artifact_projection(self.pipeline)
-        for epoch in selector.QUALITY_EPOCHS:
+        for epoch in selector.CANDIDATE_QUALITY_EPOCHS:
             checkpoint = _write(
                 root / f"e{epoch}.bin",
                 f"checkpoint-e{epoch}".encode("utf-8"),
@@ -331,7 +331,7 @@ class QualityFixture:
                     "semtalk_show_base_official_adapt_frozen_inputs_v1"
                 ),
                 "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(selector.QUALITY_EPOCHS),
+                "target_epochs": list(selector.CANDIDATE_QUALITY_EPOCHS),
                 "source": {
                     "origin": contract.EXPECTED_ORIGIN,
                     "commit": "1" * 40,
@@ -399,6 +399,33 @@ class QualityFixture:
         self,
         mode: str,
     ) -> dict[int, dict[str, object]]:
+        quality_epochs = selector.quality_epochs_for_mode(mode)
+        quality_total_epochs = quality_epochs[-1]
+        quality_role = selector.quality_role_for_mode(mode)
+        reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
+        run_root = self.root / f"{mode}-short-quality-v3"
+        run_root.mkdir(exist_ok=True)
+        for directory in (
+            "provisional_candidates",
+            "short_quality_candidate_manifest_snapshots",
+            "short_quality_candidate_receipts",
+        ):
+            (run_root / directory).mkdir(exist_ok=True)
+        frozen_body = {
+            key: value
+            for key, value in self.frozen_payload.items()
+            if key != "receipt_sha256"
+        }
+        frozen_body["target_epochs"] = list(quality_epochs)
+        frozen, frozen_payload = _write_contract_receipt(
+            run_root / "frozen_inputs.json", frozen_body
+        )
+        semantic_sha = contract._topology_independent_gate_semantic_sha256(
+            frozen_payload
+        )
+        frozen_compatibility_sha = (
+            contract._frozen_gate_compatibility_sha256(frozen_payload)
+        )
         specification = contract.TOPOLOGY_SPECS[mode]
         updates_per_epoch = int(specification["updates_per_epoch"])
         world_size = int(specification["world_size"])
@@ -418,10 +445,10 @@ class QualityFixture:
             "topology_mode": mode,
             "topology_classification": specification["classification"],
             "topology_gate_spec_sha256": self.topology_sha,
-            "topology_independent_input_sha256": self.semantic_sha,
-            "frozen_receipt_sha256": "6" * 64,
+            "topology_independent_input_sha256": semantic_sha,
+            "frozen_receipt_sha256": frozen_payload["receipt_sha256"],
             "frozen_gate_compatibility_sha256": (
-                self.frozen_compatibility_sha
+                frozen_compatibility_sha
             ),
             "topology_receipt_sha256": "7" * 64,
             "node_count": specification["node_count"],
@@ -528,14 +555,74 @@ class QualityFixture:
             ],
             "trajectory_mode": contract.FRESH_TRAJECTORY_MODE,
             "trajectory_probe": trajectory_probe,
-            "gate_frozen_receipt_sha256": "6" * 64,
+            "gate_frozen_receipt_sha256": frozen_payload[
+                "receipt_sha256"
+            ],
             "frozen_gate_compatibility_sha256": (
-                self.frozen_compatibility_sha
+                frozen_compatibility_sha
             ),
         }
+        val_artifact = selector._formal_artifact_projection(self.val_inputs)
+        pipeline_artifact = selector._formal_artifact_projection(self.pipeline)
+        self.checkpoints = {}
+        self.lineages = {}
+        self.reports = {}
+        for epoch in quality_epochs:
+            checkpoint = _write(
+                run_root
+                / "provisional_candidates"
+                / f"base_official_adapt_short_quality_epoch_{epoch:02d}.bin",
+                f"checkpoint-{mode}-e{epoch}".encode("utf-8"),
+            )
+            self.checkpoints[epoch] = checkpoint
+            prediction_dir = str(
+                (self.root / mode / f"e{epoch}" / "predictions" / "val").resolve()
+            )
+            ground_truth_dir = str(
+                (self.root / mode / f"e{epoch}" / "ground-truth" / "val").resolve()
+            )
+            clip_manifest = str(
+                (self.root / mode / f"e{epoch}" / "diffsheg_eval_clip_ids.txt").resolve()
+            )
+            lineage, _ = _write_receipt(
+                self.root / f"{mode}-e{epoch}-val-inference-lineage.json",
+                {
+                    "format": "fixture-val-inference-lineage",
+                    "status": "complete",
+                    "split": "val",
+                    "test_visible": False,
+                    "epoch": epoch,
+                    "candidate_checkpoint": checkpoint,
+                    "val_inputs_receipt": val_artifact,
+                    "pipeline_receipt": pipeline_artifact,
+                    "prediction_dir": prediction_dir,
+                    "ground_truth_dir": ground_truth_dir,
+                    "clip_manifest": clip_manifest,
+                },
+            )
+            self.lineages[epoch] = lineage
+            report = {
+                "status": "ok",
+                "protocol": {
+                    "selection_split": "val",
+                    "test_visible": False,
+                    "metric_scope": "fgd_only",
+                },
+                "inputs": {
+                    "prediction_dir": prediction_dir,
+                    "ground_truth_dir": ground_truth_dir,
+                    "clip_manifest": clip_manifest,
+                },
+                "metrics": {"fgd": 1.0 + epoch / 100.0},
+                "provenance": {"assets": "pinned"},
+            }
+            self.reports[epoch] = _write(
+                self.root / f"{mode}-e{epoch}-diffsheg-val-fgd.json",
+                (json.dumps(report, sort_keys=True) + "\n").encode("utf-8"),
+            )
         entries: list[dict[str, object]] = []
         ready: dict[int, dict[str, object]] = {}
-        for position, epoch in enumerate(selector.QUALITY_EPOCHS):
+        for position, epoch in enumerate(quality_epochs):
             checkpoint = self.checkpoints[epoch]
             relative = (
                 "provisional_candidates/"
@@ -554,7 +641,7 @@ class QualityFixture:
                 "model_state_schema_sha256": model_schema,
                 "model_state_semantic_sha256": model_semantic,
                 "all_model_state_tensors_finite": True,
-                "frozen_receipt_sha256": self.frozen_payload[
+                "frozen_receipt_sha256": frozen_payload[
                     "receipt_sha256"
                 ],
                 "trajectory_anchor_match": None,
@@ -566,9 +653,18 @@ class QualityFixture:
                 "format": contract.SHORT_QUALITY_MANIFEST_FORMAT,
                 "status": "running",
                 "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(selector.QUALITY_EPOCHS),
-                "candidate_epochs": list(selector.QUALITY_EPOCHS),
-                "frozen_receipt_sha256": self.frozen_payload[
+                "target_epochs": list(quality_epochs),
+                "candidate_epochs": list(quality_epochs),
+                "quality_protocol_version": selector.QUALITY_PROTOCOL_VERSION,
+                "artifact_root_namespace": (
+                    selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                ),
+                "artifact_root": str(run_root.resolve()),
+                "quality_role": quality_role,
+                "reference_only": reference_only,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
+                "frozen_receipt_sha256": frozen_payload[
                     "receipt_sha256"
                 ],
                 "schedule_sha256": "a" * 64,
@@ -581,7 +677,9 @@ class QualityFixture:
                 "entries_sha256": contract.canonical_json_sha256(entries),
             }
             manifest_path = (
-                self.root / f"{mode}-e{epoch}-manifest.json"
+                run_root
+                / "short_quality_candidate_manifest_snapshots"
+                / f"epoch-{epoch:04d}.json"
             )
             manifest_path.write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -591,7 +689,16 @@ class QualityFixture:
                 "format": contract.SHORT_QUALITY_READY_RECEIPT_FORMAT,
                 "status": "ready",
                 "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(selector.QUALITY_EPOCHS),
+                "target_epochs": list(quality_epochs),
+                "quality_protocol_version": selector.QUALITY_PROTOCOL_VERSION,
+                "artifact_root_namespace": (
+                    selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                ),
+                "artifact_root": str(run_root.resolve()),
+                "quality_role": quality_role,
+                "reference_only": reference_only,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
                 "selection_eligible": False,
                 "test_visible": False,
                 "epoch": epoch,
@@ -611,23 +718,26 @@ class QualityFixture:
                     ],
                     "immutable_snapshot": True,
                     "live_path": str(
-                        (self.root / f"{mode}-live-manifest.json").resolve()
+                        (
+                            run_root
+                            / "short_quality_candidate_manifest.json"
+                        ).resolve()
                     ),
                 },
                 "frozen_inputs": {
-                    "path": self.frozen["path"],
-                    "sha256": self.frozen["sha256"],
-                    "receipt_payload_sha256": self.frozen_payload[
+                    "path": frozen["path"],
+                    "sha256": frozen["sha256"],
+                    "receipt_payload_sha256": frozen_payload[
                         "receipt_sha256"
                     ],
                 },
                 "protocol": {
                     "format": contract.PROTOCOL_FORMAT,
                     "payload_sha256": contract.canonical_json_sha256(
-                        self.frozen_payload["protocol"]
+                        frozen_payload["protocol"]
                     ),
                 },
-                "frozen_receipt_sha256": self.frozen_payload[
+                "frozen_receipt_sha256": frozen_payload[
                     "receipt_sha256"
                 ],
                 "schedule_sha256": "a" * 64,
@@ -636,30 +746,43 @@ class QualityFixture:
                 "published_unix": 1_700_000_000.0 + epoch,
             }
             artifact, _ = _write_receipt(
-                self.root / f"{mode}-e{epoch}-ready.json",
+                run_root
+                / "short_quality_candidate_receipts"
+                / f"epoch-{epoch:04d}.json",
                 ready_body,
             )
             ready[epoch] = artifact
         final_manifest = {
             **manifest,
             "status": "complete",
-            "completed_epochs": contract.SHORT_QUALITY_TOTAL_EPOCHS,
+            "completed_epochs": quality_total_epochs,
             "optimizer_updates": (
-                contract.SHORT_QUALITY_TOTAL_EPOCHS * updates_per_epoch
+                quality_total_epochs * updates_per_epoch
             ),
         }
-        final_manifest_path = self.root / f"{mode}-short-final-manifest.json"
+        final_manifest_path = run_root / "short_quality_candidate_manifest.json"
         final_manifest_path.write_text(
             json.dumps(final_manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        metrics_path = self.root / f"{mode}-short-metrics.jsonl"
+        metrics_path = run_root / "epoch_metrics.jsonl"
         with metrics_path.open("w", encoding="utf-8") as handle:
-            for epoch in range(1, contract.SHORT_QUALITY_TOTAL_EPOCHS + 1):
+            for epoch in range(1, quality_total_epochs + 1):
                 row = {
                     "format": contract.SHORT_QUALITY_EPOCH_METRIC_FORMAT,
                     "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
-                    "target_epochs": list(selector.QUALITY_EPOCHS),
+                    "target_epochs": list(quality_epochs),
+                    "quality_protocol_version": (
+                        selector.QUALITY_PROTOCOL_VERSION
+                    ),
+                    "artifact_root_namespace": (
+                        selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                    ),
+                    "artifact_root": str(run_root.resolve()),
+                    "quality_role": quality_role,
+                    "reference_only": reference_only,
+                    "late_w1_status": "not_measured",
+                    "w1_tail_equivalence_claimed": False,
                     "epoch": epoch,
                     "optimizer_updates": epoch * updates_per_epoch,
                     "updates_per_epoch": updates_per_epoch,
@@ -685,14 +808,23 @@ class QualityFixture:
             "format": contract.SHORT_QUALITY_STATUS_FORMAT,
             "status": "complete",
             "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
-            "target_epochs": list(selector.QUALITY_EPOCHS),
-            "completed_epochs": contract.SHORT_QUALITY_TOTAL_EPOCHS,
+            "target_epochs": list(quality_epochs),
+            "quality_protocol_version": selector.QUALITY_PROTOCOL_VERSION,
+            "artifact_root_namespace": (
+                selector.QUALITY_ARTIFACT_ROOT_NAMESPACE
+            ),
+            "artifact_root": str(run_root.resolve()),
+            "quality_role": quality_role,
+            "reference_only": reference_only,
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
+            "completed_epochs": quality_total_epochs,
             "optimizer_updates": (
-                contract.SHORT_QUALITY_TOTAL_EPOCHS * updates_per_epoch
+                quality_total_epochs * updates_per_epoch
             ),
             "updates_per_epoch": updates_per_epoch,
             "candidate_manifest_sha256": final_manifest_artifact["sha256"],
-            "frozen_receipt_sha256": self.frozen_payload[
+            "frozen_receipt_sha256": frozen_payload[
                 "receipt_sha256"
             ],
             "throughput_gate": throughput,
@@ -702,7 +834,7 @@ class QualityFixture:
             "all_training_state_finite": True,
             "epoch_metrics_jsonl": metrics_artifact["path"],
             "epoch_metrics_sha256": metrics_artifact["sha256"],
-            "epoch_metrics_records": contract.SHORT_QUALITY_TOTAL_EPOCHS,
+            "epoch_metrics_records": quality_total_epochs,
             "schedule_sha256": "a" * 64,
             "trajectory_anchor_sha256": "b" * 64,
             "trajectory_mode": contract.FRESH_TRAJECTORY_MODE,
@@ -713,14 +845,14 @@ class QualityFixture:
             "candidate_manifest": final_manifest_artifact,
             "epoch_metrics": {
                 **metrics_artifact,
-                "records": contract.SHORT_QUALITY_TOTAL_EPOCHS,
+                "records": quality_total_epochs,
             },
             "candidate_ready_receipts": [
-                ready[epoch] for epoch in selector.QUALITY_EPOCHS
+                ready[epoch] for epoch in quality_epochs
             ],
         }
         status_artifact, _ = _write_receipt(
-            self.root / f"{mode}-short-status.json",
+            run_root / "short_quality_status.json",
             status_body,
         )
         self.short_status_by_mode[mode] = status_artifact
@@ -738,6 +870,7 @@ class QualityFixture:
         pipeline_override: dict[str, object] | None = None,
         status_override: dict[str, object] | None = None,
     ) -> list[str]:
+        quality_epochs = selector.quality_epochs_for_mode(mode)
         ready = ready_override or self.candidate_ready_receipts(mode)
         short_output = output.with_name(f"{output.stem}-short.json")
         argv = [
@@ -752,7 +885,7 @@ class QualityFixture:
             "--expected-quality-gate-spec-sha256",
             self.quality_sha,
         ]
-        for epoch in selector.QUALITY_EPOCHS:
+        for epoch in quality_epochs:
             self._append_artifact(
                 argv,
                 "--candidate-ready-receipt",
@@ -788,7 +921,7 @@ class QualityFixture:
             ("--diffsheg-report", report_override or self.reports),
         )
         for option, artifacts in sources:
-            for epoch in selector.QUALITY_EPOCHS:
+            for epoch in quality_epochs:
                 self._append_artifact(
                     argv,
                     option,
@@ -832,6 +965,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             patches = self.patches(fixture)
             with patches[0], patches[1], patches[2], patches[3]:
                 for index, mode in enumerate(contract.TOPOLOGY_SPECS):
+                    quality_epochs = selector.quality_epochs_for_mode(mode)
                     output = fixture.root / f"quality-{index}.json"
                     self.assertEqual(
                         producer.main(fixture.argv(mode, output)),
@@ -846,7 +980,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         len(short_payload["candidate_ready_receipts"]),
-                        len(selector.QUALITY_EPOCHS),
+                        len(quality_epochs),
                     )
                     validated = selector.validate_quality_report(
                         mode,
@@ -859,7 +993,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                         validated["candidate_fgd"],
                         {
                             str(epoch): 1.0 + epoch / 100.0
-                            for epoch in selector.QUALITY_EPOCHS
+                            for epoch in quality_epochs
                         },
                     )
                     self.assertEqual(
@@ -868,7 +1002,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                             for row in validated["candidates"]
                         ],
                         [selector.QUALITY_PROVENANCE_FORMAT]
-                        * len(selector.QUALITY_EPOCHS),
+                        * len(quality_epochs),
                     )
                     report_text = output.read_text(encoding="utf-8")
                     self.assertNotIn("released2", report_text.lower())
@@ -883,6 +1017,116 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                             "provenance",
                         },
                     )
+
+    def test_w1_is_exact_four_point_reference_and_copied_tail_is_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = QualityFixture(Path(directory))
+            mode = contract.OFFICIAL_W1_REFERENCE_MODE
+            output = fixture.root / "w1-quality.json"
+            patches = self.patches(fixture)
+            with patches[0], patches[1], patches[2], patches[3]:
+                self.assertEqual(producer.main(fixture.argv(mode, output)), 0)
+                validated = selector.validate_quality_report(
+                    mode,
+                    output,
+                    _sha(output),
+                    quality_gate_spec_sha256=fixture.quality_sha,
+                    topology_gate_spec_sha256=fixture.topology_sha,
+                )
+                self.assertEqual(
+                    list(validated["candidate_fgd"]),
+                    ["1", "2", "4", "8"],
+                )
+                self.assertEqual(validated["quality_role"], "w1_reference_only")
+                self.assertIs(validated["reference_only"], True)
+                self.assertEqual(validated["late_w1_status"], "not_measured")
+                self.assertIs(
+                    validated["w1_tail_equivalence_claimed"], False
+                )
+
+                copied = json.loads(output.read_text(encoding="utf-8"))
+                copied["trajectory_epochs"] = [1, 2, 4, 8, 16, 32]
+                epoch_eight = copied["candidates"][-1]
+                for epoch in (16, 32):
+                    copied_row = json.loads(json.dumps(epoch_eight))
+                    copied_row["epoch"] = epoch
+                    copied["candidates"].append(copied_row)
+                copied["receipt_sha256"] = contract.canonical_json_sha256(
+                    {
+                        key: value
+                        for key, value in copied.items()
+                        if key != "receipt_sha256"
+                    }
+                )
+                copied_path = fixture.root / "w1-copied-e8-tail.json"
+                copied_path.write_text(
+                    json.dumps(copied, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    selector.TopologySelectionError,
+                    "forged or stale",
+                ):
+                    selector.validate_quality_report(
+                        mode,
+                        copied_path,
+                        _sha(copied_path),
+                        quality_gate_spec_sha256=fixture.quality_sha,
+                        topology_gate_spec_sha256=fixture.topology_sha,
+                    )
+
+    def test_old_v2_report_and_role_or_root_swaps_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = QualityFixture(Path(directory))
+            mode = contract.OFFICIAL_W1_REFERENCE_MODE
+            output = fixture.root / "w1-quality.json"
+            patches = self.patches(fixture)
+            with patches[0], patches[1], patches[2], patches[3]:
+                self.assertEqual(producer.main(fixture.argv(mode, output)), 0)
+                original = json.loads(output.read_text(encoding="utf-8"))
+                attacks = {
+                    "old-v2": {
+                        "format": "semtalk_show_base_topology_quality_report_v2",
+                        "quality_protocol_version": 2,
+                    },
+                    "role-swap": {
+                        "quality_role": "candidate_quality",
+                        "reference_only": False,
+                    },
+                    "root-swap": {
+                        "artifact_root": str(
+                            (fixture.root / "foreign-short-quality-v3").resolve()
+                        ),
+                    },
+                }
+                for label, changes in attacks.items():
+                    with self.subTest(attack=label):
+                        changed = json.loads(json.dumps(original))
+                        changed.update(changes)
+                        changed["receipt_sha256"] = (
+                            contract.canonical_json_sha256(
+                                {
+                                    key: value
+                                    for key, value in changed.items()
+                                    if key != "receipt_sha256"
+                                }
+                            )
+                        )
+                        path = fixture.root / f"{label}.json"
+                        path.write_text(
+                            json.dumps(changed, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        with self.assertRaises(selector.TopologySelectionError):
+                            selector.validate_quality_report(
+                                mode,
+                                path,
+                                _sha(path),
+                                quality_gate_spec_sha256=fixture.quality_sha,
+                                topology_gate_spec_sha256=fixture.topology_sha,
+                            )
 
     def test_provisional_bundle_cannot_masquerade_as_final_training(self) -> None:
         from scripts.show_base import base_long_val_contract as final_contract
@@ -907,7 +1151,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
     def test_producer_rejects_old_e400_training_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
-            mode = next(iter(contract.TOPOLOGY_SPECS))
+            mode = list(contract.TOPOLOGY_SPECS)[1]
             fixture.candidate_ready_receipts(mode)
             original = json.loads(
                 Path(
@@ -942,7 +1186,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
-            mode = next(iter(contract.TOPOLOGY_SPECS))
+            mode = list(contract.TOPOLOGY_SPECS)[1]
             fixture.candidate_ready_receipts(mode)
             original = json.loads(
                 Path(
@@ -1021,7 +1265,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
-                    "e1/e2/e4/e8/e16/e32 exactly in order",
+                    "must name .* exactly in order",
                 ):
                     producer.main(argv)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,7 +12,7 @@ from scripts.show_base import run_base_val_inference as FORMAL
 
 
 class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
-    def test_cli_is_val_only_and_exactly_e1_e2_e4_e8(self) -> None:
+    def test_cli_is_val_only_and_accepts_the_candidate_epoch_union(self) -> None:
         common = [
             "shard",
             "--split",
@@ -47,21 +48,41 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             ADAPTER.parse_args(argv)
 
     def test_ready_receipts_require_exact_order_and_lowercase_sha(self) -> None:
-        values = []
+        candidate_mode = ADAPTER.training.W8_GLOBAL64_MODE
+        candidate_epochs = ADAPTER.topology.quality_epochs_for_mode(
+            candidate_mode
+        )
+        reference_mode = ADAPTER.training.OFFICIAL_W1_REFERENCE_MODE
+        reference_epochs = ADAPTER.topology.quality_epochs_for_mode(
+            reference_mode
+        )
         with mock.patch.object(Path, "read_bytes") as read_bytes:
             read_bytes.return_value = json.dumps(
                 {"receipt_payload_sha256": "b" * 64}
             ).encode()
-            for epoch in ADAPTER.QUALITY_EPOCHS:
-                values.append((str(epoch), f"/frozen/val/e{epoch}.json", "a" * 64))
-            result = ADAPTER._normalize_ready(values)
-            self.assertEqual(len(result), len(ADAPTER.QUALITY_EPOCHS))
+            values = [
+                (str(epoch), f"/frozen/val/e{epoch}.json", "a" * 64)
+                for epoch in candidate_epochs
+            ]
+            result = ADAPTER._normalize_ready(values, candidate_mode)
+            self.assertEqual(len(result), len(candidate_epochs))
             with self.assertRaises(ADAPTER.ShortQualityValError):
-                ADAPTER._normalize_ready(list(reversed(values)))
+                ADAPTER._normalize_ready(list(reversed(values)), candidate_mode)
             bad = list(values)
             bad[0] = ("1", "/frozen/val/e1.json", "A" * 64)
             with self.assertRaises(ADAPTER.ShortQualityValError):
-                ADAPTER._normalize_ready(bad)
+                ADAPTER._normalize_ready(bad, candidate_mode)
+
+            reference_values = values[: len(reference_epochs)]
+            reference = ADAPTER._normalize_ready(
+                reference_values, reference_mode
+            )
+            self.assertEqual(
+                [Path(item["path"]).stem for item in reference],
+                [f"e{epoch}" for epoch in reference_epochs],
+            )
+            with self.assertRaises(ADAPTER.ShortQualityValError):
+                ADAPTER._normalize_ready(values, reference_mode)
 
     def test_selected_five_and_selection_authority_are_exact(self) -> None:
         stages = ("face", "hands", "upper", "lower", "global")
@@ -112,6 +133,26 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             "scripts/show_base/evaluate_diffsheg_val_fgd.py",
             ADAPTER.SOURCE_FILES,
         )
+        self.assertIn(
+            "scripts/show_base/select_base_training_topology.py",
+            ADAPTER.SOURCE_FILES,
+        )
+        self.assertIn(
+            "scripts/show_base/train_base_official_adapt_long.py",
+            ADAPTER.SOURCE_FILES,
+        )
+        self.assertEqual(
+            FORMAL.SHORT_QUALITY_CHECKPOINT_FORMAT,
+            ADAPTER.training.SHORT_QUALITY_CHECKPOINT_FORMAT,
+        )
+        self.assertEqual(
+            FORMAL.SHORT_QUALITY_PROTOCOL_VERSION,
+            ADAPTER.topology.QUALITY_PROTOCOL_VERSION,
+        )
+        self.assertEqual(
+            FORMAL.SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE,
+            ADAPTER.topology.QUALITY_ARTIFACT_ROOT_NAMESPACE,
+        )
         self.assertNotIn(
             "scripts/show_base/replay_released2_primary.py",
             ADAPTER.SOURCE_FILES,
@@ -120,12 +161,25 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             ADAPTER.parse_args(["distribution"])
 
     def test_prepare_schema_is_isolated_from_formal_preflight(self) -> None:
+        candidate_mode = ADAPTER.training.W8_GLOBAL64_MODE
+        candidate_epochs = list(
+            ADAPTER.topology.quality_epochs_for_mode(candidate_mode)
+        )
         body = {
             "format": ADAPTER.FORMAT,
             "status": "complete",
+            "quality_protocol_version": ADAPTER.topology.QUALITY_PROTOCOL_VERSION,
+            "artifact_root_namespace": (
+                ADAPTER.topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+            ),
+            "artifact_root": "/frozen/quality/candidate",
+            "quality_role": "candidate_quality",
+            "reference_only": False,
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
             "split": "val",
             "test_visible": False,
-            "candidate_epochs": list(ADAPTER.QUALITY_EPOCHS),
+            "candidate_epochs": candidate_epochs,
             "candidate_bundle": {},
             "val_inputs_receipt": {},
             "pipeline_receipt": {},
@@ -149,28 +203,27 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             FORMAL._preflight_artifact(Path("/frozen/val/preflight.json"), "b" * 64)
 
     def test_dedicated_preflight_freshly_replays_all_authorities(self) -> None:
-        body = {
-            "format": ADAPTER.FORMAT,
-            "status": "complete",
-            "split": "val",
-            "test_visible": False,
-            "candidate_epochs": list(ADAPTER.QUALITY_EPOCHS),
-            "candidate_bundle": {
-                "candidates": {str(e): {} for e in ADAPTER.QUALITY_EPOCHS}
-            },
-            "val_inputs_receipt": {
-                "path": "/frozen/val/inputs.json",
-                "sha256": "1" * 64,
-            },
-            "pipeline_receipt": {
-                "path": "/frozen/val/pipeline.json",
-                "sha256": "2" * 64,
-            },
-            "pipeline_source": {},
-            "inference_entrypoint": {},
-            "coverage": {},
-            "short_quality_authority": {
-                "topology_mode": "w8_b8",
+        mode = ADAPTER.training.W8_GLOBAL64_MODE
+        epochs = ADAPTER.topology.quality_epochs_for_mode(mode)
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk_short_quality_preflight_"
+        ) as raw:
+            artifact_root = Path(raw).resolve()
+            metadata = {
+                "quality_protocol_version": (
+                    ADAPTER.topology.QUALITY_PROTOCOL_VERSION
+                ),
+                "artifact_root_namespace": (
+                    ADAPTER.topology.QUALITY_ARTIFACT_ROOT_NAMESPACE
+                ),
+                "artifact_root": str(artifact_root),
+                "quality_role": "candidate_quality",
+                "reference_only": False,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
+            }
+            authority = {
+                "topology_mode": mode,
                 "topology_gate_spec": {
                     "path": "/frozen/val/topology.json",
                     "sha256": "3" * 64,
@@ -179,40 +232,110 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
                     "path": "/frozen/val/quality.json",
                     "sha256": "4" * 64,
                 },
-                "short_quality_status": {"path": "/frozen/val/status.json"},
+                "short_quality_status": {
+                    "path": "/frozen/val/status.json"
+                },
                 "candidate_ready_receipts": [
-                    {"path": f"/frozen/val/e{e}.json"}
-                    for e in ADAPTER.QUALITY_EPOCHS
+                    {"path": f"/frozen/val/e{epoch}.json"}
+                    for epoch in epochs
                 ],
+                **metadata,
+            }
+            body = {
+                "format": ADAPTER.FORMAT,
+                "status": "complete",
+                **metadata,
+                "split": "val",
+                "test_visible": False,
+                "candidate_epochs": list(epochs),
+                "candidate_bundle": {
+                    "candidates": {str(epoch): {} for epoch in epochs}
+                },
+                "val_inputs_receipt": {
+                    "path": "/frozen/val/inputs.json",
+                    "sha256": "1" * 64,
+                },
+                "pipeline_receipt": {
+                    "path": "/frozen/val/pipeline.json",
+                    "sha256": "2" * 64,
+                },
+                "pipeline_source": {},
+                "inference_entrypoint": {},
+                "coverage": {},
+                "short_quality_authority": authority,
+                "adapter_source": {},
+                "quality_input_binding_sha256": "5" * 64,
+            }
+            payload = ADAPTER._with_payload_sha(body)
+            rebuilt = dict(body)
+            with (
+                mock.patch.object(
+                    ADAPTER.engine,
+                    "_regular_file",
+                    return_value=Path("/frozen/val/preflight.json"),
+                ),
+                mock.patch.object(
+                    ADAPTER.engine, "_verified_json", return_value=payload
+                ),
+                mock.patch.object(
+                    ADAPTER, "_build_bound_payload", return_value=rebuilt
+                ) as fresh,
+            ):
+                artifact, observed = ADAPTER._preflight_artifact(
+                    Path("/frozen/val/preflight.json"), "a" * 64
+                )
+            self.assertEqual(observed, payload)
+            self.assertEqual(artifact["sha256"], "a" * 64)
+            kwargs = fresh.call_args.kwargs
+            self.assertEqual(kwargs["mode"], mode)
+            self.assertEqual(len(kwargs["ready_artifacts"]), len(epochs))
+            self.assertEqual(kwargs["topology_gate_sha"], "3" * 64)
+            self.assertEqual(kwargs["quality_gate_sha"], "4" * 64)
+
+    def test_w1_preflight_rejects_unmeasured_tail_before_engine_entry(self) -> None:
+        preflight = {
+            "candidate_epochs": list(
+                ADAPTER.topology.W1_REFERENCE_EPOCHS
+            ),
+            "short_quality_authority": {
+                "topology_mode": ADAPTER.training.OFFICIAL_W1_REFERENCE_MODE
             },
-            "adapter_source": {},
-            "quality_input_binding_sha256": "5" * 64,
         }
-        payload = ADAPTER._with_payload_sha(body)
-        rebuilt = dict(body)
+        args = ADAPTER.parse_args(
+            [
+                "shard",
+                "--split",
+                "val",
+                "--preflight",
+                "/frozen/val/preflight.json",
+                "--expected-preflight-sha256",
+                "a" * 64,
+                "--epoch",
+                "16",
+                "--output-root",
+                "/frozen/val/e16",
+                "--num-shards",
+                "8",
+                "--shard-id",
+                "0",
+                "--device",
+                "cuda:0",
+            ]
+        )
         with (
             mock.patch.object(
-                ADAPTER.engine,
-                "_regular_file",
-                return_value=Path("/frozen/val/preflight.json"),
+                ADAPTER,
+                "_preflight_artifact",
+                return_value=({}, preflight),
             ),
-            mock.patch.object(ADAPTER.engine, "_verified_json", return_value=payload),
-            mock.patch.object(
-                ADAPTER, "_build_bound_payload", return_value=rebuilt
-            ) as fresh,
+            mock.patch.object(ADAPTER.engine, "run_shard") as engine,
+            self.assertRaisesRegex(
+                ADAPTER.ShortQualityValError,
+                "not measured",
+            ),
         ):
-            artifact, observed = ADAPTER._preflight_artifact(
-                Path("/frozen/val/preflight.json"), "a" * 64
-            )
-        self.assertEqual(observed, payload)
-        self.assertEqual(artifact["sha256"], "a" * 64)
-        kwargs = fresh.call_args.kwargs
-        self.assertEqual(kwargs["mode"], "w8_b8")
-        self.assertEqual(
-            len(kwargs["ready_artifacts"]), len(ADAPTER.QUALITY_EPOCHS)
-        )
-        self.assertEqual(kwargs["topology_gate_sha"], "3" * 64)
-        self.assertEqual(kwargs["quality_gate_sha"], "4" * 64)
+            ADAPTER.run_shard(args)
+        engine.assert_not_called()
 
     def test_launcher_is_guarded_exact_8shard_and_avoids_broad_process_tools(
         self,
@@ -225,7 +348,10 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
         self.assertIn("semtalk_require_exact_guarded_runner_all_gpus", source)
         self.assertIn("for shard_id in 0 1 2 3 4 5 6 7", source)
         self.assertIn("--num-shards 8", source)
-        self.assertIn("for epoch in 1 2 4 8 16 32", source)
+        self.assertIn("mapfile -t quality_epochs", source)
+        self.assertIn("adapter._preflight_artifact", source)
+        self.assertIn('for epoch in "${quality_epochs[@]}"', source)
+        self.assertNotIn("for epoch in 1 2 4 8 16 32", source)
         self.assertIn("--split val", source)
         for required in (
             "evaluate_diffsheg_val_fgd.py",
@@ -234,7 +360,7 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             "diffsheg_eval_clip_ids.txt",
             "--paspa-root",
             "--diffsheg-root",
-            "semtalk_show_base_short_quality_val_completion_v2",
+            "semtalk_show_base_short_quality_val_completion_v3",
             '"inference_lineage"',
             '"diffsheg_report"',
         ):

@@ -27,18 +27,23 @@ class TopologySelectionError(RuntimeError):
     """Raised when any measured topology is absent, unsafe, or stale."""
 
 
-QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v2"
-QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v2"
+QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v3"
+QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v3"
 QUALITY_SKIP_FORMAT = (
-    "semtalk_show_base_topology_quality_skipped_over_eta_budget_v1"
+    "semtalk_show_base_topology_quality_skipped_over_eta_budget_v2"
 )
 SHORT_TRAJECTORY_FORMAT = (
-    "semtalk_show_base_topology_short_trajectory_v1"
+    "semtalk_show_base_topology_short_trajectory_v2"
 )
 QUALITY_PROVENANCE_FORMAT = (
-    "semtalk_show_base_topology_quality_provenance_v2"
+    "semtalk_show_base_topology_quality_provenance_v3"
 )
-QUALITY_EPOCHS = (1, 2, 4, 8, 16, 32)
+QUALITY_PROTOCOL_VERSION = 3
+QUALITY_ARTIFACT_ROOT_NAMESPACE = "semtalk_show_base_topology_quality_v3"
+W1_REFERENCE_EPOCHS = (1, 2, 4, 8)
+CANDIDATE_QUALITY_EPOCHS = (1, 2, 4, 8, 16, 32)
+SAME_EPOCH_COMPARISON_EPOCHS = W1_REFERENCE_EPOCHS
+TAIL_EPOCHS = (16, 32)
 EXPECTED_VAL_CLIPS = formal_validation.EXPECTED_VAL_CLIPS
 PRIMARY_METRIC_PATH = "validation.diffsheg.metrics.fgd"
 VALIDATION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
@@ -53,6 +58,22 @@ SELECTION_PROTOCOL = {
     "validation_only_for_selection": True,
     "test_evaluations": 0,
 }
+
+
+def quality_epochs_for_mode(mode: str) -> tuple[int, ...]:
+    if mode not in contract.TOPOLOGY_SPECS:
+        raise TopologySelectionError(f"unknown topology mode {mode!r}")
+    if mode == contract.OFFICIAL_W1_REFERENCE_MODE:
+        return W1_REFERENCE_EPOCHS
+    return CANDIDATE_QUALITY_EPOCHS
+
+
+def quality_role_for_mode(mode: str) -> str:
+    return (
+        "w1_reference_only"
+        if mode == contract.OFFICIAL_W1_REFERENCE_MODE
+        else "candidate_quality"
+    )
 
 
 def _artifact(
@@ -333,9 +354,12 @@ def validate_candidate_ready_receipts(
     str,
     dict[int, dict[str, Any]],
 ]:
-    """Freshly replay trainer-owned e1/e2/e4/e8/e16/e32 publications."""
+    """Freshly replay the mode-specific v3 short-quality publications."""
 
-    if len(values) != len(QUALITY_EPOCHS):
+    quality_epochs = quality_epochs_for_mode(mode)
+    quality_role = quality_role_for_mode(mode)
+    reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
+    if len(values) != len(quality_epochs):
         raise TopologySelectionError(
             f"{mode} candidate-ready coverage changed"
         )
@@ -349,6 +373,13 @@ def validate_candidate_ready_receipts(
         "status",
         "run_purpose",
         "target_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "selection_eligible",
         "test_visible",
         "epoch",
@@ -379,6 +410,13 @@ def validate_candidate_ready_receipts(
         "run_purpose",
         "target_epochs",
         "candidate_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "frozen_receipt_sha256",
         "schedule_sha256",
         "trajectory_anchor_sha256",
@@ -434,7 +472,7 @@ def validate_candidate_ready_receipts(
         "topology",
         "receipt_sha256",
     }
-    for position, (epoch, value) in enumerate(zip(QUALITY_EPOCHS, values)):
+    for position, (epoch, value) in enumerate(zip(quality_epochs, values)):
         label = f"{mode} e{epoch} candidate-ready"
         ready, payload = _artifact(value, label, payload=True)
         assert payload is not None
@@ -455,7 +493,17 @@ def validate_candidate_ready_receipts(
             or payload.get("status") != "ready"
             or payload.get("run_purpose")
             != contract.RUN_PURPOSE_SHORT_QUALITY
-            or payload.get("target_epochs") != list(QUALITY_EPOCHS)
+            or payload.get("target_epochs") != list(quality_epochs)
+            or payload.get("quality_protocol_version")
+            != QUALITY_PROTOCOL_VERSION
+            or payload.get("artifact_root_namespace")
+            != QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or not isinstance(payload.get("artifact_root"), str)
+            or not Path(payload["artifact_root"]).is_absolute()
+            or payload.get("quality_role") != quality_role
+            or payload.get("reference_only") is not reference_only
+            or payload.get("late_w1_status") != "not_measured"
+            or payload.get("w1_tail_equivalence_claimed") is not False
             or payload.get("selection_eligible") is not False
             or payload.get("test_visible") is not False
             or payload.get("epoch") != epoch
@@ -521,6 +569,35 @@ def validate_candidate_ready_receipts(
             f"{label} checkpoint",
         )
         manifest_path = Path(str(manifest_value["path"]))
+        artifact_root = Path(payload["artifact_root"])
+        expected_checkpoint_path = (
+            artifact_root
+            / "provisional_candidates"
+            / f"base_official_adapt_short_quality_epoch_{epoch:02d}.bin"
+        )
+        expected_snapshot_path = (
+            artifact_root
+            / "short_quality_candidate_manifest_snapshots"
+            / f"epoch-{epoch:04d}.json"
+        )
+        expected_ready_path = (
+            artifact_root
+            / "short_quality_candidate_receipts"
+            / f"epoch-{epoch:04d}.json"
+        )
+        if (
+            not artifact_root.is_dir()
+            or artifact_root.is_symlink()
+            or artifact_root.resolve(strict=True) != artifact_root
+            or Path(ready["path"]) != expected_ready_path
+            or Path(checkpoint["path"]) != expected_checkpoint_path
+            or manifest_path != expected_snapshot_path
+            or Path(str(manifest_value["live_path"]))
+            != artifact_root / "short_quality_candidate_manifest.json"
+            or Path(str(frozen_value["path"]))
+            != artifact_root / "frozen_inputs.json"
+        ):
+            raise TopologySelectionError(f"{label} v3 artifact root changed")
         if not manifest_path.is_absolute():
             raise TopologySelectionError(f"{label} manifest path changed")
         try:
@@ -552,7 +629,7 @@ def validate_candidate_ready_receipts(
                 f"{label} manifest is not strict JSON"
             ) from error
         entries = manifest.get("entries")
-        expected_entry_epochs = list(QUALITY_EPOCHS[: position + 1])
+        expected_entry_epochs = list(quality_epochs[: position + 1])
         if (
             set(manifest) != manifest_keys
             or manifest.get("format")
@@ -560,8 +637,17 @@ def validate_candidate_ready_receipts(
             or manifest.get("status") != "running"
             or manifest.get("run_purpose")
             != contract.RUN_PURPOSE_SHORT_QUALITY
-            or manifest.get("target_epochs") != list(QUALITY_EPOCHS)
-            or manifest.get("candidate_epochs") != list(QUALITY_EPOCHS)
+            or manifest.get("target_epochs") != list(quality_epochs)
+            or manifest.get("candidate_epochs") != list(quality_epochs)
+            or manifest.get("quality_protocol_version")
+            != QUALITY_PROTOCOL_VERSION
+            or manifest.get("artifact_root_namespace")
+            != QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or manifest.get("artifact_root") != payload["artifact_root"]
+            or manifest.get("quality_role") != quality_role
+            or manifest.get("reference_only") is not reference_only
+            or manifest.get("late_w1_status") != "not_measured"
+            or manifest.get("w1_tail_equivalence_claimed") is not False
             or manifest.get("frozen_receipt_sha256")
             != payload["frozen_receipt_sha256"]
             or manifest.get("schedule_sha256") != payload["schedule_sha256"]
@@ -634,7 +720,7 @@ def validate_candidate_ready_receipts(
             != "semtalk_show_base_official_adapt_frozen_inputs_v1"
             or frozen.get("run_purpose")
             != contract.RUN_PURPOSE_SHORT_QUALITY
-            or frozen.get("target_epochs") != list(QUALITY_EPOCHS)
+            or frozen.get("target_epochs") != list(quality_epochs)
             or frozen.get("receipt_sha256")
             != frozen_value["receipt_payload_sha256"]
             or frozen.get("receipt_sha256")
@@ -789,7 +875,7 @@ def validate_short_quality_training_bundle(
     str,
     dict[int, dict[str, Any]],
 ]:
-    """Validate a completed provisional e1/e2/e4/e8/e16/e32 bundle."""
+    """Validate one completed mode-specific v3 provisional bundle."""
 
     artifact, status = _artifact(
         value,
@@ -797,12 +883,23 @@ def validate_short_quality_training_bundle(
         payload=True,
     )
     assert status is not None
+    quality_epochs = quality_epochs_for_mode(mode)
+    quality_role = quality_role_for_mode(mode)
+    reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
+    quality_total_epochs = quality_epochs[-1]
     expected_updates = int(contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"])
     required = {
         "format",
         "status",
         "run_purpose",
         "target_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "completed_epochs",
         "optimizer_updates",
         "updates_per_epoch",
@@ -837,11 +934,20 @@ def validate_short_quality_training_bundle(
         or status.get("status") != "complete"
         or status.get("run_purpose")
         != contract.RUN_PURPOSE_SHORT_QUALITY
-        or status.get("target_epochs") != list(QUALITY_EPOCHS)
+        or status.get("target_epochs") != list(quality_epochs)
+        or status.get("quality_protocol_version") != QUALITY_PROTOCOL_VERSION
+        or status.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or not isinstance(status.get("artifact_root"), str)
+        or not Path(status["artifact_root"]).is_absolute()
+        or status.get("quality_role") != quality_role
+        or status.get("reference_only") is not reference_only
+        or status.get("late_w1_status") != "not_measured"
+        or status.get("w1_tail_equivalence_claimed") is not False
         or status.get("completed_epochs")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        != quality_total_epochs
         or status.get("optimizer_updates")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS * expected_updates
+        != quality_total_epochs * expected_updates
         or status.get("updates_per_epoch") != expected_updates
         or status.get("world_size")
         != contract.TOPOLOGY_SPECS[mode]["world_size"]
@@ -851,7 +957,7 @@ def validate_short_quality_training_bundle(
         != contract.TOPOLOGY_SPECS[mode]["global_batch_size"]
         or status.get("all_training_state_finite") is not True
         or status.get("epoch_metrics_records")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        != quality_total_epochs
         or status.get("trajectory_mode")
         != contract.FRESH_TRAJECTORY_MODE
         or status.get("trajectory_probe_verified") is not True
@@ -860,7 +966,7 @@ def validate_short_quality_training_bundle(
         or not isinstance(metrics_value, dict)
         or set(metrics_value) != {"path", "sha256", "bytes", "records"}
         or metrics_value.get("records")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        != quality_total_epochs
         or not isinstance(embedded_ready, list)
     ):
         raise TopologySelectionError(
@@ -898,6 +1004,21 @@ def validate_short_quality_training_bundle(
             f"{mode} provisional output identity changed"
         )
     manifest_path = Path(str(manifest_artifact["path"]))
+    artifact_root = Path(status["artifact_root"])
+    if (
+        not artifact_root.is_dir()
+        or artifact_root.is_symlink()
+        or artifact_root.resolve(strict=True) != artifact_root
+        or Path(artifact["path"])
+        != artifact_root / "short_quality_status.json"
+        or manifest_path
+        != artifact_root / "short_quality_candidate_manifest.json"
+        or Path(metrics_artifact["path"])
+        != artifact_root / "epoch_metrics.jsonl"
+    ):
+        raise TopologySelectionError(
+            f"{mode} short-quality v3 artifact root changed"
+        )
     try:
         manifest = contract._strict_json_bytes(
             manifest_path.read_bytes(),
@@ -913,6 +1034,13 @@ def validate_short_quality_training_bundle(
         "run_purpose",
         "target_epochs",
         "candidate_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "frozen_receipt_sha256",
         "schedule_sha256",
         "trajectory_anchor_sha256",
@@ -933,12 +1061,21 @@ def validate_short_quality_training_bundle(
         or manifest.get("status") != "complete"
         or manifest.get("run_purpose")
         != contract.RUN_PURPOSE_SHORT_QUALITY
-        or manifest.get("target_epochs") != list(QUALITY_EPOCHS)
-        or manifest.get("candidate_epochs") != list(QUALITY_EPOCHS)
+        or manifest.get("target_epochs") != list(quality_epochs)
+        or manifest.get("candidate_epochs") != list(quality_epochs)
+        or manifest.get("quality_protocol_version")
+        != QUALITY_PROTOCOL_VERSION
+        or manifest.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or manifest.get("artifact_root") != status["artifact_root"]
+        or manifest.get("quality_role") != quality_role
+        or manifest.get("reference_only") is not reference_only
+        or manifest.get("late_w1_status") != "not_measured"
+        or manifest.get("w1_tail_equivalence_claimed") is not False
         or manifest.get("completed_epochs")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS
+        != quality_total_epochs
         or manifest.get("optimizer_updates")
-        != contract.SHORT_QUALITY_TOTAL_EPOCHS * expected_updates
+        != quality_total_epochs * expected_updates
         or manifest.get("frozen_receipt_sha256")
         != status["frozen_receipt_sha256"]
         or manifest.get("schedule_sha256") != status["schedule_sha256"]
@@ -949,14 +1086,14 @@ def validate_short_quality_training_bundle(
         or manifest.get("trajectory_probe_verified") is not True
         or not isinstance(entries, list)
         or [entry.get("epoch") for entry in entries]
-        != list(QUALITY_EPOCHS)
+        != list(quality_epochs)
         or manifest.get("entries_sha256")
         != contract.canonical_json_sha256(entries)
     ):
         raise TopologySelectionError(
             f"{mode} final short-quality manifest changed"
         )
-    for epoch, entry in zip(QUALITY_EPOCHS, entries):
+    for epoch, entry in zip(quality_epochs, entries):
         checkpoint = checkpoints[epoch]
         if (
             entry.get("checkpoint_sha256") != checkpoint["sha256"]
@@ -981,6 +1118,13 @@ def validate_short_quality_training_bundle(
                 "format",
                 "run_purpose",
                 "target_epochs",
+                "quality_protocol_version",
+                "artifact_root_namespace",
+                "artifact_root",
+                "quality_role",
+                "reference_only",
+                "late_w1_status",
+                "w1_tail_equivalence_claimed",
                 "epoch",
                 "optimizer_updates",
                 "updates_per_epoch",
@@ -993,7 +1137,16 @@ def validate_short_quality_training_bundle(
             != contract.SHORT_QUALITY_EPOCH_METRIC_FORMAT
             or row.get("run_purpose")
             != contract.RUN_PURPOSE_SHORT_QUALITY
-            or row.get("target_epochs") != list(QUALITY_EPOCHS)
+            or row.get("target_epochs") != list(quality_epochs)
+            or row.get("quality_protocol_version")
+            != QUALITY_PROTOCOL_VERSION
+            or row.get("artifact_root_namespace")
+            != QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or row.get("artifact_root") != status["artifact_root"]
+            or row.get("quality_role") != quality_role
+            or row.get("reference_only") is not reference_only
+            or row.get("late_w1_status") != "not_measured"
+            or row.get("w1_tail_equivalence_claimed") is not False
             or row.get("epoch") != epoch
             or row.get("optimizer_updates") != epoch * expected_updates
             or row.get("updates_per_epoch") != expected_updates
@@ -1008,11 +1161,11 @@ def validate_short_quality_training_bundle(
             )
         ):
             raise TopologySelectionError(
-                f"{mode} short-quality metrics are not exact e1..e32"
+                f"{mode} short-quality metrics are not exact e1..e{quality_total_epochs}"
             )
-    if len(rows) != contract.SHORT_QUALITY_TOTAL_EPOCHS:
+    if len(rows) != quality_total_epochs:
         raise TopologySelectionError(
-            f"{mode} short-quality metrics are not exact e1..e32"
+            f"{mode} short-quality metrics are not exact e1..e{quality_total_epochs}"
         )
     return artifact, ready, semantic_sha, checkpoints
 
@@ -1030,12 +1183,22 @@ def validate_short_trajectory_receipt(
         payload=True,
     )
     assert payload is not None
+    quality_epochs = quality_epochs_for_mode(mode)
+    quality_role = quality_role_for_mode(mode)
+    reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
     required = {
         "format",
         "status",
         "topology_mode",
         "topology_gate_spec_sha256",
         "quality_gate_spec_sha256",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "candidate_epochs",
         "split",
         "test_visible",
@@ -1055,7 +1218,16 @@ def validate_short_trajectory_receipt(
         != topology_gate_spec_sha256
         or payload.get("quality_gate_spec_sha256")
         != quality_gate_spec_sha256
-        or payload.get("candidate_epochs") != list(QUALITY_EPOCHS)
+        or payload.get("quality_protocol_version") != QUALITY_PROTOCOL_VERSION
+        or payload.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or not isinstance(payload.get("artifact_root"), str)
+        or not Path(payload["artifact_root"]).is_absolute()
+        or payload.get("quality_role") != quality_role
+        or payload.get("reference_only") is not reference_only
+        or payload.get("late_w1_status") != "not_measured"
+        or payload.get("w1_tail_equivalence_claimed") is not False
+        or payload.get("candidate_epochs") != list(quality_epochs)
         or payload.get("split") != "val"
         or payload.get("test_visible") is not False
         or re.fullmatch(
@@ -1064,9 +1236,9 @@ def validate_short_trajectory_receipt(
         )
         is None
         or not isinstance(candidates, list)
-        or len(candidates) != len(QUALITY_EPOCHS)
+        or len(candidates) != len(quality_epochs)
         or not isinstance(candidate_ready_receipts, list)
-        or len(candidate_ready_receipts) != len(QUALITY_EPOCHS)
+        or len(candidate_ready_receipts) != len(quality_epochs)
     ):
         raise TopologySelectionError(f"{mode} short trajectory changed")
     ready, ready_semantic, ready_checkpoints = (
@@ -1085,11 +1257,28 @@ def validate_short_trajectory_receipt(
         raise TopologySelectionError(
             f"{mode} short trajectory candidate-ready authority changed"
         )
+    first_ready_artifact, first_ready_payload = _artifact(
+        candidate_ready_receipts[0],
+        f"{mode} first candidate-ready root authority",
+        payload=True,
+    )
+    assert first_ready_payload is not None
+    artifact_root = Path(payload["artifact_root"])
+    if (
+        first_ready_artifact != ready[0]
+        or first_ready_payload.get("artifact_root") != payload["artifact_root"]
+        or not artifact_root.is_dir()
+        or artifact_root.is_symlink()
+        or artifact_root.resolve(strict=True) != artifact_root
+    ):
+        raise TopologySelectionError(
+            f"{mode} short trajectory v3 artifact root changed"
+        )
     expected_updates = int(contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"])
     normalized: dict[int, dict[str, Any]] = {}
     seen_paths: set[str] = set()
     seen_hashes: set[str] = set()
-    for expected_epoch, row in zip(QUALITY_EPOCHS, candidates):
+    for expected_epoch, row in zip(quality_epochs, candidates):
         if not isinstance(row, dict) or set(row) != {
             "epoch",
             "optimizer_updates",
@@ -1219,6 +1408,30 @@ def validate_quality_candidate_provenance(
     """Bind one short checkpoint to the formal DiffSHEG val-FGD chain."""
 
     label = f"{mode} e{epoch}"
+    short_artifact, short_payload = _artifact(
+        short_trajectory_receipt,
+        f"{label} short trajectory provenance authority",
+        payload=True,
+    )
+    assert short_payload is not None
+    quality_role = quality_role_for_mode(mode)
+    reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
+    if (
+        short_artifact != dict(short_trajectory_receipt)
+        or short_payload.get("quality_protocol_version")
+        != QUALITY_PROTOCOL_VERSION
+        or short_payload.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or not isinstance(short_payload.get("artifact_root"), str)
+        or not Path(short_payload["artifact_root"]).is_absolute()
+        or short_payload.get("quality_role") != quality_role
+        or short_payload.get("reference_only") is not reference_only
+        or short_payload.get("late_w1_status") != "not_measured"
+        or short_payload.get("w1_tail_equivalence_claimed") is not False
+    ):
+        raise TopologySelectionError(
+            f"{label} short trajectory v3 provenance authority changed"
+        )
     checkpoint, _ = _artifact(candidate_checkpoint, f"{label} checkpoint")
     if checkpoint != dict(expected_checkpoint):
         raise TopologySelectionError(
@@ -1289,6 +1502,13 @@ def validate_quality_candidate_provenance(
     }
     provenance = {
         "format": QUALITY_PROVENANCE_FORMAT,
+        "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
+        "artifact_root": short_payload["artifact_root"],
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "topology_mode": mode,
         "epoch": epoch,
         "split": "val",
@@ -1341,10 +1561,15 @@ def validate_quality_gate_spec(
     )
     expected = {
         "format": QUALITY_GATE_FORMAT,
+        "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
         "scope": "SemTalk Base on SHOW validation only",
         "split": "val",
         "test_visible": False,
-        "trajectory_epochs": list(QUALITY_EPOCHS),
+        "w1_reference_epochs": list(W1_REFERENCE_EPOCHS),
+        "candidate_quality_epochs": list(CANDIDATE_QUALITY_EPOCHS),
+        "same_epoch_comparison_epochs": list(SAME_EPOCH_COMPARISON_EPOCHS),
+        "tail_epochs": list(TAIL_EPOCHS),
         "primary_metric": PRIMARY_METRIC_PATH,
         "validation_protocol": VALIDATION_PROTOCOL,
         "diffsheg_validation_measurement_required": True,
@@ -1356,19 +1581,51 @@ def validate_quality_gate_spec(
             "p99_total_updates_required": True,
             "finite_probe_required": True,
             "policy": (
-                "all_quality_safe_finite_modes_compete_by_measured_eta_"
-                "under_24h"
+                "non_reference_quality_safe_finite_modes_compete_by_"
+                "measured_eta_under_24h"
+            ),
+        },
+        "w1_reference_gate": {
+            "mode": contract.OFFICIAL_W1_REFERENCE_MODE,
+            "role": "w1_reference_only",
+            "selection_eligible": False,
+            "reference_epochs": list(W1_REFERENCE_EPOCHS),
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
+            "full400_eta_over_budget_policy": (
+                "reference_only_and_never_selection_eligible"
             ),
         },
         "candidate_quality_gate": {
-            "modes": list(contract.TOPOLOGY_SPECS),
+            "modes": [
+                mode
+                for mode in contract.TOPOLOGY_SPECS
+                if mode != contract.OFFICIAL_W1_REFERENCE_MODE
+            ],
+            "role": "candidate_quality",
+            "candidate_epochs": list(CANDIDATE_QUALITY_EPOCHS),
+            "same_epoch_comparison_epochs": list(
+                SAME_EPOCH_COMPARISON_EPOCHS
+            ),
+            "tail_epochs": list(TAIL_EPOCHS),
+            "tail_reference_epochs": list(W1_REFERENCE_EPOCHS),
+            "tail_reference_reducer": "minimum",
+            "tail_maximum_allowed_function": (
+                "reference_plus_max_absolute_or_relative_margin"
+            ),
             "per_epoch_comparison": (
                 "candidate_fgd_lte_reference_fgd_plus_max_of_"
                 "absolute_or_relative_margin"
             ),
+            "tail_absolute_envelope": (
+                "candidate_fgd_lte_maximum_allowed_fgd_of_minimum_"
+                "w1_reference_fgd"
+            ),
             "maximum_absolute_fgd_regression": MAX_ABSOLUTE_FGD_REGRESSION,
             "maximum_relative_fgd_regression": MAX_RELATIVE_FGD_REGRESSION,
-            "all_trajectory_epochs_must_pass": True,
+            "all_same_epoch_and_tail_epochs_must_pass": True,
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
         },
         "over_eta_budget_quality_skip": {
             "receipt_format": QUALITY_SKIP_FORMAT,
@@ -1419,11 +1676,21 @@ def validate_quality_report(
         expected_sha256,
         f"Base topology quality report {mode}",
     )
+    quality_epochs = quality_epochs_for_mode(mode)
+    quality_role = quality_role_for_mode(mode)
+    reference_only = mode == contract.OFFICIAL_W1_REFERENCE_MODE
     required = {
         "format",
         "status",
         "mode",
         "quality_gate_spec_sha256",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "split",
         "test_visible",
         "trajectory_epochs",
@@ -1443,16 +1710,25 @@ def validate_quality_report(
         or report.get("mode") != mode
         or report.get("quality_gate_spec_sha256")
         != quality_gate_spec_sha256
+        or report.get("quality_protocol_version") != QUALITY_PROTOCOL_VERSION
+        or report.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or not isinstance(report.get("artifact_root"), str)
+        or not Path(report["artifact_root"]).is_absolute()
+        or report.get("quality_role") != quality_role
+        or report.get("reference_only") is not reference_only
+        or report.get("late_w1_status") != "not_measured"
+        or report.get("w1_tail_equivalence_claimed") is not False
         or report.get("split") != "val"
         or report.get("test_visible") is not False
-        or report.get("trajectory_epochs") != list(QUALITY_EPOCHS)
+        or report.get("trajectory_epochs") != list(quality_epochs)
         or re.fullmatch(
             r"[0-9a-f]{64}",
             str(report.get("topology_independent_input_sha256")),
         )
         is None
         or not isinstance(candidates, list)
-        or len(candidates) != len(QUALITY_EPOCHS)
+        or len(candidates) != len(quality_epochs)
         or report.get("receipt_sha256")
         != contract.canonical_json_sha256(
             {
@@ -1478,6 +1754,7 @@ def validate_quality_report(
     if (
         short_payload["topology_independent_input_sha256"]
         != report["topology_independent_input_sha256"]
+        or short_payload["artifact_root"] != report["artifact_root"]
     ):
         raise TopologySelectionError(f"{mode} short trajectory changed")
     (
@@ -1493,7 +1770,7 @@ def validate_quality_report(
     )
     values: dict[int, float] = {}
     normalized_rows: list[dict[str, Any]] = []
-    for expected_epoch, row in zip(QUALITY_EPOCHS, candidates):
+    for expected_epoch, row in zip(quality_epochs, candidates):
         row_keys = {
             "epoch",
             "candidate_checkpoint",
@@ -1549,7 +1826,16 @@ def validate_quality_report(
         "short_trajectory_receipt": short_trajectory,
         "val_inputs_receipt": val_inputs_source,
         "pipeline_receipt": pipeline_source,
-        "candidate_fgd": {str(epoch): values[epoch] for epoch in QUALITY_EPOCHS},
+        "candidate_fgd": {
+            str(epoch): values[epoch] for epoch in quality_epochs
+        },
+        "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
+        "artifact_root": report["artifact_root"],
+        "quality_role": quality_role,
+        "reference_only": reference_only,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "candidates": normalized_rows,
     }
 
@@ -1881,6 +2167,13 @@ def build_quality_skip_receipt(
     receipt: dict[str, Any] = {
         "format": QUALITY_SKIP_FORMAT,
         "status": "skipped_over_eta_budget",
+        "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
+        "artifact_root_semantics": "not_applicable_eta_skip",
+        "quality_role": "candidate_quality",
+        "reference_only": False,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "mode": mode,
         "reference_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
         "topology_gate_spec_sha256": topology_gate_spec_sha256,
@@ -1915,6 +2208,13 @@ def validate_quality_skip(
     required = {
         "format",
         "status",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root_semantics",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
         "mode",
         "reference_mode",
         "topology_gate_spec_sha256",
@@ -1934,6 +2234,16 @@ def validate_quality_skip(
         or set(receipt) != required
         or receipt.get("format") != QUALITY_SKIP_FORMAT
         or receipt.get("status") != "skipped_over_eta_budget"
+        or receipt.get("quality_protocol_version")
+        != QUALITY_PROTOCOL_VERSION
+        or receipt.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or receipt.get("artifact_root_semantics")
+        != "not_applicable_eta_skip"
+        or receipt.get("quality_role") != "candidate_quality"
+        or receipt.get("reference_only") is not False
+        or receipt.get("late_w1_status") != "not_measured"
+        or receipt.get("w1_tail_equivalence_claimed") is not False
         or receipt.get("mode") != mode
         or receipt.get("reference_mode")
         != contract.OFFICIAL_W1_REFERENCE_MODE
@@ -2006,6 +2316,13 @@ def validate_quality_skip(
     return {
         "mode": mode,
         "status": "skipped_over_eta_budget",
+        "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
+        "artifact_root_semantics": "not_applicable_eta_skip",
+        "quality_role": "candidate_quality",
+        "reference_only": False,
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "receipt_path": str(resolved),
         "receipt_sha256": observed_sha,
         "receipt_payload_sha256": receipt["receipt_sha256"],
@@ -2064,7 +2381,7 @@ def select_topology(
         )
     if contract.OFFICIAL_W1_REFERENCE_MODE not in report_modes:
         raise TopologySelectionError(
-            "W1 full e1/e2/e4/e8/e16/e32 quality reference is mandatory"
+            "W1 reference-only e1/e2/e4/e8 quality report is mandatory"
         )
     probe_by_mode = {probe["mode"]: probe for probe in eligible}
     skip_by_mode = {skip["mode"]: skip for skip in quality_skips}
@@ -2076,6 +2393,16 @@ def select_topology(
             or float(probe["estimated_training_seconds"])
             <= MAX_TRAINING_SECONDS
             or skip.get("status") != "skipped_over_eta_budget"
+            or skip.get("quality_protocol_version")
+            != QUALITY_PROTOCOL_VERSION
+            or skip.get("artifact_root_namespace")
+            != QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or skip.get("artifact_root_semantics")
+            != "not_applicable_eta_skip"
+            or skip.get("quality_role") != "candidate_quality"
+            or skip.get("reference_only") is not False
+            or skip.get("late_w1_status") != "not_measured"
+            or skip.get("w1_tail_equivalence_claimed") is not False
             or skip.get("topology_gate_spec_sha256")
             != gate_spec_sha256
             or skip.get("quality_gate_spec_sha256")
@@ -2157,6 +2484,32 @@ def select_topology(
         )
     by_mode = {report["mode"]: report for report in quality_reports}
     reference = by_mode[contract.OFFICIAL_W1_REFERENCE_MODE]
+    if (
+        reference.get("quality_protocol_version")
+        != QUALITY_PROTOCOL_VERSION
+        or reference.get("artifact_root_namespace")
+        != QUALITY_ARTIFACT_ROOT_NAMESPACE
+        or reference.get("quality_role") != "w1_reference_only"
+        or reference.get("reference_only") is not True
+        or reference.get("late_w1_status") != "not_measured"
+        or reference.get("w1_tail_equivalence_claimed") is not False
+        or set(reference.get("candidate_fgd", {}))
+        != {str(epoch) for epoch in W1_REFERENCE_EPOCHS}
+    ):
+        raise TopologySelectionError(
+            "W1 quality authority is not an honest four-point reference"
+        )
+    reference_values = {
+        epoch: float(reference["candidate_fgd"][str(epoch)])
+        for epoch in W1_REFERENCE_EPOCHS
+    }
+    if any(
+        not math.isfinite(value) or value < 0.0
+        for value in reference_values.values()
+    ):
+        raise TopologySelectionError("W1 reference FGD is invalid")
+    tail_reference_fgd = min(reference_values.values())
+    tail_maximum_allowed_fgd = maximum_allowed_fgd(tail_reference_fgd)
     quality_decisions: dict[str, dict[str, Any]] = {}
     for probe in eligible:
         mode = probe["mode"]
@@ -2166,6 +2519,10 @@ def select_topology(
                 "status": "skipped_over_eta_budget",
                 "quality_evaluated": False,
                 "selection_eligible": False,
+                "quality_role": "candidate_quality",
+                "reference_only": False,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
                 "skip_receipt_path": skip["receipt_path"],
                 "skip_receipt_sha256": skip["receipt_sha256"],
                 "estimated_training_seconds": float(
@@ -2177,13 +2534,54 @@ def select_topology(
             }
             continue
         report = by_mode[mode]
-        comparisons = []
-        for epoch in QUALITY_EPOCHS:
-            reference_fgd = float(reference["candidate_fgd"][str(epoch)])
+        if mode == contract.OFFICIAL_W1_REFERENCE_MODE:
+            quality_decisions[mode] = {
+                "status": "reference_only",
+                "quality_evaluated": True,
+                "selection_eligible": False,
+                "quality_role": "w1_reference_only",
+                "reference_only": True,
+                "late_w1_status": "not_measured",
+                "w1_tail_equivalence_claimed": False,
+                "report_path": report["report_path"],
+                "report_sha256": report["report_sha256"],
+                "reference_epochs": list(W1_REFERENCE_EPOCHS),
+                "reference_fgd": {
+                    str(epoch): reference_values[epoch]
+                    for epoch in W1_REFERENCE_EPOCHS
+                },
+                "full400_estimated_training_seconds": float(
+                    probe["estimated_training_seconds"]
+                ),
+                "full400_eta_over_24h": (
+                    float(probe["estimated_training_seconds"])
+                    > MAX_TRAINING_SECONDS
+                ),
+            }
+            continue
+        if (
+            report.get("quality_protocol_version")
+            != QUALITY_PROTOCOL_VERSION
+            or report.get("artifact_root_namespace")
+            != QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or report.get("quality_role") != "candidate_quality"
+            or report.get("reference_only") is not False
+            or report.get("late_w1_status") != "not_measured"
+            or report.get("w1_tail_equivalence_claimed") is not False
+            or set(report.get("candidate_fgd", {}))
+            != {str(epoch) for epoch in CANDIDATE_QUALITY_EPOCHS}
+        ):
+            raise TopologySelectionError(
+                f"{mode} quality authority is not an honest six-point candidate"
+            )
+        same_epoch_comparisons = []
+        for epoch in SAME_EPOCH_COMPARISON_EPOCHS:
+            reference_fgd = reference_values[epoch]
             candidate_fgd = float(report["candidate_fgd"][str(epoch)])
             allowed = maximum_allowed_fgd(reference_fgd)
-            comparisons.append(
+            same_epoch_comparisons.append(
                 {
+                    "comparison_kind": "same_epoch_w1_reference",
                     "epoch": epoch,
                     "reference_fgd": reference_fgd,
                     "candidate_fgd": candidate_fgd,
@@ -2191,16 +2589,45 @@ def select_topology(
                     "pass": candidate_fgd <= allowed,
                 }
             )
+        tail_comparisons = []
+        for epoch in TAIL_EPOCHS:
+            candidate_fgd = float(report["candidate_fgd"][str(epoch)])
+            tail_comparisons.append(
+                {
+                    "comparison_kind": "tail_absolute_envelope",
+                    "epoch": epoch,
+                    "tail_reference_epochs": list(W1_REFERENCE_EPOCHS),
+                    "tail_reference_reducer": "minimum",
+                    "tail_reference_fgd": tail_reference_fgd,
+                    "candidate_fgd": candidate_fgd,
+                    "maximum_allowed_fgd": tail_maximum_allowed_fgd,
+                    "pass": candidate_fgd <= tail_maximum_allowed_fgd,
+                }
+            )
+        all_same_epoch_pass = all(
+            item["pass"] for item in same_epoch_comparisons
+        )
+        all_tail_pass = all(item["pass"] for item in tail_comparisons)
+        all_quality_epochs_pass = all_same_epoch_pass and all_tail_pass
         quality_decisions[mode] = {
             "status": "measured",
             "quality_evaluated": True,
-            "selection_eligible": True,
+            "selection_eligible": all_quality_epochs_pass,
+            "quality_role": "candidate_quality",
+            "reference_only": False,
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
             "report_path": report["report_path"],
             "report_sha256": report["report_sha256"],
-            "comparisons": comparisons,
-            "all_trajectory_epochs_pass": all(
-                item["pass"] for item in comparisons
-            ),
+            "same_epoch_comparisons": same_epoch_comparisons,
+            "tail_reference_epochs": list(W1_REFERENCE_EPOCHS),
+            "tail_reference_reducer": "minimum",
+            "tail_reference_fgd": tail_reference_fgd,
+            "tail_maximum_allowed_fgd": tail_maximum_allowed_fgd,
+            "tail_comparisons": tail_comparisons,
+            "all_same_epoch_comparisons_pass": all_same_epoch_pass,
+            "all_tail_comparisons_pass": all_tail_pass,
+            "all_quality_epochs_pass": all_quality_epochs_pass,
         }
 
     rank_key = lambda probe: (
@@ -2219,10 +2646,10 @@ def select_topology(
         * int(contract.TOPOLOGY_SPECS[probe["mode"]]["updates_per_epoch"])
         * contract.TOTAL_EPOCHS
         <= MAX_P99_TRAINING_SECONDS
+        and probe["mode"] != contract.OFFICIAL_W1_REFERENCE_MODE
         and probe["mode"] in by_mode
-        and quality_decisions[probe["mode"]][
-            "all_trajectory_epochs_pass"
-        ]
+        and quality_decisions[probe["mode"]]["selection_eligible"]
+        and quality_decisions[probe["mode"]]["all_quality_epochs_pass"]
     ]
     if not safe_under_budget:
         raise TopologySelectionError(
@@ -2237,14 +2664,30 @@ def select_topology(
         "topology_gate_spec_sha256": gate_spec_sha256,
         "quality_gate_spec_sha256": quality_gate_spec_sha256,
         "reference_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
-        "candidate_modes": list(contract.TOPOLOGY_SPECS),
+        "matrix_modes": list(contract.TOPOLOGY_SPECS),
+        "candidate_modes": [
+            mode
+            for mode in contract.TOPOLOGY_SPECS
+            if mode != contract.OFFICIAL_W1_REFERENCE_MODE
+        ],
         "topology_independent_input_sha256": next(iter(semantic_hashes)),
         "selection_policy": (
-            "fastest_quality_safe_finite_under_24h_eta_pruned_quality_v3"
+            "fastest_quality_safe_non_reference_under_24h_eta_pruned_quality_v4"
         ),
         "selection_decision_branch": decision_branch,
         "quality_gate_policy": {
-            "trajectory_epochs": list(QUALITY_EPOCHS),
+            "quality_protocol_version": QUALITY_PROTOCOL_VERSION,
+            "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
+            "w1_reference_epochs": list(W1_REFERENCE_EPOCHS),
+            "candidate_quality_epochs": list(CANDIDATE_QUALITY_EPOCHS),
+            "same_epoch_comparison_epochs": list(
+                SAME_EPOCH_COMPARISON_EPOCHS
+            ),
+            "tail_epochs": list(TAIL_EPOCHS),
+            "tail_reference_epochs": list(W1_REFERENCE_EPOCHS),
+            "tail_reference_reducer": "minimum",
+            "tail_reference_fgd": tail_reference_fgd,
+            "tail_maximum_allowed_fgd": tail_maximum_allowed_fgd,
             "primary_metric": PRIMARY_METRIC_PATH,
             "validation_protocol": VALIDATION_PROTOCOL,
             "diffsheg_validation_measurement_required": True,
@@ -2257,12 +2700,18 @@ def select_topology(
             "maximum_relative_fgd_regression": (
                 MAX_RELATIVE_FGD_REGRESSION
             ),
+            "w1_quality_role": "w1_reference_only",
+            "w1_selection_eligible": False,
+            "late_w1_status": "not_measured",
+            "w1_tail_equivalence_claimed": False,
             "w1_quality_report_required": True,
             "within_budget_quality_report_required": True,
             "over_budget_non_w1_skip_status": (
                 "skipped_over_eta_budget"
             ),
         },
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
         "w1_trajectory_equivalence_claimed_for_selected": False,
         "probes": [dict(probe) for probe in probes],
         "quality_reports": [dict(report) for report in quality_reports],

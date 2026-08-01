@@ -57,6 +57,16 @@ from scripts.show_base import base_long_val_contract as selector  # noqa: E402
 PREFLIGHT_FORMAT = (
     "semtalk_show_base_official_adapt_val_inference_preflight_v1"
 )
+SHORT_QUALITY_PREFLIGHT_FORMAT = (
+    "semtalk_show_base_short_quality_val_preflight_v3"
+)
+SHORT_QUALITY_CHECKPOINT_FORMAT = (
+    "semtalk_show_base_official_adapt_short_quality_checkpoint_v2"
+)
+SHORT_QUALITY_PROTOCOL_VERSION = 3
+SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE = (
+    "semtalk_show_base_topology_quality_v3"
+)
 SHARD_FORMAT = "semtalk_show_base_official_adapt_val_inference_shard_v1"
 ASSIGNMENT = "canonical_position_modulo_num_shards"
 FINAL_DIRECTORY = "final"
@@ -129,6 +139,33 @@ def _with_payload_sha(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _model_state_semantic_sha256(state: Mapping[str, Any]) -> str:
+    """Recompute the trainer's value-level model-state authority."""
+
+    rows = []
+    for key, value in sorted(state.items()):
+        contiguous = value.detach().to(device="cpu").contiguous()
+        rows.append(
+            {
+                "key": key,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "sha256": hashlib.sha256(
+                    contiguous.numpy().tobytes(order="C")
+                ).hexdigest(),
+            }
+        )
+    return hashlib.sha256(
+        json.dumps(
+            rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _git_blob_sha1(payload: bytes) -> str:
@@ -1175,10 +1212,80 @@ def _load_models(
         candidate_resolved,
     )
     audit = base_payload.get("audit")
+    short_quality = (
+        preflight.get("format") == SHORT_QUALITY_PREFLIGHT_FORMAT
+    )
+    short_specific_keys = {
+        "run_purpose",
+        "target_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
+    }
+    common_audit_keys = {
+        "format",
+        "completed_epochs",
+        "optimizer_updates",
+        "frozen_receipt_sha256",
+        "official_base_checkpoint_sha256",
+        "speaker_scope",
+        "speaker_rows",
+        "vq_models_in_training_graph",
+        "all_model_state_tensors_finite",
+        "model_state_semantic_sha256",
+        "trajectory_anchor_match",
+        "trajectory_probe_verified",
+    }
+    expected_audit_format = (
+        SHORT_QUALITY_CHECKPOINT_FORMAT
+        if short_quality
+        else helper.OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT
+    )
+    expected_short_contract = {
+        "format": SHORT_QUALITY_CHECKPOINT_FORMAT,
+        "run_purpose": "topology_short_quality",
+        "target_epochs": preflight.get("candidate_epochs"),
+        "quality_protocol_version": SHORT_QUALITY_PROTOCOL_VERSION,
+        "artifact_root_namespace": (
+            SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE
+        ),
+        "artifact_root": preflight.get("artifact_root"),
+        "quality_role": preflight.get("quality_role"),
+        "reference_only": preflight.get("reference_only"),
+        "late_w1_status": "not_measured",
+        "w1_tail_equivalence_claimed": False,
+    }
+    short_quality_audit_valid = (
+        isinstance(audit, dict)
+        and {
+            key: audit.get(key) for key in expected_short_contract
+        }
+        == expected_short_contract
+        and bundle.get("checkpoint_audit_contract")
+        == expected_short_contract
+    )
     if (
         not isinstance(audit, dict)
+        or set(audit)
+        != (
+            common_audit_keys | short_specific_keys
+            if short_quality
+            else common_audit_keys
+        )
         or audit.get("format")
-        != helper.OFFICIAL_SHOW_ADAPT_BASE_CHECKPOINT_FORMAT
+        != expected_audit_format
+        or (
+            short_quality
+            and not short_quality_audit_valid
+        )
+        or (
+            not short_quality
+            and any(key in audit for key in short_specific_keys)
+        )
         or audit.get("completed_epochs") != epoch
         or audit.get("optimizer_updates")
         != epoch * updates_per_epoch
@@ -1190,6 +1297,17 @@ def _load_models(
         or audit.get("speaker_rows") != [0, 1, 2, 3]
         or audit.get("vq_models_in_training_graph") is not False
         or audit.get("all_model_state_tensors_finite") is not True
+        or audit.get("model_state_semantic_sha256")
+        != _model_state_semantic_sha256(base_payload["model_state"])
+        or (
+            short_quality
+            and audit.get("trajectory_anchor_match") is not None
+        )
+        or (
+            not short_quality
+            and audit.get("trajectory_anchor_match") not in {None, True}
+        )
+        or audit.get("trajectory_probe_verified") is not True
     ):
         raise ValInferenceContractError(
             "Base candidate audit is not preflight/frozen-input bound"

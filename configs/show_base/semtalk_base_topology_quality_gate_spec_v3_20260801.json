@@ -1,0 +1,144 @@
+{
+  "format": "semtalk_show_base_topology_quality_gate_spec_v3",
+  "quality_protocol_version": 3,
+  "artifact_root_namespace": "semtalk_show_base_topology_quality_v3",
+  "scope": "SemTalk Base on SHOW validation only",
+  "split": "val",
+  "test_visible": false,
+  "w1_reference_epochs": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "candidate_quality_epochs": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "same_epoch_comparison_epochs": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "tail_epochs": [
+    16,
+    32
+  ],
+  "primary_metric": "validation.diffsheg.metrics.fgd",
+  "validation_protocol": "diffsheg_show_validation_fgd_v1",
+  "diffsheg_validation_measurement_required": true,
+  "comparison_reference": "official_w1_b64_reference",
+  "measured_eta_constraint": {
+    "modes": [
+      "official_w1_b64_reference",
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
+    ],
+    "maximum_estimated_training_seconds": 86400,
+    "maximum_p99_training_seconds": 79200,
+    "p99_total_updates_required": true,
+    "finite_probe_required": true,
+    "policy": "non_reference_quality_safe_finite_modes_compete_by_measured_eta_under_24h"
+  },
+  "w1_reference_gate": {
+    "mode": "official_w1_b64_reference",
+    "role": "w1_reference_only",
+    "selection_eligible": false,
+    "reference_epochs": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "late_w1_status": "not_measured",
+    "w1_tail_equivalence_claimed": false,
+    "full400_eta_over_budget_policy": "reference_only_and_never_selection_eligible"
+  },
+  "candidate_quality_gate": {
+    "modes": [
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
+    ],
+    "role": "candidate_quality",
+    "candidate_epochs": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "same_epoch_comparison_epochs": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tail_epochs": [
+      16,
+      32
+    ],
+    "tail_reference_epochs": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tail_reference_reducer": "minimum",
+    "tail_maximum_allowed_function": "reference_plus_max_absolute_or_relative_margin",
+    "per_epoch_comparison": "candidate_fgd_lte_reference_fgd_plus_max_of_absolute_or_relative_margin",
+    "tail_absolute_envelope": "candidate_fgd_lte_maximum_allowed_fgd_of_minimum_w1_reference_fgd",
+    "maximum_absolute_fgd_regression": 0.01,
+    "maximum_relative_fgd_regression": 0.02,
+    "all_same_epoch_and_tail_epochs_must_pass": true,
+    "late_w1_status": "not_measured",
+    "w1_tail_equivalence_claimed": false
+  },
+  "over_eta_budget_quality_skip": {
+    "receipt_format": "semtalk_show_base_topology_quality_skipped_over_eta_budget_v2",
+    "eligible_modes": [
+      "official_objective_w8_l8_g64_ddp_adaptation",
+      "official_objective_w16_l4_g64_ddp_adaptation",
+      "validation_gated_w8_l64_g512_empirical_acceleration",
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
+    ],
+    "condition": "estimated_training_seconds_strictly_greater_than_maximum",
+    "w1_quality_report_required": true,
+    "within_budget_quality_report_required": true,
+    "required_sha256_bindings": [
+      "source_binding.frozen_receipt_sha256",
+      "source_binding.frozen_gate_compatibility_sha256",
+      "source_binding.topology_receipt_sha256",
+      "topology_gate_spec_sha256",
+      "quality_gate_spec_sha256",
+      "probe_report.sha256",
+      "topology_independent_input_sha256"
+    ]
+  },
+  "selection_tiebreak": [
+    "estimated_training_seconds",
+    "p99_seconds",
+    "topology_matrix_order"
+  ]
+}
