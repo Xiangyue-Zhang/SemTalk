@@ -59,6 +59,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.show_base import selected_prerequisites as selected_contract
+from scripts.show_base import base_v14_formal_contract as v14_contract
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 OFFICIAL_BASE_SOURCE = "released_all_speakers_v1"
@@ -390,6 +391,7 @@ DEFERRED_CANDIDATE_FORMAT = (
 )
 SCHEDULE_FORMAT = "semtalk_show_base_long_schedule_v1"
 FRESH_SCHEDULE_FORMAT = "semtalk_show_base_fresh_lineage_schedule_v1"
+V14_FRESH_SCHEDULE_FORMAT = v14_contract.SCHEDULE_FORMAT
 ANCHOR_FORMAT = "semtalk_show_base_long_trajectory_anchor_v1"
 LEGACY_TRAJECTORY_MODE = "legacy_external_anchor_v1"
 FRESH_TRAJECTORY_MODE = "fresh_lineage_gate_v1"
@@ -1695,6 +1697,31 @@ def validate_long_contract_receipts(
     training = schedule.get("training")
     selection = schedule.get("selection")
     initialization = schedule.get("initialization")
+    legacy_topology_authority = (
+        schedule.get("format")
+        in {SCHEDULE_FORMAT, FRESH_SCHEDULE_FORMAT}
+        and isinstance(training, dict)
+        and training.get("topology_source")
+        == "sealed_nine_mode_topology_gate_v1"
+        and training.get("topology_matrix") == TOPOLOGY_SPECS
+    )
+    v14_topology_authority = (
+        schedule.get("format") == V14_FRESH_SCHEDULE_FORMAT
+        and isinstance(training, dict)
+        and training.get("topology_source") == v14_contract.TOPOLOGY_SOURCE
+        and training.get("topology_matrix")
+        == {mode: TOPOLOGY_SPECS[mode] for mode in v14_contract.MODES}
+        and args.topology_mode in v14_contract.MODES
+    )
+    if v14_topology_authority:
+        try:
+            if schedule_sha != v14_contract.SCHEDULE_SHA256:
+                raise v14_contract.V14ContractError(
+                    "formal V14 schedule SHA-256 changed"
+                )
+            v14_contract.validate_schedule_payload(schedule)
+        except v14_contract.V14ContractError as error:
+            raise AdaptationContractError(str(error)) from error
     if (
         schedule.get("scope") != "SemTalk Base only"
         or schedule.get("target_dataset") != "SHOW"
@@ -1707,9 +1734,7 @@ def validate_long_contract_receipts(
         != {"Speaker2", "SemGate", "Sparse"}
         or not isinstance(training, dict)
         or training.get("total_epochs") != TOTAL_EPOCHS
-        or training.get("topology_source")
-        != "sealed_nine_mode_topology_gate_v1"
-        or training.get("topology_matrix") != TOPOLOGY_SPECS
+        or not (legacy_topology_authority or v14_topology_authority)
         or training.get("precision_source")
         != "selected_topology_matrix_entry"
         or args.precision != topology["precision"]
@@ -1740,6 +1765,13 @@ def validate_long_contract_receipts(
         "sha256": schedule_sha,
         "payload_sha256": canonical_json_sha256(schedule),
     }
+    if v14_topology_authority:
+        schedule_receipt.update(
+            {
+                "format": schedule["format"],
+                "topology_source": training["topology_source"],
+            }
+        )
     if args.trajectory_mode == FRESH_TRAJECTORY_MODE:
         expected_trajectory_contract = {
             "mode": FRESH_TRAJECTORY_MODE,
@@ -1760,7 +1792,8 @@ def validate_long_contract_receipts(
         )
         lmdb_inode_binding = dataset_receipt.get("lmdb_inode_binding")
         if (
-            schedule.get("format") != FRESH_SCHEDULE_FORMAT
+            schedule.get("format")
+            not in {FRESH_SCHEDULE_FORMAT, V14_FRESH_SCHEDULE_FORMAT}
             or schedule.get("trajectory_contract")
             != expected_trajectory_contract
             or training.get("loader_workers") != args.loader_workers
@@ -5757,6 +5790,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-throughput-gate-sha256")
     parser.add_argument("--topology-selection-report")
     parser.add_argument("--expected-topology-selection-sha256")
+    parser.add_argument("--v14-selection-protocol")
+    parser.add_argument("--expected-v14-selection-protocol-sha256")
+    parser.add_argument("--v14-selection-audit")
+    parser.add_argument("--expected-v14-selection-audit-sha256")
     parser.add_argument("--formal-node-rank", type=int, required=True)
     parser.add_argument(
         "--formal-host-slot", type=int, choices=tuple(FORMAL_HOST_BY_SLOT),
@@ -5780,6 +5817,14 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     topology = _activate_topology(args)
     host_slots = _active_host_slots(args)
+    v14_selection_protocol = getattr(args, "v14_selection_protocol", None)
+    expected_v14_selection_protocol_sha256 = getattr(
+        args, "expected_v14_selection_protocol_sha256", None
+    )
+    v14_selection_audit = getattr(args, "v14_selection_audit", None)
+    expected_v14_selection_audit_sha256 = getattr(
+        args, "expected_v14_selection_audit_sha256", None
+    )
     reject_forbidden_source_labels(
         args.run_name,
         args.output_root,
@@ -5793,6 +5838,8 @@ def validate_args(args: argparse.Namespace) -> None:
         args.trajectory_anchor_json,
         args.throughput_gate_report or "",
         args.topology_selection_report or "",
+        v14_selection_protocol or "",
+        v14_selection_audit or "",
         args.formal_master_addr,
         args.formal_run_id,
     )
@@ -5881,11 +5928,25 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.loader_workers < 0 or args.loader_workers > 16:
         raise AdaptationContractError("loader workers must be in [0,16]")
+    v14_values = (
+        v14_selection_protocol,
+        expected_v14_selection_protocol_sha256,
+        v14_selection_audit,
+        expected_v14_selection_audit_sha256,
+    )
+    if any(value is not None for value in v14_values) and not all(
+        value is not None for value in v14_values
+    ):
+        raise AdaptationContractError(
+            "V14 protocol/audit paths and external SHA-256 values must be "
+            "supplied together"
+        )
     if args.mode == "throughput_gate" and (
         args.throughput_gate_report is not None
         or args.expected_throughput_gate_sha256 is not None
         or args.topology_selection_report is not None
         or args.expected_topology_selection_sha256 is not None
+        or any(value is not None for value in v14_values)
     ):
         raise AdaptationContractError(
             "throughput_gate mode cannot consume a previous gate"
@@ -5895,21 +5956,37 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.expected_throughput_gate_sha256 is None
         or args.topology_selection_report is not None
         or args.expected_topology_selection_sha256 is not None
+        or any(value is not None for value in v14_values)
     ):
         raise AdaptationContractError(
             "short_quality requires one hash-pinned topology throughput gate "
             "and forbids topology selection"
         )
-    if args.mode == "train" and (
-        args.throughput_gate_report is None
-        or args.expected_throughput_gate_sha256 is None
-        or args.topology_selection_report is None
-        or args.expected_topology_selection_sha256 is None
-    ):
-        raise AdaptationContractError(
-            "formal training requires one topology selected by the sealed "
-            "nine-mode gate"
-        )
+    if args.mode == "train":
+        if (
+            args.throughput_gate_report is None
+            or args.expected_throughput_gate_sha256 is None
+        ):
+            raise AdaptationContractError(
+                "formal training requires one fresh hash-pinned throughput gate"
+            )
+        if all(value is not None for value in v14_values):
+            if (
+                args.topology_selection_report is not None
+                or args.expected_topology_selection_sha256 is not None
+            ):
+                raise AdaptationContractError(
+                    "V14 formal training consumes only its two-report audit; "
+                    "native nine-mode selection is non-authoritative"
+                )
+        elif (
+            args.topology_selection_report is None
+            or args.expected_topology_selection_sha256 is None
+        ):
+            raise AdaptationContractError(
+                "formal training requires one topology selected by the sealed "
+                "nine-mode authority"
+            )
 
 
 def _model_args() -> SimpleNamespace:
@@ -7570,11 +7647,91 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args, frozen_receipt=frozen_receipt
             )
             if args.mode == "train":
-                throughput_receipt["topology_selection"] = (
-                    validate_topology_selection(
+                schedule_authority = contract_receipts["schedule"].get(
+                    "topology_source"
+                )
+                if schedule_authority == v14_contract.TOPOLOGY_SOURCE:
+                    v14_values = (
+                        getattr(args, "v14_selection_protocol", None),
+                        getattr(
+                            args,
+                            "expected_v14_selection_protocol_sha256",
+                            None,
+                        ),
+                        getattr(args, "v14_selection_audit", None),
+                        getattr(
+                            args,
+                            "expected_v14_selection_audit_sha256",
+                            None,
+                        ),
+                    )
+                    if not all(value is not None for value in v14_values):
+                        raise AdaptationContractError(
+                            "V14 schedule requires the hash-pinned frozen "
+                            "selection protocol and two-report audit"
+                        )
+                    try:
+                        from scripts.show_base import (
+                            select_base_training_topology as topology_selector,
+                        )
+                        from scripts.show_base import (
+                            select_base_v14_two_candidate as v14_selector,
+                        )
+
+                        topology_selection = (
+                            v14_contract.validate_control_plane(
+                                project_root=PROJECT_ROOT,
+                                schedule_path=Path(args.schedule_json),
+                                expected_schedule_sha256=(
+                                    args.expected_schedule_sha256
+                                ),
+                                protocol_path=Path(
+                                    args.v14_selection_protocol
+                                ),
+                                expected_protocol_sha256=(
+                                    args.expected_v14_selection_protocol_sha256
+                                ),
+                                audit_path=Path(args.v14_selection_audit),
+                                expected_audit_sha256=(
+                                    args.expected_v14_selection_audit_sha256
+                                ),
+                                throughput_gate_path=Path(
+                                    args.throughput_gate_report
+                                ),
+                                expected_throughput_gate_sha256=(
+                                    args.expected_throughput_gate_sha256
+                                ),
+                                topology_mode=args.topology_mode,
+                                formal_run_id=args.formal_run_id,
+                                formal_master_port=args.formal_master_port,
+                                selector=topology_selector,
+                                v14_selector=v14_selector,
+                                training_contract=sys.modules[__name__],
+                                topology_specs=TOPOLOGY_SPECS,
+                            )
+                        )
+                    except v14_contract.V14ContractError as error:
+                        raise AdaptationContractError(str(error)) from error
+                else:
+                    if any(
+                        getattr(args, name, None) is not None
+                        for name in (
+                            "v14_selection_protocol",
+                            "expected_v14_selection_protocol_sha256",
+                            "v14_selection_audit",
+                            "expected_v14_selection_audit_sha256",
+                        )
+                    ):
+                        raise AdaptationContractError(
+                            "nine-mode schedule must not consume V14 "
+                            "selection authority"
+                        )
+                    topology_selection = validate_topology_selection(
                         args,
                         throughput_gate=throughput_receipt,
                     )
+                throughput_receipt["topology_selection"] = (
+                    topology_selection
                 )
         loader, sampler = _create_dataloader(
             args,
