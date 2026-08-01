@@ -3989,7 +3989,9 @@ class Coordinator:
             self._validate_armed(receipt, rank)
             armed_hashes[rank] = digest
         self._wait_for_peer_heartbeat_status(
-            {"ARMED"}, self.args.arm_timeout_ms, "post-ARMED barrier"
+            {"ARMED", "RUNNING", "RESULT", "HANDOFF"},
+            self.args.arm_timeout_ms,
+            "post-ARMED barrier",
         )
         if _source_evidence(self.args) != self.portable["source"]:
             raise TransactionError("source evidence changed before GO")

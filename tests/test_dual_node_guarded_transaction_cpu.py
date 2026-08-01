@@ -934,6 +934,28 @@ if os.environ.get("SEMTALK_TEST_ARM_DELAY"):
         return original_spawn(self)
     module.Coordinator._spawn_supervisor = delayed_spawn
 
+post_armed_delay_rank = os.environ.get("SEMTALK_TEST_POST_ARMED_DELAY_RANK")
+if post_armed_delay_rank is not None:
+    original_wait_for_peer_status = (
+        module.Coordinator._wait_for_peer_heartbeat_status
+    )
+    def delayed_post_armed_wait(self, accepted_statuses, timeout_ms, phase):
+        if (
+            self.rank == int(post_armed_delay_rank)
+            and phase == "post-ARMED barrier"
+        ):
+            import time
+            time.sleep(
+                float(os.environ["SEMTALK_TEST_POST_ARMED_DELAY_SECONDS"])
+            )
+        return original_wait_for_peer_status(
+            self,
+            accepted_statuses,
+            timeout_ms,
+            phase,
+        )
+    module.Coordinator._wait_for_peer_heartbeat_status = delayed_post_armed_wait
+
 if os.environ.get("SEMTALK_TEST_REPLAY_RANK"):
     original_heartbeat = module.Coordinator._heartbeat
     def replaying_heartbeat(self):
@@ -1515,6 +1537,27 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self.assertIn("restored_guards_by_gpu", final["outer_guarded_runner"]["guard_evidence"])
         replay = self._replay(transaction_root)
         self.assertEqual(replay["status"], "REPLAYED_SUCCEEDED")
+
+    def test_post_armed_barrier_accepts_peer_already_running(self) -> None:
+        transaction_root = self.root / "post_armed_peer_already_running"
+        configuration = self._configuration(seconds0=0.8, seconds1=0.05)
+        node1 = self._start(
+            self._command(1, transaction_root, configuration),
+            extra_environment={
+                "SEMTALK_TEST_POST_ARMED_DELAY_RANK": "1",
+                "SEMTALK_TEST_POST_ARMED_DELAY_SECONDS": "0.5",
+            },
+        )
+        node0 = self._start(self._command(0, transaction_root, configuration))
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
+        decision = json.loads((transaction_root / "DECISION.json").read_text())
+        self.assertEqual(decision["status"], "GO")
+        for rank in (0, 1):
+            started = json.loads(
+                (transaction_root / f"STARTED.rank{rank}.json").read_text()
+            )
+            self.assertEqual(started["status"], "STARTED")
 
     def test_started_link_commit_then_estale_is_one_successful_protocol_run(
         self,
