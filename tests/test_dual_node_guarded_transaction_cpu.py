@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -12,6 +13,8 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+
+from scripts.show_base import dual_node_guarded_transaction as TRANSACTION
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -39,6 +42,148 @@ CPU_COORDINATOR_EXIT_TIMEOUT_SECONDS = (
     + max(2.0, 3.0 * CPU_SHUTDOWN_GRACE_MS / 1000.0 + 1.0)
     + 1.0
 )
+
+
+class RenameNoReplaceCompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _unsupported_rename_libc() -> object:
+        class UnsupportedRename:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *_args: object) -> int:
+                return -1
+
+        class UnsupportedLibc:
+            renameat2 = UnsupportedRename()
+            renameatx_np = UnsupportedRename()
+
+        return UnsupportedLibc()
+
+    def test_efs_einval_falls_back_to_atomic_hard_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / ".tmp.OUTCOME.json"
+            target = root / "OUTCOME.json"
+            source.write_bytes(b"terminal\n")
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            previous_test_mode = TRANSACTION._CPU_TEST_MODE
+            TRANSACTION._CPU_TEST_MODE = True
+            try:
+                with (
+                    mock.patch.object(
+                        TRANSACTION.ctypes,
+                        "CDLL",
+                        return_value=self._unsupported_rename_libc(),
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.ctypes,
+                        "get_errno",
+                        return_value=errno.EINVAL,
+                    ),
+                ):
+                    TRANSACTION._rename_noreplace(
+                        directory_fd,
+                        source.name,
+                        directory_fd,
+                        target.name,
+                    )
+            finally:
+                TRANSACTION._CPU_TEST_MODE = previous_test_mode
+                os.close(directory_fd)
+            self.assertFalse(source.exists())
+            self.assertEqual(target.read_bytes(), b"terminal\n")
+
+    def test_efs_fallback_never_rolls_back_published_target_on_cleanup_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / ".tmp.OUTCOME.json"
+            target = root / "OUTCOME.json"
+            source.write_bytes(b"terminal\n")
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            previous_test_mode = TRANSACTION._CPU_TEST_MODE
+            TRANSACTION._CPU_TEST_MODE = True
+            real_unlink = TRANSACTION.os.unlink
+
+            def reject_source_cleanup(
+                path: os.PathLike[str] | str,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if os.fspath(path) == source.name and dir_fd == directory_fd:
+                    raise OSError(errno.EIO, "injected source cleanup failure")
+                real_unlink(path, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch.object(
+                        TRANSACTION.ctypes,
+                        "CDLL",
+                        return_value=self._unsupported_rename_libc(),
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.ctypes,
+                        "get_errno",
+                        return_value=errno.EINVAL,
+                    ),
+                    mock.patch.object(
+                        TRANSACTION.os,
+                        "unlink",
+                        side_effect=reject_source_cleanup,
+                    ),
+                ):
+                    TRANSACTION._rename_noreplace(
+                        directory_fd,
+                        source.name,
+                        directory_fd,
+                        target.name,
+                    )
+            finally:
+                TRANSACTION._CPU_TEST_MODE = previous_test_mode
+                os.close(directory_fd)
+            self.assertEqual(target.read_bytes(), b"terminal\n")
+            self.assertEqual(source.read_bytes(), b"terminal\n")
+            self.assertEqual(source.stat().st_ino, target.stat().st_ino)
+
+    def test_terminal_target_survives_post_publication_directory_fsync_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            root = parent / "transaction"
+            transaction = TRANSACTION.TransactionDirectory(
+                root,
+                parent,
+                root.name,
+                0,
+            )
+            transaction.create_or_wait(time.monotonic() + 1.0)
+            real_fsync = TRANSACTION.os.fsync
+
+            def fail_root_directory_fsync(fd: int) -> None:
+                if fd == transaction.root_fd:
+                    raise OSError(errno.EIO, "injected directory fsync failure")
+                real_fsync(fd)
+
+            payload = {"schema": "test", "status": "SUCCEEDED"}
+            previous_test_mode = TRANSACTION._CPU_TEST_MODE
+            TRANSACTION._CPU_TEST_MODE = True
+            try:
+                with mock.patch.object(
+                    TRANSACTION.os,
+                    "fsync",
+                    side_effect=fail_root_directory_fsync,
+                ):
+                    with self.assertRaisesRegex(OSError, "injected"):
+                        transaction.publish_terminal_outcome(payload)
+                self.assertTrue((root / "OUTCOME.json").is_file())
+                observed, _ = transaction.read_json("OUTCOME.json")
+                self.assertEqual(observed, payload)
+            finally:
+                TRANSACTION._CPU_TEST_MODE = previous_test_mode
+                transaction.close()
 
 HARNESS = r"""
 import json

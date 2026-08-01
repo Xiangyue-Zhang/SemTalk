@@ -4730,7 +4730,14 @@ def _topology_independent_gate_semantic_sha256(
             "schedule": long_contract["schedule"],
             "forward_contract": protocol["forward_contract"],
             "loss": protocol["loss"],
-            "precision": protocol["precision"],
+            # Precision is an intentional topology-matrix dimension: the
+            # published W1 reference is fp32 while every distributed
+            # adaptation is bf16.  Including it here made the value named
+            # ``topology_independent_input_sha256`` differ for two otherwise
+            # identical five-stage SHOW authorities, so the final selector
+            # could never accept the complete nine-mode matrix.  Precision
+            # remains hash-pinned in each topology receipt and is validated
+            # independently by every probe/training consumer.
             "target_dataset": protocol["target_dataset"],
             "target_speaker_scope": protocol["target_speaker_scope"],
             "vq_models_in_training_graph": protocol[

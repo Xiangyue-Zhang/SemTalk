@@ -1369,6 +1369,48 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
 
 
 class OfficialBaseTopologyGateContracts(unittest.TestCase):
+    def test_topology_independent_authority_excludes_matrix_precision(
+        self,
+    ) -> None:
+        fp32 = _frozen_gate_fixture(
+            receipt_sha256="a" * 64,
+            topology_receipt_sha256="b" * 64,
+            trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
+            run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
+            target_epochs=[],
+        )
+        fp32["protocol"]["precision"] = "fp32"
+        bf16 = json.loads(json.dumps(fp32))
+        bf16["protocol"]["precision"] = "bf16"
+        self.assertEqual(
+            ADAPT._topology_independent_gate_semantic_sha256(fp32),
+            ADAPT._topology_independent_gate_semantic_sha256(bf16),
+        )
+
+        changed_dataset = json.loads(json.dumps(fp32))
+        changed_dataset["dataset"]["data_mdb_sha256"] = "c" * 64
+        self.assertNotEqual(
+            ADAPT._topology_independent_gate_semantic_sha256(fp32),
+            ADAPT._topology_independent_gate_semantic_sha256(changed_dataset),
+        )
+
+    def test_matrix_precision_remains_fail_closed_per_mode(self) -> None:
+        args = ADAPT.build_parser().parse_args(_base_cli())
+        self.assertEqual(args.topology_mode, ADAPT.W8_GLOBAL512_MODE)
+        args.precision = "fp32"
+        with mock.patch.object(
+            ADAPT.os,
+            "uname",
+            return_value=types.SimpleNamespace(
+                nodename=ADAPT.FORMAL_HOST_BY_NODE_RANK[0]
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "precision differs",
+            ):
+                ADAPT.validate_args(args)
+
     def test_gate_spec_is_immutable_and_w1_is_fp32_only(self) -> None:
         receipt = ADAPT.validate_topology_gate_spec(
             argparse.Namespace(

@@ -130,6 +130,35 @@ def _rename_noreplace(
     error = ctypes.get_errno()
     if error in {errno.EEXIST, errno.ENOTEMPTY}:
         raise FileExistsError(error, os.strerror(error), target)
+    if error in {
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }:
+        # AWS EFS supports atomic hard-link creation but returns EINVAL for
+        # renameat2(RENAME_NOREPLACE).  The source is a unique, O_EXCL,
+        # O_NOFOLLOW regular file in the same pinned directory, so linkat is
+        # an equally fail-closed no-replace publication primitive.  Once the
+        # link succeeds, target is the irreversible publication commit point:
+        # never remove it in response to a later temporary-name cleanup
+        # failure, because a concurrent replay may already have observed the
+        # terminal receipt.  A failed cleanup can therefore leave only the
+        # unique read-only temporary hard-link alias; the caller still performs
+        # the directory durability barrier for the committed target.
+        os.link(
+            source,
+            target,
+            src_dir_fd=source_dir_fd,
+            dst_dir_fd=target_dir_fd,
+            follow_symlinks=False,
+        )
+        try:
+            os.unlink(source, dir_fd=source_dir_fd)
+        except OSError:
+            # Publication is monotonic.  The unique source alias is harmless
+            # and must not trigger rollback of an already visible target.
+            pass
+        return
     raise OSError(error, os.strerror(error), target)
 
 
@@ -1553,8 +1582,11 @@ class TransactionDirectory:
 
         The exclusive finalizer lock prevents a cooperating loser from
         creating or cleaning a temporary entry after ``OUTCOME.json`` becomes
-        visible.  The no-replace rename both removes the temporary name and
-        creates the terminal name in the same final namespace operation.
+        visible.  Native no-replace rename both removes the temporary name and
+        creates the terminal name in the same final namespace operation.  On
+        EFS, the atomic hard-link fallback may retain its unique read-only
+        temporary alias when alias cleanup is unavailable; the terminal target
+        is nevertheless monotonic and is never rolled back after publication.
         """
         name = "OUTCOME.json"
         self.assert_identity()
@@ -1567,7 +1599,6 @@ class TransactionDirectory:
             flags |= os.O_NOFOLLOW
         fd = os.open(temporary, flags, 0o600, dir_fd=self.root_fd)
         temporary_exists = True
-        published = False
         try:
             try:
                 view = memoryview(raw)
@@ -1587,7 +1618,6 @@ class TransactionDirectory:
                 name,
             )
             temporary_exists = False
-            published = True
             # This is a durability barrier, not a namespace/content mutation.
             os.fsync(self.root_fd)
         except FileExistsError as exc:
@@ -1595,12 +1625,11 @@ class TransactionDirectory:
                 "immutable transaction artifact exists: OUTCOME.json"
             ) from exc
         except BaseException:
-            if published:
-                try:
-                    os.unlink(name, dir_fd=self.root_fd)
-                    os.fsync(self.root_fd)
-                except OSError:
-                    pass
+            # Once publication succeeds, OUTCOME is an irreversible commit
+            # point.  In particular, a directory-fsync error must not make a
+            # receipt that a concurrent replay may already have observed
+            # disappear.  The next finalizer invocation can validate and
+            # replay the preserved terminal outcome.
             raise
         finally:
             if temporary_exists:
