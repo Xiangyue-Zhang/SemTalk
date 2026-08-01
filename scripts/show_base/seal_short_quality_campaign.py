@@ -27,8 +27,8 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 EPOCHS: Tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
-EXPECTED_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
-EXPECTED_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
+EXPECTED_SOURCE_COMMIT = "70a70f452bdf743e317b583a7770980f0ce744c3"
+EXPECTED_SOURCE_TREE = "bdf7680f56f9f53c92e7ab0bf6c6a84ef4f83d69"
 PRODUCER_RELATIVE = "scripts/show_base/produce_base_topology_short_quality.py"
 PRODUCER_SHA256 = "1d7fbd600d6ac0657896688eed0acd47600cacffe1632a655c4f9409eb604dac"
 ADAPTER_RELATIVE = "scripts/show_base/base_short_quality_val_adapter.py"
