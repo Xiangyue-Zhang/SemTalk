@@ -181,6 +181,90 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             with self.assertRaises(BRIDGE.DuplicateConsumptionError):
                 BRIDGE._write_new_or_identical(output, conflict)
 
+    def test_copied_authority_uses_the_same_producer_claim_slot(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-bridge-claim-anchor-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw)
+            ready_dir = root / "candidate_receipts"
+            ready_dir.mkdir()
+            ready_path = ready_dir / "epoch-0001.json"
+            ready_path.write_text("{}\n", encoding="utf-8")
+            candidate_dir = root / "candidates"
+            candidate_dir.mkdir()
+            candidate_path = candidate_dir / "base_official_adapt_epoch_01.bin"
+            candidate_path.write_bytes(b"checkpoint")
+            ready = {
+                "path": str(ready_path),
+                "sha256": "1" * 64,
+                "bytes": ready_path.stat().st_size,
+                "receipt_payload_sha256": "2" * 64,
+            }
+            candidate = {
+                "path": str(candidate_path),
+                "relative_path": "candidates/base_official_adapt_epoch_01.bin",
+                "sha256": "3" * 64,
+                "bytes": candidate_path.stat().st_size,
+                "model_state_tensors": 1,
+                "model_state_schema_sha256": "4" * 64,
+                "model_state_semantic_sha256": "5" * 64,
+            }
+            original = root / "authorities" / "epoch-0001.json"
+            copied = root / "copied-authorities" / "epoch-0001.json"
+            original.parent.mkdir()
+            copied.parent.mkdir()
+            first = BRIDGE._claim_path(
+                producer_ready_receipt=ready,
+                candidate_checkpoint=candidate,
+                epoch=1,
+            )
+            second = BRIDGE._claim_path(
+                producer_ready_receipt=ready,
+                candidate_checkpoint=candidate,
+                epoch=1,
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(
+                first,
+                root / "live_val_consumer_claims" / "epoch-0001.json",
+            )
+
+            first_body = BRIDGE._with_payload_sha(
+                {
+                    "format": BRIDGE.CLAIM_FORMAT,
+                    "work_authority": {"path": str(original)},
+                    "run_root": "/formal/val/run-a",
+                }
+            )
+            copied_body = BRIDGE._with_payload_sha(
+                {
+                    "format": BRIDGE.CLAIM_FORMAT,
+                    "work_authority": {"path": str(copied)},
+                    "run_root": "/formal/val/run-b",
+                }
+            )
+            _artifact, created = BRIDGE._write_new_or_identical(
+                first, first_body
+            )
+            self.assertTrue(created)
+            with self.assertRaises(BRIDGE.DuplicateConsumptionError):
+                BRIDGE._write_new_or_identical(second, copied_body)
+
+            wrong_dir = root / "other"
+            wrong_dir.mkdir()
+            wrong_path = wrong_dir / "epoch-0001.json"
+            wrong_path.write_text("{}\n", encoding="utf-8")
+            wrong_ready = dict(ready)
+            wrong_ready["path"] = str(wrong_path)
+            with self.assertRaisesRegex(
+                BRIDGE.LiveConsumerError, "fixed candidate inventory"
+            ):
+                BRIDGE._claim_path(
+                    producer_ready_receipt=wrong_ready,
+                    candidate_checkpoint=candidate,
+                    epoch=1,
+                )
+
     def _source_git(
         self,
         *,
@@ -584,6 +668,11 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
         self.assertIn("PROC_STARTTIME", source)
         self.assertIn("PROC_CMDLINE_SHA256", source)
         self.assertIn("refs/heads", source)
+        self.assertIn(
+            'semtalk_require_formal_venv_python "$python_bin" semtalk',
+            source,
+        )
+        self.assertNotIn("-L $python_bin", source)
         self.assertNotIn("--split test", source)
         self.assertNotIn("pgrep", source)
         self.assertNotIn("pkill", source)

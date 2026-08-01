@@ -849,9 +849,59 @@ def _validate_work_authority(
     return authority_artifact, authority, modules
 
 
-def _claim_path(authority_path: Path) -> Path:
-    authority_dir = authority_path.parent
-    claim_dir = authority_dir.parent / f"{authority_dir.name}.consumer-claims"
+def _claim_path(
+    *,
+    producer_ready_receipt: Mapping[str, Any],
+    candidate_checkpoint: Mapping[str, Any],
+    epoch: int,
+) -> Path:
+    """Return the one claim slot for the producer candidate itself.
+
+    The work-authority file path is not part of its signed JSON body.  A
+    byte-identical copy may therefore live at another path.  Deriving the
+    claim namespace from that copy would give the same producer candidate a
+    second GPU allowance.  The producer-ready receipt *is* embedded in the
+    authority and is SHA-verified before this helper is reached, so anchor the
+    claim next to its immutable training-run inventory instead.
+    """
+
+    ready = _exact_keys(
+        producer_ready_receipt,
+        frozenset({"path", "sha256", "bytes", "receipt_payload_sha256"}),
+        "producer ready receipt for consumer claim",
+    )
+    checkpoint = _exact_keys(
+        candidate_checkpoint,
+        frozenset(
+            {
+                "path", "relative_path", "sha256", "bytes",
+                "model_state_tensors", "model_state_schema_sha256",
+                "model_state_semantic_sha256",
+            }
+        ),
+        "candidate checkpoint for consumer claim",
+    )
+    ready_path = _canonical_path(
+        ready["path"], "producer ready receipt for consumer claim"
+    )
+    checkpoint_path = _canonical_path(
+        checkpoint["path"], "candidate checkpoint for consumer claim"
+    )
+    expected_name = f"epoch-{epoch:04d}.json"
+    if checkpoint_path.parent.name != "candidates":
+        raise LiveConsumerError(
+            "candidate checkpoint is outside its fixed producer inventory"
+        )
+    training_root = checkpoint_path.parent.parent
+    expected_ready_path = training_root / "candidate_receipts" / expected_name
+    if (
+        ready_path != expected_ready_path
+        or ready_path.name != expected_name
+    ):
+        raise LiveConsumerError(
+            "producer ready receipt is outside its fixed candidate inventory"
+        )
+    claim_dir = training_root / "live_val_consumer_claims"
     created = False
     if os.path.lexists(claim_dir):
         resolved = _canonical_path(claim_dir, "consumer claim directory")
@@ -872,7 +922,7 @@ def _claim_path(authority_path: Path) -> Path:
             os.fsync(parent_fd)
         finally:
             os.close(parent_fd)
-    return resolved / authority_path.name
+    return resolved / expected_name
 
 
 def _preflight_body(
@@ -949,7 +999,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "run_root": str(run_root),
         }
     )
-    claim_path = _claim_path(Path(authority_artifact["path"]))
+    claim_path = _claim_path(
+        producer_ready_receipt=authority["producer_ready_receipt"],
+        candidate_checkpoint=authority["candidate_checkpoint"],
+        epoch=epoch,
+    )
     claim_artifact, _created = _write_new_or_identical(claim_path, claim_body)
     claim_artifact["receipt_payload_sha256"] = claim_body["receipt_payload_sha256"]
     preflight = _with_payload_sha(

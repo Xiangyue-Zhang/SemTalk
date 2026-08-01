@@ -104,8 +104,8 @@ if [[ $repo_root != "$raw_repo_root" || ! -d $repo_root || -L $raw_repo_root ]];
     printf 'repository root must be canonical and non-symlinked\n' >&2
     exit 1
 fi
-if [[ ! -x $python_bin || ! -f $python_bin || -L $python_bin ]]; then
-    printf 'Python interpreter is unavailable or symlinked\n' >&2
+if [[ ! -x $python_bin || ! -f $python_bin ]]; then
+    printf 'Python interpreter is unavailable\n' >&2
     exit 1
 fi
 raw_work_authority=$work_authority
