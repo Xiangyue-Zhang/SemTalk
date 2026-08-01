@@ -372,6 +372,25 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
             + b"\n"
         )
 
+    def _strict_receipt_artifact(
+        self, name: str, *, marker: str = "shared"
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "format": "fixture-receipt",
+            "marker": marker,
+            "split": "val",
+            "test_visible": False,
+        }
+        payload["receipt_payload_sha256"] = selection._canonical_sha(payload)
+        path = self.root / name
+        self._write_json(path, payload)
+        return {
+            "path": str(path.resolve(strict=True)),
+            "sha256": _sha(path),
+            "bytes": path.stat().st_size,
+            "receipt_payload_sha256": payload["receipt_payload_sha256"],
+        }
+
     def _select(
         self,
         specs,
@@ -836,6 +855,112 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
             ):
                 selection._artifact_payload(changed, "embedded fixture")
 
+    def test_receipt_identity_allows_same_or_different_paths_only_when_exact(
+        self,
+    ) -> None:
+        first = self._strict_receipt_artifact(
+            "receipt-identity-first.json", marker="identity"
+        )
+        second = self._strict_receipt_artifact(
+            "receipt-identity-second.json", marker="identity"
+        )
+        first_identity = selection._receipt_identity_projection(
+            first, "first receipt"
+        )
+        self.assertEqual(
+            first_identity,
+            selection._receipt_identity_projection(first, "same-path receipt"),
+        )
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertEqual(
+            first_identity,
+            selection._receipt_identity_projection(
+                second, "different-path receipt"
+            ),
+        )
+        for key, value in (
+            ("sha256", "0" * 64),
+            ("bytes", int(first["bytes"]) + 1),
+            ("receipt_payload_sha256", "0" * 64),
+            ("receipt_payload_sha256", None),
+            ("receipt_payload_sha256", True),
+        ):
+            attacked = dict(first)
+            attacked[key] = value
+            with self.subTest(key=key), self.assertRaises(
+                selection.SelectionError
+            ):
+                selection._receipt_identity_projection(
+                    attacked, f"attacked {key} receipt"
+                )
+        missing_payload_sha = dict(first)
+        missing_payload_sha.pop("receipt_payload_sha256")
+        with self.assertRaises(selection.SelectionError):
+            selection._receipt_identity_projection(
+                missing_payload_sha, "missing payload SHA receipt"
+            )
+
+    def test_selection_accepts_distinct_receipt_paths_with_same_identity(
+        self,
+    ) -> None:
+        original = official_selector.validate_quality_report
+
+        def validate_with_distinct_paths(*args, **kwargs):
+            validated = copy.deepcopy(original(*args, **kwargs))
+            mode = validated["mode"]
+            if mode == selection.MODE_P2:
+                for key in ("val_inputs_receipt", "pipeline_receipt"):
+                    artifact = dict(validated[key])
+                    source = Path(artifact["path"])
+                    destination = self.root / f"distinct-{mode}-{key}.json"
+                    destination.write_bytes(source.read_bytes())
+                    artifact["path"] = str(destination.resolve(strict=True))
+                    validated[key] = artifact
+            return validated
+
+        output = self.root / "selection-distinct-receipt-paths.json"
+        with (
+            self._formal_patches(),
+            mock.patch.object(
+                official_selector,
+                "validate_quality_report",
+                side_effect=validate_with_distinct_paths,
+            ),
+        ):
+            payload = self._select(self.report_specs, output=output)
+        self.assertEqual(payload["status"], "complete")
+        self.assertTrue(output.is_file())
+
+    def test_selection_rejects_individually_valid_receipt_identity_drift(
+        self,
+    ) -> None:
+        original = official_selector.validate_quality_report
+        different = self._strict_receipt_artifact(
+            "valid-but-different-validation-input.json",
+            marker="different-identity",
+        )
+
+        def validate_with_identity_drift(*args, **kwargs):
+            validated = copy.deepcopy(original(*args, **kwargs))
+            if validated["mode"] == selection.MODE_P2:
+                validated["val_inputs_receipt"] = copy.deepcopy(different)
+            return validated
+
+        output = self.root / "selection-valid-receipt-identity-drift.json"
+        with (
+            self._formal_patches(),
+            mock.patch.object(
+                official_selector,
+                "validate_quality_report",
+                side_effect=validate_with_identity_drift,
+            ),
+            self.assertRaisesRegex(
+                selection.SelectionError, "validation-input authority"
+            ),
+        ):
+            self._select(self.report_specs, output=output)
+        self.assertFalse(output.exists())
+
     def test_validation_pipeline_source_must_be_exact_4066f20(self) -> None:
         def receipt(commit: str, name: str):
             payload = {
@@ -904,6 +1029,13 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                 )
 
     def test_nonfinite_fgd_is_rejected_before_output(self) -> None:
+        val_receipt = self._strict_receipt_artifact(
+            "nonfinite-val-receipt.json", marker="nonfinite-val"
+        )
+        pipeline_receipt = self._strict_receipt_artifact(
+            "nonfinite-pipeline-receipt.json", marker="nonfinite-pipeline"
+        )
+
         class FakeSelector:
             @staticmethod
             def validate_quality_report(mode, path, expected_sha256, **kwargs):
@@ -919,8 +1051,8 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                         str(epoch): 1.0 for epoch in selection.CANDIDATE_EPOCHS
                     },
                     "topology_independent_input_sha256": "a" * 64,
-                    "val_inputs_receipt": {"same": True},
-                    "pipeline_receipt": {"same": True},
+                    "val_inputs_receipt": copy.deepcopy(val_receipt),
+                    "pipeline_receipt": copy.deepcopy(pipeline_receipt),
                     "candidates": [
                         {
                             "diffsheg_fgd": (
@@ -958,6 +1090,13 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
     def test_bool_cannot_spoof_candidate_or_provenance_epoch(self) -> None:
+        val_receipt = self._strict_receipt_artifact(
+            "bool-epoch-val-receipt.json", marker="bool-epoch-val"
+        )
+        pipeline_receipt = self._strict_receipt_artifact(
+            "bool-epoch-pipeline-receipt.json", marker="bool-epoch-pipeline"
+        )
+
         class FakeSelector:
             attack_location = "row"
 
@@ -1004,8 +1143,8 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                         for epoch in selection.CANDIDATE_EPOCHS
                     },
                     "topology_independent_input_sha256": "a" * 64,
-                    "val_inputs_receipt": {"same": True},
-                    "pipeline_receipt": {"same": True},
+                    "val_inputs_receipt": copy.deepcopy(val_receipt),
+                    "pipeline_receipt": copy.deepcopy(pipeline_receipt),
                     "candidates": candidates,
                 }
 

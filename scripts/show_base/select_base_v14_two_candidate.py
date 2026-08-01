@@ -522,6 +522,38 @@ def _artifact_payload(value: Mapping[str, Any], label: str) -> dict[str, Any]:
     return payload
 
 
+def _receipt_identity_projection(
+    value: Any, label: str,
+) -> dict[str, Any]:
+    """Revalidate one receipt file and compare only its content identity.
+
+    Independently frozen topology reports may name the same receipt bytes at
+    different canonical absolute paths.  Paths are therefore provenance
+    locations, not semantic identity.  Every location is still opened and
+    verified independently before this path-free projection is returned.
+    """
+
+    if type(value) is not dict or set(value) != {
+        "path", "sha256", "bytes", "receipt_payload_sha256"
+    }:
+        raise SelectionError(f"{label} artifact schema changed")
+    raw_path = value.get("path")
+    if type(raw_path) is not str or not raw_path:
+        raise SelectionError(f"{label} path changed")
+    payload_sha256 = _require_sha(
+        value.get("receipt_payload_sha256"),
+        f"{label} payload SHA-256",
+    )
+    # _artifact_payload reopens the exact canonical single-link regular file,
+    # checks bytes/SHA-256, parses strict JSON, and replays the payload hash.
+    _artifact_payload(value, label)
+    return {
+        "bytes": value["bytes"],
+        "sha256": value["sha256"],
+        "receipt_payload_sha256": payload_sha256,
+    }
+
+
 def _validation_pipeline_authority(
     validated: Mapping[str, Any], mode: str
 ) -> dict[str, Any]:
@@ -1139,10 +1171,28 @@ def select_two_reports(
     }
     if len(semantic) != 1:
         raise SelectionError("two reports do not share topology-independent authority")
-    if validated_by_mode[MODE_P1]["val_inputs_receipt"] != validated_by_mode[MODE_P2]["val_inputs_receipt"]:
-        raise SelectionError("two reports do not share one validation-input authority")
-    if validated_by_mode[MODE_P1]["pipeline_receipt"] != validated_by_mode[MODE_P2]["pipeline_receipt"]:
-        raise SelectionError("two reports do not share one inference-pipeline authority")
+    val_input_identities = {
+        mode: _receipt_identity_projection(
+            validated_by_mode[mode].get("val_inputs_receipt"),
+            f"{mode} validation-input receipt",
+        )
+        for mode in MODES
+    }
+    pipeline_identities = {
+        mode: _receipt_identity_projection(
+            validated_by_mode[mode].get("pipeline_receipt"),
+            f"{mode} inference-pipeline receipt",
+        )
+        for mode in MODES
+    }
+    if val_input_identities[MODE_P1] != val_input_identities[MODE_P2]:
+        raise SelectionError(
+            "two reports do not share one validation-input authority"
+        )
+    if pipeline_identities[MODE_P1] != pipeline_identities[MODE_P2]:
+        raise SelectionError(
+            "two reports do not share one inference-pipeline authority"
+        )
     if projections[MODE_P1] != projections[MODE_P2]:
         raise SelectionError("source/data/VQ/init/runtime authority differs between reports")
     if validate_specs and (
