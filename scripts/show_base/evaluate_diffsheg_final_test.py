@@ -1688,13 +1688,30 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
         completion,
         "formal DiffSHEG completion marker",
     )
+    completion_payload = completion_path.read_bytes()
+    completion_file_sha256 = hashlib.sha256(completion_payload).hexdigest()
+    completion_bytes = len(completion_payload)
+    completion_pin = {
+        "path": str(completion_path),
+        "sha256": completion_file_sha256,
+        "bytes": completion_bytes,
+        "canonical_payload_sha256": completion[
+            "receipt_payload_sha256"
+        ],
+    }
     return {
         "status": "complete",
         "output": str(completion_path),
+        "sha256": completion_file_sha256,
+        "bytes": completion_bytes,
         "metrics": metrics,
         "receipt_payload_sha256": completion[
             "receipt_payload_sha256"
         ],
+        "canonical_payload_sha256": completion[
+            "receipt_payload_sha256"
+        ],
+        "final_metrics": completion_pin,
     }
 
 

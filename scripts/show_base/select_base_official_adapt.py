@@ -112,8 +112,11 @@ MEASUREMENT_FORMAT = (
     "semtalk_show_base_official_adapt_val_measurement_v1"
 )
 SELECTION_FORMAT = "semtalk_show_base_official_adapt_selection_v1"
+PRIMARY_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
+PRIMARY_SELECTION_METRIC_PATH = "validation.diffsheg.metrics.fgd"
+PRIMARY_SELECTION_REPORT_KEY = "fgd"
 
-VAL_METRIC_KEYS = ("fgd",)
+VAL_METRIC_KEYS = (PRIMARY_SELECTION_REPORT_KEY,)
 INFERENCE_HELPERS = (
     "_load_canonical_clip",
     "_load_audio_features",
@@ -122,7 +125,7 @@ INFERENCE_HELPERS = (
     "_inference_auxiliary_loss_bypass_receipt",
     "_output_arrays",
 )
-FRESH_PIPELINE_SOURCE_FILES = (
+DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/__init__.py",
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/run_base_inference.py",
@@ -153,6 +156,9 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "models/utils/layer.py",
     "models/utils/skeleton.py",
 )
+# Backward-compatible name for archived receipts.  New source receipts use
+# the explicit DiffSHEG-primary name above.
+FRESH_PIPELINE_SOURCE_FILES = DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES
 # Match reserved labels, not incidental substrings such as Latest or contest.
 _TEST_PATH_LABEL_TOKENS = frozenset(
     {"test", "tests", "testset", "testsets"}
@@ -187,7 +193,7 @@ DIFFSHEG_PINNED_RECEIPT: dict[str, Any] = {
     "window_length": DIFFSHEG_WINDOW,
     "window_stride": DIFFSHEG_STRIDE,
     "precision": "float32 AE inference; no autocast",
-    "selection_metric": "fgd",
+    "selection_metric": PRIMARY_SELECTION_REPORT_KEY,
     "ba_during_selection": False,
 }
 
@@ -1771,9 +1777,9 @@ def _git_output(
 
 
 def build_fresh_pipeline_source_receipt(source_root: Path) -> dict[str, Any]:
-    """Freeze the single detached official SemTalk source used by Base val."""
+    """Freeze primary authority files plus whole-repository provenance."""
 
-    root = require_directory(source_root, "fresh Base source root")
+    root = require_directory(str(source_root), "fresh Base source root")
     _, remotes_raw = _git_output(root, ["remote"], label="remote names")
     remotes = [
         line
@@ -1834,7 +1840,7 @@ def build_fresh_pipeline_source_receipt(source_root: Path) -> dict[str, Any]:
             "checkout with no local branch at HEAD"
         )
     files: dict[str, dict[str, Any]] = {}
-    for relative in FRESH_PIPELINE_SOURCE_FILES:
+    for relative in DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES:
         path = root / relative
         resolved, payload = _safe_file_snapshot(
             path, f"fresh Base source {relative}"
@@ -3305,7 +3311,7 @@ def build_selection(
         "selection_policy": {
             "candidate_epochs": list(EXPECTED_CANDIDATE_EPOCHS),
             "metric": "FGD",
-            "metric_report_key": "fgd",
+            "metric_report_key": PRIMARY_SELECTION_REPORT_KEY,
             "operator": "min",
             "tie_break": "lowest_epoch",
             "ordering": ["fgd", "epoch"],

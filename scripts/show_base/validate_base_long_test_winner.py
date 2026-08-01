@@ -141,10 +141,10 @@ def validate_test_winner(
             long_contract.EXPECTED_CANDIDATE_EPOCHS
         ),
         "metric": "FGD",
-        "metric_report_key": "fgd",
+        "metric_report_key": long_contract.PRIMARY_SELECTION_REPORT_KEY,
         "operator": "min",
         "tie_break": "lowest_epoch",
-        "ordering": ["fgd", "epoch"],
+        "ordering": [long_contract.PRIMARY_SELECTION_REPORT_KEY, "epoch"],
         "test_feedback_into_selection": False,
     }
     if selection.get("selection_policy") != expected_policy:
@@ -188,11 +188,16 @@ def validate_test_winner(
             f"long Base selection row e{expected_epoch}",
         )
         metrics = row.get("metrics")
-        fgd = metrics.get("fgd") if isinstance(metrics, dict) else None
+        fgd = (
+            metrics.get(long_contract.PRIMARY_SELECTION_REPORT_KEY)
+            if isinstance(metrics, dict)
+            else None
+        )
         if (
             epoch != expected_epoch
             or epoch == 30
-            or set(metrics or {}) != {"fgd"}
+            or set(metrics or {})
+            != {long_contract.PRIMARY_SELECTION_REPORT_KEY}
             or isinstance(fgd, bool)
             or type(fgd) not in {int, float}
             or not math.isfinite(float(fgd))

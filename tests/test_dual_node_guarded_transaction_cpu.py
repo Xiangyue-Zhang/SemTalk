@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -612,6 +613,170 @@ class TransactionDirectoryEstaleTests(unittest.TestCase):
         self.assertEqual(observed, payload)
         self.assertEqual(observed_digest, digest)
 
+
+class AbortPathSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _anchor() -> dict[str, object]:
+        return {
+            "pid": 4321,
+            "ppid": 4000,
+            "pgid": 4321,
+            "sid": 4000,
+            "starttime_ticks": 123456,
+            "argv_sha256": "a" * 64,
+        }
+
+    def test_anchor_disappeared_never_signals_numeric_pgid(self) -> None:
+        anchor = self._anchor()
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_proc_identity",
+                side_effect=TRANSACTION.TransactionError(
+                    "injected anchor disappeared"
+                ),
+            ),
+            mock.patch.object(TRANSACTION.os, "killpg") as killpg,
+        ):
+            self.assertFalse(
+                TRANSACTION._signal_exact_anchored_group(
+                    anchor,
+                    signal.SIGKILL,
+                )
+            )
+        killpg.assert_not_called()
+
+    def test_coordinator_abort_has_no_group_signal_ownership(self) -> None:
+        inspect = __import__("inspect")
+        coordinator_cleanup = inspect.getsource(
+            TRANSACTION.Coordinator._terminate_workload
+        )
+        self.assertNotIn("os.killpg", coordinator_cleanup)
+        self.assertNotIn("_signal_exact_anchored_group", coordinator_cleanup)
+        self.assertIn("_signal_exact_process_generation", coordinator_cleanup)
+
+    def test_anchor_generation_change_never_signals_recycled_pgid(self) -> None:
+        anchor = self._anchor()
+        replacement = {**anchor, "starttime_ticks": 123457}
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_proc_identity",
+                return_value=replacement,
+            ),
+            mock.patch.object(TRANSACTION.os, "killpg") as killpg,
+        ):
+            with self.assertRaisesRegex(
+                TRANSACTION.TransactionError,
+                "anchor generation changed",
+            ):
+                TRANSACTION._signal_exact_anchored_group(
+                    anchor,
+                    signal.SIGTERM,
+                )
+        killpg.assert_not_called()
+
+    def test_exact_anchor_eperm_is_a_recordable_cleanup_error(self) -> None:
+        anchor = self._anchor()
+        with (
+            mock.patch.object(
+                TRANSACTION,
+                "_proc_identity",
+                return_value=anchor,
+            ),
+            mock.patch.object(
+                TRANSACTION.os,
+                "killpg",
+                side_effect=PermissionError(
+                    errno.EPERM,
+                    "injected exact-anchor EPERM",
+                ),
+            ) as killpg,
+        ):
+            with self.assertRaisesRegex(
+                TRANSACTION.TransactionError,
+                "errno=1",
+            ):
+                TRANSACTION._signal_exact_anchored_group(
+                    anchor,
+                    signal.SIGTERM,
+                )
+        killpg.assert_called_once_with(anchor["pid"], signal.SIGTERM)
+
+    def test_concurrent_failures_with_cleanup_eperm_publish_one_outcome(
+        self,
+    ) -> None:
+        # Repeat the real O_EXCL publication race; each round uses independent
+        # directory handles just like two nodes observing one transaction.
+        with tempfile.TemporaryDirectory(prefix="semtalk-abort-race-") as temporary:
+            parent = Path(temporary).resolve()
+            for ordinal in range(20):
+                root = parent / f"transaction-{ordinal}"
+                transactions = [
+                    TRANSACTION.TransactionDirectory(
+                        root,
+                        parent,
+                        root.name,
+                        rank,
+                    )
+                    for rank in (0, 1)
+                ]
+                transactions[0].create_or_wait(time.monotonic() + 1.0)
+                transactions[1].open_existing()
+                barrier = threading.Barrier(2)
+                coordinators = []
+                errors: list[BaseException] = []
+                try:
+                    for rank, transaction in enumerate(transactions):
+                        coordinator = object.__new__(TRANSACTION.Coordinator)
+                        coordinator.rank = rank
+                        coordinator.portable_sha256 = "b" * 64
+                        coordinator.tx = transaction
+                        coordinator.decision_go = True
+                        coordinator.workload_result_sha256 = "already-published"
+
+                        def cleanup_failure() -> None:
+                            barrier.wait(timeout=1.0)
+                            raise PermissionError(
+                                errno.EPERM,
+                                "injected cleanup EPERM",
+                            )
+
+                        coordinator._terminate_workload = cleanup_failure
+                        coordinators.append(coordinator)
+
+                    def invoke(rank: int) -> None:
+                        try:
+                            coordinators[rank].fail(
+                                TRANSACTION.PeerAbort(f"primary failure rank {rank}")
+                            )
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    threads = [
+                        threading.Thread(target=invoke, args=(rank,))
+                        for rank in (0, 1)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=2.0)
+                    self.assertTrue(all(not thread.is_alive() for thread in threads))
+                    self.assertEqual(errors, [])
+                    outcome, _ = transactions[0].read_json("OUTCOME.json")
+                    self.assertEqual(outcome["status"], "FAILED")
+                    self.assertIn("cleanup: PermissionError", outcome["reason"])
+                    self.assertIn("injected cleanup EPERM", outcome["reason"])
+                    self.assertFalse(
+                        any(
+                            path.name.startswith(".tmp.OUTCOME.json.")
+                            for path in root.iterdir()
+                        )
+                    )
+                finally:
+                    for transaction in transactions:
+                        transaction.close()
+
 HARNESS = r"""
 import errno
 import json
@@ -666,6 +831,50 @@ def fake_source(args):
 
 module._runner_evidence = fake_runner
 module._source_evidence = fake_source
+
+group_error_rank = os.environ.get("SEMTALK_TEST_GROUP_SIGNAL_ERROR_RANK")
+if group_error_rank is not None:
+    argument_rank = int(sys.argv[sys.argv.index("--node-rank") + 1])
+    if argument_rank == int(group_error_rank):
+        group_error_marker = os.environ["SEMTALK_TEST_GROUP_SIGNAL_ERROR_MARKER"]
+        tracker_marker = os.environ["SEMTALK_TEST_TRACKER_SIGNAL_MARKER"]
+        original_tracker_signal = module._DescendantTracker.signal_live
+
+        def injected_group_error(pgid, signum):
+            fd = os.open(
+                group_error_marker,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            try:
+                os.write(fd, f"pid={os.getpid()} pgid={pgid} signal={signum}\n".encode())
+            finally:
+                os.close(fd)
+            raise PermissionError(errno.EPERM, "injected real killpg EPERM")
+
+        def observed_tracker_signal(self, signum):
+            result = original_tracker_signal(self, signum)
+            if signum == module.signal.SIGKILL:
+                fd = os.open(
+                    tracker_marker,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                try:
+                    owner = int(os.getpid() == self.supervisor_pid)
+                    os.write(
+                        fd,
+                        (
+                            f"pid={os.getpid()} supervisor_owner={owner} "
+                            f"signal={signum}\n"
+                        ).encode(),
+                    )
+                finally:
+                    os.close(fd)
+            return result
+
+        module.os.killpg = injected_group_error
+        module._DescendantTracker.signal_live = observed_tracker_signal
 
 identity_offset = int(os.environ.get("SEMTALK_TEST_ARTIFACT_IDENTITY_OFFSET", "0"))
 artifact_tamper = os.environ.get("SEMTALK_TEST_ARTIFACT_PORTABLE_TAMPER")
@@ -1790,6 +1999,79 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             "SUCCEEDED",
         )
 
+    def test_group_signal_eperm_still_pidfd_kills_and_reaps_descendants(
+        self,
+    ) -> None:
+        transaction_root = self.root / "group_signal_eperm"
+        configuration = self._configuration(
+            seconds0=0.1,
+            seconds1=8.0,
+            rc0=9,
+            descendants=True,
+            ignore_term=True,
+            setsid=True,
+        )
+        group_marker = self.root / "group-signal-errors.log"
+        tracker_marker = self.root / "tracker-signals.log"
+        environment = {
+            "SEMTALK_TEST_GROUP_SIGNAL_ERROR_RANK": "0",
+            "SEMTALK_TEST_GROUP_SIGNAL_ERROR_MARKER": str(group_marker),
+            "SEMTALK_TEST_TRACKER_SIGNAL_MARKER": str(tracker_marker),
+        }
+        node1 = self._start(
+            self._command(1, transaction_root, configuration),
+            extra_environment=environment,
+        )
+        node0 = self._start(
+            self._command(0, transaction_root, configuration),
+            extra_environment=environment,
+        )
+        descendant_markers = [
+            self.root / "markers" / f"descendant.rank{rank}"
+            for rank in (0, 1)
+        ]
+        for marker in descendant_markers:
+            self._wait_for(marker)
+        descendant_pids = [int(marker.read_text()) for marker in descendant_markers]
+        self.assertNotEqual(self._wait_process(node0), 0)
+        self.assertNotEqual(self._wait_process(node1), 0)
+        self._wait_for(group_marker)
+        self._wait_for(tracker_marker)
+
+        started = json.loads(
+            (transaction_root / "STARTED.rank0.json").read_text()
+        )
+        supervisor_pid = started["supervisor"]["pid"]
+        group_events = group_marker.read_text().splitlines()
+        self.assertTrue(
+            any(f"signal={signal.SIGTERM}" in line for line in group_events)
+        )
+        self.assertTrue(
+            any(f"signal={signal.SIGKILL}" in line for line in group_events)
+        )
+        self.assertTrue(
+            all(f"pid={supervisor_pid} " in line for line in group_events),
+            group_events,
+        )
+        tracker_events = tracker_marker.read_text().splitlines()
+        self.assertTrue(
+            any(
+                "supervisor_owner=1" in line
+                and f"signal={signal.SIGKILL}" in line
+                for line in tracker_events
+            ),
+            tracker_events,
+        )
+        self.assertTrue(
+            all(not self._pid_is_live(pid) for pid in descendant_pids),
+            descendant_pids,
+        )
+        outcome = json.loads((transaction_root / "OUTCOME.json").read_text())
+        self.assertEqual(outcome["status"], "FAILED")
+        self.assertIn("group SIGTERM", outcome["reason"])
+        self.assertIn("permission denied signalling exact workgroup", outcome["reason"])
+        self.assertIn("errno=1", outcome["reason"])
+
     def test_pid_reuse_starttime_change_is_never_signalled(self) -> None:
         from scripts.show_base import dual_node_guarded_transaction as module
 
@@ -1904,7 +2186,15 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         )
         self.assertNotEqual(self._wait_process(node0), 0)
         self.assertNotEqual(self._wait_process(node1), 0)
-        self.assertFalse((parent0 / "same_run" / "OUTCOME.json").exists())
+        # Rank zero created the only valid namespace and must leave a durable
+        # failure receipt when its impossible peer never joins.  Rank one is
+        # rejected before it can create anything under the wrong parent.
+        self.assertEqual(
+            json.loads(
+                (parent0 / "same_run" / "OUTCOME.json").read_text()
+            )["status"],
+            "FAILED",
+        )
         self.assertFalse((parent1 / "same_run" / "OUTCOME.json").exists())
 
     def test_run_id_is_bound_to_root_basename(self) -> None:

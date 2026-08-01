@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Strict TalkSHOW released2 validation authority for SemTalk Base.
+"""Selected-five inference and TalkSHOW compatibility validation authority.
 
-This module is the only formal validation contract used by fresh Base
-training, validation inference, winner selection, and independent metric
-replay. Historical evaluator contracts are intentionally outside this
-authority: selection is TalkSHOW body.released2 FGD, followed by one complete
-TalkSHOW body/face evaluation of the frozen winner.
+This module validates the fresh five-prerequisite inference closure and keeps
+the TalkSHOW released2/paper16 report available as a compatibility result.  It
+is never the Base checkpoint-selection authority.  Formal Base selection is
+owned by :mod:`base_long_val_contract` and uses only DiffSHEG SHOW validation
+FGD; the frozen winner is then evaluated exactly once on the final test split.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ FRESH_PREREQUISITE_CONSUMPTION = {
         "global_translation_reconstruction": True,
     },
 }
-FRESH_PIPELINE_SOURCE_FILES = (
+TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/__init__.py",
     "scripts/show_base/talkshow_base_val_contract.py",
     "scripts/show_base/base_long_val_contract.py",
@@ -126,6 +126,8 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "models/utils/layer.py",
     "models/utils/skeleton.py",
 )
+# Backward-compatible name for archived compatibility receipts.
+FRESH_PIPELINE_SOURCE_FILES = TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES
 _TEST_PATH_LABEL_TOKENS = frozenset(
     {"test", "tests", "testset", "testsets"}
 )
@@ -1172,7 +1174,7 @@ def build_fresh_pipeline_source_receipt(source_root: Path) -> dict[str, Any]:
             "checkout with no local branch at HEAD"
         )
     files: dict[str, dict[str, Any]] = {}
-    for relative in FRESH_PIPELINE_SOURCE_FILES:
+    for relative in TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES:
         path = root / relative
         resolved, payload = _safe_file_snapshot(
             path, f"fresh Base source {relative}"

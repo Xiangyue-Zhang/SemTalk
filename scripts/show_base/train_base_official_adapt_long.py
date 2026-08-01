@@ -37,6 +37,7 @@ The executable modes are:
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import hashlib
 import io
 import json
@@ -174,6 +175,13 @@ SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE = (
 )
 SHORT_QUALITY_REFERENCE_EPOCHS = (1, 2, 4, 8)
 SHORT_QUALITY_CANDIDATE_EPOCHS = (1, 2, 4, 8, 16, 32)
+TOPOLOGY_MAX_TRAINING_SECONDS = 24 * 60 * 60
+TOPOLOGY_MAX_P99_TRAINING_SECONDS = 22 * 60 * 60
+TOPOLOGY_QUALITY_SKIP_POLICY = (
+    "non_w1_median_full400_gt_24h_or_p99_full400_gt_22h_v1"
+)
+TOPOLOGY_MEDIAN_SKIP_REASON = "median_full400_gt_24h"
+TOPOLOGY_P99_SKIP_REASON = "p99_full400_gt_22h"
 MAX_ABSOLUTE_FGD_REGRESSION = 0.01
 MAX_RELATIVE_FGD_REGRESSION = 0.02
 SHORT_QUALITY_MODE = "short_quality"
@@ -376,6 +384,9 @@ TOPOLOGY_SELECTION_FORMAT = "semtalk_show_base_topology_selection_v2"
 PROTOCOL_FORMAT = "semtalk_show_base_official_adapt_long_protocol_v1"
 READY_RECEIPT_FORMAT = (
     "semtalk_show_base_official_adapt_long_candidate_ready_v1"
+)
+DEFERRED_CANDIDATE_FORMAT = (
+    "semtalk_show_base_official_adapt_long_deferred_candidate_v1"
 )
 SCHEDULE_FORMAT = "semtalk_show_base_long_schedule_v1"
 FRESH_SCHEDULE_FORMAT = "semtalk_show_base_fresh_lineage_schedule_v1"
@@ -2623,6 +2634,186 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(directory)
 
 
+def _write_new_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
+    """Publish one private torch payload without replacement.
+
+    The deferred e1 snapshot is crash evidence, not a public candidate.  It
+    therefore uses the same fsync discipline as public checkpoints while
+    retaining create-new semantics so a stale/restarted run cannot silently
+    replace the exact epoch-bound state.
+    """
+
+    import torch
+
+    parent_stat = os.lstat(path.parent)
+    if (
+        stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        or path.parent.resolve(strict=True) != path.parent
+    ):
+        raise AdaptationContractError(
+            "deferred candidate directory must be canonical mode 0700"
+        )
+    if path.is_symlink() or os.path.lexists(path):
+        raise FileExistsError(
+            f"refusing to overwrite deferred candidate state: {path}"
+        )
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    created_inode: tuple[int, int] | None = None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        os.fchmod(descriptor, 0o400)
+        opened = os.fstat(descriptor)
+        created_inode = (int(opened.st_dev), int(opened.st_ino))
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with handle:
+            torch.save(dict(payload), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            completed = os.fstat(handle.fileno())
+        named = os.stat(temporary, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or (int(completed.st_dev), int(completed.st_ino))
+            != created_inode
+            or (int(named.st_dev), int(named.st_ino)) != created_inode
+            or stat.S_IMODE(named.st_mode) != 0o400
+        ):
+            raise AdaptationContractError(
+                "deferred candidate temporary inode changed during save"
+            )
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError(
+                f"refusing to overwrite deferred candidate state: {path}"
+            ) from None
+        published = os.stat(path, follow_symlinks=False)
+        if (
+            (int(published.st_dev), int(published.st_ino)) != created_inode
+            or not stat.S_ISREG(published.st_mode)
+            or stat.S_IMODE(published.st_mode) != 0o400
+        ):
+            raise AdaptationContractError(
+                "deferred candidate publication did not preserve its inode"
+            )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created_inode is not None and os.path.lexists(temporary):
+            current = os.stat(temporary, follow_symlinks=False)
+            if (int(current.st_dev), int(current.st_ino)) == created_inode:
+                temporary.unlink()
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _write_new_private_json(path: Path, payload: Mapping[str, Any]) -> None:
+    parent_stat = os.lstat(path.parent)
+    if (
+        stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        or path.parent.resolve(strict=True) != path.parent
+    ):
+        raise AdaptationContractError(
+            "deferred candidate directory must be canonical mode 0700"
+        )
+    if path.is_symlink() or os.path.lexists(path):
+        raise FileExistsError(
+            f"refusing to overwrite deferred candidate receipt: {path}"
+        )
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    created_inode: tuple[int, int] | None = None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        os.fchmod(descriptor, 0o400)
+        opened = os.fstat(descriptor)
+        created_inode = (int(opened.st_dev), int(opened.st_ino))
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+            completed = os.fstat(handle.fileno())
+        named = os.stat(temporary, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or (int(completed.st_dev), int(completed.st_ino))
+            != created_inode
+            or (int(named.st_dev), int(named.st_ino)) != created_inode
+            or stat.S_IMODE(named.st_mode) != 0o400
+        ):
+            raise AdaptationContractError(
+                "deferred candidate receipt temporary inode changed"
+            )
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError(
+                f"refusing to overwrite deferred candidate receipt: {path}"
+            ) from None
+        published = os.stat(path, follow_symlinks=False)
+        if (
+            (int(published.st_dev), int(published.st_ino)) != created_inode
+            or not stat.S_ISREG(published.st_mode)
+            or stat.S_IMODE(published.st_mode) != 0o400
+        ):
+            raise AdaptationContractError(
+                "deferred candidate receipt publication changed inode"
+            )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created_inode is not None and os.path.lexists(temporary):
+            current = os.stat(temporary, follow_symlinks=False)
+            if (int(current.st_dev), int(current.st_ino)) == created_inode:
+                temporary.unlink()
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def _unwrap_model(model: Any) -> Any:
     return model.module if hasattr(model, "module") else model
 
@@ -3091,6 +3282,7 @@ def _save_candidate(
     contract_receipts: Mapping[str, Any],
     manifest: dict[str, Any],
     provisional: bool,
+    model_state_override: Mapping[str, Any] | None = None,
 ) -> None:
     candidate_epochs = (
         tuple(manifest["candidate_epochs"])
@@ -3109,9 +3301,13 @@ def _save_candidate(
     checkpoint_path = run_dir / checkpoint_relative
     if checkpoint_path.exists() or checkpoint_path.is_symlink():
         raise AdaptationContractError(f"candidate already exists: {checkpoint_path}")
+    state_source = (
+        model_state_override
+        if model_state_override is not None
+        else _unwrap_model(model).state_dict()
+    )
     model_state = {
-        key: value.detach().cpu()
-        for key, value in _unwrap_model(model).state_dict().items()
+        key: value.detach().cpu() for key, value in state_source.items()
     }
     semantic_sha = _model_state_semantic_sha256(model_state)
     trajectory_contract = contract_receipts["trajectory_anchor"]
@@ -3290,6 +3486,984 @@ def _save_candidate(
             "receipt_payload_sha256": canonical_json_sha256(ready_body),
         },
     )
+
+
+def _deferred_candidate_required(
+    *,
+    provisional: bool,
+    trajectory_mode: str,
+    updates_per_epoch: int,
+) -> bool:
+    """Return whether e1 ends before the immutable trajectory gate.
+
+    The selected single-node global-2048 topology satisfies this predicate
+    (62 < 70) in both short-quality and formal training.  W8G1024, W16G1024,
+    global512, and the W1 reference all publish e1 through the unchanged
+    direct path.
+    """
+
+    return (
+        isinstance(provisional, bool)
+        and trajectory_mode == FRESH_TRAJECTORY_MODE
+        and updates_per_epoch < TRAJECTORY_PROBE_UPDATES
+    )
+
+
+def _deferred_candidate_path(run_dir: Path) -> Path:
+    return run_dir / ".private_candidate_staging" / "epoch-0001.bin"
+
+
+def _deferred_candidate_receipt_path(run_dir: Path) -> Path:
+    return run_dir / ".private_candidate_staging" / "epoch-0001.json"
+
+
+def _deferred_public_paths(
+    run_dir: Path,
+    *,
+    provisional: bool,
+) -> dict[str, Any]:
+    if provisional:
+        checkpoint_relative = (
+            "provisional_candidates/"
+            "base_official_adapt_short_quality_epoch_01.bin"
+        )
+        snapshot_relative = (
+            "short_quality_candidate_manifest_snapshots/epoch-0001.json"
+        )
+        ready_relative = (
+            "short_quality_candidate_receipts/epoch-0001.json"
+        )
+        manifest_relative = "short_quality_candidate_manifest.json"
+        manifest_format = SHORT_QUALITY_MANIFEST_FORMAT
+        ready_format = SHORT_QUALITY_READY_RECEIPT_FORMAT
+        checkpoint_format = SHORT_QUALITY_CHECKPOINT_FORMAT
+    else:
+        checkpoint_relative = "candidates/base_official_adapt_epoch_01.bin"
+        snapshot_relative = "candidate_manifest_snapshots/epoch-0001.json"
+        ready_relative = "candidate_receipts/epoch-0001.json"
+        manifest_relative = "candidate_manifest.json"
+        manifest_format = MANIFEST_FORMAT
+        ready_format = READY_RECEIPT_FORMAT
+        checkpoint_format = CHECKPOINT_FORMAT
+    return {
+        "checkpoint": run_dir / checkpoint_relative,
+        "checkpoint_relative": checkpoint_relative,
+        "snapshot": run_dir / snapshot_relative,
+        "ready": run_dir / ready_relative,
+        "live_manifest": run_dir / manifest_relative,
+        "manifest_format": manifest_format,
+        "ready_format": ready_format,
+        "checkpoint_format": checkpoint_format,
+    }
+
+
+def _deferred_frozen_inputs_seal(
+    *,
+    run_dir: Path,
+    frozen_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind deferred e1 to the exact canonical frozen-inputs inode.
+
+    The file is read, hashed, and parsed from one no-follow descriptor by the
+    shared immutable-file helper.  In addition to byte identity, the parsed
+    JSON must still be the in-memory preflight receipt and retain its valid
+    self-hash.  This prevents a preflight-to-e1 replacement from becoming a
+    new source of truth merely because it has the same pathname and type.
+    """
+
+    expected_path = run_dir / "frozen_inputs.json"
+    resolved, payload, identity = _read_regular_file_bytes(
+        expected_path,
+        "deferred e1 frozen inputs",
+    )
+    observed_receipt = _strict_json_bytes(
+        payload,
+        "deferred e1 frozen inputs",
+    )
+    try:
+        expected_receipt = json.loads(
+            json.dumps(
+                frozen_receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise AdaptationContractError(
+            "in-memory frozen inputs are not strict canonical JSON"
+        ) from error
+    unsigned_receipt = dict(observed_receipt)
+    claimed_receipt_sha = unsigned_receipt.pop("receipt_sha256", None)
+    if (
+        not expected_path.is_absolute()
+        or run_dir.resolve(strict=True) != run_dir
+        or resolved != expected_path
+        or observed_receipt != expected_receipt
+        or _require_sha256(
+            claimed_receipt_sha,
+            "deferred e1 frozen inputs self-hash",
+        )
+        != canonical_json_sha256(unsigned_receipt)
+    ):
+        raise AdaptationContractError(
+            "deferred e1 frozen inputs differ from immutable preflight"
+        )
+    return {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+        "identity": identity,
+        "receipt_payload_sha256": claimed_receipt_sha,
+    }
+
+
+def _deferred_run_context(
+    *,
+    provisional: bool,
+    run_dir: Path,
+    frozen_receipt: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_format = (
+        SHORT_QUALITY_MANIFEST_FORMAT if provisional else MANIFEST_FORMAT
+    )
+    expected_purpose = (
+        RUN_PURPOSE_SHORT_QUALITY
+        if provisional
+        else RUN_PURPOSE_FORMAL_TRAINING
+    )
+    candidate_epochs = manifest.get("candidate_epochs")
+    throughput_gate = manifest.get("throughput_gate")
+    expected_probe = (
+        throughput_gate.get("trajectory_probe")
+        if isinstance(throughput_gate, dict)
+        else None
+    )
+    if (
+        manifest.get("format") != expected_format
+        or not isinstance(candidate_epochs, list)
+        or not candidate_epochs
+        or not isinstance(throughput_gate, dict)
+        or not isinstance(expected_probe, dict)
+    ):
+        raise AdaptationContractError(
+            "deferred e1 manifest context is stale or incompatible"
+        )
+    try:
+        frozen_gate = json.loads(
+            json.dumps(
+                throughput_gate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+        frozen_probe = json.loads(
+            json.dumps(
+                expected_probe,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise AdaptationContractError(
+            "deferred e1 throughput gate is not strict canonical JSON"
+        ) from error
+    context: dict[str, Any] = {
+        "provisional": provisional,
+        "run_purpose": expected_purpose,
+        "candidate_epochs": list(candidate_epochs),
+        "throughput_gate_canonical_sha256": canonical_json_sha256(
+            frozen_gate
+        ),
+        "expected_trajectory_probe": frozen_probe,
+        "expected_trajectory_probe_canonical_sha256": (
+            canonical_json_sha256(frozen_probe)
+        ),
+        "frozen_inputs_seal": _deferred_frozen_inputs_seal(
+            run_dir=run_dir,
+            frozen_receipt=frozen_receipt,
+        ),
+    }
+    if provisional:
+        quality_context = {
+            "target_epochs": manifest.get("target_epochs"),
+            "quality_protocol_version": manifest.get(
+                "quality_protocol_version"
+            ),
+            "artifact_root_namespace": manifest.get(
+                "artifact_root_namespace"
+            ),
+            "artifact_root": manifest.get("artifact_root"),
+            "quality_role": manifest.get("quality_role"),
+            "reference_only": manifest.get("reference_only"),
+            "late_w1_status": manifest.get("late_w1_status"),
+            "w1_tail_equivalence_claimed": manifest.get(
+                "w1_tail_equivalence_claimed"
+            ),
+        }
+        if (
+            manifest.get("run_purpose") != RUN_PURPOSE_SHORT_QUALITY
+            or candidate_epochs != list(SHORT_QUALITY_CANDIDATE_EPOCHS)
+            or quality_context["target_epochs"] != candidate_epochs
+            or quality_context["quality_protocol_version"]
+            != SHORT_QUALITY_PROTOCOL_VERSION
+            or quality_context["artifact_root_namespace"]
+            != SHORT_QUALITY_ARTIFACT_ROOT_NAMESPACE
+            or quality_context["artifact_root"] != str(run_dir)
+            or quality_context["quality_role"] != "candidate_quality"
+            or quality_context["reference_only"] is not False
+            or quality_context["late_w1_status"] != "not_measured"
+            or quality_context["w1_tail_equivalence_claimed"] is not False
+        ):
+            raise AdaptationContractError(
+                "deferred short-quality e1 context is incomplete"
+            )
+        context.update(quality_context)
+    elif candidate_epochs != list(CANDIDATE_EPOCHS):
+        raise AdaptationContractError(
+            "deferred formal e1 candidate epochs changed"
+        )
+    return context
+
+
+def _stage_deferred_candidate(
+    *,
+    model: Any,
+    optimizer: Any,
+    run_dir: Path,
+    epoch: int,
+    optimizer_updates: int,
+    frozen_receipt: Mapping[str, Any],
+    contract_receipts: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    provisional: bool,
+) -> Path:
+    """Snapshot exact e1 model bytes without making them validation-visible."""
+
+    if (
+        epoch != 1
+        or optimizer_updates != EXPECTED_UPDATES_PER_EPOCH
+        or EXPECTED_UPDATES_PER_EPOCH >= TRAJECTORY_PROBE_UPDATES
+        or contract_receipts["trajectory_anchor"].get("mode")
+        != FRESH_TRAJECTORY_MODE
+        or manifest.get("trajectory_probe_verified") is not False
+        or manifest.get("trajectory_probe") is not None
+        or manifest.get("entries") != []
+    ):
+        raise AdaptationContractError(
+            "deferred publication is only valid for pre-gate formal e1"
+        )
+    _finite_model_and_optimizer(model, optimizer)
+    model_state = {
+        key: value.detach().cpu()
+        for key, value in _unwrap_model(model).state_dict().items()
+    }
+    semantic_sha = _model_state_semantic_sha256(model_state)
+    public = _deferred_public_paths(run_dir, provisional=provisional)
+    context = _deferred_run_context(
+        provisional=provisional,
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        manifest=manifest,
+    )
+    payload = {
+        "format": DEFERRED_CANDIDATE_FORMAT,
+        "epoch": epoch,
+        "optimizer_updates": optimizer_updates,
+        "checkpoint_format": public["checkpoint_format"],
+        "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+        "schedule_sha256": contract_receipts["schedule"]["sha256"],
+        "trajectory_anchor_sha256": contract_receipts[
+            "trajectory_anchor"
+        ]["sha256"],
+        "trajectory_mode": FRESH_TRAJECTORY_MODE,
+        "model_state_tensors": len(model_state),
+        "model_state_schema_sha256": _state_schema_sha256(model_state),
+        "model_state_semantic_sha256": semantic_sha,
+        "all_model_state_tensors_finite": True,
+        "selection_eligible": False,
+        "test_visible": False,
+        "model_state": model_state,
+        **context,
+    }
+    path = _deferred_candidate_path(run_dir)
+    private_root = path.parent
+    public_paths = (public["checkpoint"], public["snapshot"], public["ready"])
+    if os.path.lexists(private_root) or any(
+        os.path.lexists(public) for public in public_paths
+    ):
+        raise AdaptationContractError(
+            "refusing stale, restarted, or already-public deferred e1"
+        )
+    private_root.mkdir(mode=0o700)
+    if stat.S_IMODE(os.lstat(private_root).st_mode) != 0o700:
+        raise AdaptationContractError(
+            "deferred candidate staging directory is not mode 0700"
+        )
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    _write_new_torch_save(path, payload)
+    staged_sha = sha256_file(path)
+    receipt_body = {
+        "format": "semtalk_show_base_official_adapt_long_deferred_candidate_receipt_v1",
+        "status": "staged_private",
+        "epoch": epoch,
+        "optimizer_updates": optimizer_updates,
+        "selection_eligible": False,
+        "test_visible": False,
+        "staged_file": {
+            "path": str(path.resolve(strict=True)),
+            "sha256": staged_sha,
+            "bytes": path.stat().st_size,
+        },
+        "model_state_tensors": len(model_state),
+        "model_state_schema_sha256": _state_schema_sha256(model_state),
+        "model_state_semantic_sha256": semantic_sha,
+        "frozen_receipt_sha256": frozen_receipt["receipt_sha256"],
+        "schedule_sha256": contract_receipts["schedule"]["sha256"],
+        "trajectory_anchor_sha256": contract_receipts[
+            "trajectory_anchor"
+        ]["sha256"],
+        "trajectory_mode": FRESH_TRAJECTORY_MODE,
+        **context,
+    }
+    _write_new_private_json(
+        _deferred_candidate_receipt_path(run_dir),
+        {
+            **receipt_body,
+            "receipt_payload_sha256": canonical_json_sha256(receipt_body),
+        },
+    )
+    return path
+
+
+def _load_deferred_candidate(
+    *,
+    run_dir: Path,
+    frozen_receipt: Mapping[str, Any],
+    contract_receipts: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    provisional: bool,
+) -> tuple[Path, dict[str, Any]]:
+    """Replay the private e1 snapshot before public create-new publication."""
+
+    import torch
+
+    path = _deferred_candidate_path(run_dir)
+    receipt_path = _deferred_candidate_receipt_path(run_dir)
+    private_root = path.parent
+    public = _deferred_public_paths(run_dir, provisional=provisional)
+    context = _deferred_run_context(
+        provisional=provisional,
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        manifest=manifest,
+    )
+    if (
+        not private_root.is_absolute()
+        or private_root.is_symlink()
+        or not private_root.is_dir()
+        or private_root.resolve(strict=True) != private_root
+        or stat.S_IMODE(os.lstat(private_root).st_mode) != 0o700
+        or set(private_root.iterdir()) != {path, receipt_path}
+        or not path.is_absolute()
+        or path.is_symlink()
+        or not path.is_file()
+        or path.resolve(strict=True) != path
+        or receipt_path.is_symlink()
+        or not receipt_path.is_file()
+        or receipt_path.resolve(strict=True) != receipt_path
+        or stat.S_IMODE(os.lstat(path).st_mode) != 0o400
+        or stat.S_IMODE(os.lstat(receipt_path).st_mode) != 0o400
+    ):
+        raise AdaptationContractError(
+            "deferred e1 staging namespace is absent, stale, or unsafe"
+        )
+    receipt = _strict_json_bytes(
+        receipt_path.read_bytes(), "deferred e1 sidecar receipt"
+    )
+    receipt_exact_keys = {
+        "format",
+        "status",
+        "epoch",
+        "optimizer_updates",
+        "selection_eligible",
+        "test_visible",
+        "staged_file",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "frozen_receipt_sha256",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "trajectory_mode",
+        "receipt_payload_sha256",
+    } | set(context)
+    receipt_unsigned = dict(receipt) if isinstance(receipt, dict) else {}
+    receipt_claimed = receipt_unsigned.pop("receipt_payload_sha256", None)
+    staged_artifact = receipt.get("staged_file") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != receipt_exact_keys
+        or receipt.get("format")
+        != "semtalk_show_base_official_adapt_long_deferred_candidate_receipt_v1"
+        or receipt.get("status") != "staged_private"
+        or receipt.get("epoch") != 1
+        or receipt.get("optimizer_updates") != EXPECTED_UPDATES_PER_EPOCH
+        or receipt.get("selection_eligible") is not False
+        or receipt.get("test_visible") is not False
+        or not isinstance(staged_artifact, dict)
+        or set(staged_artifact) != {"path", "sha256", "bytes"}
+        or staged_artifact.get("path") != str(path)
+        or staged_artifact.get("sha256") != sha256_file(path)
+        or staged_artifact.get("bytes") != path.stat().st_size
+        or receipt.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or receipt.get("schedule_sha256")
+        != contract_receipts["schedule"]["sha256"]
+        or receipt.get("trajectory_anchor_sha256")
+        != contract_receipts["trajectory_anchor"]["sha256"]
+        or receipt.get("trajectory_mode") != FRESH_TRAJECTORY_MODE
+        or any(receipt.get(key) != value for key, value in context.items())
+        or not isinstance(receipt_claimed, str)
+        or canonical_json_sha256(receipt_unsigned) != receipt_claimed
+    ):
+        raise AdaptationContractError(
+            "deferred e1 sidecar receipt or staged bytes changed"
+        )
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError as error:  # pragma: no cover - formal runtime supports it
+        raise AdaptationContractError(
+            "deferred e1 replay requires torch.load(weights_only=True)"
+        ) from error
+    exact_keys = {
+        "format",
+        "epoch",
+        "optimizer_updates",
+        "checkpoint_format",
+        "frozen_receipt_sha256",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "trajectory_mode",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "all_model_state_tensors_finite",
+        "selection_eligible",
+        "test_visible",
+        "model_state",
+    } | set(context)
+    state = payload.get("model_state") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != exact_keys
+        or payload.get("format") != DEFERRED_CANDIDATE_FORMAT
+        or payload.get("epoch") != 1
+        or payload.get("optimizer_updates") != EXPECTED_UPDATES_PER_EPOCH
+        or payload.get("checkpoint_format") != public["checkpoint_format"]
+        or payload.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or payload.get("schedule_sha256")
+        != contract_receipts["schedule"]["sha256"]
+        or payload.get("trajectory_anchor_sha256")
+        != contract_receipts["trajectory_anchor"]["sha256"]
+        or payload.get("trajectory_mode") != FRESH_TRAJECTORY_MODE
+        or payload.get("all_model_state_tensors_finite") is not True
+        or payload.get("selection_eligible") is not False
+        or payload.get("test_visible") is not False
+        or any(payload.get(key) != value for key, value in context.items())
+        or not isinstance(state, Mapping)
+        or payload.get("model_state_tensors") != len(state)
+        or payload.get("model_state_tensors")
+        != receipt.get("model_state_tensors")
+        or payload.get("model_state_schema_sha256")
+        != _state_schema_sha256(state)
+        or payload.get("model_state_schema_sha256")
+        != receipt.get("model_state_schema_sha256")
+        or payload.get("model_state_semantic_sha256")
+        != _model_state_semantic_sha256(state)
+        or payload.get("model_state_semantic_sha256")
+        != receipt.get("model_state_semantic_sha256")
+    ):
+        raise AdaptationContractError(
+            "deferred e1 candidate changed before trajectory-gated publication"
+        )
+    for name, tensor in state.items():
+        if (
+            not isinstance(name, str)
+            or not hasattr(tensor, "isfinite")
+            or not bool(tensor.isfinite().all().item())
+        ):
+            raise AdaptationContractError(
+                "deferred e1 candidate contains a non-finite model tensor"
+            )
+    return path, payload
+
+
+def _publish_deferred_candidate(
+    *,
+    model: Any,
+    optimizer: Any,
+    run_dir: Path,
+    frozen_receipt: Mapping[str, Any],
+    contract_receipts: Mapping[str, Any],
+    manifest: dict[str, Any],
+    provisional: bool,
+) -> None:
+    """Publish staged e1 only after the unchanged update-70 gate succeeds."""
+
+    if (
+        manifest.get("trajectory_probe_verified") is not True
+        or manifest.get("trajectory_mode") != FRESH_TRAJECTORY_MODE
+        or manifest.get("entries") != []
+    ):
+        raise AdaptationContractError(
+            "deferred e1 publication requires a verified empty-prefix manifest"
+        )
+    _deferred_run_context(
+        provisional=provisional,
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        manifest=manifest,
+    )
+    public = _deferred_public_paths(run_dir, provisional=provisional)
+    path, payload = _load_deferred_candidate(
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        contract_receipts=contract_receipts,
+        manifest=manifest,
+        provisional=provisional,
+    )
+    if (
+        canonical_json_sha256(manifest["throughput_gate"])
+        != payload["throughput_gate_canonical_sha256"]
+        or manifest.get("trajectory_probe")
+        != payload["expected_trajectory_probe"]
+        or canonical_json_sha256(manifest.get("trajectory_probe"))
+        != payload["expected_trajectory_probe_canonical_sha256"]
+    ):
+        raise AdaptationContractError(
+            "deferred e1 publication trajectory gate differs from staging"
+        )
+    _save_candidate(
+        model=model,
+        optimizer=optimizer,
+        run_dir=run_dir,
+        epoch=1,
+        optimizer_updates=EXPECTED_UPDATES_PER_EPOCH,
+        frozen_receipt=frozen_receipt,
+        contract_receipts=contract_receipts,
+        manifest=manifest,
+        provisional=provisional,
+        model_state_override=payload["model_state"],
+    )
+    checkpoint_entry = manifest["entries"][0]
+    if (
+        checkpoint_entry.get("epoch") != 1
+        or checkpoint_entry.get("optimizer_updates")
+        != EXPECTED_UPDATES_PER_EPOCH
+        or checkpoint_entry.get("model_state_semantic_sha256")
+        != payload["model_state_semantic_sha256"]
+        or not public["ready"].is_file()
+    ):
+        raise AdaptationContractError(
+            "deferred e1 publication did not preserve the staged model state"
+        )
+    _cleanup_deferred_candidate_after_publication(
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        contract_receipts=contract_receipts,
+        provisional=provisional,
+    )
+
+
+def _cleanup_deferred_candidate_after_publication(
+    *,
+    run_dir: Path,
+    frozen_receipt: Mapping[str, Any],
+    contract_receipts: Mapping[str, Any],
+    provisional: bool,
+) -> None:
+    """Remove private bytes only after replaying the public ready closure.
+
+    This function is intentionally independently callable: a crash after the
+    public ready receipt is durable but before cleanup leaves a fail-closed
+    private namespace that can only be removed by this exact public/private
+    equivalence replay.  It never republishes or treats the staging payload as
+    a resume checkpoint.
+    """
+
+    import torch
+
+    public = _deferred_public_paths(run_dir, provisional=provisional)
+    checkpoint_path = public["checkpoint"]
+    snapshot_path = public["snapshot"]
+    ready_path = public["ready"]
+    for path, label in (
+        (checkpoint_path, "public deferred e1 checkpoint"),
+        (snapshot_path, "public deferred e1 manifest snapshot"),
+        (ready_path, "public deferred e1 ready receipt"),
+    ):
+        if path.is_symlink() or not path.is_file() or path.resolve() != path:
+            raise AdaptationContractError(f"{label} is not durable and canonical")
+    snapshot = _strict_json_bytes(
+        snapshot_path.read_bytes(), "public deferred e1 manifest snapshot"
+    )
+    ready = _strict_json_bytes(
+        ready_path.read_bytes(), "public deferred e1 ready receipt"
+    )
+    staged_path, staged_payload = _load_deferred_candidate(
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        contract_receipts=contract_receipts,
+        manifest=snapshot,
+        provisional=provisional,
+    )
+    private_root = staged_path.parent
+    receipt_path = _deferred_candidate_receipt_path(run_dir)
+    snapshot_keys = {
+        "format",
+        "status",
+        "candidate_epochs",
+        "frozen_receipt_sha256",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "throughput_gate",
+        "trajectory_mode",
+        "trajectory_probe_verified",
+        "trajectory_probe",
+        "entries",
+        "entries_sha256",
+    }
+    entry_keys = {
+        "epoch",
+        "optimizer_updates",
+        "checkpoint",
+        "checkpoint_sha256",
+        "checkpoint_bytes",
+        "checkpoint_container_schema",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+        "all_model_state_tensors_finite",
+        "frozen_receipt_sha256",
+        "trajectory_anchor_match",
+        "trajectory_probe_verified",
+    }
+    ready_keys = {
+        "format",
+        "status",
+        "selection_eligible",
+        "test_visible",
+        "epoch",
+        "optimizer_updates",
+        "candidate_checkpoint",
+        "candidate_manifest",
+        "frozen_inputs",
+        "protocol",
+        "frozen_receipt_sha256",
+        "schedule_sha256",
+        "trajectory_anchor_sha256",
+        "trajectory_anchor_match",
+        "published_unix",
+        "receipt_payload_sha256",
+    }
+    candidate_keys = {
+        "path",
+        "relative_path",
+        "sha256",
+        "bytes",
+        "model_state_tensors",
+        "model_state_schema_sha256",
+        "model_state_semantic_sha256",
+    }
+    candidate_manifest_keys = {
+        "path",
+        "sha256_at_ready",
+        "entries_sha256_at_ready",
+        "immutable_snapshot",
+        "live_path",
+    }
+    frozen_input_keys = {
+        "path",
+        "sha256",
+        "receipt_payload_sha256",
+    }
+    protocol_keys = {"format", "payload_sha256"}
+    quality_public_keys = {
+        "run_purpose",
+        "target_epochs",
+        "quality_protocol_version",
+        "artifact_root_namespace",
+        "artifact_root",
+        "quality_role",
+        "reference_only",
+        "late_w1_status",
+        "w1_tail_equivalence_claimed",
+    }
+    if provisional:
+        snapshot_keys |= quality_public_keys
+        entry_keys.add("run_purpose")
+        ready_keys |= quality_public_keys
+    entries = snapshot.get("entries") if isinstance(snapshot, dict) else None
+    entry = entries[0] if isinstance(entries, list) and len(entries) == 1 else None
+    candidate = ready.get("candidate_checkpoint") if isinstance(ready, dict) else None
+    ready_manifest = ready.get("candidate_manifest") if isinstance(ready, dict) else None
+    ready_frozen = ready.get("frozen_inputs") if isinstance(ready, dict) else None
+    ready_protocol = ready.get("protocol") if isinstance(ready, dict) else None
+    ready_unsigned = dict(ready) if isinstance(ready, dict) else {}
+    ready_claimed_sha = ready_unsigned.pop("receipt_payload_sha256", None)
+    context = _deferred_run_context(
+        provisional=provisional,
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+        manifest=snapshot,
+    )
+    staged_frozen_seal = staged_payload.get("frozen_inputs_seal")
+    current_frozen_seal = context["frozen_inputs_seal"]
+    expected_anchor = contract_receipts["trajectory_anchor"]["entries"].get(
+        "1"
+    )
+    expected_anchor_match = True if expected_anchor is not None else None
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != snapshot_keys
+        or snapshot.get("format") != public["manifest_format"]
+        or snapshot.get("status") != "running"
+        or snapshot.get("candidate_epochs") != context["candidate_epochs"]
+        or snapshot.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or snapshot.get("schedule_sha256")
+        != contract_receipts["schedule"]["sha256"]
+        or snapshot.get("trajectory_anchor_sha256")
+        != contract_receipts["trajectory_anchor"]["sha256"]
+        or not isinstance(snapshot.get("throughput_gate"), dict)
+        or canonical_json_sha256(snapshot.get("throughput_gate"))
+        != staged_payload.get("throughput_gate_canonical_sha256")
+        or snapshot.get("trajectory_mode") != FRESH_TRAJECTORY_MODE
+        or snapshot.get("trajectory_probe_verified") is not True
+        or not isinstance(snapshot.get("trajectory_probe"), dict)
+        or snapshot.get("trajectory_probe")
+        != staged_payload.get("expected_trajectory_probe")
+        or canonical_json_sha256(snapshot.get("trajectory_probe"))
+        != staged_payload.get(
+            "expected_trajectory_probe_canonical_sha256"
+        )
+        or not isinstance(entry, dict)
+        or set(entry) != entry_keys
+        or not isinstance(candidate, dict)
+        or set(candidate) != candidate_keys
+        or not isinstance(ready_manifest, dict)
+        or set(ready_manifest) != candidate_manifest_keys
+        or not isinstance(ready_frozen, dict)
+        or set(ready_frozen) != frozen_input_keys
+        or not isinstance(staged_frozen_seal, dict)
+        or current_frozen_seal != staged_frozen_seal
+        or not isinstance(ready_protocol, dict)
+        or set(ready_protocol) != protocol_keys
+        or snapshot.get("entries_sha256")
+        != canonical_json_sha256(entries)
+        or entry.get("epoch") != 1
+        or entry.get("optimizer_updates") != EXPECTED_UPDATES_PER_EPOCH
+        or entry.get("checkpoint") != public["checkpoint_relative"]
+        or entry.get("checkpoint_container_schema")
+        != ["audit", "model_state"]
+        or entry.get("model_state_tensors")
+        != staged_payload.get("model_state_tensors")
+        or entry.get("model_state_schema_sha256")
+        != staged_payload.get("model_state_schema_sha256")
+        or entry.get("model_state_semantic_sha256")
+        != staged_payload.get("model_state_semantic_sha256")
+        or entry.get("all_model_state_tensors_finite") is not True
+        or entry.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or entry.get("trajectory_anchor_match") is not expected_anchor_match
+        or entry.get("trajectory_probe_verified") is not True
+        or entry.get("checkpoint_sha256") != sha256_file(checkpoint_path)
+        or entry.get("checkpoint_bytes") != checkpoint_path.stat().st_size
+        or not isinstance(ready, dict)
+        or set(ready) != ready_keys
+        or ready.get("format") != public["ready_format"]
+        or ready.get("status") != "ready"
+        or ready.get("selection_eligible") is not False
+        or ready.get("test_visible") is not False
+        or ready.get("epoch") != 1
+        or ready.get("optimizer_updates") != EXPECTED_UPDATES_PER_EPOCH
+        or ready.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or ready.get("schedule_sha256")
+        != contract_receipts["schedule"]["sha256"]
+        or ready.get("trajectory_anchor_sha256")
+        != contract_receipts["trajectory_anchor"]["sha256"]
+        or ready.get("trajectory_anchor_match") is not expected_anchor_match
+        or not isinstance(ready.get("published_unix"), (int, float))
+        or isinstance(ready.get("published_unix"), bool)
+        or not math.isfinite(float(ready["published_unix"]))
+        or canonical_json_sha256(ready_unsigned) != ready_claimed_sha
+        or candidate.get("path") != str(checkpoint_path)
+        or candidate.get("relative_path") != public["checkpoint_relative"]
+        or candidate.get("sha256") != entry.get("checkpoint_sha256")
+        or candidate.get("bytes") != entry.get("checkpoint_bytes")
+        or candidate.get("model_state_tensors")
+        != staged_payload.get("model_state_tensors")
+        or candidate.get("model_state_schema_sha256")
+        != staged_payload.get("model_state_schema_sha256")
+        or candidate.get("model_state_semantic_sha256")
+        != staged_payload.get("model_state_semantic_sha256")
+        or ready_manifest.get("path") != str(snapshot_path)
+        or ready_manifest.get("sha256_at_ready")
+        != sha256_file(snapshot_path)
+        or ready_manifest.get("entries_sha256_at_ready")
+        != snapshot.get("entries_sha256")
+        or ready_manifest.get("immutable_snapshot") is not True
+        or ready_manifest.get("live_path")
+        != str(public["live_manifest"])
+        or ready_frozen.get("path")
+        != staged_frozen_seal.get("path")
+        or ready_frozen.get("sha256")
+        != staged_frozen_seal.get("sha256")
+        or ready_frozen.get("receipt_payload_sha256")
+        != staged_frozen_seal.get("receipt_payload_sha256")
+        or ready_frozen.get("receipt_payload_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or ready_protocol.get("format")
+        != frozen_receipt["protocol"]["format"]
+        or ready_protocol.get("payload_sha256")
+        != canonical_json_sha256(frozen_receipt["protocol"])
+        or (
+            provisional
+            and (
+                any(
+                    snapshot.get(key) != context[key]
+                    for key in quality_public_keys
+                )
+                or entry.get("run_purpose")
+                != context["run_purpose"]
+                or any(
+                    ready.get(key) != context[key]
+                    for key in quality_public_keys
+                )
+            )
+        )
+    ):
+        raise AdaptationContractError(
+            "public deferred e1 closure differs from private staged state"
+        )
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError as error:  # pragma: no cover - formal runtime supports it
+        raise AdaptationContractError(
+            "public deferred e1 replay requires torch.load(weights_only=True)"
+        ) from error
+    checkpoint_state = (
+        checkpoint.get("model_state") if isinstance(checkpoint, dict) else None
+    )
+    checkpoint_audit = (
+        checkpoint.get("audit") if isinstance(checkpoint, dict) else None
+    )
+    audit_keys = {
+        "format",
+        "completed_epochs",
+        "optimizer_updates",
+        "frozen_receipt_sha256",
+        "official_base_checkpoint_sha256",
+        "speaker_scope",
+        "speaker_rows",
+        "vq_models_in_training_graph",
+        "all_model_state_tensors_finite",
+        "model_state_semantic_sha256",
+        "trajectory_anchor_match",
+        "trajectory_probe_verified",
+    }
+    if provisional:
+        audit_keys |= quality_public_keys
+    if (
+        not isinstance(checkpoint, dict)
+        or set(checkpoint) != {"audit", "model_state"}
+        or not isinstance(checkpoint_state, Mapping)
+        or not isinstance(checkpoint_audit, dict)
+        or set(checkpoint_audit) != audit_keys
+        or len(checkpoint_state) != staged_payload.get("model_state_tensors")
+        or _state_schema_sha256(checkpoint_state)
+        != staged_payload.get("model_state_schema_sha256")
+        or _model_state_semantic_sha256(checkpoint_state)
+        != staged_payload.get("model_state_semantic_sha256")
+        or checkpoint_audit.get("format") != public["checkpoint_format"]
+        or checkpoint_audit.get("completed_epochs") != 1
+        or checkpoint_audit.get("optimizer_updates")
+        != EXPECTED_UPDATES_PER_EPOCH
+        or checkpoint_audit.get("frozen_receipt_sha256")
+        != frozen_receipt["receipt_sha256"]
+        or checkpoint_audit.get("official_base_checkpoint_sha256")
+        != OFFICIAL_BASE_SPEC["sha256"]
+        or checkpoint_audit.get("speaker_scope") != "SHOW_All"
+        or checkpoint_audit.get("speaker_rows") != [0, 1, 2, 3]
+        or checkpoint_audit.get("vq_models_in_training_graph") is not False
+        or checkpoint_audit.get("all_model_state_tensors_finite") is not True
+        or checkpoint_audit.get("model_state_semantic_sha256")
+        != staged_payload.get("model_state_semantic_sha256")
+        or checkpoint_audit.get("trajectory_anchor_match")
+        is not expected_anchor_match
+        or checkpoint_audit.get("trajectory_probe_verified") is not True
+        or (
+            provisional
+            and any(
+                checkpoint_audit.get(key) != context[key]
+                for key in quality_public_keys
+            )
+        )
+        or any(
+            not isinstance(name, str)
+            or not hasattr(tensor, "isfinite")
+            or not bool(tensor.isfinite().all().item())
+            for name, tensor in checkpoint_state.items()
+        )
+    ):
+        raise AdaptationContractError(
+            "public deferred e1 checkpoint differs from private staged state"
+        )
+    final_frozen_seal = _deferred_frozen_inputs_seal(
+        run_dir=run_dir,
+        frozen_receipt=frozen_receipt,
+    )
+    if (
+        final_frozen_seal != staged_frozen_seal
+        or ready_frozen.get("sha256")
+        != final_frozen_seal.get("sha256")
+        or ready_frozen.get("path") != final_frozen_seal.get("path")
+        or ready_frozen.get("receipt_payload_sha256")
+        != final_frozen_seal.get("receipt_payload_sha256")
+    ):
+        raise AdaptationContractError(
+            "frozen inputs changed during deferred e1 cleanup replay"
+        )
+    staged_path.unlink()
+    receipt_path.unlink()
+    directory = os.open(private_root, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    private_root.rmdir()
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _cpu_tree(value: Any) -> Any:
@@ -3619,6 +4793,89 @@ def _maximum_allowed_quality_fgd(reference_fgd: float) -> float:
     )
 
 
+def _topology_skip_budget_evidence(
+    mode: str,
+    probe: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Replay exact median/p99 skip evidence without trusting a receipt."""
+
+    specification = TOPOLOGY_SPECS.get(mode)
+    if not isinstance(specification, dict):
+        return None
+    estimated = probe.get("estimated_training_seconds")
+    p99_seconds = probe.get("p99_seconds")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+        for value in (estimated, p99_seconds)
+    ):
+        return None
+    try:
+        estimated_decimal = Decimal(str(estimated))
+        p99_decimal = Decimal(str(p99_seconds))
+    except InvalidOperation:
+        return None
+    if (
+        not estimated_decimal.is_finite()
+        or estimated_decimal <= 0
+        or not p99_decimal.is_finite()
+        or p99_decimal <= 0
+    ):
+        return None
+
+    def canonical_decimal(value: Decimal) -> str:
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return "0" if text in {"", "-0"} else text
+
+    updates_per_epoch = int(specification["updates_per_epoch"])
+    p99_full400_decimal = (
+        p99_decimal * Decimal(updates_per_epoch) * Decimal(TOTAL_EPOCHS)
+    )
+    median_over_budget = estimated_decimal > Decimal(
+        TOPOLOGY_MAX_TRAINING_SECONDS
+    )
+    p99_over_budget = p99_full400_decimal > Decimal(
+        TOPOLOGY_MAX_P99_TRAINING_SECONDS
+    )
+    over_budget_reasons = []
+    if median_over_budget:
+        over_budget_reasons.append(TOPOLOGY_MEDIAN_SKIP_REASON)
+    if p99_over_budget:
+        over_budget_reasons.append(TOPOLOGY_P99_SKIP_REASON)
+    return {
+        "policy": TOPOLOGY_QUALITY_SKIP_POLICY,
+        "median_full400_seconds": float(estimated_decimal),
+        "median_full400_seconds_decimal": canonical_decimal(
+            estimated_decimal
+        ),
+        "maximum_median_full400_seconds": (
+            TOPOLOGY_MAX_TRAINING_SECONDS
+        ),
+        "median_full400_operator": "strictly_greater_than",
+        "median_full400_reason": TOPOLOGY_MEDIAN_SKIP_REASON,
+        "median_full400_over_budget": median_over_budget,
+        "p99_seconds": float(p99_decimal),
+        "p99_seconds_decimal": canonical_decimal(p99_decimal),
+        "updates_per_epoch": updates_per_epoch,
+        "total_epochs": TOTAL_EPOCHS,
+        "p99_full400_seconds": float(p99_full400_decimal),
+        "p99_full400_seconds_decimal": canonical_decimal(
+            p99_full400_decimal
+        ),
+        "maximum_p99_full400_seconds": (
+            TOPOLOGY_MAX_P99_TRAINING_SECONDS
+        ),
+        "p99_full400_operator": "strictly_greater_than",
+        "p99_full400_reason": TOPOLOGY_P99_SKIP_REASON,
+        "p99_full400_over_budget": p99_over_budget,
+        "over_budget_reasons": over_budget_reasons,
+    }
+
+
 def _replay_topology_quality_decisions(
     *,
     matrix_modes: Sequence[str],
@@ -3640,12 +4897,32 @@ def _replay_topology_quality_decisions(
         item.get("mode"): item for item in quality_reports
     }
     skip_by_mode = {item.get("mode"): item for item in quality_skips}
+    expected_report_modes: list[str] = []
+    expected_skip_modes: list[str] = []
+    for mode in matrix_modes:
+        probe = probe_by_mode.get(mode)
+        if not isinstance(probe, dict):
+            return None
+        evidence = _topology_skip_budget_evidence(mode, probe)
+        if evidence is None:
+            return None
+        if (
+            mode != OFFICIAL_W1_REFERENCE_MODE
+            and bool(evidence["over_budget_reasons"])
+        ):
+            expected_skip_modes.append(mode)
+        else:
+            expected_report_modes.append(mode)
+    observed_report_modes = [item.get("mode") for item in quality_reports]
+    observed_skip_modes = [item.get("mode") for item in quality_skips]
     if (
         len(report_by_mode) != len(quality_reports)
         or len(skip_by_mode) != len(quality_skips)
         or set(report_by_mode) & set(skip_by_mode)
         or set(report_by_mode) | set(skip_by_mode) != set(matrix_modes)
         or OFFICIAL_W1_REFERENCE_MODE not in report_by_mode
+        or observed_report_modes != expected_report_modes
+        or observed_skip_modes != expected_skip_modes
     ):
         return None
     reference_report = report_by_mode[OFFICIAL_W1_REFERENCE_MODE]
@@ -3677,12 +4954,32 @@ def _replay_topology_quality_decisions(
             return None
         if mode in skip_by_mode:
             skip = skip_by_mode[mode]
-            eta = probe.get("estimated_training_seconds")
+            budget_evidence = _topology_skip_budget_evidence(mode, probe)
             if (
-                not isinstance(eta, (int, float))
-                or isinstance(eta, bool)
-                or not math.isfinite(float(eta))
-                or float(eta) <= 0.0
+                mode == OFFICIAL_W1_REFERENCE_MODE
+                or budget_evidence is None
+                or not budget_evidence["over_budget_reasons"]
+                or skip.get("quality_evaluated") is not False
+                or skip.get("selection_eligible") is not False
+                or skip.get("skip_policy")
+                != TOPOLOGY_QUALITY_SKIP_POLICY
+                or skip.get("budget_evidence") != budget_evidence
+                or skip.get("over_budget_reasons")
+                != budget_evidence["over_budget_reasons"]
+                or skip.get("estimated_training_seconds_decimal")
+                != budget_evidence["median_full400_seconds_decimal"]
+                or skip.get("p99_seconds")
+                != budget_evidence["p99_seconds"]
+                or skip.get("p99_seconds_decimal")
+                != budget_evidence["p99_seconds_decimal"]
+                or skip.get("updates_per_epoch")
+                != budget_evidence["updates_per_epoch"]
+                or skip.get("total_epochs")
+                != budget_evidence["total_epochs"]
+                or skip.get("p99_estimated_training_seconds")
+                != budget_evidence["p99_full400_seconds"]
+                or skip.get("p99_estimated_training_seconds_decimal")
+                != budget_evidence["p99_full400_seconds_decimal"]
             ):
                 return None
             replayed[mode] = {
@@ -3695,8 +4992,36 @@ def _replay_topology_quality_decisions(
                 "w1_tail_equivalence_claimed": False,
                 "skip_receipt_path": skip.get("receipt_path"),
                 "skip_receipt_sha256": skip.get("receipt_sha256"),
-                "estimated_training_seconds": float(eta),
-                "maximum_estimated_training_seconds": 86_400,
+                "skip_policy": TOPOLOGY_QUALITY_SKIP_POLICY,
+                "over_budget_reasons": list(
+                    budget_evidence["over_budget_reasons"]
+                ),
+                "estimated_training_seconds": budget_evidence[
+                    "median_full400_seconds"
+                ],
+                "estimated_training_seconds_decimal": budget_evidence[
+                    "median_full400_seconds_decimal"
+                ],
+                "maximum_estimated_training_seconds": (
+                    TOPOLOGY_MAX_TRAINING_SECONDS
+                ),
+                "p99_seconds": budget_evidence["p99_seconds"],
+                "p99_seconds_decimal": budget_evidence[
+                    "p99_seconds_decimal"
+                ],
+                "updates_per_epoch": budget_evidence[
+                    "updates_per_epoch"
+                ],
+                "total_epochs": TOTAL_EPOCHS,
+                "p99_estimated_training_seconds": budget_evidence[
+                    "p99_full400_seconds"
+                ],
+                "p99_estimated_training_seconds_decimal": (
+                    budget_evidence["p99_full400_seconds_decimal"]
+                ),
+                "maximum_p99_training_seconds": (
+                    TOPOLOGY_MAX_P99_TRAINING_SECONDS
+                ),
             }
             continue
 
@@ -3723,7 +5048,9 @@ def _replay_topology_quality_decisions(
                 "reference_epochs": list(SHORT_QUALITY_REFERENCE_EPOCHS),
                 "reference_fgd": dict(reference_fgd),
                 "full400_estimated_training_seconds": float(eta),
-                "full400_eta_over_24h": float(eta) > 86_400.0,
+                "full400_eta_over_24h": (
+                    float(eta) > TOPOLOGY_MAX_TRAINING_SECONDS
+                ),
             }
             continue
         candidate_fgd = _finite_nonnegative_quality_fgd(
@@ -3982,6 +5309,26 @@ def validate_topology_selection(
     probe_by_mode = {
         probe.get("mode"): probe for probe in verified_probes
     }
+    expected_report_modes: list[str] = []
+    expected_skip_modes: list[str] = []
+    quality_partition_valid = True
+    for mode in matrix_modes:
+        probe = probe_by_mode.get(mode)
+        budget_evidence = (
+            _topology_skip_budget_evidence(mode, probe)
+            if isinstance(probe, dict)
+            else None
+        )
+        if budget_evidence is None:
+            quality_partition_valid = False
+            break
+        if (
+            mode != OFFICIAL_W1_REFERENCE_MODE
+            and bool(budget_evidence["over_budget_reasons"])
+        ):
+            expected_skip_modes.append(mode)
+        else:
+            expected_report_modes.append(mode)
     throughput_projection_fields = (
         "samples_per_second",
         "median_seconds",
@@ -4001,23 +5348,27 @@ def validate_topology_selection(
     selected_specification = TOPOLOGY_SPECS.get(args.topology_mode)
     actual_eta = throughput_gate.get("estimated_training_seconds")
     actual_p99 = throughput_gate.get("p99_seconds")
+    actual_budget_evidence = _topology_skip_budget_evidence(
+        args.topology_mode,
+        throughput_gate,
+    )
     actual_throughput_gate_valid = (
         selected_specification is not None
         and isinstance(actual_eta, (int, float))
         and not isinstance(actual_eta, bool)
         and math.isfinite(float(actual_eta))
-        and 0.0 < float(actual_eta) <= 86_400.0
+        and float(actual_eta) > 0.0
         and isinstance(actual_p99, (int, float))
         and not isinstance(actual_p99, bool)
         and math.isfinite(float(actual_p99))
         and float(actual_p99) > 0.0
-        and float(actual_p99)
-        * int(selected_specification["updates_per_epoch"])
-        * TOTAL_EPOCHS
-        <= 79_200.0
+        and actual_budget_evidence is not None
+        and actual_budget_evidence["median_full400_over_budget"] is False
+        and actual_budget_evidence["p99_full400_over_budget"] is False
     )
     quality_authority_valid = (
         embedded_artifacts_match
+        and quality_partition_valid
         and len(set(report_modes)) == len(report_modes)
         and len(set(skip_modes)) == len(skip_modes)
         and report_modes
@@ -4026,6 +5377,8 @@ def validate_topology_selection(
         and not (set(report_modes) & set(skip_modes))
         and set(report_modes) | set(skip_modes) == set(matrix_modes)
         and OFFICIAL_W1_REFERENCE_MODE in report_modes
+        and report_modes == expected_report_modes
+        and skip_modes == expected_skip_modes
     )
     if quality_authority_valid:
         for mode in matrix_modes:
@@ -4033,16 +5386,15 @@ def validate_topology_selection(
             if not isinstance(probe, dict):
                 quality_authority_valid = False
                 break
-            eta = probe.get("estimated_training_seconds")
-            if (
-                not isinstance(eta, (int, float))
-                or isinstance(eta, bool)
-                or not math.isfinite(float(eta))
-                or float(eta) <= 0.0
-            ):
+            budget_evidence = _topology_skip_budget_evidence(mode, probe)
+            if budget_evidence is None:
                 quality_authority_valid = False
                 break
-            if mode == OFFICIAL_W1_REFERENCE_MODE or float(eta) <= 86_400:
+            skip_allowed = (
+                mode != OFFICIAL_W1_REFERENCE_MODE
+                and bool(budget_evidence["over_budget_reasons"])
+            )
+            if mode == OFFICIAL_W1_REFERENCE_MODE:
                 if mode not in report_modes:
                     quality_authority_valid = False
                     break
@@ -4056,7 +5408,8 @@ def validate_topology_selection(
                 source_binding = skip.get("source_binding")
                 skip_eta = skip.get("estimated_training_seconds")
                 if (
-                    skip.get("status") != "skipped_over_eta_budget"
+                    not skip_allowed
+                    or skip.get("status") != "skipped_over_eta_budget"
                     or skip.get("quality_protocol_version")
                     != SHORT_QUALITY_PROTOCOL_VERSION
                     or skip.get("artifact_root_namespace")
@@ -4064,6 +5417,8 @@ def validate_topology_selection(
                     or skip.get("artifact_root_semantics")
                     != "not_applicable_eta_skip"
                     or skip.get("quality_role") != "candidate_quality"
+                    or skip.get("quality_evaluated") is not False
+                    or skip.get("selection_eligible") is not False
                     or skip.get("reference_only") is not False
                     or skip.get("late_w1_status") != "not_measured"
                     or skip.get("w1_tail_equivalence_claimed") is not False
@@ -4074,13 +5429,38 @@ def validate_topology_selection(
                     )
                     or skip.get("quality_gate_spec_sha256")
                     != report.get("quality_gate_spec_sha256")
+                    or skip.get("skip_policy")
+                    != TOPOLOGY_QUALITY_SKIP_POLICY
                     or skip.get("maximum_estimated_training_seconds")
-                    != 86_400
+                    != TOPOLOGY_MAX_TRAINING_SECONDS
+                    or skip.get("maximum_p99_training_seconds")
+                    != TOPOLOGY_MAX_P99_TRAINING_SECONDS
                     or not isinstance(skip_eta, (int, float))
                     or isinstance(skip_eta, bool)
                     or not math.isfinite(float(skip_eta))
                     or float(skip_eta)
-                    != float(eta)
+                    != budget_evidence["median_full400_seconds"]
+                    or skip.get("estimated_training_seconds_decimal")
+                    != budget_evidence[
+                        "median_full400_seconds_decimal"
+                    ]
+                    or skip.get("p99_seconds")
+                    != budget_evidence["p99_seconds"]
+                    or skip.get("p99_seconds_decimal")
+                    != budget_evidence["p99_seconds_decimal"]
+                    or skip.get("updates_per_epoch")
+                    != budget_evidence["updates_per_epoch"]
+                    or skip.get("total_epochs")
+                    != budget_evidence["total_epochs"]
+                    or skip.get("p99_estimated_training_seconds")
+                    != budget_evidence["p99_full400_seconds"]
+                    or skip.get(
+                        "p99_estimated_training_seconds_decimal"
+                    )
+                    != budget_evidence["p99_full400_seconds_decimal"]
+                    or skip.get("over_budget_reasons")
+                    != budget_evidence["over_budget_reasons"]
+                    or skip.get("budget_evidence") != budget_evidence
                     or skip.get("topology_independent_input_sha256")
                     != probe.get("topology_independent_input_sha256")
                     or not isinstance(probe_report, dict)
@@ -4107,6 +5487,9 @@ def validate_topology_selection(
                 ):
                     quality_authority_valid = False
                     break
+            elif mode not in report_modes:
+                quality_authority_valid = False
+                break
     replayed_quality_decisions = _replay_topology_quality_decisions(
         matrix_modes=matrix_modes,
         probe_by_mode=probe_by_mode,
@@ -4125,19 +5508,19 @@ def validate_topology_selection(
                 continue
             eta = probe.get("estimated_training_seconds")
             p99 = probe.get("p99_seconds")
+            budget_evidence = _topology_skip_budget_evidence(mode, probe)
             if (
                 isinstance(eta, (int, float))
                 and not isinstance(eta, bool)
                 and math.isfinite(float(eta))
-                and 0.0 < float(eta) <= 86_400.0
+                and float(eta) > 0.0
                 and isinstance(p99, (int, float))
                 and not isinstance(p99, bool)
                 and math.isfinite(float(p99))
                 and float(p99) > 0.0
-                and float(p99)
-                * int(specification["updates_per_epoch"])
-                * TOTAL_EPOCHS
-                <= 79_200.0
+                and budget_evidence is not None
+                and budget_evidence["median_full400_over_budget"] is False
+                and budget_evidence["p99_full400_over_budget"] is False
                 and probe.get("status") == "pass"
                 and probe.get("formal_training_eligible") is True
                 and mode != OFFICIAL_W1_REFERENCE_MODE
@@ -4199,8 +5582,12 @@ def validate_topology_selection(
                         "diffsheg_show_validation_fgd_v1"
                     ),
                     "diffsheg_validation_measurement_required": True,
-                    "maximum_training_seconds": 86_400,
-                    "maximum_p99_training_seconds": 79_200,
+                    "maximum_training_seconds": (
+                        TOPOLOGY_MAX_TRAINING_SECONDS
+                    ),
+                    "maximum_p99_training_seconds": (
+                        TOPOLOGY_MAX_P99_TRAINING_SECONDS
+                    ),
                     "p99_total_updates_required": True,
                     "maximum_absolute_fgd_regression": (
                         MAX_ABSOLUTE_FGD_REGRESSION
@@ -4213,9 +5600,14 @@ def validate_topology_selection(
                     "late_w1_status": "not_measured",
                     "w1_tail_equivalence_claimed": False,
                     "w1_quality_report_required": True,
-                    "within_budget_quality_report_required": True,
+                    "within_both_budgets_quality_report_required": True,
+                    "over_budget_non_w1_skip_required": True,
+                    "quality_partition_derived_from_validated_probes": True,
                     "over_budget_non_w1_skip_status": (
                         "skipped_over_eta_budget"
+                    ),
+                    "selection_ineligible_budget_skip_policy": (
+                        TOPOLOGY_QUALITY_SKIP_POLICY
                     ),
                 }
     if (
@@ -5360,6 +6752,11 @@ def _run_training(
     )
     trajectory_mode = contract_receipts["trajectory_anchor"]["mode"]
     fresh_trajectory = trajectory_mode == FRESH_TRAJECTORY_MODE
+    deferred_e1 = _deferred_candidate_required(
+        provisional=provisional,
+        trajectory_mode=trajectory_mode,
+        updates_per_epoch=EXPECTED_UPDATES_PER_EPOCH,
+    )
     expected_trajectory_probe = throughput_receipt.get(
         "trajectory_probe"
     )
@@ -5465,6 +6862,16 @@ def _run_training(
                         run_dir / manifest_name,
                         manifest,
                     )
+                    if deferred_e1:
+                        _publish_deferred_candidate(
+                            model=model,
+                            optimizer=optimizer,
+                            run_dir=run_dir,
+                            frozen_receipt=frozen_receipt,
+                            contract_receipts=contract_receipts,
+                            manifest=manifest,
+                            provisional=provisional,
+                        )
                 dist.barrier()
             for key in epoch_sums:
                 metric_key = key
@@ -5494,17 +6901,30 @@ def _run_training(
                 full_hash_on_rank0=False,
             )
             if rank == 0:
-                _save_candidate(
-                    model=model,
-                    optimizer=optimizer,
-                    run_dir=run_dir,
-                    epoch=completed_epoch,
-                    optimizer_updates=optimizer_updates,
-                    frozen_receipt=frozen_receipt,
-                    contract_receipts=contract_receipts,
-                    manifest=manifest,
-                    provisional=provisional,
-                )
+                if deferred_e1 and completed_epoch == 1:
+                    _stage_deferred_candidate(
+                        model=model,
+                        optimizer=optimizer,
+                        run_dir=run_dir,
+                        epoch=completed_epoch,
+                        optimizer_updates=optimizer_updates,
+                        frozen_receipt=frozen_receipt,
+                        contract_receipts=contract_receipts,
+                        manifest=manifest,
+                        provisional=provisional,
+                    )
+                else:
+                    _save_candidate(
+                        model=model,
+                        optimizer=optimizer,
+                        run_dir=run_dir,
+                        epoch=completed_epoch,
+                        optimizer_updates=optimizer_updates,
+                        frozen_receipt=frozen_receipt,
+                        contract_receipts=contract_receipts,
+                        manifest=manifest,
+                        provisional=provisional,
+                    )
             dist.barrier()
         if not provisional and completed_epoch in RESUME_EPOCHS:
             local_rng_state = {
@@ -5635,6 +7055,12 @@ def _run_training(
         if fresh_trajectory and manifest["trajectory_probe_verified"] is not True:
             raise AdaptationContractError(
                 "fresh Base trajectory gate was not verified"
+            )
+        if deferred_e1 and os.path.lexists(
+            _deferred_candidate_path(run_dir).parent
+        ):
+            raise AdaptationContractError(
+                "deferred e1 staging state survived public publication"
             )
         if [entry["epoch"] for entry in manifest["entries"]] != list(
             target_candidate_epochs

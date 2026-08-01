@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -27,10 +28,10 @@ class TopologySelectionError(RuntimeError):
     """Raised when any measured topology is absent, unsafe, or stale."""
 
 
-QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v3"
+QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v4"
 QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v3"
 QUALITY_SKIP_FORMAT = (
-    "semtalk_show_base_topology_quality_skipped_over_eta_budget_v2"
+    "semtalk_show_base_topology_quality_skipped_over_eta_budget_v3"
 )
 SHORT_TRAJECTORY_FORMAT = (
     "semtalk_show_base_topology_short_trajectory_v2"
@@ -49,6 +50,11 @@ PRIMARY_METRIC_PATH = "validation.diffsheg.metrics.fgd"
 VALIDATION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
 MAX_TRAINING_SECONDS = 24 * 60 * 60
 MAX_P99_TRAINING_SECONDS = 22 * 60 * 60
+QUALITY_SKIP_POLICY = (
+    "non_w1_median_full400_gt_24h_or_p99_full400_gt_22h_v1"
+)
+MEDIAN_SKIP_REASON = "median_full400_gt_24h"
+P99_SKIP_REASON = "p99_full400_gt_22h"
 MAX_ABSOLUTE_FGD_REGRESSION = 0.01
 MAX_RELATIVE_FGD_REGRESSION = 0.02
 SELECTION_PROTOCOL = {
@@ -1578,6 +1584,10 @@ def validate_quality_gate_spec(
             "modes": list(contract.TOPOLOGY_SPECS),
             "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
             "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
+            "median_budget_operator": "strictly_greater_than",
+            "p99_budget_operator": "strictly_greater_than",
+            "median_over_budget_reason": MEDIAN_SKIP_REASON,
+            "p99_over_budget_reason": P99_SKIP_REASON,
             "p99_total_updates_required": True,
             "finite_probe_required": True,
             "policy": (
@@ -1635,11 +1645,21 @@ def validate_quality_gate_spec(
                 if mode != contract.OFFICIAL_W1_REFERENCE_MODE
             ],
             "condition": (
-                "estimated_training_seconds_strictly_greater_than_"
-                "maximum"
+                "median_full400_seconds_strictly_greater_than_24h_or_"
+                "p99_seconds_times_exact_updates_per_epoch_times_400_"
+                "strictly_greater_than_22h"
             ),
+            "policy": QUALITY_SKIP_POLICY,
+            "selection_eligible": False,
+            "quality_evaluated": False,
+            "total_epochs": contract.TOTAL_EPOCHS,
+            "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+            "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
+            "exact_updates_per_epoch_required": True,
             "w1_quality_report_required": True,
-            "within_budget_quality_report_required": True,
+            "within_both_budgets_quality_report_required": True,
+            "over_budget_non_w1_skip_required": True,
+            "quality_partition_derived_from_validated_probes": True,
             "required_sha256_bindings": [
                 "source_binding.frozen_receipt_sha256",
                 "source_binding.frozen_gate_compatibility_sha256",
@@ -1647,7 +1667,15 @@ def validate_quality_gate_spec(
                 "topology_gate_spec_sha256",
                 "quality_gate_spec_sha256",
                 "probe_report.sha256",
+                "probe_report.receipt_sha256",
                 "topology_independent_input_sha256",
+            ],
+            "required_exact_probe_bindings": [
+                "budget_evidence.median_full400_seconds_decimal",
+                "budget_evidence.p99_seconds_decimal",
+                "budget_evidence.updates_per_epoch",
+                "budget_evidence.total_epochs",
+                "budget_evidence.p99_full400_seconds_decimal",
             ],
         },
         "selection_tiebreak": [
@@ -1847,6 +1875,128 @@ def _finite_positive(value: Any) -> bool:
         and math.isfinite(float(value))
         and float(value) > 0.0
     )
+
+
+def _positive_decimal(value: Any, label: str) -> Decimal:
+    if not _finite_positive(value):
+        raise TopologySelectionError(f"{label} is not finite/positive")
+    try:
+        normalized = Decimal(str(value))
+    except InvalidOperation as error:
+        raise TopologySelectionError(
+            f"{label} is not one valid decimal"
+        ) from error
+    if not normalized.is_finite() or normalized <= 0:
+        raise TopologySelectionError(f"{label} is not finite/positive")
+    return normalized
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if not value.is_finite():
+        raise TopologySelectionError("cannot canonicalize non-finite decimal")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def _quality_skip_budget_evidence(
+    mode: str,
+    probe: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the only two fail-closed reasons short quality may be skipped."""
+
+    if mode not in contract.TOPOLOGY_SPECS:
+        raise TopologySelectionError(f"unknown topology mode {mode!r}")
+    estimated_decimal = _positive_decimal(
+        probe.get("estimated_training_seconds"),
+        f"{mode} median full400 ETA",
+    )
+    p99_decimal = _positive_decimal(
+        probe.get("p99_seconds"),
+        f"{mode} p99 seconds",
+    )
+    updates_per_epoch = int(
+        contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+    )
+    total_epochs = int(contract.TOTAL_EPOCHS)
+    p99_full400_decimal = (
+        p99_decimal * Decimal(updates_per_epoch) * Decimal(total_epochs)
+    )
+    median_over_budget = estimated_decimal > Decimal(MAX_TRAINING_SECONDS)
+    p99_over_budget = p99_full400_decimal > Decimal(
+        MAX_P99_TRAINING_SECONDS
+    )
+    over_budget_reasons = []
+    if median_over_budget:
+        over_budget_reasons.append(MEDIAN_SKIP_REASON)
+    if p99_over_budget:
+        over_budget_reasons.append(P99_SKIP_REASON)
+    return {
+        "policy": QUALITY_SKIP_POLICY,
+        "median_full400_seconds": float(estimated_decimal),
+        "median_full400_seconds_decimal": _canonical_decimal(
+            estimated_decimal
+        ),
+        "maximum_median_full400_seconds": MAX_TRAINING_SECONDS,
+        "median_full400_operator": "strictly_greater_than",
+        "median_full400_reason": MEDIAN_SKIP_REASON,
+        "median_full400_over_budget": median_over_budget,
+        "p99_seconds": float(p99_decimal),
+        "p99_seconds_decimal": _canonical_decimal(p99_decimal),
+        "updates_per_epoch": updates_per_epoch,
+        "total_epochs": total_epochs,
+        "p99_full400_seconds": float(p99_full400_decimal),
+        "p99_full400_seconds_decimal": _canonical_decimal(
+            p99_full400_decimal
+        ),
+        "maximum_p99_full400_seconds": MAX_P99_TRAINING_SECONDS,
+        "p99_full400_operator": "strictly_greater_than",
+        "p99_full400_reason": P99_SKIP_REASON,
+        "p99_full400_over_budget": p99_over_budget,
+        "over_budget_reasons": over_budget_reasons,
+    }
+
+
+def _quality_skip_allowed(evidence: Mapping[str, Any]) -> bool:
+    reasons = evidence.get("over_budget_reasons")
+    return isinstance(reasons, list) and bool(reasons)
+
+
+def _within_quality_budgets(
+    mode: str,
+    probe: Mapping[str, Any],
+) -> bool:
+    evidence = _quality_skip_budget_evidence(mode, probe)
+    return (
+        evidence["median_full400_over_budget"] is False
+        and evidence["p99_full400_over_budget"] is False
+    )
+
+
+def _expected_quality_partition(
+    order: Sequence[str],
+    probe_by_mode: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Derive the one admissible report/skip partition from raw probes."""
+
+    report_modes: list[str] = []
+    skip_modes: list[str] = []
+    for mode in order:
+        probe = probe_by_mode.get(mode)
+        if not isinstance(probe, Mapping):
+            raise TopologySelectionError(
+                f"missing validated probe while partitioning {mode}"
+            )
+        evidence = _quality_skip_budget_evidence(mode, probe)
+        if (
+            mode != contract.OFFICIAL_W1_REFERENCE_MODE
+            and _quality_skip_allowed(evidence)
+        ):
+            skip_modes.append(mode)
+        else:
+            report_modes.append(mode)
+    return report_modes, skip_modes
 
 
 def maximum_allowed_fgd(reference_fgd: float) -> float:
@@ -2157,12 +2307,12 @@ def build_quality_skip_receipt(
             gate_spec_sha256=topology_gate_spec_sha256,
         )
     )
-    estimated = float(probe["estimated_training_seconds"])
-    if estimated <= MAX_TRAINING_SECONDS:
+    budget_evidence = _quality_skip_budget_evidence(mode, probe)
+    if not _quality_skip_allowed(budget_evidence):
         raise TopologySelectionError(
-            f"{mode} ETA is within 24 hours and requires full "
-            "e1/e2/e4/e8/e16/e32 "
-            "quality"
+            f"{mode} median full400 ETA is within 24 hours and p99 "
+            "full400 ETA is within 22 hours; full "
+            "e1/e2/e4/e8/e16/e32 quality is required"
         )
     receipt: dict[str, Any] = {
         "format": QUALITY_SKIP_FORMAT,
@@ -2171,6 +2321,8 @@ def build_quality_skip_receipt(
         "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
         "artifact_root_semantics": "not_applicable_eta_skip",
         "quality_role": "candidate_quality",
+        "quality_evaluated": False,
+        "selection_eligible": False,
         "reference_only": False,
         "late_w1_status": "not_measured",
         "w1_tail_equivalence_claimed": False,
@@ -2178,8 +2330,29 @@ def build_quality_skip_receipt(
         "reference_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
         "topology_gate_spec_sha256": topology_gate_spec_sha256,
         "quality_gate_spec_sha256": quality_gate_spec_sha256,
+        "skip_policy": QUALITY_SKIP_POLICY,
         "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
-        "estimated_training_seconds": estimated,
+        "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
+        "estimated_training_seconds": budget_evidence[
+            "median_full400_seconds"
+        ],
+        "estimated_training_seconds_decimal": budget_evidence[
+            "median_full400_seconds_decimal"
+        ],
+        "p99_seconds": budget_evidence["p99_seconds"],
+        "p99_seconds_decimal": budget_evidence["p99_seconds_decimal"],
+        "updates_per_epoch": budget_evidence["updates_per_epoch"],
+        "total_epochs": budget_evidence["total_epochs"],
+        "p99_estimated_training_seconds": budget_evidence[
+            "p99_full400_seconds"
+        ],
+        "p99_estimated_training_seconds_decimal": budget_evidence[
+            "p99_full400_seconds_decimal"
+        ],
+        "over_budget_reasons": list(
+            budget_evidence["over_budget_reasons"]
+        ),
+        "budget_evidence": budget_evidence,
         "topology_independent_input_sha256": probe[
             "topology_independent_input_sha256"
         ],
@@ -2212,6 +2385,8 @@ def validate_quality_skip(
         "artifact_root_namespace",
         "artifact_root_semantics",
         "quality_role",
+        "quality_evaluated",
+        "selection_eligible",
         "reference_only",
         "late_w1_status",
         "w1_tail_equivalence_claimed",
@@ -2219,8 +2394,19 @@ def validate_quality_skip(
         "reference_mode",
         "topology_gate_spec_sha256",
         "quality_gate_spec_sha256",
+        "skip_policy",
         "maximum_estimated_training_seconds",
+        "maximum_p99_training_seconds",
         "estimated_training_seconds",
+        "estimated_training_seconds_decimal",
+        "p99_seconds",
+        "p99_seconds_decimal",
+        "updates_per_epoch",
+        "total_epochs",
+        "p99_estimated_training_seconds",
+        "p99_estimated_training_seconds_decimal",
+        "over_budget_reasons",
+        "budget_evidence",
         "topology_independent_input_sha256",
         "source_binding",
         "probe_report",
@@ -2241,6 +2427,8 @@ def validate_quality_skip(
         or receipt.get("artifact_root_semantics")
         != "not_applicable_eta_skip"
         or receipt.get("quality_role") != "candidate_quality"
+        or receipt.get("quality_evaluated") is not False
+        or receipt.get("selection_eligible") is not False
         or receipt.get("reference_only") is not False
         or receipt.get("late_w1_status") != "not_measured"
         or receipt.get("w1_tail_equivalence_claimed") is not False
@@ -2251,11 +2439,28 @@ def validate_quality_skip(
         != topology_gate_spec_sha256
         or receipt.get("quality_gate_spec_sha256")
         != quality_gate_spec_sha256
+        or receipt.get("skip_policy") != QUALITY_SKIP_POLICY
         or receipt.get("maximum_estimated_training_seconds")
         != MAX_TRAINING_SECONDS
+        or receipt.get("maximum_p99_training_seconds")
+        != MAX_P99_TRAINING_SECONDS
         or not _finite_positive(receipt.get("estimated_training_seconds"))
-        or float(receipt["estimated_training_seconds"])
-        <= MAX_TRAINING_SECONDS
+        or not isinstance(
+            receipt.get("estimated_training_seconds_decimal"), str
+        )
+        or not _finite_positive(receipt.get("p99_seconds"))
+        or not isinstance(receipt.get("p99_seconds_decimal"), str)
+        or type(receipt.get("updates_per_epoch")) is not int
+        or type(receipt.get("total_epochs")) is not int
+        or not _finite_positive(
+            receipt.get("p99_estimated_training_seconds")
+        )
+        or not isinstance(
+            receipt.get("p99_estimated_training_seconds_decimal"), str
+        )
+        or not isinstance(receipt.get("over_budget_reasons"), list)
+        or not receipt["over_budget_reasons"]
+        or not isinstance(receipt.get("budget_evidence"), dict)
         or re.fullmatch(
             r"[0-9a-f]{64}",
             str(receipt.get("topology_independent_input_sha256")),
@@ -2302,6 +2507,7 @@ def validate_quality_skip(
             gate_spec_sha256=topology_gate_spec_sha256,
         )
     )
+    expected_budget_evidence = _quality_skip_budget_evidence(mode, probe)
     if (
         probe_report != observed_probe_artifact
         or source_binding != observed_source
@@ -2309,6 +2515,23 @@ def validate_quality_skip(
         != probe["topology_independent_input_sha256"]
         or float(receipt["estimated_training_seconds"])
         != float(probe["estimated_training_seconds"])
+        or not _quality_skip_allowed(expected_budget_evidence)
+        or receipt["budget_evidence"] != expected_budget_evidence
+        or receipt["estimated_training_seconds_decimal"]
+        != expected_budget_evidence["median_full400_seconds_decimal"]
+        or float(receipt["p99_seconds"])
+        != float(expected_budget_evidence["p99_seconds"])
+        or receipt["p99_seconds_decimal"]
+        != expected_budget_evidence["p99_seconds_decimal"]
+        or receipt["updates_per_epoch"]
+        != expected_budget_evidence["updates_per_epoch"]
+        or receipt["total_epochs"] != expected_budget_evidence["total_epochs"]
+        or float(receipt["p99_estimated_training_seconds"])
+        != float(expected_budget_evidence["p99_full400_seconds"])
+        or receipt["p99_estimated_training_seconds_decimal"]
+        != expected_budget_evidence["p99_full400_seconds_decimal"]
+        or receipt["over_budget_reasons"]
+        != expected_budget_evidence["over_budget_reasons"]
     ):
         raise TopologySelectionError(
             f"Base topology over-budget quality skip {mode} probe binding changed"
@@ -2320,6 +2543,8 @@ def validate_quality_skip(
         "artifact_root_namespace": QUALITY_ARTIFACT_ROOT_NAMESPACE,
         "artifact_root_semantics": "not_applicable_eta_skip",
         "quality_role": "candidate_quality",
+        "quality_evaluated": False,
+        "selection_eligible": False,
         "reference_only": False,
         "late_w1_status": "not_measured",
         "w1_tail_equivalence_claimed": False,
@@ -2328,6 +2553,7 @@ def validate_quality_skip(
         "receipt_payload_sha256": receipt["receipt_sha256"],
         "topology_gate_spec_sha256": topology_gate_spec_sha256,
         "quality_gate_spec_sha256": quality_gate_spec_sha256,
+        "skip_policy": QUALITY_SKIP_POLICY,
         "topology_independent_input_sha256": receipt[
             "topology_independent_input_sha256"
         ],
@@ -2336,7 +2562,23 @@ def validate_quality_skip(
         "estimated_training_seconds": float(
             receipt["estimated_training_seconds"]
         ),
+        "estimated_training_seconds_decimal": receipt[
+            "estimated_training_seconds_decimal"
+        ],
+        "p99_seconds": float(receipt["p99_seconds"]),
+        "p99_seconds_decimal": receipt["p99_seconds_decimal"],
+        "updates_per_epoch": receipt["updates_per_epoch"],
+        "total_epochs": receipt["total_epochs"],
+        "p99_estimated_training_seconds": float(
+            receipt["p99_estimated_training_seconds"]
+        ),
+        "p99_estimated_training_seconds_decimal": receipt[
+            "p99_estimated_training_seconds_decimal"
+        ],
+        "over_budget_reasons": list(receipt["over_budget_reasons"]),
+        "budget_evidence": dict(receipt["budget_evidence"]),
         "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+        "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
     }
 
 
@@ -2365,6 +2607,10 @@ def select_topology(
     if [probe["mode"] for probe in eligible] != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError("formal candidate topology set changed")
     order = list(contract.TOPOLOGY_SPECS)
+    probe_by_mode = {probe["mode"]: probe for probe in eligible}
+    expected_report_modes, expected_skip_modes = (
+        _expected_quality_partition(order, probe_by_mode)
+    )
     report_modes = [report.get("mode") for report in quality_reports]
     skip_modes = [skip.get("mode") for skip in quality_skips]
     if (
@@ -2383,15 +2629,24 @@ def select_topology(
         raise TopologySelectionError(
             "W1 reference-only e1/e2/e4/e8 quality report is mandatory"
         )
-    probe_by_mode = {probe["mode"]: probe for probe in eligible}
+    if (
+        report_modes != expected_report_modes
+        or skip_modes != expected_skip_modes
+    ):
+        raise TopologySelectionError(
+            "quality reports/skips must match the Decimal-derived budget "
+            "partition exactly once in matrix order"
+        )
     skip_by_mode = {skip["mode"]: skip for skip in quality_skips}
     for mode, skip in skip_by_mode.items():
         probe = probe_by_mode[mode]
         probe_report = skip.get("probe_report")
+        expected_budget_evidence = _quality_skip_budget_evidence(
+            mode, probe
+        )
         if (
             mode == contract.OFFICIAL_W1_REFERENCE_MODE
-            or float(probe["estimated_training_seconds"])
-            <= MAX_TRAINING_SECONDS
+            or not _quality_skip_allowed(expected_budget_evidence)
             or skip.get("status") != "skipped_over_eta_budget"
             or skip.get("quality_protocol_version")
             != QUALITY_PROTOCOL_VERSION
@@ -2400,6 +2655,8 @@ def select_topology(
             or skip.get("artifact_root_semantics")
             != "not_applicable_eta_skip"
             or skip.get("quality_role") != "candidate_quality"
+            or skip.get("quality_evaluated") is not False
+            or skip.get("selection_eligible") is not False
             or skip.get("reference_only") is not False
             or skip.get("late_w1_status") != "not_measured"
             or skip.get("w1_tail_equivalence_claimed") is not False
@@ -2407,6 +2664,7 @@ def select_topology(
             != gate_spec_sha256
             or skip.get("quality_gate_spec_sha256")
             != quality_gate_spec_sha256
+            or skip.get("skip_policy") != QUALITY_SKIP_POLICY
             or skip.get("topology_independent_input_sha256")
             != probe["topology_independent_input_sha256"]
             or not _finite_positive(
@@ -2414,8 +2672,35 @@ def select_topology(
             )
             or float(skip["estimated_training_seconds"])
             != float(probe["estimated_training_seconds"])
+            or skip.get("estimated_training_seconds_decimal")
+            != expected_budget_evidence[
+                "median_full400_seconds_decimal"
+            ]
             or skip.get("maximum_estimated_training_seconds")
             != MAX_TRAINING_SECONDS
+            or skip.get("maximum_p99_training_seconds")
+            != MAX_P99_TRAINING_SECONDS
+            or not _finite_positive(skip.get("p99_seconds"))
+            or float(skip["p99_seconds"])
+            != float(expected_budget_evidence["p99_seconds"])
+            or skip.get("p99_seconds_decimal")
+            != expected_budget_evidence["p99_seconds_decimal"]
+            or skip.get("updates_per_epoch")
+            != expected_budget_evidence["updates_per_epoch"]
+            or skip.get("total_epochs")
+            != expected_budget_evidence["total_epochs"]
+            or not _finite_positive(
+                skip.get("p99_estimated_training_seconds")
+            )
+            or float(skip["p99_estimated_training_seconds"])
+            != float(expected_budget_evidence["p99_full400_seconds"])
+            or skip.get("p99_estimated_training_seconds_decimal")
+            != expected_budget_evidence[
+                "p99_full400_seconds_decimal"
+            ]
+            or skip.get("over_budget_reasons")
+            != expected_budget_evidence["over_budget_reasons"]
+            or skip.get("budget_evidence") != expected_budget_evidence
             or re.fullmatch(
                 r"[0-9a-f]{64}", str(skip.get("receipt_sha256"))
             )
@@ -2525,11 +2810,33 @@ def select_topology(
                 "w1_tail_equivalence_claimed": False,
                 "skip_receipt_path": skip["receipt_path"],
                 "skip_receipt_sha256": skip["receipt_sha256"],
+                "skip_policy": QUALITY_SKIP_POLICY,
+                "over_budget_reasons": list(
+                    skip["over_budget_reasons"]
+                ),
                 "estimated_training_seconds": float(
                     probe["estimated_training_seconds"]
                 ),
+                "estimated_training_seconds_decimal": skip[
+                    "estimated_training_seconds_decimal"
+                ],
                 "maximum_estimated_training_seconds": (
                     MAX_TRAINING_SECONDS
+                ),
+                "p99_seconds": float(probe["p99_seconds"]),
+                "p99_seconds_decimal": skip["p99_seconds_decimal"],
+                "updates_per_epoch": int(
+                    contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+                ),
+                "total_epochs": contract.TOTAL_EPOCHS,
+                "p99_estimated_training_seconds": float(
+                    skip["p99_estimated_training_seconds"]
+                ),
+                "p99_estimated_training_seconds_decimal": skip[
+                    "p99_estimated_training_seconds_decimal"
+                ],
+                "maximum_p99_training_seconds": (
+                    MAX_P99_TRAINING_SECONDS
                 ),
             }
             continue
@@ -2640,12 +2947,7 @@ def select_topology(
         for probe in eligible
         if _finite_positive(probe.get("estimated_training_seconds"))
         and _finite_positive(probe.get("p99_seconds"))
-        and float(probe["estimated_training_seconds"])
-        <= MAX_TRAINING_SECONDS
-        and float(probe["p99_seconds"])
-        * int(contract.TOPOLOGY_SPECS[probe["mode"]]["updates_per_epoch"])
-        * contract.TOTAL_EPOCHS
-        <= MAX_P99_TRAINING_SECONDS
+        and _within_quality_budgets(probe["mode"], probe)
         and probe["mode"] != contract.OFFICIAL_W1_REFERENCE_MODE
         and probe["mode"] in by_mode
         and quality_decisions[probe["mode"]]["selection_eligible"]
@@ -2705,9 +3007,14 @@ def select_topology(
             "late_w1_status": "not_measured",
             "w1_tail_equivalence_claimed": False,
             "w1_quality_report_required": True,
-            "within_budget_quality_report_required": True,
+            "within_both_budgets_quality_report_required": True,
+            "over_budget_non_w1_skip_required": True,
+            "quality_partition_derived_from_validated_probes": True,
             "over_budget_non_w1_skip_status": (
                 "skipped_over_eta_budget"
+            ),
+            "selection_ineligible_budget_skip_policy": (
+                QUALITY_SKIP_POLICY
             ),
         },
         "late_w1_status": "not_measured",

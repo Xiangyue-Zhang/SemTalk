@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,7 +27,7 @@ QUALITY_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
+    / "semtalk_base_topology_quality_gate_spec_v4_20260801.json"
 )
 
 
@@ -33,7 +35,13 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_probe(path: Path, mode: str, eta: float) -> Path:
+def _write_probe(
+    path: Path,
+    mode: str,
+    eta: float,
+    *,
+    p99_seconds: float | None = None,
+) -> Path:
     specification = contract.TOPOLOGY_SPECS[mode]
     world_size = int(specification["world_size"])
     global_batch_size = int(specification["global_batch_size"])
@@ -57,6 +65,12 @@ def _write_probe(path: Path, mode: str, eta: float) -> Path:
         * float(specification["updates_per_epoch"])
         * float(contract.TOTAL_EPOCHS)
     )
+    measured_p99 = (
+        median_seconds * 1.2
+        if p99_seconds is None
+        else float(p99_seconds)
+    )
+    measured_p90 = median_seconds + (measured_p99 - median_seconds) / 2.0
     body: dict[str, object] = {
         "format": contract.GATE_FORMAT,
         "status": "pass",
@@ -86,8 +100,8 @@ def _write_probe(path: Path, mode: str, eta: float) -> Path:
         "oom": False,
         "seconds_per_update": median_seconds,
         "median_seconds": median_seconds,
-        "p90_seconds": median_seconds * 1.1,
-        "p99_seconds": median_seconds * 1.2,
+        "p90_seconds": measured_p90,
+        "p99_seconds": measured_p99,
         "estimated_training_seconds": derived_eta,
         "estimated_epochs": contract.TOTAL_EPOCHS,
         "samples_per_second": global_batch_size / median_seconds,
@@ -195,6 +209,11 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
             self.assertIs(validated["reference_only"], False)
             self.assertEqual(validated["late_w1_status"], "not_measured")
             self.assertIs(validated["w1_tail_equivalence_claimed"], False)
+            self.assertIs(validated["quality_evaluated"], False)
+            self.assertIs(validated["selection_eligible"], False)
+            self.assertEqual(
+                validated["skip_policy"], selector.QUALITY_SKIP_POLICY
+            )
             self.assertEqual(
                 validated["probe_report"]["sha256"], _sha(probe)
             )
@@ -208,18 +227,92 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
             ):
                 producer.main(_argv(mode, probe, output))
 
-    def test_within_budget_probe_requires_full_quality(self) -> None:
-        mode = contract.W8_GLOBAL64_MODE
-        for eta in (86_400.0, 10_000.0):
-            with self.subTest(eta=eta), tempfile.TemporaryDirectory() as raw:
-                root = Path(raw).resolve()
-                probe = _write_probe(root / "probe.json", mode, eta)
-                with self.assertRaisesRegex(
-                    selector.TopologySelectionError,
-                    "within 24 hours and requires full "
-                    "e1/e2/e4/e8/e16/e32",
-                ):
-                    producer.main(_argv(mode, probe, root / "skip.json"))
+    def test_within_both_budgets_requires_full_quality(self) -> None:
+        mode = contract.W8_GLOBAL2048_MODE
+        updates = contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+        p99_boundary = selector.MAX_P99_TRAINING_SECONDS / (
+            updates * contract.TOTAL_EPOCHS
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            probe = _write_probe(
+                root / "probe.json",
+                mode,
+                20_000.0,
+                p99_seconds=p99_boundary,
+            )
+            with self.assertRaisesRegex(
+                selector.TopologySelectionError,
+                "within 24 hours and p99 full400 ETA is within 22 hours",
+            ):
+                producer.main(_argv(mode, probe, root / "skip.json"))
+
+    def test_p99_boundary_is_strict_and_next_float_is_skippable(self) -> None:
+        mode = contract.W8_GLOBAL2048_MODE
+        updates = contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+        p99_boundary = selector.MAX_P99_TRAINING_SECONDS / (
+            updates * contract.TOTAL_EPOCHS
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            below = _write_probe(
+                root / "below.json",
+                mode,
+                20_000.0,
+                p99_seconds=math.nextafter(p99_boundary, -math.inf),
+            )
+            with self.assertRaises(selector.TopologySelectionError):
+                producer.main(_argv(mode, below, root / "below-skip.json"))
+            exact = _write_probe(
+                root / "exact.json",
+                mode,
+                20_000.0,
+                p99_seconds=p99_boundary,
+            )
+            with self.assertRaises(selector.TopologySelectionError):
+                producer.main(_argv(mode, exact, root / "exact-skip.json"))
+            above = _write_probe(
+                root / "above.json",
+                mode,
+                20_000.0,
+                p99_seconds=math.nextafter(p99_boundary, math.inf),
+            )
+            output = root / "above-skip.json"
+            self.assertEqual(producer.main(_argv(mode, above, output)), 0)
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["over_budget_reasons"],
+                [selector.P99_SKIP_REASON],
+            )
+            self.assertGreater(
+                receipt["p99_estimated_training_seconds"],
+                selector.MAX_P99_TRAINING_SECONDS,
+            )
+            self.assertEqual(
+                receipt["p99_seconds_decimal"],
+                receipt["budget_evidence"]["p99_seconds_decimal"],
+            )
+            self.assertEqual(
+                receipt["p99_estimated_training_seconds_decimal"],
+                receipt["budget_evidence"][
+                    "p99_full400_seconds_decimal"
+                ],
+            )
+
+    def test_median_24h_boundary_skips_only_because_p99_exceeds_22h(self) -> None:
+        mode = contract.W8_GLOBAL2048_MODE
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            probe = _write_probe(
+                root / "probe.json", mode, selector.MAX_TRAINING_SECONDS
+            )
+            output = root / "skip.json"
+            self.assertEqual(producer.main(_argv(mode, probe, output)), 0)
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["over_budget_reasons"],
+                [selector.P99_SKIP_REASON],
+            )
 
     def test_probe_and_input_tampering_are_rejected(self) -> None:
         mode = contract.W16_GLOBAL512_MODE
@@ -251,6 +344,82 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                     topology_gate_spec_sha256=_sha(TOPOLOGY_SPEC),
                     quality_gate_spec_sha256=_sha(QUALITY_SPEC),
                 )
+
+    def test_forged_p99_and_updates_evidence_are_rejected(self) -> None:
+        mode = contract.W8_GLOBAL2048_MODE
+        updates = contract.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+        boundary = selector.MAX_P99_TRAINING_SECONDS / (
+            updates * contract.TOTAL_EPOCHS
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            probe = _write_probe(
+                root / "probe.json",
+                mode,
+                20_000.0,
+                p99_seconds=math.nextafter(boundary, math.inf),
+            )
+            output = root / "skip.json"
+            self.assertEqual(producer.main(_argv(mode, probe, output)), 0)
+            original = json.loads(output.read_text(encoding="utf-8"))
+            for label in ("p99", "updates"):
+                forged = json.loads(json.dumps(original))
+                forged.pop("receipt_sha256")
+                if label == "p99":
+                    forged["p99_seconds"] *= 1.01
+                    forged_updates = updates
+                else:
+                    forged_updates = updates * 2
+                    forged["updates_per_epoch"] = forged_updates
+                    forged["budget_evidence"][
+                        "updates_per_epoch"
+                    ] = forged_updates
+                p99_decimal = Decimal(str(forged["p99_seconds"]))
+                total_decimal = (
+                    p99_decimal
+                    * Decimal(forged_updates)
+                    * Decimal(contract.TOTAL_EPOCHS)
+                )
+                p99_decimal_text = format(p99_decimal, "f").rstrip("0").rstrip(".")
+                total_decimal_text = format(total_decimal, "f").rstrip("0").rstrip(".")
+                forged["p99_seconds_decimal"] = p99_decimal_text
+                forged["budget_evidence"]["p99_seconds"] = float(
+                    p99_decimal
+                )
+                forged["budget_evidence"][
+                    "p99_seconds_decimal"
+                ] = p99_decimal_text
+                forged["p99_estimated_training_seconds"] = float(
+                    total_decimal
+                )
+                forged["p99_estimated_training_seconds_decimal"] = (
+                    total_decimal_text
+                )
+                forged["budget_evidence"]["p99_full400_seconds"] = float(
+                    total_decimal
+                )
+                forged["budget_evidence"][
+                    "p99_full400_seconds_decimal"
+                ] = total_decimal_text
+                forged["receipt_sha256"] = (
+                    contract.canonical_json_sha256(forged)
+                )
+                path = root / f"forged-{label}.json"
+                path.write_text(
+                    json.dumps(forged, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    selector.TopologySelectionError,
+                    "probe binding changed",
+                ):
+                    selector.validate_quality_skip(
+                        mode,
+                        path,
+                        _sha(path),
+                        topology_gate_spec_sha256=_sha(TOPOLOGY_SPEC),
+                        quality_gate_spec_sha256=_sha(QUALITY_SPEC),
+                    )
 
             probe.write_text(probe.read_text(encoding="utf-8") + " ")
             with self.assertRaisesRegex(
@@ -303,12 +472,15 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                 "topology_independent_input_sha256": "a" * 64,
                 "median_seconds": 1.0,
                 "p90_seconds": 1.1,
-                "p99_seconds": 1.2,
+                "p99_seconds": 0.01,
                 "estimated_training_seconds": eta,
                 "samples_per_second": 1000.0,
             }
             probes.append(probe)
             if mode in skipped_modes:
+                budget_evidence = selector._quality_skip_budget_evidence(
+                    mode, probe
+                )
                 skips.append(
                     {
                         "mode": mode,
@@ -323,6 +495,8 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                             "not_applicable_eta_skip"
                         ),
                         "quality_role": "candidate_quality",
+                        "quality_evaluated": False,
+                        "selection_eligible": False,
                         "reference_only": False,
                         "late_w1_status": "not_measured",
                         "w1_tail_equivalence_claimed": False,
@@ -331,6 +505,7 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                         "receipt_payload_sha256": "c" * 64,
                         "topology_gate_spec_sha256": "d" * 64,
                         "quality_gate_spec_sha256": "e" * 64,
+                        "skip_policy": selector.QUALITY_SKIP_POLICY,
                         "topology_independent_input_sha256": "a" * 64,
                         "source_binding": {
                             "frozen_receipt_sha256": "1" * 64,
@@ -344,7 +519,33 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                             "receipt_sha256": "4" * 64,
                         },
                         "estimated_training_seconds": eta,
+                        "estimated_training_seconds_decimal": (
+                            budget_evidence[
+                                "median_full400_seconds_decimal"
+                            ]
+                        ),
+                        "p99_seconds": budget_evidence["p99_seconds"],
+                        "p99_seconds_decimal": budget_evidence[
+                            "p99_seconds_decimal"
+                        ],
+                        "updates_per_epoch": budget_evidence[
+                            "updates_per_epoch"
+                        ],
+                        "total_epochs": budget_evidence["total_epochs"],
+                        "p99_estimated_training_seconds": budget_evidence[
+                            "p99_full400_seconds"
+                        ],
+                        "p99_estimated_training_seconds_decimal": (
+                            budget_evidence[
+                                "p99_full400_seconds_decimal"
+                            ]
+                        ),
+                        "over_budget_reasons": list(
+                            budget_evidence["over_budget_reasons"]
+                        ),
+                        "budget_evidence": budget_evidence,
                         "maximum_estimated_training_seconds": 86_400,
+                        "maximum_p99_training_seconds": 79_200,
                     }
                 )
             else:

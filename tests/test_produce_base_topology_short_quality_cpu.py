@@ -23,7 +23,7 @@ QUALITY_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
+    / "semtalk_base_topology_quality_gate_spec_v4_20260801.json"
 )
 
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Select the one SemTalk SHOW Base winner from frozen TalkSHOW reports."""
+"""Select an archived compatibility winner from frozen TalkSHOW reports.
+
+This entrypoint is not part of the primary DiffSHEG Base selection authority.
+"""
 
 from __future__ import annotations
 

@@ -113,10 +113,13 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
                     long_contract.EXPECTED_CANDIDATE_EPOCHS
                 ),
                 "metric": "FGD",
-                "metric_report_key": "fgd",
+                "metric_report_key": long_contract.PRIMARY_SELECTION_REPORT_KEY,
                 "operator": "min",
                 "tie_break": "lowest_epoch",
-                "ordering": ["fgd", "epoch"],
+                "ordering": [
+                    long_contract.PRIMARY_SELECTION_REPORT_KEY,
+                    "epoch",
+                ],
                 "test_feedback_into_selection": False,
             },
             "candidate_bundle": {
@@ -227,6 +230,26 @@ class LongBaseTestWinnerContracts(unittest.TestCase):
     def test_nonwinner_checkpoint_is_rejected(self) -> None:
         with self.assertRaises(validator.TestWinnerContractError):
             self._authorize(epoch=180)
+
+    def test_released2_compatibility_formats_cannot_authorize_test(self) -> None:
+        for index, compatibility_format in enumerate(
+            (
+                "semtalk_show_base_talkshow_released2_fgd_selection_v1",
+                "semtalk_show_base_fresh_val_released2_fgd_selection_v2",
+            )
+        ):
+            selection = json.loads(
+                self.selection_path.read_text(encoding="utf-8")
+            )
+            selection["format"] = compatibility_format
+            selection.pop("receipt_payload_sha256")
+            selection["receipt_payload_sha256"] = (
+                long_contract.canonical_json_sha256(selection)
+            )
+            altered = self.root / f"compatibility-selection-{index}.json"
+            _write_json(altered, selection)
+            with self.assertRaises(validator.TestWinnerContractError):
+                self._authorize(selection_path=altered)
 
     def test_declared_winner_must_equal_recomputed_minimum(self) -> None:
         selection = json.loads(

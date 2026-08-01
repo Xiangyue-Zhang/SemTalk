@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -46,7 +47,7 @@ TOPOLOGY_QUALITY_GATE_SPEC = (
     REPOSITORY
     / "configs"
     / "show_base"
-    / "semtalk_base_topology_quality_gate_spec_v3_20260801.json"
+    / "semtalk_base_topology_quality_gate_spec_v4_20260801.json"
 )
 OFFICIAL_TRAINER = REPOSITORY / "semtalk_base_trainer.py"
 SPEC = importlib.util.spec_from_file_location(
@@ -67,6 +68,9 @@ SELECTOR_SPEC = importlib.util.spec_from_file_location(
 assert SELECTOR_SPEC is not None and SELECTOR_SPEC.loader is not None
 SELECTOR = importlib.util.module_from_spec(SELECTOR_SPEC)
 SELECTOR_SPEC.loader.exec_module(SELECTOR)
+from scripts.show_base import (  # noqa: E402
+    select_base_training_topology as PACKAGE_SELECTOR,
+)
 
 
 def _sha(path: Path) -> str:
@@ -380,6 +384,7 @@ def _over_budget_quality_skip(
     position: int,
 ) -> dict[str, object]:
     mode = str(probe["mode"])
+    budget_evidence = SELECTOR._quality_skip_budget_evidence(mode, probe)
     return {
         "mode": mode,
         "status": "skipped_over_eta_budget",
@@ -389,14 +394,17 @@ def _over_budget_quality_skip(
         ),
         "artifact_root_semantics": "not_applicable_eta_skip",
         "quality_role": "candidate_quality",
+        "quality_evaluated": False,
+        "selection_eligible": False,
         "reference_only": False,
         "late_w1_status": "not_measured",
         "w1_tail_equivalence_claimed": False,
         "receipt_path": f"/quality-skips/{mode}.json",
-        "receipt_sha256": f"{position + 10:x}" * 64,
-        "receipt_payload_sha256": f"{position + 11:x}" * 64,
+        "receipt_sha256": f"{(position + 10) % 16:x}" * 64,
+        "receipt_payload_sha256": f"{(position + 11) % 16:x}" * 64,
         "topology_gate_spec_sha256": "b" * 64,
         "quality_gate_spec_sha256": "f" * 64,
+        "skip_policy": SELECTOR.QUALITY_SKIP_POLICY,
         "topology_independent_input_sha256": probe[
             "topology_independent_input_sha256"
         ],
@@ -414,8 +422,28 @@ def _over_budget_quality_skip(
         "estimated_training_seconds": probe[
             "estimated_training_seconds"
         ],
+        "estimated_training_seconds_decimal": budget_evidence[
+            "median_full400_seconds_decimal"
+        ],
+        "p99_seconds": budget_evidence["p99_seconds"],
+        "p99_seconds_decimal": budget_evidence["p99_seconds_decimal"],
+        "updates_per_epoch": budget_evidence["updates_per_epoch"],
+        "total_epochs": budget_evidence["total_epochs"],
+        "p99_estimated_training_seconds": budget_evidence[
+            "p99_full400_seconds"
+        ],
+        "p99_estimated_training_seconds_decimal": budget_evidence[
+            "p99_full400_seconds_decimal"
+        ],
+        "over_budget_reasons": list(
+            budget_evidence["over_budget_reasons"]
+        ),
+        "budget_evidence": budget_evidence,
         "maximum_estimated_training_seconds": (
             SELECTOR.MAX_TRAINING_SECONDS
+        ),
+        "maximum_p99_training_seconds": (
+            SELECTOR.MAX_P99_TRAINING_SECONDS
         ),
     }
 
@@ -481,6 +509,14 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         self.assertEqual(base_long.TOPOLOGY_SPECS, ADAPT.TOPOLOGY_SPECS)
         # The selected-five inference pipeline remains internally TalkSHOW
         # owned.  The formal long-run selection ABI is DiffSHEG-only.
+        self.assertIs(
+            talkshow.FRESH_PIPELINE_SOURCE_FILES,
+            talkshow.TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES,
+        )
+        self.assertIs(
+            diffsheg.FRESH_PIPELINE_SOURCE_FILES,
+            diffsheg.DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES,
+        )
         self.assertIs(talkshow.validate_pipeline, talkshow.validate_fresh_pipeline)
         self.assertIs(base_long.validate_val_inputs, diffsheg.validate_val_inputs)
         self.assertIs(
@@ -493,7 +529,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertIn(
             "scripts/show_base/evaluate_diffsheg_val_fgd.py",
-            talkshow.FRESH_PIPELINE_SOURCE_FILES,
+            diffsheg.DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES,
         )
         self.assertIs(
             long_selector._profile_values()["validate_diffsheg_report"],
@@ -558,7 +594,16 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             {
                 module.replace(".", "/") + ".py"
                 for module in internal_evaluators
-            }.issubset(talkshow.FRESH_PIPELINE_SOURCE_FILES)
+            }.issubset(
+                talkshow.TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES
+            )
+        )
+        self.assertFalse(
+            {
+                module.replace(".", "/") + ".py"
+                for module in internal_evaluators
+            }
+            & set(diffsheg.DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES)
         )
         control_modules = set(final_authority._CONTROL_DEPENDENCIES)
         for dependencies in final_authority._CONTROL_DEPENDENCIES.values():
@@ -1619,6 +1664,11 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 for index, mode in enumerate(ADAPT.TOPOLOGY_SPECS)
             }
         )
+        skip_modes = {
+            mode
+            for mode in ADAPT.TOPOLOGY_SPECS
+            if mode != ADAPT.OFFICIAL_W1_REFERENCE_MODE
+        }
         with self.assertRaisesRegex(
             SELECTOR.TopologySelectionError,
             "no quality-safe finite topology meets the 24-hour median and "
@@ -1626,7 +1676,12 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         ):
             SELECTOR.select_topology(
                 probes,
-                quality,
+                [quality[0]],
+                quality_skips=[
+                    _over_budget_quality_skip(probe, position=index)
+                    for index, probe in enumerate(probes)
+                    if probe["mode"] in skip_modes
+                ],
                 gate_spec_sha256="b" * 64,
                 quality_gate_spec_sha256="f" * 64,
             )
@@ -1692,7 +1747,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         ]
         with self.assertRaisesRegex(
             SELECTOR.TopologySelectionError,
-            "not bound to one over-budget probe",
+            "Decimal-derived budget partition",
         ):
             SELECTOR.select_topology(
                 probes,
@@ -1780,6 +1835,227 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             receipt["selected"]["mode"], ADAPT.W8_GLOBAL512_MODE
         )
 
+    def test_p6_p7_p99_only_skips_are_ineligible_and_consumer_replays(
+        self,
+    ) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        p99 = {mode: 0.01 for mode in modes}
+        measured_modes = {
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            ADAPT.W8_GLOBAL1024_MODE,
+            ADAPT.W8_GLOBAL2048_MODE,
+        }
+        p99_only_skip_modes = {
+            ADAPT.W16_GLOBAL1024_MODE,
+            ADAPT.W16_GLOBAL1024_LR6E5_MODE,
+        }
+        median_skip_modes = set(modes) - measured_modes - p99_only_skip_modes
+        skip_modes = median_skip_modes | p99_only_skip_modes
+        for mode in median_skip_modes:
+            eta[mode] = 90_000.0
+        for mode in p99_only_skip_modes:
+            updates = ADAPT.TOPOLOGY_SPECS[mode]["updates_per_epoch"]
+            boundary = SELECTOR.MAX_P99_TRAINING_SECONDS / (
+                updates * ADAPT.TOTAL_EPOCHS
+            )
+            p99[mode] = math.nextafter(boundary, math.inf)
+        probes, quality = _topology_selection_inputs(
+            eta, p99_seconds=p99
+        )
+        skips = [
+            _over_budget_quality_skip(probe, position=index)
+            for index, probe in enumerate(probes)
+            if probe["mode"] in skip_modes
+        ]
+        measured = [
+            report for report in quality if report["mode"] not in skip_modes
+        ]
+        self.assertEqual(len(measured), 3)
+        self.assertEqual(len(skips), 6)
+        expected_measured_modes = [
+            ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            ADAPT.W8_GLOBAL1024_MODE,
+            ADAPT.W8_GLOBAL2048_MODE,
+        ]
+        self.assertEqual(
+            [report["mode"] for report in measured],
+            expected_measured_modes,
+        )
+        self.assertEqual(
+            [skip["mode"] for skip in skips],
+            [mode for mode in modes if mode not in measured_modes],
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            measured,
+            quality_skips=skips,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        p99_moved_mode = next(
+            mode for mode in modes if mode in p99_only_skip_modes
+        )
+        over_budget_as_report = [
+            report
+            for report in quality
+            if report["mode"] not in (skip_modes - {p99_moved_mode})
+        ]
+        five_skips = [
+            skip for skip in skips if skip["mode"] != p99_moved_mode
+        ]
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "Decimal-derived budget partition",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                over_budget_as_report,
+                quality_skips=five_skips,
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
+
+        under_budget_moved_mode = ADAPT.W8_GLOBAL1024_MODE
+        under_budget_as_skip = [
+            _over_budget_quality_skip(probe, position=index)
+            for index, probe in enumerate(probes)
+            if probe["mode"] in skip_modes | {under_budget_moved_mode}
+        ]
+        two_reports = [
+            report
+            for report in measured
+            if report["mode"] != under_budget_moved_mode
+        ]
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "Decimal-derived budget partition",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                two_reports,
+                quality_skips=under_budget_as_skip,
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
+        for mode in p99_only_skip_modes:
+            decision = selection["quality_decisions"][mode]
+            self.assertEqual(
+                decision["over_budget_reasons"],
+                [SELECTOR.P99_SKIP_REASON],
+            )
+            self.assertIs(decision["quality_evaluated"], False)
+            self.assertIs(decision["selection_eligible"], False)
+            self.assertNotEqual(selection["selected"]["mode"], mode)
+        for mode in median_skip_modes:
+            self.assertIn(
+                SELECTOR.MEDIAN_SKIP_REASON,
+                selection["quality_decisions"][mode][
+                    "over_budget_reasons"
+                ],
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-p99-skip-40424-consumer-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            consumed = _consume_topology_selection(
+                selection=selection,
+                path=path,
+                topology_mode=str(selection["selected"]["mode"]),
+                throughput_gate=_validated_throughput_projection(
+                    selection["selected"]
+                ),
+            )
+        self.assertEqual(
+            consumed["selected"]["mode"], selection["selected"]["mode"]
+        )
+
+        trainer_partition_forgery_cases = {
+            "over_budget_as_report": (
+                over_budget_as_report,
+                five_skips,
+            ),
+            "under_budget_as_skip": (
+                two_reports,
+                under_budget_as_skip,
+            ),
+        }
+        for label, (forged_reports, forged_skips) in (
+            trainer_partition_forgery_cases.items()
+        ):
+            forged_selection = copy.deepcopy(selection)
+            forged_selection["quality_reports"] = copy.deepcopy(
+                forged_reports
+            )
+            forged_selection["quality_skips"] = copy.deepcopy(
+                forged_skips
+            )
+            forged_selection.pop("receipt_sha256")
+            forged_selection["receipt_sha256"] = (
+                ADAPT.canonical_json_sha256(forged_selection)
+            )
+            with tempfile.TemporaryDirectory(
+                prefix=f"semtalk-partition-{label}-",
+                dir="/private/tmp",
+            ) as raw:
+                path = Path(raw) / "selection.json"
+                path.write_text(
+                    json.dumps(
+                        forged_selection,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        PACKAGE_SELECTOR,
+                        "select_topology",
+                        return_value=forged_selection,
+                    ),
+                    self.assertRaisesRegex(
+                        ADAPT.AdaptationContractError,
+                        "selection is missing, forged, or stale",
+                    ),
+                ):
+                    _consume_topology_selection(
+                        selection=forged_selection,
+                        path=path,
+                        topology_mode=str(
+                            forged_selection["selected"]["mode"]
+                        ),
+                        throughput_gate=_validated_throughput_projection(
+                            forged_selection["selected"]
+                        ),
+                        verified_selection=forged_selection,
+                    )
+
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "cover all nine modes exactly once",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                measured,
+                quality_skips=skips[:-1],
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
+
     def test_selection_tiebreak_is_p99_then_matrix_order(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
         eta = {mode: 10_000.0 for mode in modes}
@@ -1830,9 +2106,23 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             eta,
             p99_seconds=p99,
         )
+        rejected_mode = ADAPT.W8_GLOBAL2048_MODE
+        rejected_probe = next(
+            probe for probe in probes if probe["mode"] == rejected_mode
+        )
         selection = SELECTOR.select_topology(
             probes,
-            quality,
+            [
+                report
+                for report in quality
+                if report["mode"] != rejected_mode
+            ],
+            quality_skips=[
+                _over_budget_quality_skip(
+                    rejected_probe,
+                    position=modes.index(rejected_mode),
+                )
+            ],
             gate_spec_sha256="b" * 64,
             quality_gate_spec_sha256="f" * 64,
         )
@@ -1858,9 +2148,22 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             eta,
             p99_seconds=p99,
         )
+        rejected_probe = next(
+            probe for probe in probes if probe["mode"] == rejected_mode
+        )
         selection = SELECTOR.select_topology(
             probes,
-            quality,
+            [
+                report
+                for report in quality
+                if report["mode"] != rejected_mode
+            ],
+            quality_skips=[
+                _over_budget_quality_skip(
+                    rejected_probe,
+                    position=modes.index(rejected_mode),
+                )
+            ],
             gate_spec_sha256="b" * 64,
             quality_gate_spec_sha256="f" * 64,
         )
@@ -2368,9 +2671,22 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             },
             failing_quality_modes={ADAPT.W8_GLOBAL512_MODE},
         )
+        skip_modes = {
+            ADAPT.W8_GLOBAL64_MODE,
+            ADAPT.W16_GLOBAL64_MODE,
+        }
         selection = SELECTOR.select_topology(
             probes,
-            quality,
+            [
+                report
+                for report in quality
+                if report["mode"] not in skip_modes
+            ],
+            quality_skips=[
+                _over_budget_quality_skip(probe, position=index)
+                for index, probe in enumerate(probes)
+                if probe["mode"] in skip_modes
+            ],
             gate_spec_sha256="b" * 64,
             quality_gate_spec_sha256="f" * 64,
         )
@@ -2401,9 +2717,25 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.W16_GLOBAL64_MODE,
             },
         )
+        skip_modes = {
+            ADAPT.W16_GLOBAL512_MODE,
+            ADAPT.W8_GLOBAL1024_MODE,
+            ADAPT.W8_GLOBAL2048_MODE,
+            ADAPT.W16_GLOBAL1024_MODE,
+            ADAPT.W16_GLOBAL1024_LR6E5_MODE,
+        }
         selection = SELECTOR.select_topology(
             probes,
-            quality,
+            [
+                report
+                for report in quality
+                if report["mode"] not in skip_modes
+            ],
+            quality_skips=[
+                _over_budget_quality_skip(probe, position=index)
+                for index, probe in enumerate(probes)
+                if probe["mode"] in skip_modes
+            ],
             gate_spec_sha256="b" * 64,
             quality_gate_spec_sha256="f" * 64,
         )
@@ -2428,7 +2760,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 list(SELECTOR.TAIL_EPOCHS),
             )
 
-    def test_nonfinite_eta_is_never_ranked(self) -> None:
+    def test_nonfinite_eta_is_rejected_before_partitioning(self) -> None:
         probes, quality = _topology_selection_inputs(
             {
                 ADAPT.OFFICIAL_W1_REFERENCE_MODE: float("nan"),
@@ -2442,15 +2774,16 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.W16_GLOBAL1024_LR6E5_MODE: 8_000.0,
             }
         )
-        selection = SELECTOR.select_topology(
-            probes,
-            quality,
-            gate_spec_sha256="b" * 64,
-            quality_gate_spec_sha256="f" * 64,
-        )
-        self.assertEqual(
-            selection["selected"]["mode"], ADAPT.W8_GLOBAL64_MODE
-        )
+        with self.assertRaisesRegex(
+            SELECTOR.TopologySelectionError,
+            "not finite/positive",
+        ):
+            SELECTOR.select_topology(
+                probes,
+                quality,
+                gate_spec_sha256="b" * 64,
+                quality_gate_spec_sha256="f" * 64,
+            )
 
     def test_quality_gate_spec_is_hash_pinned_and_preregistered(self) -> None:
         receipt = SELECTOR.validate_quality_gate_spec(
@@ -2467,7 +2800,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         self.assertEqual(
             receipt["payload"]["format"],
-            "semtalk_show_base_topology_quality_gate_spec_v3",
+            "semtalk_show_base_topology_quality_gate_spec_v4",
         )
         self.assertNotIn(
             "raw_prediction_replay_required",
@@ -2525,7 +2858,20 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         skip_policy = receipt["payload"]["over_eta_budget_quality_skip"]
         self.assertTrue(skip_policy["w1_quality_report_required"])
-        self.assertTrue(skip_policy["within_budget_quality_report_required"])
+        self.assertTrue(
+            skip_policy["within_both_budgets_quality_report_required"]
+        )
+        self.assertTrue(skip_policy["over_budget_non_w1_skip_required"])
+        self.assertTrue(
+            skip_policy[
+                "quality_partition_derived_from_validated_probes"
+            ]
+        )
+        self.assertIs(skip_policy["selection_eligible"], False)
+        self.assertIs(skip_policy["quality_evaluated"], False)
+        self.assertEqual(
+            skip_policy["policy"], SELECTOR.QUALITY_SKIP_POLICY
+        )
         self.assertEqual(
             skip_policy["receipt_format"], SELECTOR.QUALITY_SKIP_FORMAT
         )

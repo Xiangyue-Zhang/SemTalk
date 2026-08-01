@@ -2692,21 +2692,187 @@ def _wait_status_returncode(status_value: int) -> int:
     return 255
 
 
-def _kill_exact_group(pgid: int, signum: int) -> None:
+def _signal_exact_anchored_group(
+    expected_anchor: Mapping[str, Any],
+    signum: int,
+) -> bool:
+    """Signal a process group only while its original anchor is still exact.
+
+    A numeric PGID is not an identity: after the anchor is reaped Linux may
+    recycle that number for an unrelated process group.  Re-snapshot the full
+    anchor identity immediately before every ``killpg`` and never signal when
+    the anchor has disappeared or changed generation.  The caller can still
+    terminate previously-censused descendants by pidfd.
+    """
+    anchor_pid = expected_anchor.get("pid")
+    if not _exact_int(anchor_pid, minimum=1):
+        raise TransactionError("invalid workgroup anchor identity")
     try:
-        os.killpg(pgid, signum)
+        observed_anchor = _proc_identity(int(anchor_pid))
+    except TransactionError:
+        return False
+    if any(
+        observed_anchor.get(key) != expected_anchor.get(key)
+        for key in IDENTITY_KEYS
+    ):
+        raise TransactionError("workgroup anchor generation changed before signal")
+    if (
+        observed_anchor["pid"] != observed_anchor["pgid"]
+        or observed_anchor["pid"] != int(anchor_pid)
+    ):
+        raise TransactionError("workgroup anchor no longer owns its process group")
+    try:
+        os.killpg(int(anchor_pid), signum)
     except ProcessLookupError:
-        pass
+        return False
+    except PermissionError as exc:
+        raise TransactionError(
+            "permission denied signalling exact workgroup anchor "
+            f"pid={anchor_pid} signal={signum} errno={exc.errno}"
+        ) from exc
+    return True
+
+
+def _signal_exact_process_generation(
+    expected: Mapping[str, Any],
+    signum: int,
+) -> bool:
+    """Signal one exact process generation, using pidfd on formal Linux."""
+    pid = expected.get("pid")
+    if not _exact_int(pid, minimum=1):
+        raise TransactionError("invalid exact process identity")
+    pidfd = -1
+    if sys.platform == "linux" and (
+        not hasattr(os, "pidfd_open")
+        or not hasattr(signal, "pidfd_send_signal")
+    ):
+        raise TransactionError("formal exact process signalling requires pidfd")
+    try:
+        if sys.platform == "linux":
+            try:
+                pidfd = os.pidfd_open(int(pid), 0)
+            except ProcessLookupError:
+                return False
+        try:
+            observed = _proc_identity(int(pid))
+        except TransactionError:
+            return False
+        if any(observed.get(key) != expected.get(key) for key in IDENTITY_KEYS):
+            raise TransactionError("exact process generation changed before signal")
+        if pidfd >= 0:
+            signal.pidfd_send_signal(pidfd, signum)
+        elif _CPU_TEST_MODE:
+            os.kill(int(pid), signum)
+        else:  # pragma: no cover - formal hosts are Linux.
+            raise TransactionError("formal exact process signalling requires Linux")
+    except ProcessLookupError:
+        return False
+    finally:
+        if pidfd >= 0:
+            os.close(pidfd)
+    return True
+
+
+def _direct_child_pids(parent_pid: int) -> set[int]:
+    """Return the supervisor's exact direct children, including zombies."""
+    children_path = Path(f"/proc/{parent_pid}/task/{parent_pid}/children")
+    if children_path.is_file():
+        try:
+            fields = children_path.read_text(encoding="ascii").split()
+        except OSError as exc:
+            raise TransactionError("cannot inspect exact supervisor children") from exc
+        if not all(field.isdigit() for field in fields):
+            raise TransactionError("invalid exact supervisor children record")
+        return {int(field) for field in fields}
+    if not _CPU_TEST_MODE:
+        raise TransactionError("exact child inspection requires Linux /proc")
+    try:
+        output = subprocess.check_output(
+            ["/bin/ps", "-axo", "pid=,ppid="],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise TransactionError("cannot inspect exact test children") from exc
+    children: set[int] = set()
+    for line in output.splitlines():
+        fields = line.split()
+        if (
+            len(fields) == 2
+            and fields[0].isdigit()
+            and fields[1].isdigit()
+            and int(fields[1]) == parent_pid
+        ):
+            children.add(int(fields[0]))
+    return children
+
+
+def _reap_non_anchor_children(supervisor_pid: int, anchor_pid: int) -> None:
+    """Reap exact direct children without ever accidentally reaping anchor."""
+    for pid in sorted(_direct_child_pids(supervisor_pid) - {anchor_pid}):
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _reap_owned_anchor(
+    anchor_identity: Mapping[str, Any],
+    deadline: float,
+) -> None:
+    """Reap the owner's exact anchor only after all group signalling is over."""
+    anchor_pid = int(anchor_identity["pid"])
+    first_attempt = True
+    while first_attempt or time.monotonic() < deadline:
+        first_attempt = False
+        try:
+            observed = _proc_identity(anchor_pid)
+        except TransactionError:
+            observed = None
+        if observed is not None and not _same_process_generation(
+            anchor_identity,
+            observed,
+        ):
+            raise TransactionError("workgroup anchor generation changed before reap")
+        try:
+            waited, _ = os.waitpid(anchor_pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited == anchor_pid:
+            return
+        time.sleep(0.01)
+    raise TransactionError("exact workgroup anchor did not exit for reap")
 
 
 def _supervisor_cleanup_group(
-    anchor_pid: int,
+    anchor_identity: Mapping[str, Any],
+    anchor_write_fd: int,
     tracker: _DescendantTracker | None,
     grace_seconds: float,
 ) -> dict[str, Any]:
-    _kill_exact_group(anchor_pid, signal.SIGTERM)
-    if tracker is not None:
-        tracker.signal_live(signal.SIGTERM)
+    """Clean the workgroup while the sole killpg owner pins its anchor.
+
+    Group-signal failures are evidence failures, not control-flow shortcuts:
+    exact pidfd descendant termination, pipe-driven anchor shutdown, census,
+    and reaping all still run before the errors are aggregated.
+    """
+    anchor_pid = int(anchor_identity["pid"])
+    supervisor_pid = os.getpid()
+    cleanup_errors: list[str] = []
+
+    def record_error(label: str, exc: BaseException) -> None:
+        cleanup_errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
+    try:
+        _signal_exact_anchored_group(anchor_identity, signal.SIGTERM)
+    except BaseException as exc:
+        record_error("group SIGTERM", exc)
+    finally:
+        if tracker is not None:
+            try:
+                tracker.signal_live(signal.SIGTERM)
+            except BaseException as exc:
+                record_error("tracker SIGTERM", exc)
+
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         members = _group_members(anchor_pid)
@@ -2714,34 +2880,48 @@ def _supervisor_cleanup_group(
         if members <= {anchor_pid} and not live:
             break
         time.sleep(0.01)
-    # The anchor is deliberately still in this group, so its PGID cannot have
-    # been recycled before this exact final kill.  Always target the group:
-    # /proc inspection is advisory and a missed member must not escape.
-    _kill_exact_group(anchor_pid, signal.SIGKILL)
-    if tracker is not None:
-        tracker.signal_live(signal.SIGKILL)
+
+    # The supervisor is the anchor's only parent and has not reaped it.  Thus
+    # the PID/PGID cannot be recycled across the final identity snapshot and
+    # killpg.  No code issues a group signal after this block.
+    try:
+        _signal_exact_anchored_group(anchor_identity, signal.SIGKILL)
+    except BaseException as exc:
+        record_error("group SIGKILL", exc)
+    finally:
+        if tracker is not None:
+            try:
+                tracker.signal_live(signal.SIGKILL)
+            except BaseException as exc:
+                record_error("tracker SIGKILL", exc)
+        try:
+            os.close(anchor_write_fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                record_error("anchor pipe close", exc)
+
     reap_deadline = time.monotonic() + max(grace_seconds, 0.5)
     empty_censuses = 0
+    proof: dict[str, Any] | None = None
     while time.monotonic() < reap_deadline:
-        while True:
-            try:
-                waited, _ = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if waited == 0:
-                break
+        try:
+            _reap_non_anchor_children(supervisor_pid, anchor_pid)
+        except BaseException as exc:
+            record_error("non-anchor reap", exc)
         live = [] if tracker is None else tracker.live_identities()
+        members = _group_members(anchor_pid)
         if live:
             empty_censuses = 0
-            tracker.signal_live(signal.SIGKILL)
-        elif _group_members(anchor_pid):
-            empty_censuses = 0
-            _kill_exact_group(anchor_pid, signal.SIGKILL)
-        else:
+            if tracker is not None:
+                try:
+                    tracker.signal_live(signal.SIGKILL)
+                except BaseException as exc:
+                    record_error("tracker SIGKILL retry", exc)
+        elif members <= {anchor_pid}:
             empty_censuses += 1
             if empty_censuses >= 3:
                 if tracker is None:
-                    return {
+                    proof = {
                         "schema": SCHEMA,
                         "status": "DESCENDANTS_CLEAN",
                         "identity_basis": "no-workload-started",
@@ -2750,9 +2930,34 @@ def _supervisor_cleanup_group(
                         "tracked": [],
                         "live_after": [],
                     }
-                return tracker.receipt(empty_censuses)
+                else:
+                    proof = tracker.receipt(empty_censuses)
+                break
+        else:
+            # The anchor remains owned and unreaped, but group signalling is
+            # finished.  Exact tracker pidfds are the only permitted retry.
+            empty_censuses = 0
+            if tracker is not None:
+                try:
+                    tracker.signal_live(signal.SIGKILL)
+                except BaseException as exc:
+                    record_error("tracker group-member retry", exc)
         time.sleep(0.02)
-    raise TransactionError("cannot prove exact workload descendants are gone")
+
+    if proof is None:
+        record_error(
+            "descendant census",
+            TransactionError("cannot prove exact workload descendants are gone"),
+        )
+    try:
+        _reap_owned_anchor(anchor_identity, reap_deadline)
+    except BaseException as exc:
+        record_error("anchor reap", exc)
+    if cleanup_errors:
+        raise TransactionError("; ".join(cleanup_errors))
+    if proof is None:
+        raise AssertionError("missing cleanup proof without cleanup error")
+    return proof
 
 
 def _supervisor_main(
@@ -2774,7 +2979,11 @@ def _supervisor_main(
     runtime_monitor: _FormalRuntimeMonitor | None,
 ) -> None:
     anchor_pid = -1
+    anchor_identity: dict[str, Any] | None = None
+    anchor_write = -1
+    cleanup_attempted = False
     abort_requested = False
+    abort_signal_errors: list[str] = []
     tracker: _DescendantTracker | None = None
     passed_fds: dict[str, int] = {}
 
@@ -2812,6 +3021,13 @@ def _supervisor_main(
         if os.read(ready_read, 1) != b"1":
             raise TransactionError("workgroup anchor failed to arm")
         os.close(ready_read)
+        anchor_identity = _proc_identity(anchor_pid)
+        if (
+            anchor_identity["ppid"] != os.getpid()
+            or anchor_identity["pid"] != anchor_identity["pgid"]
+            or anchor_identity["sid"] != os.getsid(0)
+        ):
+            raise TransactionError("workgroup anchor ancestry mismatch")
         _write_supervisor_event(
             event_fd,
             {"event": "LOCAL_ARMED", "workgroup_pgid": anchor_pid},
@@ -2829,10 +3045,16 @@ def _supervisor_main(
                 except BlockingIOError:
                     pass
         if abort_requested or command != b"G":
-            cleanup = _supervisor_cleanup_group(
-                anchor_pid, None, shutdown_grace_seconds
-            )
-            os.close(anchor_write)
+            cleanup_attempted = True
+            try:
+                cleanup = _supervisor_cleanup_group(
+                    anchor_identity,
+                    anchor_write,
+                    None,
+                    shutdown_grace_seconds,
+                )
+            finally:
+                anchor_write = -1
             _write_supervisor_event(
                 event_fd,
                 {
@@ -2955,6 +3177,7 @@ def _supervisor_main(
 
         status_value: int | None = None
         abort_deadline: float | None = None
+        abort_kill_sent = False
         while status_value is None:
             if runtime_monitor is not None:
                 runtime_monitor.assert_quiet("formal workload runtime")
@@ -2975,16 +3198,59 @@ def _supervisor_main(
                     raise TransactionError("invalid post-GO supervisor command")
             if abort_requested or os.getppid() != parent_pid:
                 if abort_deadline is None:
-                    _kill_exact_group(anchor_pid, signal.SIGTERM)
+                    try:
+                        _signal_exact_anchored_group(
+                            anchor_identity,
+                            signal.SIGTERM,
+                        )
+                    except BaseException as signal_exc:
+                        abort_signal_errors.append(
+                            "abort group SIGTERM: "
+                            f"{type(signal_exc).__name__}: {signal_exc}"
+                        )
+                    finally:
+                        try:
+                            tracker.signal_live(signal.SIGTERM)
+                        except BaseException as tracker_exc:
+                            abort_signal_errors.append(
+                                "abort tracker SIGTERM: "
+                                f"{type(tracker_exc).__name__}: {tracker_exc}"
+                            )
                     abort_deadline = time.monotonic() + shutdown_grace_seconds
-                elif time.monotonic() >= abort_deadline:
-                    _kill_exact_group(anchor_pid, signal.SIGKILL)
+                elif time.monotonic() >= abort_deadline and not abort_kill_sent:
+                    try:
+                        _signal_exact_anchored_group(
+                            anchor_identity,
+                            signal.SIGKILL,
+                        )
+                    except BaseException as signal_exc:
+                        abort_signal_errors.append(
+                            "abort group SIGKILL: "
+                            f"{type(signal_exc).__name__}: {signal_exc}"
+                        )
+                    finally:
+                        try:
+                            tracker.signal_live(signal.SIGKILL)
+                        except BaseException as tracker_exc:
+                            abort_signal_errors.append(
+                                "abort tracker SIGKILL: "
+                                f"{type(tracker_exc).__name__}: {tracker_exc}"
+                            )
+                        abort_kill_sent = True
             time.sleep(0.01)
         returncode = _wait_status_returncode(status_value)
-        cleanup = _supervisor_cleanup_group(
-            anchor_pid, tracker, shutdown_grace_seconds
-        )
-        os.close(anchor_write)
+        cleanup_attempted = True
+        try:
+            cleanup = _supervisor_cleanup_group(
+                anchor_identity,
+                anchor_write,
+                tracker,
+                shutdown_grace_seconds,
+            )
+        finally:
+            anchor_write = -1
+        if abort_signal_errors:
+            raise TransactionError("; ".join(abort_signal_errors))
         _write_supervisor_event(
             event_fd,
             {
@@ -2996,15 +3262,24 @@ def _supervisor_main(
         )
     except BaseException as exc:
         cleanup_error: BaseException | None = None
-        if anchor_pid > 0:
+        if anchor_identity is not None and not cleanup_attempted:
             try:
                 _supervisor_cleanup_group(
-                    anchor_pid,
+                    anchor_identity,
+                    anchor_write,
                     tracker,
                     shutdown_grace_seconds,
                 )
             except BaseException as cleanup_exc:
                 cleanup_error = cleanup_exc
+            finally:
+                anchor_write = -1
+        elif anchor_write >= 0:
+            try:
+                os.close(anchor_write)
+            except OSError as cleanup_exc:
+                cleanup_error = cleanup_exc
+            anchor_write = -1
         try:
             _write_supervisor_event(
                 event_fd,
@@ -3500,6 +3775,10 @@ class Coordinator:
         except DuplicateInvocation:
             existing, _ = self.tx.read_json("OUTCOME.json")
             self._validate_outcome(existing)
+            if existing["status"] != "FAILED":
+                raise TransactionError(
+                    "cannot reconcile failure with successful OUTCOME"
+                )
 
     def _wait_for_file(self, name: str, timeout_ms: int, phase: str) -> None:
         deadline = time.monotonic() + timeout_ms / 1000.0
@@ -4164,6 +4443,8 @@ class Coordinator:
             raise PeerAbort(f"HANDOFF cleanup mismatch for rank {rank}")
 
     def _terminate_workload(self) -> None:
+        cleanup_errors: list[str] = []
+        fallback_needed = False
         if self.control_fd >= 0:
             try:
                 os.write(self.control_fd, b"A")
@@ -4171,39 +4452,13 @@ class Coordinator:
                 pass
             os.close(self.control_fd)
             self.control_fd = -1
-        if self.workgroup is not None:
-            pgid = int(self.workgroup["pid"])
-            if self.descendant_tracker is not None:
-                self.descendant_tracker.signal_live(signal.SIGTERM)
-            try:
-                observed_anchor = _proc_identity(pgid)
-                anchor_is_exact = all(
-                    observed_anchor[key] == self.workgroup[key]
-                    for key in IDENTITY_KEYS - {"ppid"}
-                )
-            except TransactionError:
-                anchor_is_exact = False
-            if anchor_is_exact:
-                _kill_exact_group(pgid, signal.SIGTERM)
-                deadline = time.monotonic() + self.args.shutdown_grace_ms / 1000.0
-                while time.monotonic() < deadline:
-                    live = (
-                        []
-                        if self.descendant_tracker is None
-                        else self.descendant_tracker.live_identities()
-                    )
-                    if _group_members(pgid) <= {pgid} and not live:
-                        break
-                    time.sleep(0.01)
-                # The ignored-TERM anchor still pins the PGID here.
-                _kill_exact_group(pgid, signal.SIGKILL)
-                if self.descendant_tracker is not None:
-                    self.descendant_tracker.signal_live(signal.SIGKILL)
         if self.supervisor_pid is not None:
             # The supervisor may need one grace interval for the workload,
             # one for escaped descendants, and a final reap/census interval.
-            # Killing the subreaper after only one interval can strand a
-            # setsid descendant outside the anchored process group.
+            # It is the sole killpg owner and keeps its anchor unreaped until
+            # all group signalling is over.  The coordinator only requests A
+            # and waits here; a bounded fallback targets the exact supervisor
+            # generation, never the numeric workgroup PGID.
             grace = self.args.shutdown_grace_ms / 1000.0
             deadline = time.monotonic() + max(2.0, grace * 3.0 + 1.0)
             while time.monotonic() < deadline:
@@ -4216,17 +4471,47 @@ class Coordinator:
                     break
                 time.sleep(0.01)
             if self.supervisor_pid is not None:
+                fallback_needed = True
                 try:
-                    os.kill(self.supervisor_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    os.waitpid(self.supervisor_pid, 0)
-                except ChildProcessError:
-                    pass
-                self.supervisor_pid = None
-        if self.descendant_tracker is not None:
-            self.descendant_tracker.signal_live(signal.SIGKILL)
+                    if self.supervisor_identity is None:
+                        raise TransactionError(
+                            "supervisor fallback identity is unavailable"
+                        )
+                    _signal_exact_process_generation(
+                        self.supervisor_identity,
+                        signal.SIGKILL,
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(
+                        f"supervisor fallback: {type(exc).__name__}: {exc}"
+                    )
+                fallback_deadline = time.monotonic() + max(0.5, grace)
+                while time.monotonic() < fallback_deadline:
+                    try:
+                        waited, _ = os.waitpid(
+                            self.supervisor_pid,
+                            os.WNOHANG,
+                        )
+                    except ChildProcessError:
+                        waited = self.supervisor_pid
+                    if waited == self.supervisor_pid:
+                        self.supervisor_pid = None
+                        break
+                    time.sleep(0.01)
+                if self.supervisor_pid is not None:
+                    cleanup_errors.append(
+                        "exact supervisor remained live after bounded fallback"
+                    )
+        if fallback_needed and self.descendant_tracker is not None:
+            try:
+                self.descendant_tracker.signal_live(signal.SIGKILL)
+            except BaseException as exc:
+                cleanup_errors.append(
+                    f"coordinator pidfd fallback: {type(exc).__name__}: {exc}"
+                )
+        self.workgroup = None
+        if cleanup_errors:
+            raise TransactionError("; ".join(cleanup_errors))
 
     def _run_workload(self) -> int:
         self._check_abort()
@@ -4336,14 +4621,26 @@ class Coordinator:
         return self._run_workload()
 
     def fail(self, exc: BaseException) -> None:
-        self._terminate_workload()
+        cleanup_error: BaseException | None = None
+        try:
+            self._terminate_workload()
+        except BaseException as cleanup_exc:
+            cleanup_error = cleanup_exc
         if isinstance(exc, DuplicateInvocation):
             return
         reason = f"{type(exc).__name__}: {exc}"
+        if cleanup_error is not None:
+            reason += (
+                " | cleanup: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        # FAILED OUTCOME is the first required failure receipt.  In
+        # particular, a cleanup error must never prevent the peer from seeing
+        # an atomically published terminal failure.  The remaining receipts
+        # are useful diagnostics but cannot weaken this commit point.
+        self._publish_failure(reason)
         try:
-            if self.decision_go:
-                self._publish_failure(reason)
-            else:
+            if not self.decision_go:
                 self._publish_decision_abort(reason)
             if not self.workload_result_sha256:
                 self._publish_workload_result("ABORTED", None, reason)

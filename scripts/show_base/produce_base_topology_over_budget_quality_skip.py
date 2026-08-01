@@ -2,12 +2,15 @@
 """Seal one immutable SemTalk Base over-ETA quality-skip receipt.
 
 All nine real throughput probes remain mandatory.  This CPU-only producer is
-usable only for a non-W1 topology whose validated 400-epoch ETA is strictly
-greater than 24 hours.  It binds the skip to the frozen source authority, both
-gate specifications, the exact probe artifact, and the shared five-stage SHOW
-input identity.  W1 still requires its honest reference-only e1/e2/e4/e8
-measurements, while every within-budget candidate requires the formal
-e1/e2/e4/e8/e16/e32 quality trajectory.
+usable only for a non-W1 topology that the formal selector already hard-rejects:
+either its validated median-derived 400-epoch ETA is strictly greater than 24
+hours, or its validated p99 seconds multiplied by the topology's exact updates
+per epoch and 400 epochs is strictly greater than 22 hours.  A skip is always
+selection-ineligible.  It binds the skip to the frozen source authority, both
+gate specifications, the exact probe artifact, the exact p99/update evidence,
+and the shared five-stage SHOW input identity.  W1 still requires its honest
+reference-only e1/e2/e4/e8 measurements, while every candidate within both
+budgets requires the formal e1/e2/e4/e8/e16/e32 quality trajectory.
 """
 
 from __future__ import annotations

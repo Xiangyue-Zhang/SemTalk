@@ -2,7 +2,7 @@
 """Twenty-two-candidate DiffSHEG validation contract for Base adaptation.
 
 The Base checkpoint family and the five-prerequisite inference pipeline stay
-under the fresh SemTalk/TalkSHOW source authority.  Checkpoint selection is a
+under the fresh SemTalk/DiffSHEG-primary source authority.  Selection is a
 different concern: all 22 candidates are compared only by the reconstructed
 DiffSHEG SHOW validation FGD protocol.  The explicit
 ``diffsheg_eval_clip_ids.txt`` manifest is therefore the selection coverage
@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from scripts.show_base import select_base_official_adapt as diffsheg
-from scripts.show_base import talkshow_base_val_contract as talkshow
 
 
 OFFICIAL_BASE_SHA256 = (
@@ -193,19 +192,52 @@ READY_FORMAT = (
     "semtalk_show_base_official_adapt_long_candidate_ready_v1"
 )
 SELECTION_FORMAT = "semtalk_show_base_official_adapt_long_selection_v1"
+PRIMARY_SELECTION_PROTOCOL = diffsheg.PRIMARY_SELECTION_PROTOCOL
+PRIMARY_SELECTION_METRIC_PATH = diffsheg.PRIMARY_SELECTION_METRIC_PATH
+PRIMARY_SELECTION_REPORT_KEY = diffsheg.PRIMARY_SELECTION_REPORT_KEY
+PRIMARY_SELECTION_ENTRYPOINTS = (
+    "scripts/show_base/run_base_diffsheg_val_8shard.sh",
+    "scripts/show_base/base_diffsheg_val_partition_contract.py",
+    "scripts/show_base/run_base_val_inference.py",
+    "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+    "scripts/show_base/produce_base_val_measurement.py",
+    "scripts/show_base/finalize_base_diffsheg_val_partitions.sh",
+    "scripts/show_base/select_base_official_adapt_long.py",
+)
+PRIMARY_AUTHORITY_FINAL_ENTRYPOINTS = (
+    "scripts/show_base/validate_base_long_test_winner.py",
+    "scripts/show_base/prepare_base_final_authority_inputs.py",
+    "scripts/show_base/build_base_final_authority.sh",
+    "scripts/show_base/base_final_authority.py",
+    "scripts/show_base/run_base_final_test.sh",
+    "scripts/show_base/run_base_final_test.py",
+    "scripts/show_base/prepare_diffsheg_audio_view.py",
+    "scripts/show_base/evaluate_diffsheg_final_test.py",
+    "scripts/show_base/validate_diffsheg_final_result.py",
+)
+COMPATIBILITY_ONLY_ENTRYPOINTS = (
+    "scripts/show_base/run_base_fresh_val_8shard.sh",
+    "scripts/show_base/finalize_base_fresh_val_partitions.sh",
+    "scripts/show_base/base_fresh_val_orchestrator.py",
+    "scripts/show_base/select_published_base_winner.py",
+    "scripts/show_base/published_test_winner_claim.py",
+    "scripts/show_base/replay_released2_primary.py",
+    "scripts/show_base/evaluate_talkshow_show_metrics.py",
+)
 
 # Re-export the exact formal validation ABI used by the 22-way producer.  The
-# input/lineage and coverage validators are the pinned DiffSHEG selectors;
-# only the fresh five-prerequisite pipeline validator remains TalkSHOW-owned.
+# input/lineage, coverage, and fresh five-prerequisite pipeline validators are
+# all pinned to the DiffSHEG-primary source closure.  Compatibility code is
+# not a runtime dependency below this boundary.
 EXPECTED_VAL_CLIPS = diffsheg.EXPECTED_VAL_CLIPS
-INFERENCE_HELPERS = talkshow.INFERENCE_HELPERS
+INFERENCE_HELPERS = diffsheg.INFERENCE_HELPERS
 VAL_INFERENCE_LINEAGE_FORMAT = diffsheg.VAL_INFERENCE_LINEAGE_FORMAT
-VAL_INFERENCE_SOURCE = talkshow.VAL_INFERENCE_SOURCE
-canonical_json_sha256 = talkshow.canonical_json_sha256
-sha256_file = talkshow.sha256_file
-require_sha256 = talkshow.require_sha256
-require_exact_int = talkshow.require_exact_int
-canonical_clip_id = talkshow.canonical_clip_id
+VAL_INFERENCE_SOURCE = diffsheg.VAL_INFERENCE_SOURCE
+canonical_json_sha256 = diffsheg.canonical_json_sha256
+sha256_file = diffsheg.sha256_file
+require_sha256 = diffsheg.require_sha256
+require_exact_int = diffsheg.require_exact_int
+canonical_clip_id = diffsheg.canonical_clip_id
 public_val_coverage = diffsheg.public_val_coverage
 validate_val_inputs = diffsheg.validate_val_inputs
 validate_val_inference_lineage = diffsheg.validate_val_inference_lineage
@@ -232,11 +264,11 @@ def validate_diffsheg_report(
 
 
 def reject_test_path(path: Path, label: str) -> None:
-    """Expose one error ABI while retaining the strict TalkSHOW path gate."""
+    """Expose one error ABI while retaining the strict validation path gate."""
 
     try:
-        talkshow.reject_test_path(path, label)
-    except talkshow.SelectionContractError as exc:
+        diffsheg.reject_test_path(path, label)
+    except diffsheg.SelectionContractError as exc:
         raise SelectionContractError(str(exc)) from exc
 
 
@@ -247,10 +279,10 @@ def validate_pipeline(
     expected_prerequisite_selection: Mapping[str, Any] | None = None,
     expected_source: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Validate the fresh selected-five pipeline under the unified ABI."""
+    """Validate the fresh selected-five DiffSHEG-primary pipeline."""
 
     try:
-        return talkshow.validate_fresh_pipeline(
+        return diffsheg.validate_fresh_pipeline(
             path,
             expected_sha256,
             expected_prerequisite_selection=(
@@ -258,7 +290,7 @@ def validate_pipeline(
             ),
             expected_source=expected_source,
         )
-    except talkshow.SelectionContractError as exc:
+    except diffsheg.SelectionContractError as exc:
         raise SelectionContractError(str(exc)) from exc
 
 
@@ -271,7 +303,7 @@ def _verified_json(
     expected_sha256: str,
     label: str,
 ) -> tuple[Path, dict[str, Any], str]:
-    return talkshow._verified_json(path, expected_sha256, label)
+    return diffsheg._verified_json(path, expected_sha256, label)
 
 
 def _artifact(path: Path, sha256: str) -> dict[str, str]:
@@ -638,7 +670,7 @@ def validate_candidate_bundle(
             raise LongCandidateContractError(
                 f"long Base candidate e{expected_epoch} protocol mismatch"
             )
-        checkpoint = talkshow._regular_file(
+        checkpoint = diffsheg._regular_file(
             manifest_resolved.parent / relative,
             f"long Base candidate e{expected_epoch}",
         )

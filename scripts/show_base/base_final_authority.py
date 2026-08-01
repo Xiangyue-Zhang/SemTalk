@@ -199,7 +199,6 @@ _CONTROL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "merge_prerequisite_val_shards",
         "selected_prerequisites",
         "select_base_official_adapt",
-        "talkshow_base_val_contract",
     ),
     "select_base_official_adapt_long": (
         "select_base_official_adapt",

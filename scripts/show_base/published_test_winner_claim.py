@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Fresh validation for one published SemTalk SHOW Base test winner.
+"""Archived TalkSHOW-compatibility winner validation for SemTalk SHOW Base.
 
 This module is intentionally self-contained and standard-library only.  It
 does not trust caller-supplied checkpoint mappings.  The Base checkpoint is
 recomputed from the frozen validation rows and the five representation
 checkpoints are recovered from the separately pinned prerequisite selection.
-Only then is the claim allowed to authorize one test evaluation.
+Only then is the compatibility claim allowed to authorize one compatibility
+evaluation.  It is not accepted by the primary DiffSHEG Base authority.
 """
 
 from __future__ import annotations

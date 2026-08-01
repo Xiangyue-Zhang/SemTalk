@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -451,11 +453,261 @@ class ReadyWatcherContracts(unittest.TestCase):
 
 
 class TrainerWatcherCompatibilityContracts(unittest.TestCase):
-    def test_watcher_pins_the_exact_frozen_trainer_bytes(self) -> None:
+    def test_legacy_watcher_pin_stays_frozen_and_rejects_current_trainer(
+        self,
+    ) -> None:
         self.assertEqual(
-            _sha_bytes(TRAINER_PATH.read_bytes()),
+            WATCHER.TRAINER_ENTRYPOINT_SHA256,
+            "73d2139bf289000e4909becb319e430cebde67b09ff7a32c101389b482f270aa",
+        )
+        current_trainer_sha256 = _sha_bytes(TRAINER_PATH.read_bytes())
+        self.assertNotEqual(
+            current_trainer_sha256,
             WATCHER.TRAINER_ENTRYPOINT_SHA256,
         )
+
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-legacy-watcher-current-trainer-"
+        ) as temporary:
+            root = Path(temporary)
+            fixture = LongValidationFixture(root)
+            frozen_path = root / "frozen_inputs.json"
+            frozen = dict(fixture.frozen)
+            frozen["source"] = dict(frozen["source"])
+            frozen["source"]["entrypoint_sha256"] = current_trainer_sha256
+            body = dict(frozen)
+            body.pop("receipt_sha256")
+            frozen["receipt_sha256"] = WATCHER.canonical_json_sha256(body)
+            _write_json(frozen_path, frozen)
+            reference = {
+                "path": str(frozen_path),
+                "sha256": HARDLINK.sha256_file(frozen_path),
+                "receipt_payload_sha256": frozen["receipt_sha256"],
+            }
+            with self.assertRaises(WATCHER.WatchContractError):
+                WATCHER.validate_frozen_inputs(
+                    train_root=root,
+                    value=reference,
+                    expected_receipt_sha=frozen["receipt_sha256"],
+                )
+
+    def test_formal_diffsheg_pipeline_excludes_legacy_and_compatibility(
+        self,
+    ) -> None:
+        from scripts.show_base import base_final_authority
+        from scripts.show_base import base_long_val_contract as primary
+        from scripts.show_base import select_base_official_adapt as diffsheg
+        from scripts.show_base import (
+            talkshow_base_val_contract as compatibility,
+        )
+
+        primary_roots = set(primary.PRIMARY_SELECTION_ENTRYPOINTS)
+        primary_roots.update(primary.PRIMARY_AUTHORITY_FINAL_ENTRYPOINTS)
+        compatibility_roots = set(primary.COMPATIBILITY_ONLY_ENTRYPOINTS)
+        self.assertFalse(primary_roots & compatibility_roots)
+        primary_source_roots = set(
+            diffsheg.DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES
+        )
+        self.assertFalse(primary_source_roots & compatibility_roots)
+        self.assertEqual(
+            primary_source_roots,
+            set(diffsheg.FRESH_PIPELINE_SOURCE_FILES),
+        )
+        self.assertEqual(
+            primary.PRIMARY_SELECTION_PROTOCOL,
+            "diffsheg_show_validation_fgd_v1",
+        )
+        self.assertEqual(
+            primary.PRIMARY_SELECTION_METRIC_PATH,
+            "validation.diffsheg.metrics.fgd",
+        )
+        self.assertEqual(primary.PRIMARY_SELECTION_REPORT_KEY, "fgd")
+        self.assertEqual(
+            base_final_authority.BASE_SELECTION_PROTOCOL,
+            primary.PRIMARY_SELECTION_PROTOCOL,
+        )
+        self.assertEqual(
+            base_final_authority.BASE_SELECTION_METRIC,
+            primary.PRIMARY_SELECTION_METRIC_PATH,
+        )
+
+        required_roots = {
+            "scripts/show_base/run_base_diffsheg_val_8shard.sh",
+            "scripts/show_base/finalize_base_diffsheg_val_partitions.sh",
+            "scripts/show_base/select_base_official_adapt_long.py",
+            "scripts/show_base/validate_base_long_test_winner.py",
+            "scripts/show_base/base_final_authority.py",
+            "scripts/show_base/run_base_final_test.sh",
+            "scripts/show_base/evaluate_diffsheg_final_test.py",
+        }
+        self.assertTrue(required_roots.issubset(primary_roots))
+
+        legacy_tokens = {WATCHER_PATH.name, WATCHER_PATH.stem}
+        for relative in primary_roots:
+            source = (REPOSITORY / relative).read_text(encoding="utf-8")
+            for token in legacy_tokens:
+                self.assertNotIn(token, source, relative)
+
+        pending = [
+            relative
+            for relative in primary_roots
+            if relative.endswith(".py")
+        ]
+        python_closure: set[str] = set()
+        while pending:
+            relative = pending.pop()
+            if relative in python_closure:
+                continue
+            python_closure.add(relative)
+            path = REPOSITORY / relative
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            imported_modules: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_modules.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    imported_modules.add(module)
+                    if module == "scripts.show_base":
+                        imported_modules.update(
+                            f"{module}.{alias.name}" for alias in node.names
+                        )
+            for module in imported_modules:
+                if not module.startswith("scripts.show_base."):
+                    continue
+                imported = module.replace(".", "/") + ".py"
+                if (REPOSITORY / imported).is_file():
+                    pending.append(imported)
+
+        forbidden_modules = {
+            Path(relative).stem
+            for relative in compatibility_roots
+            if relative.endswith(".py")
+        }
+        observed_modules = {Path(relative).stem for relative in python_closure}
+        self.assertFalse(forbidden_modules & observed_modules)
+        self.assertNotIn("talkshow_base_val_contract", observed_modules)
+        self.assertNotIn(WATCHER_PATH.stem, observed_modules)
+
+        expected_pipeline = {"authority": "diffsheg-primary"}
+        expected_source = {"commit": "1" * 40}
+        validated = ({"sha256": "2" * 64}, expected_pipeline)
+        with (
+            mock.patch.object(
+                diffsheg,
+                "validate_fresh_pipeline",
+                return_value=validated,
+            ) as primary_validator,
+            mock.patch.object(
+                compatibility,
+                "validate_fresh_pipeline",
+                side_effect=AssertionError(
+                    "primary validation entered compatibility authority"
+                ),
+            ) as compatibility_validator,
+        ):
+            result = primary.validate_pipeline(
+                Path("/private/tmp/diffsheg-primary-pipeline.json"),
+                "3" * 64,
+                expected_prerequisite_selection=expected_pipeline,
+                expected_source=expected_source,
+            )
+        self.assertEqual(result, validated)
+        primary_validator.assert_called_once_with(
+            Path("/private/tmp/diffsheg-primary-pipeline.json"),
+            "3" * 64,
+            expected_prerequisite_selection=expected_pipeline,
+            expected_source=expected_source,
+        )
+        compatibility_validator.assert_not_called()
+
+        compatibility_relative = (
+            "scripts/show_base/replay_released2_primary.py"
+        )
+        self.assertIn(
+            compatibility_relative,
+            compatibility.TALKSHOW_COMPATIBILITY_PIPELINE_SOURCE_FILES,
+        )
+        self.assertNotIn(compatibility_relative, primary_source_roots)
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-primary-source-",
+            dir="/private/tmp",
+        ) as temporary:
+            source_root = (Path(temporary) / "source").resolve()
+            for relative in sorted(primary_source_roots):
+                target = source_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((REPOSITORY / relative).read_bytes())
+            compatibility_path = source_root / compatibility_relative
+            compatibility_path.parent.mkdir(parents=True, exist_ok=True)
+            compatibility_path.write_bytes(
+                (REPOSITORY / compatibility_relative).read_bytes()
+            )
+
+            def git(*arguments: str) -> str:
+                process = subprocess.run(
+                    ["git", "-C", str(source_root), *arguments],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return process.stdout.strip()
+
+            git("init", "--quiet")
+            git(
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            )
+
+            def commit_fixture(message: str) -> None:
+                git(
+                    "-c",
+                    "user.name=Xiangyue-Zhang",
+                    "-c",
+                    (
+                        "user.email="
+                        "85532891+Xiangyue-Zhang@users.noreply.github.com"
+                    ),
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    message,
+                )
+
+            git(
+                "add",
+                "--",
+                *sorted(primary_source_roots),
+                compatibility_relative,
+            )
+            commit_fixture("primary source receipt fixture")
+            branch = git("symbolic-ref", "--short", "HEAD")
+            commit = git("rev-parse", "HEAD")
+            git("checkout", "--quiet", "--detach", commit)
+            git("branch", "-D", branch)
+
+            before = diffsheg.build_fresh_pipeline_source_receipt(source_root)
+            compatibility_path.write_bytes(
+                compatibility_path.read_bytes()
+                + b"\n# compatibility-only revision\n"
+            )
+            git("add", "--", compatibility_relative)
+            commit_fixture("change compatibility-only source")
+            after = diffsheg.build_fresh_pipeline_source_receipt(source_root)
+
+        # commit/tree identify the whole repository; files is the formal
+        # DiffSHEG-primary source_closure authority.
+        self.assertNotEqual(before, after)
+        self.assertNotEqual(before["commit"], after["commit"])
+        self.assertNotEqual(before["tree"], after["tree"])
+        self.assertEqual(before["files"], after["files"])
+        self.assertEqual(set(before["files"]), primary_source_roots)
+        self.assertFalse(set(before["files"]) & compatibility_roots)
 
     def test_watcher_ready_schema_matches_trainer_literal(self) -> None:
         tree = ast.parse(

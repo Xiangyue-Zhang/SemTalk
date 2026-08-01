@@ -1572,6 +1572,59 @@ class BaseFinalAuthorityTest(unittest.TestCase):
         )
         self.assertEqual(observed.EXPECTED_UPDATES_PER_EPOCH, 497)
 
+    def test_dynamic_control_closure_excludes_compatibility(self) -> None:
+        source_root = Path(AUTH.__file__).resolve().parent
+        compiled: list[str] = []
+        executed: list[str] = []
+        real_compile = compile
+        real_exec = exec
+
+        def recording_compile(*args: object, **kwargs: object) -> object:
+            filename = Path(str(args[1])).resolve()
+            if filename.parent == source_root:
+                compiled.append(filename.stem)
+            return real_compile(*args, **kwargs)
+
+        def recording_exec(*args: object, **kwargs: object) -> object:
+            code = args[0]
+            filename = Path(str(code.co_filename)).resolve()
+            if filename.parent == source_root:
+                executed.append(filename.stem)
+            return real_exec(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                AUTH,
+                "compile",
+                recording_compile,
+                create=True,
+            ),
+            mock.patch.object(
+                AUTH,
+                "exec",
+                recording_exec,
+                create=True,
+            ),
+        ):
+            observed = AUTH._control_module(
+                "validate_base_long_test_winner"
+            )
+
+        compatibility_modules = {
+            Path(relative).stem
+            for relative in LONG.COMPATIBILITY_ONLY_ENTRYPOINTS
+            if relative.endswith(".py")
+        }
+        compatibility_modules.add("talkshow_base_val_contract")
+        self.assertEqual(
+            observed.__name__,
+            "scripts.show_base.validate_base_long_test_winner",
+        )
+        self.assertEqual(compiled, executed)
+        self.assertIn("base_long_val_contract", compiled)
+        self.assertIn("validate_base_long_test_winner", compiled)
+        self.assertFalse(set(compiled) & compatibility_modules)
+
     def test_each_checkpoint_replacement_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = AuthorityFixture(Path(directory))

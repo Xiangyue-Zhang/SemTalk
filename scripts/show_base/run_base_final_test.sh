@@ -93,12 +93,13 @@ done
 
 adapter=$launcher_dir/run_base_final_test.py
 evaluator=$launcher_dir/evaluate_diffsheg_final_test.py
+result_validator=$launcher_dir/validate_diffsheg_final_result.py
 audio_view_builder=$launcher_dir/prepare_diffsheg_audio_view.py
 for required in \
     "$python_bin" "$fresh_test_authority" \
     "$paspa_root" "$diffsheg_root" "$talkshow_root" \
     "$source_audio_root" "$smplx_path" "$adapter" "$evaluator" \
-    "$audio_view_builder" "$python_runtime_contract"; do
+    "$result_validator" "$audio_view_builder" "$python_runtime_contract"; do
     [[ -e $required ]] || {
         printf 'missing required input: %s\n' "$required" >&2
         exit 1
@@ -433,6 +434,18 @@ trap cleanup_children EXIT
 trap 'signal_exit 130' INT
 trap 'signal_exit 143' TERM
 trap 'signal_exit 129' HUP
+metric_fifo=$log_root/.diffsheg-metric-stdout.fifo
+[[ ! -e /proc/$$/fd/9 && ! -L /proc/$$/fd/9 ]] || {
+    printf 'refusing to overwrite inherited file descriptor 9\n' >&2
+    exit 1
+}
+(umask 077; mkfifo -m 600 -- "$metric_fifo")
+metric_fifo_identity=$(stat -Lc '%d:%i:%f:%h' "$metric_fifo")
+metric_fifo_mode_links=$(stat -Lc '%a:%h' "$metric_fifo")
+[[ $metric_fifo_mode_links == 600:1 ]] || {
+    printf 'metric stdout FIFO is not exclusive mode0600/nlink1\n' >&2
+    exit 1
+}
 CUDA_VISIBLE_DEVICES=0 "$python_bin" "$evaluator" \
     "${workload_authority_args[@]}" \
     "${diffsheg_asset_args[@]}" \
@@ -441,8 +454,9 @@ CUDA_VISIBLE_DEVICES=0 "$python_bin" "$evaluator" \
     --expected-audio-set-sha256 "$diffsheg_audio_set_sha" \
     --output-root "$diffsheg_output" \
     --device cuda:0 \
-    >"$log_root/diffsheg-metrics.log" 2>&1 &
+    >"$metric_fifo" 2>"$log_root/diffsheg-metrics.stderr.log" &
 metric_pid=$!
+exec 9<"$metric_fifo"
 pending_pid=$metric_pid
 pending_entry=$evaluator
 pending_subcommand=
@@ -463,6 +477,43 @@ if [[ -z $metric_snapshot ]]; then
     printf 'cannot attest the sole DiffSHEG metric child\n' >&2
     exit 1
 fi
+metric_fifo_parent_link=$(readlink "/proc/$$/fd/9")
+metric_fifo_child_link=$(readlink "/proc/$metric_pid/fd/1")
+metric_fifo_parent_identity=$(stat -Lc '%d:%i:%f:%h' "/proc/$$/fd/9")
+metric_fifo_child_identity=$(stat -Lc '%d:%i:%f:%h' "/proc/$metric_pid/fd/1")
+[[ $metric_fifo_parent_link == "$metric_fifo" && \
+   $metric_fifo_child_link == "$metric_fifo" && \
+   $metric_fifo_parent_identity == "$metric_fifo_identity" && \
+   $metric_fifo_child_identity == "$metric_fifo_identity" && \
+   $(stat -Lc '%a:%h' "/proc/$$/fd/9") == 600:1 && \
+   $(stat -Lc '%a:%h' "/proc/$metric_pid/fd/1") == 600:1 ]] || {
+    printf 'metric stdout FIFO endpoint identity changed\n' >&2
+    exit 1
+}
+[[ $(stat -Lc '%d:%i:%f:%h' "$metric_fifo") == \
+   "$metric_fifo_identity" ]] || {
+    printf 'metric stdout FIFO path changed before unlink\n' >&2
+    exit 1
+}
+rm -- "$metric_fifo"
+[[ ! -e $metric_fifo && ! -L $metric_fifo ]] || {
+    printf 'metric stdout FIFO path survived unlink\n' >&2
+    exit 1
+}
+# Compare the unlinked endpoints again using only device/inode; nlink is now
+# zero by construction, so no path can replace or reopen this parent-owned
+# stream before the producer pins are consumed.
+metric_fifo_device_inode=${metric_fifo_identity%%:*}
+metric_fifo_identity_tail=${metric_fifo_identity#*:}
+metric_fifo_device_inode+=:${metric_fifo_identity_tail%%:*}
+[[ $(stat -Lc '%d:%i' "/proc/$$/fd/9") == "$metric_fifo_device_inode" && \
+   $(stat -Lc '%d:%i' "/proc/$metric_pid/fd/1") == \
+       "$metric_fifo_device_inode" && \
+   $(stat -Lc '%h' "/proc/$$/fd/9") == 0 && \
+   $(stat -Lc '%h' "/proc/$metric_pid/fd/1") == 0 ]] || {
+    printf 'unlinked metric stdout stream identity changed\n' >&2
+    exit 1
+}
 pids+=("$metric_pid")
 starttimes+=("$metric_start")
 argv_hashes+=("$metric_argv")
@@ -472,6 +523,11 @@ pending_subcommand=
 printf 'metric\t%s\t%s\t%s\n' \
     "$metric_pid" "$metric_start" "$metric_argv" \
     >>"$log_root/children.tsv"
+metric_stdout=
+while IFS= read -r metric_stdout_line <&9; do
+    metric_stdout+="$metric_stdout_line"$'\n'
+done
+exec 9<&-
 if ! wait "$metric_pid"; then
     printf 'the sole DiffSHEG test evaluation failed; no retry is allowed\n' >&2
     exit 1
@@ -481,10 +537,110 @@ starttimes=()
 argv_hashes=()
 trap - EXIT INT TERM HUP
 
-[[ -f $diffsheg_output/final_metrics.json && \
-   -s $diffsheg_output/final_metrics.json ]] || {
-    printf 'formal result is not the unique DiffSHEG seven-metric closure\n' >&2
+final_result_fields=()
+mapfile -d '' -t final_result_fields < <(
+    "$python_bin" -c '
+import json, sys
+lines = [line for line in sys.stdin.read().splitlines() if line.strip()]
+if not lines:
+    raise SystemExit("metric producer returned no structured result")
+value = json.loads(lines[-1])
+pin = value.get("final_metrics")
+if value.get("status") != "complete" or not isinstance(pin, dict) or set(pin) != {"path", "sha256", "bytes", "canonical_payload_sha256"}:
+    raise SystemExit("metric producer result schema mismatch")
+if not isinstance(pin["path"], str) or not isinstance(pin["sha256"], str) or not isinstance(pin["canonical_payload_sha256"], str) or type(pin["bytes"]) is not int:
+    raise SystemExit("metric producer pin types changed")
+sys.stdout.buffer.write(b"\0".join((pin["path"].encode(), pin["sha256"].encode(), str(pin["bytes"]).encode(), pin["canonical_payload_sha256"].encode())) + b"\0")
+' <<<"$metric_stdout"
+)
+if ((${#final_result_fields[@]} != 4)); then
+    printf 'formal metric producer did not return four external pins\n' >&2
+    exit 1
+fi
+final_metrics_path=${final_result_fields[0]}
+final_metrics_sha=${final_result_fields[1]}
+final_metrics_bytes=${final_result_fields[2]}
+final_metrics_payload_sha=${final_result_fields[3]}
+[[ $final_metrics_path == "$diffsheg_output/final_metrics.json" && \
+   $final_metrics_sha =~ ^[0-9a-f]{64}$ && \
+   $final_metrics_bytes =~ ^[1-9][0-9]*$ && \
+   $final_metrics_payload_sha =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'formal metric producer external pins are invalid\n' >&2
     exit 1
 }
+
+terminal_validation=$log_root/diffsheg-final-result-validation.json
+validation_result=$(
+    CUDA_VISIBLE_DEVICES='' "$python_bin" "$result_validator" \
+        "${authority_args[@]}" \
+        "${diffsheg_asset_args[@]}" \
+        --preflight-json "$diffsheg_preflight" \
+        --expected-preflight-sha256 "$diffsheg_preflight_sha" \
+        --expected-audio-set-sha256 "$diffsheg_audio_set_sha" \
+        --final-metrics-json "$final_metrics_path" \
+        --expected-final-metrics-sha256 "$final_metrics_sha" \
+        --expected-final-metrics-bytes "$final_metrics_bytes" \
+        --expected-final-metrics-canonical-payload-sha256 \
+            "$final_metrics_payload_sha" \
+        --output-report "$terminal_validation"
+)
+validation_fields=()
+mapfile -d '' -t validation_fields < <(
+    "$python_bin" -c '
+import json, sys
+value=json.load(sys.stdin)
+fields=(value.get("status"), value.get("output"), value.get("sha256"), value.get("bytes"), value.get("canonical_payload_sha256"))
+if fields[0] != "complete" or not isinstance(fields[1], str) or not isinstance(fields[2], str) or type(fields[3]) is not int or not isinstance(fields[4], str):
+    raise SystemExit("terminal validator result schema mismatch")
+sys.stdout.buffer.write(b"\0".join(str(item).encode() for item in fields) + b"\0")
+' <<<"$validation_result"
+)
+[[ ${#validation_fields[@]} == 5 && \
+   ${validation_fields[0]} == complete && \
+   ${validation_fields[1]} == "$terminal_validation" && \
+   ${validation_fields[2]} =~ ^[0-9a-f]{64}$ && \
+   ${validation_fields[3]} =~ ^[1-9][0-9]*$ && \
+   ${validation_fields[4]} =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'terminal DiffSHEG result validator did not PASS\n' >&2
+    exit 1
+}
+observed_validation_sha=$(sha256sum "$terminal_validation")
+observed_validation_sha=${observed_validation_sha%% *}
+observed_validation_bytes=$(stat -c %s "$terminal_validation")
+[[ $observed_validation_sha == "${validation_fields[2]}" && \
+   $observed_validation_bytes == "${validation_fields[3]}" ]] || {
+    printf 'terminal validator PASS receipt changed after publication\n' >&2
+    exit 1
+}
+"$python_bin" -c '
+import hashlib, json, pathlib, sys
+path=pathlib.Path(sys.argv[1])
+expected_payload=sys.argv[2]
+value=json.loads(path.read_bytes())
+if value.get("format") != "semtalk_show_diffsheg_final_result_validation_v1" or value.get("status") != "complete":
+    raise SystemExit("terminal PASS receipt identity changed")
+stored=value.get("receipt_payload_sha256")
+payload={key:item for key,item in value.items() if key != "receipt_payload_sha256"}
+observed=hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+if stored != expected_payload or observed != expected_payload:
+    raise SystemExit("terminal PASS receipt payload pin changed")
+' "$terminal_validation" "${validation_fields[4]}"
+post_validation_final_sha=$(sha256sum "$final_metrics_path")
+post_validation_final_sha=${post_validation_final_sha%% *}
+post_validation_final_bytes=$(stat -c %s "$final_metrics_path")
+[[ $post_validation_final_sha == "$final_metrics_sha" && \
+   $post_validation_final_bytes == "$final_metrics_bytes" ]] || {
+    printf 'final_metrics.json changed after terminal validation\n' >&2
+    exit 1
+}
+"$python_bin" -c '
+import hashlib, json, pathlib, sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+stored=value.get("receipt_payload_sha256")
+payload={key:item for key,item in value.items() if key != "receipt_payload_sha256"}
+observed=hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+if stored != sys.argv[2] or observed != sys.argv[2]:
+    raise SystemExit("final_metrics.json payload changed after validation")
+' "$final_metrics_path" "$final_metrics_payload_sha"
 printf 'SemTalk SHOW DiffSHEG final test complete: %s\n' \
-    "$diffsheg_output/final_metrics.json"
+    "$final_metrics_path"
