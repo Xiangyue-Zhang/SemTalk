@@ -2,7 +2,7 @@
 """Fail-closed live validation authority for fresh SemTalk SHOW Base runs.
 
 This program is deliberately external to the producer checkout.  The runtime
-producer is the exact V14 formal-training source at 59f3bb6.  Its numerical
+producer is the exact V14 formal-training source at 8f1fa7b.  Its numerical
 training semantics are proved against 5b84075.  The immutable pipeline evidence
 remains pinned to 4066f20, while validation code executes only from the minimal
 70a70f4 provenance-fix successor.  Those roles are intentionally distinct.  It never
@@ -46,13 +46,13 @@ from typing import Any, Callable, Mapping, Sequence
 sys.dont_write_bytecode = True
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
-PRODUCER_SOURCE_COMMIT = "59f3bb60e9eb96a3066c5ff8c1ec35d4e725787f"
-PRODUCER_SOURCE_TREE = "0ff290be19a5d938308abce40bcd895ae45af5ed"
+PRODUCER_SOURCE_COMMIT = "8f1fa7b85ed8253600a4c571e98eb9927edeb073"
+PRODUCER_SOURCE_TREE = "d5e5eb74acdc6d9ca330d5731e718e33b67cf626"
 PRODUCER_TRAINER_SHA256 = (
     "29fdd5d3e9bdfc61904f649b71d4dae1766b42a4a6a5a40b2bbd37a4c6b33173"
 )
 PRODUCER_V14_CONTRACT_SHA256 = (
-    "bed2854f6d8ca8a293ee5107f55a32867dbe84f500d05abe459c7e48a8f1f336"
+    "3526ca896f23e7849545e3f81553dd242dc1ca3049eabdeeb89fc38357616323"
 )
 TRAINING_SEMANTICS_SOURCE_COMMIT = (
     "5b84075bb5bc9577a891a1f5ff72e93c39bab2e8"
@@ -64,7 +64,7 @@ TRAINING_SEMANTICS_TRAINER_SHA256 = (
     "65cb565ceaf70f5c744b5c85db50e41d728f507d12cac28b06a5cc3756b65dba"
 )
 # The unchanged top-level numerical objective/data/checkpoint definitions in
-# 5b84075 and 59f3bb6 have this canonical name->AST hash projection.  The exact
+# 5b84075 and 8f1fa7b have this canonical name->AST hash projection.  The exact
 # changed-name set below is limited to V14 control-plane, schedule, and
 # throughput-gate plumbing; the entire runtime producer file is independently
 # byte pinned above.
@@ -841,7 +841,7 @@ def _prove_training_semantics(root: Path) -> dict[str, Any]:
         semantic_bytes, label="5b84075 trainer"
     )
     producer_defs = _top_level_definition_hashes(
-        producer_bytes, label="59f3bb6 trainer"
+        producer_bytes, label="8f1fa7b trainer"
     )
     changed = {
         name
@@ -1273,56 +1273,78 @@ class ValidationHooks:
             "origin",
             "commit",
             "tree",
-            "branch",
             "clean",
-            "entrypoint",
             "entrypoint_sha256",
+            "node_local_clones",
         }
+        if not isinstance(frozen_source, dict):
+            raise LiveValidationContractError(
+                "frozen runtime producer source changed"
+            )
+        clones = frozen_source.get("node_local_clones")
         if (
-            not isinstance(frozen_source, dict)
-            or set(frozen_source) != expected_keys
+            set(frozen_source) != expected_keys
             or frozen_source.get("origin") != EXPECTED_ORIGIN
             or frozen_source.get("commit") != PRODUCER_SOURCE_COMMIT
             or frozen_source.get("tree") != PRODUCER_SOURCE_TREE
-            or frozen_source.get("branch") is not None
             or frozen_source.get("clean") is not True
             or frozen_source.get("entrypoint_sha256")
             != PRODUCER_TRAINER_SHA256
+            or not isinstance(clones, list)
+            or len(clones) != 1
         ):
             raise LiveValidationContractError("frozen runtime producer source changed")
-        entrypoint = Path(str(frozen_source.get("entrypoint", "")))
-        if (
-            not entrypoint.is_absolute()
-            or ".." in entrypoint.parts
-            or entrypoint.name != "train_base_official_adapt_long.py"
-        ):
-            raise LiveValidationContractError(
-                "frozen training entrypoint path changed"
+        observed_slots: set[int] = set()
+        for node_rank, clone in enumerate(clones):
+            if not isinstance(clone, dict) or set(clone) != {
+                "node_rank", "host_slot", "hostname", "entrypoint", "branch"
+            }:
+                raise LiveValidationContractError(
+                    "frozen node-local producer source schema changed"
+                )
+            slot = clone.get("host_slot")
+            entrypoint = Path(str(clone.get("entrypoint", "")))
+            if (
+                type(clone.get("node_rank")) is not int
+                or clone.get("node_rank") != node_rank
+                or type(slot) is not int
+                or slot in observed_slots
+                or slot not in FORMAL_HOST_BY_SLOT
+                or clone.get("hostname") != FORMAL_HOST_BY_SLOT[slot]
+                or clone.get("branch") is not None
+                or not entrypoint.is_absolute()
+                or ".." in entrypoint.parts
+                or entrypoint.name != "train_base_official_adapt_long.py"
+            ):
+                raise LiveValidationContractError(
+                    "frozen node-local producer source changed"
+                )
+            resolved_entrypoint, entrypoint_sha, _entrypoint_bytes = (
+                safe_regular_hash(
+                    entrypoint,
+                    f"frozen node {node_rank} training entrypoint",
+                )
             )
-        resolved_entrypoint, entrypoint_sha, _entrypoint_bytes = (
-            safe_regular_hash(entrypoint, "frozen training entrypoint")
-        )
-        if (
-            resolved_entrypoint != entrypoint
-            or entrypoint_sha != PRODUCER_TRAINER_SHA256
-        ):
-            raise LiveValidationContractError(
-                "frozen runtime producer entrypoint bytes changed"
+            training_root = canonical_existing_directory(
+                entrypoint.parents[2],
+                f"frozen node {node_rank} training source root",
             )
-        training_root = canonical_existing_directory(
-            entrypoint.parents[2], "frozen training source root"
-        )
-        if training_root != self.producer_source_root:
-            raise LiveValidationContractError(
-                "frozen runtime producer differs from the configured producer root"
-            )
+            if (
+                resolved_entrypoint != entrypoint
+                or entrypoint_sha != PRODUCER_TRAINER_SHA256
+                or training_root != self.producer_source_root
+            ):
+                raise LiveValidationContractError(
+                    "frozen runtime producer differs from the configured producer root"
+                )
+            observed_slots.add(slot)
         self._git_checkout_authority(
-            training_root,
+            self.producer_source_root,
             expected_commit=PRODUCER_SOURCE_COMMIT,
             expected_tree=PRODUCER_SOURCE_TREE,
             label="runtime producer source",
         )
-        proof = _prove_training_semantics(training_root)
+        proof = _prove_training_semantics(self.producer_source_root)
         self._load_verified_modules()
         return {
             **dict(frozen_source),
@@ -1703,10 +1725,12 @@ def _validate_topology_and_dataset(
     protocol = frozen.get("protocol")
     topology = frozen.get("topology")
     dataset = frozen.get("dataset")
-    if not isinstance(protocol, dict) or not isinstance(topology, dict) or not isinstance(dataset, dict):
+    source = frozen.get("source")
+    if not isinstance(protocol, dict) or not isinstance(topology, dict) or not isinstance(dataset, dict) or not isinstance(source, dict):
         raise LiveValidationContractError("frozen topology/dataset is malformed")
     distributed = protocol.get("distributed_topology")
     protocol_nodes = distributed.get("nodes") if isinstance(distributed, dict) else None
+    source_clones = source.get("node_local_clones")
     expected_optimizer = {
         "name": "Adam",
         "learning_rate": specification["learning_rate"],
@@ -1752,6 +1776,8 @@ def _validate_topology_and_dataset(
         )
         or not isinstance(protocol_nodes, list)
         or len(protocol_nodes) != specification["node_count"]
+        or not isinstance(source_clones, list)
+        or len(source_clones) != specification["node_count"]
         or type(distributed.get("master_port")) is not int
         or not (1 <= distributed["master_port"] <= 65_535)
         or not isinstance(distributed.get("master_addr"), str)
@@ -1810,7 +1836,8 @@ def _validate_topology_and_dataset(
         raise LiveValidationContractError("frozen topology receipt changed")
     expected_ranks: list[dict[str, Any]] = []
     for node_rank, node in enumerate(protocol_nodes):
-        if not isinstance(node, dict):
+        clone = source_clones[node_rank]
+        if not isinstance(node, dict) or not isinstance(clone, dict):
             raise LiveValidationContractError("protocol node is malformed")
         slot = exact_int(node.get("host_slot"), "protocol host slot")
         if slot not in FORMAL_HOST_BY_SLOT:
@@ -1818,8 +1845,15 @@ def _validate_topology_and_dataset(
         hostname = FORMAL_HOST_BY_SLOT.get(slot)
         if (
             set(node) != {"node_rank", "host_slot", "hostname", "rank_range"}
+            or set(clone) != {
+                "node_rank", "host_slot", "hostname", "entrypoint", "branch"
+            }
             or not exact_int_equal(node.get("node_rank"), node_rank)
             or node.get("hostname") != hostname
+            or not exact_int_equal(clone.get("node_rank"), node_rank)
+            or not exact_int_equal(clone.get("host_slot"), slot)
+            or clone.get("hostname") != hostname
+            or clone.get("branch") is not None
             or not strict_json_equal(
                 node.get("rank_range"),
                 list(

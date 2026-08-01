@@ -127,6 +127,24 @@ class ContractTests(unittest.TestCase):
     def test_exact_candidate_queue(self) -> None:
         self.assertEqual(sup.CANDIDATE_EPOCHS, (1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80, 100, 120, 140, 160, 180, 200, 240, 280, 320, 360, 400))
 
+    def test_formal_producer_is_frozen_at_8f_not_the_control_successor(self) -> None:
+        self.assertEqual(
+            sup.PRODUCER_SOURCE_COMMIT,
+            "8f1fa7b85ed8253600a4c571e98eb9927edeb073",
+        )
+        self.assertEqual(
+            sup.PRODUCER_SOURCE_TREE,
+            "d5e5eb74acdc6d9ca330d5731e718e33b67cf626",
+        )
+        self.assertEqual(
+            sup.PRODUCER_TRAINER_SHA256,
+            "29fdd5d3e9bdfc61904f649b71d4dae1766b42a4a6a5a40b2bbd37a4c6b33173",
+        )
+        self.assertEqual(
+            sup.PRODUCER_CONTRACT_SHA256,
+            "3526ca896f23e7849545e3f81553dd242dc1ca3049eabdeeb89fc38357616323",
+        )
+
     def test_real_double_symlink_venv_chain_is_bound(self) -> None:
         base = self.fx.root / "base/bin"
         base.mkdir(parents=True)

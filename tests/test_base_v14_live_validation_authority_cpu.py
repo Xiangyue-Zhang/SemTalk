@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -528,10 +530,20 @@ class Fixture:
                 "origin": ADAPTER.EXPECTED_ORIGIN,
                 "commit": ADAPTER.PRODUCER_SOURCE_COMMIT,
                 "tree": ADAPTER.PRODUCER_SOURCE_TREE,
-                "branch": None,
                 "clean": True,
-                "entrypoint": str(self.source_root / "scripts/show_base/train_base_official_adapt_long.py"),
                 "entrypoint_sha256": ADAPTER.PRODUCER_TRAINER_SHA256,
+                "node_local_clones": [
+                    {
+                        "node_rank": 0,
+                        "host_slot": host_slot,
+                        "hostname": hostname,
+                        "entrypoint": str(
+                            self.source_root
+                            / "scripts/show_base/train_base_official_adapt_long.py"
+                        ),
+                        "branch": None,
+                    }
+                ],
             },
             "official_base": {
                 "source": "released_all_speakers_v1",
@@ -859,9 +871,7 @@ class LiveValidationAdapterTests(unittest.TestCase):
         validation_root = Path(
             "/private/tmp/semtalk_final_integration_20260801"
         ).resolve(strict=True)
-        producer_root = Path(
-            "/private/tmp/semtalk_integrated_v14_20260802.wEhq8K"
-        ).resolve(strict=True)
+        producer_root = REPOSITORY.resolve(strict=True)
         with mock.patch.object(
             ADAPTER.ValidationHooks, "_load_verified_modules"
         ) as loader:
@@ -891,6 +901,138 @@ class LiveValidationAdapterTests(unittest.TestCase):
                 ),
             )
         loader.assert_not_called()
+
+    def test_producer_pin_is_exact_8f_and_control_successors_do_not_chase_it(self):
+        self.assertEqual(
+            ADAPTER.PRODUCER_SOURCE_COMMIT,
+            "8f1fa7b85ed8253600a4c571e98eb9927edeb073",
+        )
+        self.assertEqual(
+            ADAPTER.PRODUCER_SOURCE_TREE,
+            "d5e5eb74acdc6d9ca330d5731e718e33b67cf626",
+        )
+        expected = {
+            "scripts/show_base/train_base_official_adapt_long.py": (
+                ADAPTER.PRODUCER_TRAINER_SHA256
+            ),
+            "scripts/show_base/base_v14_formal_contract.py": (
+                ADAPTER.PRODUCER_V14_CONTRACT_SHA256
+            ),
+            "configs/show_base/semtalk_base_v14_formal_schedule_20260802.json": (
+                ADAPTER.V14_SCHEDULE_SHA256
+            ),
+        }
+        for relative, digest in expected.items():
+            with self.subTest(relative=relative):
+                blob = subprocess.run(
+                    [
+                        "git", "-C", str(REPOSITORY), "show",
+                        f"{ADAPTER.PRODUCER_SOURCE_COMMIT}:{relative}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                self.assertEqual(hashlib.sha256(blob).hexdigest(), digest)
+
+    def test_default_training_source_accepts_only_portable_8f_clone_schema(self):
+        hooks = ADAPTER.ValidationHooks.__new__(ADAPTER.ValidationHooks)
+        hooks.producer_source_root = REPOSITORY.resolve(strict=True)
+        hooks._git_checkout_authority = mock.Mock(
+            return_value={
+                "origin": ADAPTER.EXPECTED_ORIGIN,
+                "commit": ADAPTER.PRODUCER_SOURCE_COMMIT,
+                "tree": ADAPTER.PRODUCER_SOURCE_TREE,
+                "clean": True,
+                "detached": True,
+                "local_branches_at_commit": [],
+            }
+        )
+        hooks._load_verified_modules = mock.Mock()
+        entrypoint = (
+            REPOSITORY
+            / "scripts/show_base/train_base_official_adapt_long.py"
+        ).resolve(strict=True)
+        source = {
+            "origin": ADAPTER.EXPECTED_ORIGIN,
+            "commit": ADAPTER.PRODUCER_SOURCE_COMMIT,
+            "tree": ADAPTER.PRODUCER_SOURCE_TREE,
+            "clean": True,
+            "entrypoint_sha256": ADAPTER.PRODUCER_TRAINER_SHA256,
+            "node_local_clones": [
+                {
+                    "node_rank": 0,
+                    "host_slot": 0,
+                    "hostname": ADAPTER.FORMAL_HOST_BY_SLOT[0],
+                    "entrypoint": str(entrypoint),
+                    "branch": None,
+                }
+            ],
+        }
+        with mock.patch.object(
+            ADAPTER,
+            "_prove_training_semantics",
+            return_value={"format": "fixture-proof"},
+        ):
+            accepted = hooks.validate_training_source(source)
+            self.assertEqual(
+                accepted["training_semantics_proof"],
+                {"format": "fixture-proof"},
+            )
+            with self.assertRaises(ADAPTER.LiveValidationContractError):
+                hooks.validate_training_source(None)
+            for label, mutate in (
+                (
+                    "old-top-level-entrypoint-schema",
+                    lambda value: value.update(
+                        {"entrypoint": str(entrypoint), "branch": None}
+                    ),
+                ),
+                (
+                    "missing-clones",
+                    lambda value: value.pop("node_local_clones"),
+                ),
+                (
+                    "bool-node-rank",
+                    lambda value: value["node_local_clones"][0].update(
+                        {"node_rank": True}
+                    ),
+                ),
+                (
+                    "bool-host-slot",
+                    lambda value: value["node_local_clones"][0].update(
+                        {"host_slot": True}
+                    ),
+                ),
+                (
+                    "clone-branch",
+                    lambda value: value["node_local_clones"][0].update(
+                        {"branch": "main"}
+                    ),
+                ),
+                (
+                    "clone-hostname",
+                    lambda value: value["node_local_clones"][0].update(
+                        {"hostname": "forged-host"}
+                    ),
+                ),
+                (
+                    "clone-entrypoint",
+                    lambda value: value["node_local_clones"][0].update(
+                        {
+                            "entrypoint": (
+                                "/private/tmp/forged-source/scripts/show_base/"
+                                "train_base_official_adapt_long.py"
+                            )
+                        }
+                    ),
+                ),
+            ):
+                attacked = copy.deepcopy(source)
+                mutate(attacked)
+                with self.subTest(label=label), self.assertRaises(
+                    ADAPTER.LiveValidationContractError
+                ):
+                    hooks.validate_training_source(attacked)
 
     def test_authorize_both_supported_topologies(self):
         for mode in (ADAPTER.W8G1024_MODE, ADAPTER.W8G2048_MODE):
@@ -1124,6 +1266,22 @@ class LiveValidationAdapterTests(unittest.TestCase):
         with self.assertRaises(ADAPTER.LiveValidationContractError):
             ADAPTER.authorize_candidate(config, hooks=fixture.hooks)
 
+    def test_source_clone_and_topology_host_binding_cannot_diverge(self):
+        fixture = self.fixture()
+        fixture.rewrite_frozen(
+            lambda value: value["source"]["node_local_clones"][0].update(
+                {
+                    "host_slot": 1,
+                    "hostname": ADAPTER.FORMAL_HOST_BY_SLOT[1],
+                }
+            )
+        )
+        fixture.publish_candidate(1)
+        with self.assertRaises(ADAPTER.LiveValidationContractError):
+            ADAPTER.authorize_candidate(
+                fixture.config(1), hooks=fixture.hooks
+            )
+
     def test_self_consistent_unaudited_host_slot_is_rejected(self):
         fixture = self.fixture()
 
@@ -1206,11 +1364,7 @@ class LiveValidationAdapterTests(unittest.TestCase):
             )
 
     def test_real_runtime_producer_ast_proof(self):
-        root = Path(
-            "/private/tmp/semtalk_integrated_v14_20260802.wEhq8K"
-        )
-        if not root.is_dir():
-            self.skipTest("pinned producer checkout is not present")
+        root = REPOSITORY
         proof = ADAPTER._prove_training_semantics(root.resolve(strict=True))
         self.assertEqual(
             proof["runtime_producer"]["commit"],
