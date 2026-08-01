@@ -1,0 +1,70 @@
+{
+  "format": "semtalk_show_base_v14_fast_selection_protocol_v1",
+  "created_cst": "2026-08-02T01:38:32+0800",
+  "status": "frozen_before_validation_results",
+  "scope": {
+    "repository": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+    "source_commit": "5b84075bb5bc9577a891a1f5ff72e93c39bab2e8",
+    "source_tree": "05372163157d24cc8a72c073ac172b7c1859bba0",
+    "dataset": "SHOW",
+    "speakers": [
+      "oliver",
+      "chemistry",
+      "seth",
+      "conan"
+    ],
+    "speaker_scope": "All",
+    "base_motion_only": true,
+    "semgate": false,
+    "sparse_motion_generation": false
+  },
+  "quality_campaign_root": "/efs/xiangyuezhang/semtalk_show_base_topology_quality_5b84075_20260802_v14_fast",
+  "candidate_topologies": [
+    {
+      "id": "quality_p1_w8g2048_worker",
+      "mode": "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "world_size": 8,
+      "local_batch_size": 256,
+      "global_batch_size": 2048
+    },
+    {
+      "id": "quality_p2_w8g1024_master",
+      "mode": "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "world_size": 8,
+      "local_batch_size": 128,
+      "global_batch_size": 1024
+    }
+  ],
+  "candidate_epochs": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "validation": {
+    "split": "val",
+    "primary_metric": "DiffSHEG FGD",
+    "metric_direction": "minimize",
+    "expected_reports": 12,
+    "require_all_reports_complete": true,
+    "require_all_metrics_finite": true,
+    "require_exact_source_data_vq_init_and_runtime_lineage": true,
+    "test_visible": false,
+    "test_measurements_authorized": 0
+  },
+  "selection_tuple": [
+    "validation_diffsheg_fgd_ascending",
+    "epoch_ascending",
+    "topology_mode_lexicographic_ascending"
+  ],
+  "decision": {
+    "select_exactly_one_topology": true,
+    "selected_quality_checkpoint_is_evidence_only": true,
+    "formal_base_training_restarts_from_the_same_frozen_initialization": true,
+    "formal_target_epochs": 400,
+    "formal_checkpoint_selection_split": "val",
+    "final_test_runs_after_formal_selection": 1
+  }
+}
