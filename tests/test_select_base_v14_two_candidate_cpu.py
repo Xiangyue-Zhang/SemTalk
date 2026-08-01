@@ -203,6 +203,69 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         cls.native_path = cls.root / "trainer-native-selection.json"
         cls._write_json(cls.native_path, cls.native_selection)
         cls.native_sha = _sha(cls.native_path)
+        cls.native_probe_root = cls.root / "native-probe-campaign"
+        cls.native_quality_root = cls.root / "native-quality-campaign"
+        cls.native_probe_rows = []
+        for index, mode in enumerate(contract.TOPOLOGY_SPECS):
+            probe_path = (
+                cls.native_probe_root
+                / "probes"
+                / f"slot-{index:02d}"
+                / "throughput_gate.json"
+            )
+            probe_path.parent.mkdir(parents=True, exist_ok=True)
+            cls._write_json(probe_path, {"mode": mode, "slot": index})
+            cls.native_probe_rows.append(
+                {
+                    "mode": mode,
+                    "path": str(probe_path),
+                    "sha256": _sha(probe_path),
+                    "bytes": probe_path.stat().st_size,
+                }
+            )
+        cls.native_failure_path = (
+            cls.native_quality_root
+            / "training"
+            / "quality_p1_w1_master"
+            / "failure.json"
+        )
+        cls.native_failure_path.parent.mkdir(parents=True, exist_ok=True)
+        cls._write_json(
+            cls.native_failure_path,
+            {
+                "format": contract.SHORT_QUALITY_STATUS_FORMAT,
+                "status": "failed",
+                "error_type": "AdaptationContractError",
+                "error": selection.W1_FAILURE_ERROR,
+                "failed_unix": 1_700_000_000.0,
+                "run_purpose": contract.RUN_PURPOSE_SHORT_QUALITY,
+                "target_epochs": list(official_selector.W1_REFERENCE_EPOCHS),
+            },
+        )
+        cls.native_unavailable = {
+            "format": selection.TRAINER_NATIVE_UNAVAILABLE_FORMAT,
+            "status": "unavailable_not_authoritative",
+            "role": "audit_only",
+            "authoritative_for_winner": False,
+            "reason_code": selection.TRAINER_NATIVE_UNAVAILABLE_REASON,
+            "topology_gate_spec_sha256": selection.TOPOLOGY_GATE_SHA256,
+            "quality_gate_spec_sha256": selection.QUALITY_GATE_SHA256,
+            "probe_campaign_root": str(cls.native_probe_root),
+            "quality_campaign_root": str(cls.native_quality_root),
+            "probes": cls.native_probe_rows,
+            "blocking_failure": {
+                "mode": contract.OFFICIAL_W1_REFERENCE_MODE,
+                "path": str(cls.native_failure_path),
+                "sha256": _sha(cls.native_failure_path),
+                "bytes": cls.native_failure_path.stat().st_size,
+            },
+        }
+        cls.native_unavailable["receipt_sha256"] = selection._canonical_sha(
+            cls.native_unavailable
+        )
+        cls.native_unavailable_path = cls.root / "native-unavailable.json"
+        cls._write_json(cls.native_unavailable_path, cls.native_unavailable)
+        cls.native_unavailable_sha = _sha(cls.native_unavailable_path)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -378,6 +441,18 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         self.assertEqual(
             payload["winner"]["topology_mode"], selection.MODE_P2
         )
+        self.assertEqual(
+            payload["trainer_native_selection"],
+            {
+                "role": "audit_only",
+                "authoritative_for_winner": False,
+                "status": "available_not_authoritative",
+                "path": str(self.native_path),
+                "format": contract.TOPOLOGY_SELECTION_FORMAT,
+                "receipt_sha256": self.native_selection["receipt_sha256"],
+                "selected_mode": self.native_selection["selected"]["mode"],
+            },
+        )
         loaded = json.loads(output.read_text(encoding="utf-8"))
         claimed = loaded.pop("receipt_sha256")
         self.assertEqual(claimed, selection._canonical_sha(loaded))
@@ -444,6 +519,22 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         with self.assertRaises(selection.SelectionError):
             selection.load_protocol(symlink, selection.PROTOCOL_SHA256)
         parser = selection._parser()
+        parsed = parser.parse_args(
+            [
+                "--official-project-root",
+                str(REPOSITORY),
+                "--selection-protocol",
+                str(self.protocol_path),
+                "--expected-selection-protocol-sha256",
+                selection.PROTOCOL_SHA256,
+                "--quality-report",
+                *[str(value) for value in self.report_specs[0]],
+                "--output",
+                str(self.root / "native-optional-cli.json"),
+            ]
+        )
+        self.assertIsNone(parsed.trainer_native_selection)
+        self.assertIsNone(parsed.trainer_native_unavailable_receipt)
         with self.assertRaises(SystemExit):
             parser.parse_args(
                 [
@@ -551,6 +642,156 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                         selector=ReplaySelector,
                         contract=contract,
                     )
+
+    def test_unavailable_native_audit_freshly_replays_nine_probes_and_w1_failure(
+        self,
+    ) -> None:
+        rows = {row["mode"]: row for row in self.native_probe_rows}
+
+        class ReplayUnavailableSelector:
+            W1_REFERENCE_EPOCHS = official_selector.W1_REFERENCE_EPOCHS
+
+            @staticmethod
+            def validate_probe(mode, path, expected_sha256, **kwargs):
+                self.assertEqual(
+                    kwargs, {"gate_spec_sha256": selection.TOPOLOGY_GATE_SHA256}
+                )
+                row = rows[mode]
+                self.assertEqual(str(path), row["path"])
+                self.assertEqual(expected_sha256, row["sha256"])
+                return {
+                    "mode": mode,
+                    "report_path": str(path),
+                    "report_sha256": expected_sha256,
+                }
+
+        audit, artifact = selection._validate_trainer_native_unavailable_receipt(
+            self.native_unavailable_path,
+            self.native_unavailable_sha,
+            selector=ReplayUnavailableSelector,
+            contract=contract,
+        )
+        self.assertEqual(
+            audit,
+            {
+                "role": "audit_only",
+                "authoritative_for_winner": False,
+                "status": "unavailable_not_authoritative",
+                "reason_code": selection.TRAINER_NATIVE_UNAVAILABLE_REASON,
+                "evidence_receipt": {
+                    "path": str(self.native_unavailable_path),
+                    "sha256": self.native_unavailable_sha,
+                    "bytes": self.native_unavailable_path.stat().st_size,
+                    "receipt_sha256": self.native_unavailable[
+                        "receipt_sha256"
+                    ],
+                },
+                "probe_modes": list(contract.TOPOLOGY_SPECS),
+                "blocking_mode": contract.OFFICIAL_W1_REFERENCE_MODE,
+            },
+        )
+        self.assertEqual(artifact["sha256"], self.native_unavailable_sha)
+
+        attacks = {}
+        missing = copy.deepcopy(self.native_unavailable)
+        missing["probes"].pop()
+        attacks["missing_probe"] = missing
+        reordered = copy.deepcopy(self.native_unavailable)
+        reordered["probes"][0], reordered["probes"][1] = (
+            reordered["probes"][1],
+            reordered["probes"][0],
+        )
+        attacks["reordered_probes"] = reordered
+        wrong_bytes = copy.deepcopy(self.native_unavailable)
+        wrong_bytes["probes"][0]["bytes"] += 1
+        attacks["wrong_probe_bytes"] = wrong_bytes
+        wrong_failure = copy.deepcopy(self.native_unavailable)
+        wrong_failure["blocking_failure"]["sha256"] = "0" * 64
+        attacks["wrong_failure_sha"] = wrong_failure
+        authoritative = copy.deepcopy(self.native_unavailable)
+        authoritative["authoritative_for_winner"] = True
+        attacks["authoritative_spoof"] = authoritative
+        for name, changed in attacks.items():
+            changed.pop("receipt_sha256", None)
+            changed["receipt_sha256"] = selection._canonical_sha(changed)
+            attacked = self.root / f"native-unavailable-{name}.json"
+            self._write_json(attacked, changed)
+            with self.subTest(name=name), self.assertRaises(
+                selection.SelectionError
+            ):
+                selection._validate_trainer_native_unavailable_receipt(
+                    attacked,
+                    _sha(attacked),
+                    selector=ReplayUnavailableSelector,
+                    contract=contract,
+                )
+
+    def test_native_audit_absence_is_explicit_and_cannot_block_or_change_winner(
+        self,
+    ) -> None:
+        available_output = self.root / "native-available-selection.json"
+        absent_output = self.root / "native-absent-selection.json"
+        with self._formal_patches():
+            available = self._select(
+                self.report_specs,
+                output=available_output,
+            )
+            absent = self._select(
+                self.report_specs,
+                output=absent_output,
+                trainer_native_selection=None,
+                expected_trainer_native_selection_sha256=None,
+            )
+        self.assertEqual(absent["winner"], available["winner"])
+        self.assertEqual(absent["results"], available["results"])
+        self.assertEqual(
+            absent["trainer_native_selection"],
+            {
+                "role": "audit_only",
+                "authoritative_for_winner": False,
+                "status": "unavailable_not_authoritative",
+                "reason_code": selection.TRAINER_NATIVE_NOT_PROVIDED_REASON,
+                "evidence_receipt": None,
+                "probe_modes": [],
+                "blocking_mode": None,
+            },
+        )
+
+    def test_native_audit_alternatives_are_paired_and_mutually_exclusive(
+        self,
+    ) -> None:
+        base = {
+            "selector": official_selector,
+            "contract": contract,
+            "validate_specs": False,
+            "trainer_native_selection": None,
+            "expected_trainer_native_selection_sha256": None,
+            "trainer_native_unavailable_receipt": None,
+            "expected_trainer_native_unavailable_receipt_sha256": None,
+        }
+        for changed in (
+            {"trainer_native_selection": self.native_path},
+            {
+                "expected_trainer_native_unavailable_receipt_sha256": (
+                    self.native_unavailable_sha
+                )
+            },
+            {
+                "trainer_native_selection": self.native_path,
+                "expected_trainer_native_selection_sha256": self.native_sha,
+                "trainer_native_unavailable_receipt": (
+                    self.native_unavailable_path
+                ),
+                "expected_trainer_native_unavailable_receipt_sha256": (
+                    self.native_unavailable_sha
+                ),
+            },
+        ):
+            kwargs = {**base, **changed}
+            with self.subTest(changed=sorted(changed)), self.assertRaises(
+                selection.SelectionError
+            ):
+                selection._trainer_native_audit(**kwargs)
 
     def test_report_file_sha_bytes_and_payload_sha_are_independently_pinned(self) -> None:
         mode, path, digest, size, payload = self.report_specs[0]

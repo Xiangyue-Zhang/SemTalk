@@ -5,9 +5,11 @@ This is a CPU-only, fail-closed adapter around the 4066f20 official
 ``validate_quality_report`` evidence replay.  The short-quality training
 artifacts remain bound to the earlier, frozen 5b84075 source.  Keeping those
 two authorities explicit prevents an evaluator-only source update from being
-misrepresented as a training-source change.  The legacy nine-mode decision is
-replayed only as independent audit evidence; it never decides the V14 winner.
-This adapter never opens a test-set artifact.
+misrepresented as a training-source change.  A legacy nine-mode decision may
+be replayed as independent audit evidence when it exists.  Its absence is
+recorded explicitly (and may itself be evidenced by the nine probes plus the
+failed W1 short-quality receipt), but neither audit state can decide or block
+the V14 winner.  This adapter never opens a test-set artifact.
 """
 
 from __future__ import annotations
@@ -62,6 +64,14 @@ CANDIDATE_EPOCHS = (1, 2, 4, 8, 16, 32)
 MODE_P1 = "validation_gated_w8_l256_g2048_empirical_acceleration"
 MODE_P2 = "validation_gated_w8_l128_g1024_empirical_acceleration"
 MODES = (MODE_P1, MODE_P2)
+TRAINER_NATIVE_UNAVAILABLE_FORMAT = (
+    "semtalk_show_base_trainer_native_unavailable_audit_v1"
+)
+TRAINER_NATIVE_UNAVAILABLE_REASON = (
+    "w1_reference_quality_report_unavailable"
+)
+TRAINER_NATIVE_NOT_PROVIDED_REASON = "trainer_native_audit_not_provided"
+W1_FAILURE_ERROR = "throughput gate does not bind the exact training protocol"
 MODE_PROTOCOL = {
     MODE_P1: {
         "id": "quality_p1_w8g2048_worker",
@@ -745,6 +755,254 @@ def _validate_trainer_native_selection(
     return value, artifact
 
 
+def _canonical_directory(value: Any, label: str) -> Path:
+    if not isinstance(value, str):
+        raise SelectionError(f"{label} must be one absolute directory path")
+    candidate = Path(value)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise SelectionError(f"{label} is not absolute/canonical")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise SelectionError(f"{label} is absent") from error
+    if resolved != candidate or candidate.is_symlink() or not candidate.is_dir():
+        raise SelectionError(f"{label} is not one canonical directory")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        if stat.S_ISLNK(os.lstat(current).st_mode):
+            raise SelectionError(f"{label} contains a symlink")
+    return candidate
+
+
+def _validate_trainer_native_unavailable_receipt(
+    path: Path,
+    expected_sha256: str,
+    *,
+    selector: ModuleType,
+    contract: ModuleType,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the evidence explaining why native nine-mode audit is absent."""
+
+    value, artifact = _verified_json_file(
+        path,
+        expected_sha256,
+        "trainer-native unavailable audit receipt",
+    )
+    required = {
+        "format",
+        "status",
+        "role",
+        "authoritative_for_winner",
+        "reason_code",
+        "topology_gate_spec_sha256",
+        "quality_gate_spec_sha256",
+        "probe_campaign_root",
+        "quality_campaign_root",
+        "probes",
+        "blocking_failure",
+        "receipt_sha256",
+    }
+    probes_raw = value.get("probes")
+    failure_raw = value.get("blocking_failure")
+    expected_modes = list(contract.TOPOLOGY_SPECS)
+    if (
+        set(value) != required
+        or value.get("format") != TRAINER_NATIVE_UNAVAILABLE_FORMAT
+        or value.get("status") != "unavailable_not_authoritative"
+        or value.get("role") != "audit_only"
+        or value.get("authoritative_for_winner") is not False
+        or value.get("reason_code") != TRAINER_NATIVE_UNAVAILABLE_REASON
+        or value.get("topology_gate_spec_sha256") != TOPOLOGY_GATE_SHA256
+        or value.get("quality_gate_spec_sha256") != QUALITY_GATE_SHA256
+        or not isinstance(probes_raw, list)
+        or len(probes_raw) != len(expected_modes)
+        or not isinstance(failure_raw, dict)
+        or value.get("receipt_sha256")
+        != _canonical_sha(
+            {key: item for key, item in value.items() if key != "receipt_sha256"}
+        )
+    ):
+        raise SelectionError("trainer-native unavailable audit envelope changed")
+
+    probe_root = _canonical_directory(
+        value["probe_campaign_root"], "trainer-native probe campaign root"
+    )
+    quality_root = _canonical_directory(
+        value["quality_campaign_root"], "trainer-native quality campaign root"
+    )
+    validated_modes: list[str] = []
+    for expected_mode, row in zip(expected_modes, probes_raw):
+        if not isinstance(row, dict) or set(row) != {
+            "mode",
+            "path",
+            "sha256",
+            "bytes",
+        }:
+            raise SelectionError("trainer-native probe artifact schema changed")
+        mode = row.get("mode")
+        probe_path = Path(str(row.get("path")))
+        if (
+            mode != expected_mode
+            or probe_path.name != "throughput_gate.json"
+            or probe_path.parent.parent != probe_root / "probes"
+        ):
+            raise SelectionError("trainer-native probe coverage/order changed")
+        _payload, verified = _verified_json_file(
+            probe_path,
+            str(row.get("sha256")),
+            f"trainer-native probe {mode}",
+            expected_bytes=row.get("bytes"),
+        )
+        try:
+            replayed = selector.validate_probe(
+                mode,
+                Path(verified["path"]),
+                verified["sha256"],
+                gate_spec_sha256=TOPOLOGY_GATE_SHA256,
+            )
+        except Exception as error:
+            raise SelectionError(
+                f"trainer-native probe replay failed for {mode}"
+            ) from error
+        if (
+            not isinstance(replayed, dict)
+            or replayed.get("mode") != mode
+            or replayed.get("report_path") != verified["path"]
+            or replayed.get("report_sha256") != verified["sha256"]
+        ):
+            raise SelectionError(f"trainer-native probe replay changed for {mode}")
+        validated_modes.append(mode)
+
+    if set(failure_raw) != {"mode", "path", "sha256", "bytes"}:
+        raise SelectionError("trainer-native blocking failure schema changed")
+    failure_mode = failure_raw.get("mode")
+    failure_path = Path(str(failure_raw.get("path")))
+    if (
+        failure_mode != contract.OFFICIAL_W1_REFERENCE_MODE
+        or failure_path.name != "failure.json"
+        or failure_path.parent.parent != quality_root / "training"
+    ):
+        raise SelectionError("trainer-native blocking failure path/mode changed")
+    failure, _failure_artifact = _verified_json_file(
+        failure_path,
+        str(failure_raw.get("sha256")),
+        "trainer-native W1 blocking failure",
+        expected_bytes=failure_raw.get("bytes"),
+    )
+    failed_unix = failure.get("failed_unix")
+    if (
+        set(failure)
+        != {
+            "format",
+            "status",
+            "error_type",
+            "error",
+            "failed_unix",
+            "run_purpose",
+            "target_epochs",
+        }
+        or failure.get("format") != contract.SHORT_QUALITY_STATUS_FORMAT
+        or failure.get("status") != "failed"
+        or failure.get("error_type") != "AdaptationContractError"
+        or failure.get("error") != W1_FAILURE_ERROR
+        or isinstance(failed_unix, bool)
+        or not isinstance(failed_unix, (int, float))
+        or not math.isfinite(float(failed_unix))
+        or float(failed_unix) <= 0.0
+        or failure.get("run_purpose") != contract.RUN_PURPOSE_SHORT_QUALITY
+        or failure.get("target_epochs") != list(selector.W1_REFERENCE_EPOCHS)
+    ):
+        raise SelectionError("trainer-native W1 blocking failure changed")
+    return {
+        "role": "audit_only",
+        "authoritative_for_winner": False,
+        "status": "unavailable_not_authoritative",
+        "reason_code": TRAINER_NATIVE_UNAVAILABLE_REASON,
+        "evidence_receipt": {
+            **artifact,
+            "receipt_sha256": value["receipt_sha256"],
+        },
+        "probe_modes": validated_modes,
+        "blocking_mode": failure_mode,
+    }, artifact
+
+
+def _trainer_native_audit(
+    *,
+    trainer_native_selection: Path | None,
+    expected_trainer_native_selection_sha256: str | None,
+    trainer_native_unavailable_receipt: Path | None,
+    expected_trainer_native_unavailable_receipt_sha256: str | None,
+    selector: ModuleType,
+    contract: ModuleType,
+    validate_specs: bool,
+) -> dict[str, Any]:
+    available_pair = (
+        trainer_native_selection is not None,
+        expected_trainer_native_selection_sha256 is not None,
+    )
+    unavailable_pair = (
+        trainer_native_unavailable_receipt is not None,
+        expected_trainer_native_unavailable_receipt_sha256 is not None,
+    )
+    if len(set(available_pair)) != 1 or len(set(unavailable_pair)) != 1:
+        raise SelectionError("trainer-native path and SHA must be supplied together")
+    if all(available_pair) and all(unavailable_pair):
+        raise SelectionError("trainer-native audit alternatives are mutually exclusive")
+    if all(available_pair):
+        assert trainer_native_selection is not None
+        assert expected_trainer_native_selection_sha256 is not None
+        if validate_specs:
+            native, artifact = _validate_trainer_native_selection(
+                trainer_native_selection,
+                expected_trainer_native_selection_sha256,
+                selector=selector,
+                contract=contract,
+            )
+        else:
+            native, artifact = _verified_json_file(
+                trainer_native_selection,
+                expected_trainer_native_selection_sha256,
+                "trainer-native nine-mode selection test fixture",
+            )
+            if (
+                native.get("format")
+                != "semtalk_show_base_topology_selection_v2"
+                or native.get("status") != "pass"
+                or not isinstance(native.get("selected"), dict)
+            ):
+                raise SelectionError("trainer-native test fixture is invalid")
+        return {
+            "role": "audit_only",
+            "authoritative_for_winner": False,
+            "status": "available_not_authoritative",
+            "path": artifact["path"],
+            "format": native["format"],
+            "receipt_sha256": native["receipt_sha256"],
+            "selected_mode": native["selected"]["mode"],
+        }
+    if all(unavailable_pair):
+        assert trainer_native_unavailable_receipt is not None
+        assert expected_trainer_native_unavailable_receipt_sha256 is not None
+        audit, _artifact = _validate_trainer_native_unavailable_receipt(
+            trainer_native_unavailable_receipt,
+            expected_trainer_native_unavailable_receipt_sha256,
+            selector=selector,
+            contract=contract,
+        )
+        return audit
+    return {
+        "role": "audit_only",
+        "authoritative_for_winner": False,
+        "status": "unavailable_not_authoritative",
+        "reason_code": TRAINER_NATIVE_NOT_PROVIDED_REASON,
+        "evidence_receipt": None,
+        "probe_modes": [],
+        "blocking_mode": None,
+    }
+
+
 def select_two_reports(
     report_specs: Sequence[tuple[str, Path, str, int, str]],
     *,
@@ -752,8 +1010,10 @@ def select_two_reports(
     project_root: Path,
     selection_protocol: Path,
     expected_selection_protocol_sha256: str,
-    trainer_native_selection: Path,
-    expected_trainer_native_selection_sha256: str,
+    trainer_native_selection: Path | None = None,
+    expected_trainer_native_selection_sha256: str | None = None,
+    trainer_native_unavailable_receipt: Path | None = None,
+    expected_trainer_native_unavailable_receipt_sha256: str | None = None,
     selector: ModuleType | None = None,
     contract: ModuleType | None = None,
     validate_specs: bool = True,
@@ -767,28 +1027,21 @@ def select_two_reports(
     validation_source_authority = _validation_source_authority(root)
     if validate_specs:
         _validate_gate_specs(root, selector, contract)
-    if validate_specs:
-        trainer_native, _trainer_native_artifact = (
-            _validate_trainer_native_selection(
-                trainer_native_selection,
-                expected_trainer_native_selection_sha256,
-                selector=selector,
-                contract=contract,
-            )
-        )
-    else:
-        trainer_native, _trainer_native_artifact = _verified_json_file(
-            trainer_native_selection,
-            expected_trainer_native_selection_sha256,
-            "trainer-native nine-mode selection test fixture",
-        )
-        if (
-            trainer_native.get("format")
-            != "semtalk_show_base_topology_selection_v2"
-            or trainer_native.get("status") != "pass"
-            or not isinstance(trainer_native.get("selected"), dict)
-        ):
-            raise SelectionError("trainer-native test fixture is invalid")
+    trainer_native_audit = _trainer_native_audit(
+        trainer_native_selection=trainer_native_selection,
+        expected_trainer_native_selection_sha256=(
+            expected_trainer_native_selection_sha256
+        ),
+        trainer_native_unavailable_receipt=(
+            trainer_native_unavailable_receipt
+        ),
+        expected_trainer_native_unavailable_receipt_sha256=(
+            expected_trainer_native_unavailable_receipt_sha256
+        ),
+        selector=selector,
+        contract=contract,
+        validate_specs=validate_specs,
+    )
     if len(report_specs) != 2 or {item[0] for item in report_specs} != set(MODES):
         raise SelectionError("exactly one report for each frozen V14 topology is required")
 
@@ -964,13 +1217,7 @@ def select_two_reports(
             "validation_diffsheg_fgd": winner["validation_diffsheg_fgd"],
             "checkpoint_sha256": winner["checkpoint_sha256"],
         },
-        "trainer_native_selection": {
-            "path": str(_trainer_native_artifact["path"]),
-            "format": trainer_native["format"],
-            "status": trainer_native["status"],
-            "receipt_sha256": trainer_native["receipt_sha256"],
-            "selected_mode": trainer_native["selected"]["mode"],
-        },
+        "trainer_native_selection": trainer_native_audit,
         "formal_training": {
             "target_epochs": 400,
             "fresh": True,
@@ -1032,11 +1279,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trainer-native-selection",
         type=Path,
-        required=True,
     )
     parser.add_argument(
         "--expected-trainer-native-selection-sha256",
-        required=True,
+    )
+    parser.add_argument(
+        "--trainer-native-unavailable-receipt",
+        type=Path,
+    )
+    parser.add_argument(
+        "--expected-trainer-native-unavailable-receipt-sha256",
     )
     parser.add_argument(
         "--quality-report",
@@ -1067,6 +1319,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             trainer_native_selection=args.trainer_native_selection,
             expected_trainer_native_selection_sha256=(
                 args.expected_trainer_native_selection_sha256
+            ),
+            trainer_native_unavailable_receipt=(
+                args.trainer_native_unavailable_receipt
+            ),
+            expected_trainer_native_unavailable_receipt_sha256=(
+                args.expected_trainer_native_unavailable_receipt_sha256
             ),
         )
     except (SelectionError, OSError, ValueError) as error:
