@@ -127,9 +127,28 @@ BASE_LONG_BUNDLE_KEYS = {
     "producer_source",
     "selected_prerequisite_sha256",
     "selected_topology",
+    "selected_dataset",
     "candidate_epochs",
     "updates_per_epoch",
     "candidates",
+}
+BASE_LONG_DATASET_KEYS = {
+    "format",
+    "lmdb",
+    "summary",
+    "summary_sha256",
+    "lineage",
+    "lineage_sha256",
+    "entries",
+    "train_clips",
+    "split",
+    "test_visible",
+    "data_mdb_sha256",
+    "lock_mdb_sha256",
+    "prerequisite_selection",
+    "selected_prerequisite_sha256",
+    "lmdb_binding_scope",
+    "node_lmdb_inode_bindings",
 }
 _CONTROL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "gate_released_all_speakers_on_show": (),
@@ -1140,6 +1159,7 @@ def _replay_base_long_candidate_bundle(
             "producer_source",
             "selected_prerequisite_sha256",
             "selected_topology",
+            "selected_dataset",
             "updates_per_epoch",
             "candidates",
         }
@@ -1165,10 +1185,18 @@ def _replay_base_long_candidate_bundle(
         or type(replayed["selected_prerequisite_sha256"]) is not dict
         or set(replayed["selected_prerequisite_sha256"])
         != set(REPRESENTATION_STAGES)
-        or replayed.get("updates_per_epoch") not in {248, 1988}
+        or replayed.get("updates_per_epoch") not in {62, 124, 248, 1988}
         or not isinstance(replayed.get("selected_topology"), dict)
         or replayed["selected_topology"].get("updates_per_epoch")
         != replayed["updates_per_epoch"]
+        or type(replayed.get("selected_dataset")) is not dict
+        or set(replayed["selected_dataset"]) != BASE_LONG_DATASET_KEYS
+        or replayed["selected_dataset"].get("split") != "train"
+        or replayed["selected_dataset"].get("test_visible") is not False
+        or replayed["selected_dataset"].get(
+            "selected_prerequisite_sha256"
+        )
+        != replayed["selected_prerequisite_sha256"]
     ):
         raise BaseFinalAuthorityError(
             "Base-long neutral candidate replay returned a non-canonical "
@@ -1202,6 +1230,7 @@ def _replay_base_long_candidate_bundle(
             replayed["selected_prerequisite_sha256"]
         ),
         "selected_topology": dict(replayed["selected_topology"]),
+        "selected_dataset": dict(replayed["selected_dataset"]),
         "candidate_epochs": list(expected_epochs),
         "updates_per_epoch": updates_per_epoch,
         "candidates": candidates,

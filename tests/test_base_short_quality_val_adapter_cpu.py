@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from scripts.show_base import base_short_quality_val_adapter as ADAPTER
+from scripts.show_base import base_long_val_contract as LONG
 from scripts.show_base import run_base_val_inference as FORMAL
 
 
@@ -95,77 +95,29 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             raise RuntimeError("boom")
         self.assertIs(FORMAL._preflight_artifact, original)
 
-    def test_distribution_rejects_gate_fixed_five_or_source_mismatch(self) -> None:
-        checkpoint = {
-            "path": "/frozen/val/base.bin",
-            "sha256": "a" * 64,
-            "bytes": 10,
-        }
-        stages = ("face", "hands", "upper", "lower", "global")
-        pipeline = {
-            "source": {"commit": "1" * 40, "tree": "2" * 40},
-            "fixed_checkpoints": {
-                stage: {
-                    "path": f"/frozen/val/{stage}.bin",
-                    "sha256": str(index + 1) * 64,
-                    "bytes": index + 1,
-                }
-                for index, stage in enumerate(stages)
-            },
-        }
-        expected = {
-            "base": checkpoint,
-            **{stage: dict(pipeline["fixed_checkpoints"][stage]) for stage in stages},
-        }
-        gate = {
-            "model_bundle": {
-                "checkpoints": {
-                    **expected,
-                    "face": {**expected["face"], "sha256": "0" * 64},
-                }
-            },
-            "source_closure": {"commit": "1" * 40, "tree": "2" * 40},
-        }
-        args = SimpleNamespace(
-            preflight=Path("/frozen/val/preflight.json"),
-            expected_preflight_sha256="b" * 64,
-            epoch=1,
-            validation_gate=Path("/frozen/val/gate.json"),
-            expected_validation_gate_sha256="c" * 64,
-            lineage=Path("/does/not/get/read.json"),
+    def test_adapter_reuses_formal_diffsheg_abi_without_distribution(self) -> None:
+        self.assertIs(
+            ADAPTER.formal_validation.validate_val_inference_lineage,
+            LONG.validate_val_inference_lineage,
         )
-        preflight = {
-            "candidate_bundle": {"candidates": {"1": checkpoint}},
-            "pipeline_receipt": {
-                "path": "/frozen/val/pipeline.json",
-                "sha256": "d" * 64,
-            },
-        }
-        with (
-            mock.patch.object(
-                ADAPTER,
-                "_preflight_artifact",
-                return_value=({}, preflight),
-            ),
-            mock.patch.object(
-                ADAPTER.replication,
-                "load_gate",
-                return_value=(
-                    {"path": "/frozen/val/gate.json", "sha256": "c" * 64},
-                    gate,
-                ),
-            ),
-            mock.patch.object(
-                ADAPTER.engine.selector,
-                "validate_pipeline",
-                return_value=({}, pipeline),
-            ),
-            self.assertRaisesRegex(
-                ADAPTER.ShortQualityValError,
-                "Base plus selected five/source",
-            ),
-        ):
-            ADAPTER.distribution(args)
+        self.assertIs(
+            ADAPTER.formal_validation.validate_diffsheg_report,
+            LONG.validate_diffsheg_report,
+        )
+        self.assertIs(
+            FORMAL.selector.validate_val_inference_lineage,
+            LONG.validate_val_inference_lineage,
+        )
+        self.assertIn(
+            "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+            ADAPTER.SOURCE_FILES,
+        )
+        self.assertNotIn(
+            "scripts/show_base/replay_released2_primary.py",
+            ADAPTER.SOURCE_FILES,
+        )
+        with self.assertRaises(SystemExit):
+            ADAPTER.parse_args(["distribution"])
 
     def test_prepare_schema_is_isolated_from_formal_preflight(self) -> None:
         body = {
@@ -270,8 +222,40 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
         self.assertIn("--num-shards 8", source)
         self.assertIn("for epoch in 1 2 4 8", source)
         self.assertIn("--split val", source)
-        for forbidden in ("pgrep", "pkill", "killall", "--split test"):
+        for required in (
+            "evaluate_diffsheg_val_fgd.py",
+            "final/predictions/val",
+            "final/ground-truth/val",
+            "diffsheg_eval_clip_ids.txt",
+            "--paspa-root",
+            "--diffsheg-root",
+            "semtalk_show_base_short_quality_val_completion_v2",
+            '"inference_lineage"',
+            '"diffsheg_report"',
+        ):
+            self.assertIn(required, source)
+        for forbidden in (
+            "pgrep",
+            "pkill",
+            "killall",
+            "--split test",
+            "released2",
+            "replay_released2_primary.py",
+            "distribution.json",
+            "real-feature-cache",
+            "talkshow-metric-root",
+            "feature-extractor",
+            "smplx-asset",
+        ):
             self.assertNotIn(forbidden, source)
+        repository = Path(__file__).resolve().parents[1]
+        for relative in (
+            "scripts/show_base/base_short_quality_val_adapter.py",
+            "scripts/show_base/produce_base_topology_short_quality.py",
+            "scripts/show_base/select_base_training_topology.py",
+        ):
+            migrated = (repository / relative).read_text(encoding="utf-8")
+            self.assertNotIn("released2", migrated.lower(), relative)
 
 
 if __name__ == "__main__":

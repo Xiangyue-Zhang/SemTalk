@@ -123,22 +123,19 @@ def _trajectory_probe(mode: str) -> dict[str, object]:
     }
 
 
-class _FakeReplication:
+class _FakeFormalValidation:
     @staticmethod
-    def load_gate(
+    def _receipt(
         path: Path,
         expected_sha256: str,
-        *,
-        expected_scope: str,
     ) -> tuple[dict[str, object], dict[str, object]]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if _sha(path) != expected_sha256:
-            raise ValueError("gate hash mismatch")
-        if payload["scope"] != expected_scope:
-            raise ValueError("gate scope mismatch")
+            raise ValueError("receipt hash mismatch")
         return (
             {
-                **_artifact(path),
+                "path": str(path.resolve()),
+                "sha256": expected_sha256,
                 "receipt_payload_sha256": payload[
                     "receipt_payload_sha256"
                 ],
@@ -146,65 +143,103 @@ class _FakeReplication:
             payload,
         )
 
-
-class _FakeMetrics:
     @staticmethod
-    def validate_released2_primary_screen_receipt(
-        value: dict[str, object],
-        **expected: object,
-    ) -> dict[str, object]:
-        payload = json.loads(
-            Path(str(value["path"])).read_text(encoding="utf-8")
+    def validate_val_inputs(
+        path: Path,
+        expected_sha256: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        artifact, payload = _FakeFormalValidation._receipt(
+            path, expected_sha256
         )
-        if payload["prediction_manifest"] != expected[
-            "expected_prediction_manifest"
-        ]:
-            raise ValueError("screen prediction mismatch")
-        if payload["distribution_receipt"] != expected[
-            "expected_distribution_receipt"
-        ]:
-            raise ValueError("screen distribution mismatch")
-        if payload["canonical_manifest"] != expected[
-            "expected_canonical_manifest"
-        ]:
-            raise ValueError("screen canonical mismatch")
-        if payload["real_feature_cache"] != expected[
-            "expected_real_feature_cache"
-        ]:
-            raise ValueError("screen cache mismatch")
-        return {
-            "artifact": dict(value),
-            "primary_metric": payload["primary_metric"],
+        if payload.get("split") != "val" or payload.get("test_visible") is not False:
+            raise ValueError("val inputs are not val-only")
+        return artifact, {
+            "clip_count": selector.EXPECTED_VAL_CLIPS,
+            "frame_count": 12_345,
+            "window_count": 6_789,
+            "uncovered_tail_frames": 321,
+            "diffsheg_clip_manifest_sha256": "a" * 64,
         }
 
     @staticmethod
-    def validate_released2_primary_screen_replay_receipt(
-        value: dict[str, object],
-        **expected: object,
-    ) -> dict[str, object]:
-        payload = json.loads(
-            Path(str(value["path"])).read_text(encoding="utf-8")
+    def validate_pipeline(
+        path: Path,
+        expected_sha256: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        artifact, payload = _FakeFormalValidation._receipt(
+            path, expected_sha256
         )
-        screen = expected["expected_screen"]
-        if expected["screen_validation"]["artifact"] != expected[
-            "expected_screen_artifact"
-        ]:
-            raise ValueError("screen artifact mismatch")
-        if payload["report_payload_sha256"] != screen[
-            "receipt_payload_sha256"
-        ]:
-            raise ValueError("replay screen mismatch")
-        if payload["prediction_manifest"] != expected[
-            "expected_prediction_manifest"
-        ]:
-            raise ValueError("replay prediction mismatch")
-        if payload["primary_metric"] != expected["screen_validation"][
-            "primary_metric"
-        ]:
-            raise ValueError("replay metric mismatch")
-        return {
-            "artifact": dict(value),
-            "primary_metric": payload["primary_metric"],
+        if payload.get("split") != "val" or payload.get("test_visible") is not False:
+            raise ValueError("pipeline is not val-only")
+        return artifact, payload
+
+    @staticmethod
+    def validate_val_inference_lineage(
+        path: Path,
+        expected_sha256: str,
+        *,
+        epoch: int,
+        expected_candidate: dict[str, object],
+        val_inputs_artifact: dict[str, object],
+        pipeline_artifact: dict[str, object],
+        expected_coverage: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        artifact, payload = _FakeFormalValidation._receipt(
+            path, expected_sha256
+        )
+        if (
+            payload.get("split") != "val"
+            or payload.get("test_visible") is not False
+            or payload.get("epoch") != epoch
+            or payload.get("candidate_checkpoint") != expected_candidate
+            or payload.get("val_inputs_receipt") != val_inputs_artifact
+            or payload.get("pipeline_receipt") != pipeline_artifact
+        ):
+            raise ValueError("lineage is not candidate-bound val-only")
+        if expected_coverage.get("clip_count") != selector.EXPECTED_VAL_CLIPS:
+            raise ValueError("coverage mismatch")
+        return artifact, {
+            "prediction_dir": payload["prediction_dir"],
+            "ground_truth_dir": payload["ground_truth_dir"],
+            "clip_manifest": {"path": payload["clip_manifest"]},
+            "coverage": dict(expected_coverage),
+        }
+
+    @staticmethod
+    def validate_diffsheg_report(
+        report: dict[str, object],
+        *,
+        expected_coverage: dict[str, object],
+        inference_lineage: dict[str, object],
+        expected_pipeline: dict[str, object],
+    ) -> tuple[dict[str, float], dict[str, int]]:
+        protocol = report.get("protocol")
+        inputs = report.get("inputs")
+        metrics = report.get("metrics")
+        if (
+            report.get("status") != "ok"
+            or not isinstance(protocol, dict)
+            or protocol.get("selection_split") != "val"
+            or protocol.get("test_visible") is not False
+            or protocol.get("metric_scope") != "fgd_only"
+            or not isinstance(inputs, dict)
+            or inputs.get("prediction_dir") != inference_lineage["prediction_dir"]
+            or inputs.get("ground_truth_dir")
+            != inference_lineage["ground_truth_dir"]
+            or inputs.get("clip_manifest")
+            != inference_lineage["clip_manifest"]["path"]
+            or not isinstance(metrics, dict)
+            or set(metrics) != {"fgd"}
+            or report.get("provenance") != {"assets": "pinned"}
+        ):
+            raise ValueError("DiffSHEG report mismatch")
+        return {"fgd": float(metrics["fgd"])}, {
+            "clip_count": int(expected_coverage["clip_count"]),
+            "frame_count": int(expected_coverage["frame_count"]),
+            "window_count": int(expected_coverage["window_count"]),
+            "uncovered_tail_frames": int(
+                expected_coverage["uncovered_tail_frames"]
+            ),
         }
 
 
@@ -217,126 +252,77 @@ class QualityFixture:
         self.topology_sha = _sha(self.topology_spec)
         self.quality_sha = _sha(self.quality_spec)
 
-        canonical_path = root / "canonical.jsonl"
-        canonical_path.write_text('{"clip_id":"fixture"}\n', encoding="utf-8")
-        self.canonical = {
-            **_artifact(canonical_path),
-            "rows": selector.EXPECTED_VAL_CLIPS,
-            "selected_rows": selector.EXPECTED_VAL_CLIPS,
-        }
-        self.cache, _ = _write_receipt(
-            root / "real-cache.json",
-            {"format": "fixture-real-cache"},
+        self.val_inputs, _ = _write_receipt(
+            root / "val-inputs.json",
+            {
+                "format": "fixture-val-inputs",
+                "split": "val",
+                "test_visible": False,
+            },
+        )
+        self.pipeline, _ = _write_receipt(
+            root / "val-pipeline.json",
+            {
+                "format": "fixture-val-pipeline",
+                "split": "val",
+                "test_visible": False,
+            },
         )
         self.checkpoints: dict[int, dict[str, object]] = {}
-        self.predictions: dict[int, dict[str, object]] = {}
-        self.distributions: dict[int, dict[str, object]] = {}
-        self.screens: dict[int, dict[str, object]] = {}
-        self.replays: dict[int, dict[str, object]] = {}
+        self.lineages: dict[int, dict[str, object]] = {}
+        self.reports: dict[int, dict[str, object]] = {}
         self.short_status_by_mode: dict[str, dict[str, object]] = {}
-        for position, epoch in enumerate(selector.QUALITY_EPOCHS):
+        val_artifact = selector._formal_artifact_projection(self.val_inputs)
+        pipeline_artifact = selector._formal_artifact_projection(self.pipeline)
+        for epoch in selector.QUALITY_EPOCHS:
             checkpoint = _write(
                 root / f"e{epoch}.bin",
                 f"checkpoint-e{epoch}".encode("utf-8"),
             )
             self.checkpoints[epoch] = checkpoint
-            prediction_path = root / f"e{epoch}-prediction.jsonl"
-            with prediction_path.open("w", encoding="utf-8") as handle:
-                for index in range(selector.EXPECTED_VAL_CLIPS):
-                    row = {
-                        "global_index": index,
-                        "split": "val",
-                        "source_clip_id": f"source-{index:04d}",
-                        "canonical_clip_id": f"clip-{index:04d}",
-                        "frames": 32,
-                        "epoch": epoch,
-                        "candidate_checkpoint_sha256": checkpoint[
-                            "sha256"
-                        ],
-                        "prediction": {
-                            "path": str(
-                                (root / f"e{epoch}-res-{index:04d}.npz")
-                                .resolve()
-                            ),
-                            "sha256": f"{(index + position) % 16:x}" * 64,
-                            "bytes": 1,
-                        },
-                        "ground_truth": {
-                            "path": str(
-                                (root / f"gt-{index:04d}.npz").resolve()
-                            ),
-                            "sha256": f"{(index + position + 1) % 16:x}"
-                            * 64,
-                            "bytes": 1,
-                        },
-                    }
-                    handle.write(
-                        json.dumps(
-                            row,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        + "\n"
-                    )
-            prediction = _artifact(prediction_path)
-            self.predictions[epoch] = prediction
-            gate, _gate_payload = _write_receipt(
-                root / f"e{epoch}-gate.json",
+            prediction_dir = str((root / f"e{epoch}" / "predictions" / "val").resolve())
+            ground_truth_dir = str(
+                (root / f"e{epoch}" / "ground-truth" / "val").resolve()
+            )
+            clip_manifest = str(
+                (root / f"e{epoch}" / "diffsheg_eval_clip_ids.txt").resolve()
+            )
+            lineage, _ = _write_receipt(
+                root / f"e{epoch}-val-inference-lineage.json",
                 {
-                    "format": "fixture-gate",
-                    "status": "pass",
-                    "scope": "validation_candidate_family",
+                    "format": "fixture-val-inference-lineage",
+                    "status": "complete",
                     "split": "val",
                     "test_visible": False,
-                    "model_bundle": {
-                        "checkpoints": {"base": checkpoint}
-                    },
+                    "epoch": epoch,
+                    "candidate_checkpoint": checkpoint,
+                    "val_inputs_receipt": val_artifact,
+                    "pipeline_receipt": pipeline_artifact,
+                    "prediction_dir": prediction_dir,
+                    "ground_truth_dir": ground_truth_dir,
+                    "clip_manifest": clip_manifest,
                 },
             )
-            distribution, distribution_payload = _write_receipt(
-                root / f"e{epoch}-distribution.json",
-                {
-                    "format": "fixture-distribution",
-                    "prediction_manifest": prediction,
-                    "validation_gate": gate,
-                },
-            )
-            self.distributions[epoch] = distribution
-            metric = 1.0 + epoch / 100.0
-            screen, screen_payload = _write_receipt(
-                root / f"e{epoch}-screen.json",
-                {
-                    "format": "fixture-screen",
-                    "split": "val",
+            self.lineages[epoch] = lineage
+            report = {
+                "status": "ok",
+                "protocol": {
+                    "selection_split": "val",
                     "test_visible": False,
-                    "clip_count": selector.EXPECTED_VAL_CLIPS,
-                    "canonical_manifest": self.canonical,
-                    "prediction_manifest": prediction,
-                    "distribution_receipt": distribution,
-                    "real_feature_cache": self.cache,
-                    "primary_metric": metric,
+                    "metric_scope": "fgd_only",
                 },
-            )
-            self.screens[epoch] = screen
-            replay, _ = _write_receipt(
-                root / f"e{epoch}-replay.json",
-                {
-                    "format": "fixture-replay",
-                    "split": "val",
-                    "clip_count": selector.EXPECTED_VAL_CLIPS,
-                    "report_payload_sha256": screen_payload[
-                        "receipt_payload_sha256"
-                    ],
-                    "canonical_manifest": self.canonical,
-                    "prediction_manifest": prediction,
-                    "distribution_receipt_payload_sha256": (
-                        distribution_payload["receipt_payload_sha256"]
-                    ),
-                    "real_feature_cache": self.cache,
-                    "primary_metric": metric,
+                "inputs": {
+                    "prediction_dir": prediction_dir,
+                    "ground_truth_dir": ground_truth_dir,
+                    "clip_manifest": clip_manifest,
                 },
+                "metrics": {"fgd": 1.0 + epoch / 100.0},
+                "provenance": {"assets": "pinned"},
+            }
+            self.reports[epoch] = _write(
+                root / f"e{epoch}-diffsheg-val-fgd.json",
+                (json.dumps(report, sort_keys=True) + "\n").encode("utf-8"),
             )
-            self.replays[epoch] = replay
 
         self.frozen, self.frozen_payload = _write_contract_receipt(
             root / "frozen-inputs.json",
@@ -416,6 +402,15 @@ class QualityFixture:
         specification = contract.TOPOLOGY_SPECS[mode]
         updates_per_epoch = int(specification["updates_per_epoch"])
         world_size = int(specification["world_size"])
+        probe_epoch_updates = list(
+            contract._probe_epoch_update_counts(updates_per_epoch)
+        )
+        probe_epoch_samples = [
+            updates * int(specification["global_batch_size"])
+            for updates in probe_epoch_updates
+        ]
+        probe_samples = sum(probe_epoch_samples)
+        cross_epoch_duplicates = 0 if len(probe_epoch_updates) == 1 else 1
         trajectory_probe = _trajectory_probe(mode)
         full_probe_body: dict[str, object] = {
             "format": contract.GATE_FORMAT,
@@ -448,12 +443,17 @@ class QualityFixture:
             "all_losses_finite": True,
             "all_gradients_finite": True,
             "oom": False,
-            "samples_per_second": 1024.0,
+            "samples_per_second": (
+                float(specification["global_batch_size"]) / 0.5
+            ),
             "seconds_per_update": 0.5,
             "median_seconds": 0.5,
             "p90_seconds": 0.6,
             "p99_seconds": 0.7,
-            "estimated_training_seconds": 100.0,
+            "estimated_training_seconds": (
+                0.5 * updates_per_epoch * contract.TOTAL_EPOCHS
+            ),
+            "estimated_epochs": contract.TOTAL_EPOCHS,
             "last_metrics": {"total": 1.0},
             "peak_cuda_memory_bytes_all_ranks": [1024] * world_size,
             "data_wait_seconds": {"median": 0.01, "p99": 0.02},
@@ -480,14 +480,17 @@ class QualityFixture:
             "sample_inventory": {
                 "sampler_drop_last": True,
                 "padding_duplicates": 0,
-                "probe_samples": (
-                    contract.TRAJECTORY_PROBE_UPDATES
-                    * int(specification["global_batch_size"])
-                ),
+                "probe_samples": probe_samples,
                 "probe_unique_samples": (
-                    contract.TRAJECTORY_PROBE_UPDATES
-                    * int(specification["global_batch_size"])
+                    probe_samples - cross_epoch_duplicates
                 ),
+                "probe_sampler_epochs": list(
+                    range(len(probe_epoch_updates))
+                ),
+                "probe_epoch_updates": probe_epoch_updates,
+                "probe_epoch_samples": probe_epoch_samples,
+                "probe_epoch_unique_samples": probe_epoch_samples,
+                "probe_cross_epoch_duplicates": cross_epoch_duplicates,
                 "full_epoch_samples": specification[
                     "unique_samples_per_epoch"
                 ],
@@ -729,9 +732,10 @@ class QualityFixture:
         output: Path,
         *,
         ready_override: dict[int, dict[str, object]] | None = None,
-        prediction_override: dict[int, dict[str, object]] | None = None,
-        screen_override: dict[int, dict[str, object]] | None = None,
-        replay_override: dict[int, dict[str, object]] | None = None,
+        lineage_override: dict[int, dict[str, object]] | None = None,
+        report_override: dict[int, dict[str, object]] | None = None,
+        val_inputs_override: dict[str, object] | None = None,
+        pipeline_override: dict[str, object] | None = None,
         status_override: dict[str, object] | None = None,
     ) -> list[str]:
         ready = ready_override or self.candidate_ready_receipts(mode)
@@ -764,27 +768,24 @@ class QualityFixture:
         argv.extend(
             ["--short-trajectory-output", str(short_output.resolve())]
         )
-        argv.extend(
-            [
-                "--canonical-manifest",
-                str(self.canonical["path"]),
-                str(self.canonical["sha256"]),
-                str(self.canonical["bytes"]),
-                str(self.canonical["rows"]),
-                str(self.canonical["selected_rows"]),
-            ]
+        self._append_artifact(
+            argv,
+            "--val-inputs-receipt",
+            None,
+            val_inputs_override or self.val_inputs,
         )
         self._append_artifact(
-            argv, "--real-feature-cache", None, self.cache
+            argv,
+            "--pipeline-receipt",
+            None,
+            pipeline_override or self.pipeline,
         )
         sources = (
             (
-                "--prediction-manifest",
-                prediction_override or self.predictions,
+                "--inference-lineage",
+                lineage_override or self.lineages,
             ),
-            ("--distribution-receipt", self.distributions),
-            ("--primary-screen-receipt", screen_override or self.screens),
-            ("--primary-replay-receipt", replay_override or self.replays),
+            ("--diffsheg-report", report_override or self.reports),
         )
         for option, artifacts in sources:
             for epoch in selector.QUALITY_EPOCHS:
@@ -802,22 +803,34 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
     def patches(self, fixture: QualityFixture):
         return (
             mock.patch.object(
-                selector,
-                "_replication_module",
-                return_value=_FakeReplication,
+                selector.formal_validation,
+                "validate_val_inputs",
+                side_effect=_FakeFormalValidation.validate_val_inputs,
             ),
             mock.patch.object(
-                selector,
-                "_metrics_module",
-                return_value=_FakeMetrics,
+                selector.formal_validation,
+                "validate_pipeline",
+                side_effect=_FakeFormalValidation.validate_pipeline,
+            ),
+            mock.patch.object(
+                selector.formal_validation,
+                "validate_val_inference_lineage",
+                side_effect=(
+                    _FakeFormalValidation.validate_val_inference_lineage
+                ),
+            ),
+            mock.patch.object(
+                selector.formal_validation,
+                "validate_diffsheg_report",
+                side_effect=_FakeFormalValidation.validate_diffsheg_report,
             ),
         )
 
-    def test_positive_cli_is_callable_for_all_five_modes(self) -> None:
+    def test_positive_cli_is_callable_for_all_nine_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 for index, mode in enumerate(contract.TOPOLOGY_SPECS):
                     output = fixture.root / f"quality-{index}.json"
                     self.assertEqual(
@@ -852,6 +865,19 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                             for row in validated["candidates"]
                         ],
                         [selector.QUALITY_PROVENANCE_FORMAT] * 4,
+                    )
+                    report_text = output.read_text(encoding="utf-8")
+                    self.assertNotIn("released2", report_text.lower())
+                    report_payload = json.loads(report_text)
+                    self.assertEqual(
+                        set(report_payload["candidates"][0]),
+                        {
+                            "epoch",
+                            "candidate_checkpoint",
+                            "inference_lineage",
+                            "diffsheg_report",
+                            "provenance",
+                        },
                     )
 
     def test_provisional_bundle_cannot_masquerade_as_final_training(self) -> None:
@@ -894,7 +920,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                 original,
             )
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
                     "provisional short-quality status changed",
@@ -924,7 +950,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                 original,
             )
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
                     "provisional short-quality status changed",
@@ -944,7 +970,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             swapped = fixture.candidate_ready_receipts(mode)
             swapped[1], swapped[2] = swapped[2], swapped[1]
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
                     "candidate-ready protocol changed",
@@ -957,23 +983,23 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                         )
                     )
 
-    def test_prediction_swap_attack_is_rejected(self) -> None:
+    def test_inference_lineage_swap_attack_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
             mode = next(iter(contract.TOPOLOGY_SPECS))
-            swapped = dict(fixture.predictions)
-            swapped[1] = fixture.predictions[2]
+            swapped = dict(fixture.lineages)
+            swapped[1] = fixture.lineages[2]
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
-                    "prediction row 0 authority changed",
+                    "inference lineage validation failed",
                 ):
                     producer.main(
                         fixture.argv(
                             mode,
-                            fixture.root / "prediction-swap.json",
-                            prediction_override=swapped,
+                            fixture.root / "lineage-swap.json",
+                            lineage_override=swapped,
                         )
                     )
 
@@ -986,7 +1012,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             starts = [index for index, value in enumerate(argv) if value == option]
             del argv[starts[-1] : starts[-1] + 6]
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
                     "e1/e2/e4/e8 exactly in order",
@@ -1000,7 +1026,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             reused = fixture.candidate_ready_receipts(mode)
             reused[2] = reused[1]
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
                     "receipt was reused|protocol changed",
@@ -1020,7 +1046,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             output = fixture.root / "immutable-output.json"
             argv = fixture.argv(mode, output)
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 self.assertEqual(producer.main(argv), 0)
                 with self.assertRaisesRegex(
                     FileExistsError,
@@ -1028,26 +1054,50 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                 ):
                     producer.main(argv)
 
-    def test_metric_receipt_swap_attack_is_rejected(self) -> None:
+    def test_diffsheg_report_swap_attack_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
             mode = next(iter(contract.TOPOLOGY_SPECS))
-            screens = dict(fixture.screens)
-            replays = dict(fixture.replays)
-            screens[1] = fixture.screens[2]
-            replays[1] = fixture.replays[2]
+            reports = dict(fixture.reports)
+            reports[1] = fixture.reports[2]
             patches = self.patches(fixture)
-            with patches[0], patches[1]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
-                    "chain changed",
+                    "DiffSHEG report validation failed",
                 ):
                     producer.main(
                         fixture.argv(
                             mode,
-                            fixture.root / "metric-swap.json",
-                            screen_override=screens,
-                            replay_override=replays,
+                            fixture.root / "diffsheg-report-swap.json",
+                            report_override=reports,
+                        )
+                    )
+
+    def test_common_val_input_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = QualityFixture(Path(directory))
+            mode = next(iter(contract.TOPOLOGY_SPECS))
+            alternate, _ = _write_receipt(
+                fixture.root / "alternate-val-inputs.json",
+                {
+                    "format": "fixture-val-inputs",
+                    "split": "val",
+                    "test_visible": False,
+                    "changed": True,
+                },
+            )
+            patches = self.patches(fixture)
+            with patches[0], patches[1], patches[2], patches[3]:
+                with self.assertRaisesRegex(
+                    selector.TopologySelectionError,
+                    "inference lineage validation failed",
+                ):
+                    producer.main(
+                        fixture.argv(
+                            mode,
+                            fixture.root / "val-input-mismatch.json",
+                            val_inputs_override=alternate,
                         )
                     )
 

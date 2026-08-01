@@ -126,6 +126,7 @@ FRESH_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/__init__.py",
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/run_base_inference.py",
+    "scripts/show_base/evaluate_diffsheg_val_fgd.py",
     "scripts/show_base/base_long_val_contract.py",
     "scripts/show_base/select_base_official_adapt.py",
     "scripts/show_base/build_base_features.py",
@@ -2603,22 +2604,83 @@ def validate_diffsheg_report(
     *,
     expected_coverage: Mapping[str, Any],
     inference_lineage: Mapping[str, Any] | None = None,
+    expected_pipeline: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
-    if not isinstance(report, dict) or report.get("status") != "ok":
+    report = require_exact_keys(
+        report,
+        {
+            "status",
+            "protocol",
+            "inputs",
+            "metrics",
+            "diagnostics",
+            "provenance",
+        },
+        "DiffSHEG validation report",
+    )
+    if report.get("status") != "ok":
         raise SelectionContractError("DiffSHEG validation report is incomplete")
-    protocol = report.get("protocol")
-    inputs = report.get("inputs")
-    metrics = report.get("metrics")
-    provenance = report.get("provenance")
-    if not all(
-        isinstance(value, dict)
-        for value in (protocol, inputs, metrics, provenance)
-    ):
-        raise SelectionContractError("DiffSHEG report schema is incomplete")
-    assert isinstance(protocol, dict)
-    assert isinstance(inputs, dict)
-    assert isinstance(metrics, dict)
-    assert isinstance(provenance, dict)
+    protocol = require_exact_keys(
+        report["protocol"],
+        {
+            "name",
+            "version",
+            "status",
+            "diffsheg_reference_commit",
+            "window_length",
+            "window_stride",
+            "precision",
+            "ba",
+            "clip_order",
+            "selection_split",
+            "test_visible",
+            "metric_scope",
+            "parameter_order",
+            "normalization",
+            "tail_policy",
+        },
+        "DiffSHEG validation protocol",
+    )
+    inputs = require_exact_keys(
+        report["inputs"],
+        {
+            "prediction_dir",
+            "ground_truth_dir",
+            "clip_manifest",
+            "clip_count",
+            "frame_count",
+            "window_count",
+            "uncovered_tail_frames",
+            "clip_manifest_sha256",
+            "clip_manifest_file_sha256",
+            "stats",
+            "weights_dir",
+            "checkpoint_paths",
+        },
+        "DiffSHEG validation inputs",
+    )
+    metrics = report["metrics"]
+    if not isinstance(metrics, dict) or set(metrics) != set(VAL_METRIC_KEYS):
+        raise SelectionContractError(
+            "validation metric coverage must be exactly FGD-only"
+        )
+    diagnostics = require_exact_keys(
+        report["diagnostics"],
+        {"gesture_feature_count", "gesture_feature_dim"},
+        "DiffSHEG validation diagnostics",
+    )
+    provenance = require_exact_keys(
+        report["provenance"],
+        {
+            "evaluator",
+            "diffsheg_root",
+            "autoencoders",
+            "adapter",
+            "device",
+            "runtime_versions",
+        },
+        "DiffSHEG validation provenance",
+    )
     pins = DIFFSHEG_PINNED_RECEIPT
     public_coverage = public_val_coverage(expected_coverage)
     expected_clip_manifest_path = (
@@ -2645,6 +2707,17 @@ def validate_diffsheg_report(
         or protocol.get("window_stride") != DIFFSHEG_STRIDE
         or protocol.get("precision") != pins["precision"]
         or protocol.get("ba") is not None
+        or protocol.get("selection_split") != "val"
+        or protocol.get("test_visible") is not False
+        or protocol.get("metric_scope") != "fgd_only"
+        or protocol.get("parameter_order")
+        != (
+            "PASPA/BEAT2 poses[165] -> DiffSHEG "
+            "ShowDataset.extract_pose gesture[129]"
+        )
+        or protocol.get("normalization")
+        != "DiffSHEG talkshow_mean_std.npy"
+        or protocol.get("tail_policy") != "drop_incomplete_tail"
         or (
             protocol.get("clip_order") != expected_clip_order
             if expected_clip_order is not None
@@ -2670,6 +2743,10 @@ def validate_diffsheg_report(
         inputs.get("uncovered_tail_frames"),
         "DiffSHEG validation uncovered_tail_frames",
     )
+    clip_manifest_file_sha256 = require_sha256(
+        inputs.get("clip_manifest_file_sha256"),
+        "DiffSHEG inputs.clip_manifest_file_sha256",
+    )
     if (
         clip_count != public_coverage["clip_count"]
         or frame_count != public_coverage["frame_count"]
@@ -2677,12 +2754,24 @@ def validate_diffsheg_report(
         or uncovered != public_coverage["uncovered_tail_frames"]
         or inputs.get("clip_manifest_sha256")
         != expected_clip_manifest_sha256
-        or not isinstance(inputs.get("stats"), dict)
-        or inputs["stats"].get("sha256") != pins["stats_sha256"]
     ):
         raise SelectionContractError(
             "DiffSHEG report does not exactly cover frozen validation"
         )
+    stats = require_exact_keys(
+        inputs["stats"],
+        {"path", "sha256"},
+        "DiffSHEG validation stats",
+    )
+    if stats["sha256"] != pins["stats_sha256"]:
+        raise SelectionContractError(
+            "DiffSHEG report does not bind the pinned statistics"
+        )
+    checkpoint_paths = require_exact_keys(
+        inputs["checkpoint_paths"],
+        {"fgd"},
+        "DiffSHEG validation checkpoint paths",
+    )
     for field in (
         "prediction_dir",
         "ground_truth_dir",
@@ -2716,40 +2805,67 @@ def validate_diffsheg_report(
                 ).resolve()
             )
             != expected_clip_manifest_path
+            or clip_manifest_file_sha256
+            != inference_lineage["clip_manifest"]["sha256"]
         ):
             raise SelectionContractError(
                 "DiffSHEG report paths do not bind the candidate inference "
                 "lineage"
             )
-    require_absolute_path(
-        inputs["stats"].get("path"),
-        "DiffSHEG inputs.stats.path",
+    require_absolute_path(stats["path"], "DiffSHEG inputs.stats.path")
+    checkpoint_path = require_absolute_path(
+        checkpoint_paths["fgd"],
+        "DiffSHEG inputs.checkpoint_paths.fgd",
     )
-    if set(metrics) != set(VAL_METRIC_KEYS):
-        raise SelectionContractError(
-            "validation metric coverage must be exactly FGD-only"
-        )
     validated_metrics = {
         key: require_finite_number(metrics[key], f"DiffSHEG metric {key}")
         for key in VAL_METRIC_KEYS
     }
     if validated_metrics["fgd"] < 0.0:
         raise SelectionContractError("DiffSHEG metric fgd is negative")
+    feature_count = require_exact_int(
+        diagnostics["gesture_feature_count"],
+        "DiffSHEG diagnostics.gesture_feature_count",
+    )
+    feature_dim = require_exact_int(
+        diagnostics["gesture_feature_dim"],
+        "DiffSHEG diagnostics.gesture_feature_dim",
+    )
+    if feature_count != window_count or feature_dim != 300:
+        raise SelectionContractError(
+            "DiffSHEG validation feature diagnostics mismatch"
+        )
 
-    evaluator = provenance.get("evaluator")
-    diffsheg_root = provenance.get("diffsheg_root")
-    autoencoders = provenance.get("autoencoders")
+    evaluator = require_exact_keys(
+        provenance["evaluator"],
+        {
+            "path",
+            "sha256",
+            "repository_root",
+            "repository_git_head",
+            "repository_git_tree",
+            "repository_origin",
+        },
+        "DiffSHEG evaluator provenance",
+    )
+    diffsheg_root = require_exact_keys(
+        provenance["diffsheg_root"],
+        {"path", "git_head"},
+        "DiffSHEG reference provenance",
+    )
+    autoencoders = require_exact_keys(
+        provenance["autoencoders"],
+        {"fgd"},
+        "DiffSHEG evaluator provenance",
+    )
     if (
-        not isinstance(evaluator, dict)
-        or evaluator.get("sha256")
-        != pins["paspa"]["evaluator_sha256"]
+        evaluator["sha256"] != pins["paspa"]["evaluator_sha256"]
         or evaluator.get("repository_git_head")
         != pins["paspa"]["commit"]
-        or not isinstance(diffsheg_root, dict)
+        or evaluator.get("repository_git_tree") != pins["paspa"]["tree"]
+        or evaluator.get("repository_origin") != pins["paspa"]["origin"]
         or diffsheg_root.get("git_head")
         != pins["diffsheg_reference_commit"]
-        or not isinstance(autoencoders, dict)
-        or set(autoencoders) != {"fgd"}
     ):
         raise SelectionContractError("DiffSHEG evaluator provenance mismatch")
     require_absolute_path(
@@ -2765,11 +2881,26 @@ def validate_diffsheg_report(
         "DiffSHEG reference checkout",
     )
     for metric_name, specification in pins["autoencoders"].items():
-        observed = autoencoders[metric_name]
+        observed = require_exact_keys(
+            autoencoders[metric_name],
+            {
+                "path",
+                "sha256",
+                "input_dim",
+                "latent_dim",
+                "state_container",
+                "load_mode",
+                "feature_count",
+            },
+            f"DiffSHEG {metric_name} autoencoder provenance",
+        )
         if (
-            not isinstance(observed, dict)
-            or observed.get("sha256") != specification["sha256"]
+            observed.get("sha256") != specification["sha256"]
             or observed.get("input_dim") != specification["input_dim"]
+            or observed.get("latent_dim") != 300
+            or observed.get("state_container") != "model_state"
+            or observed.get("load_mode") != "encoder_only"
+            or observed.get("feature_count") != window_count
             or Path(str(observed.get("path", ""))).name
             != specification["filename"]
         ):
@@ -2780,6 +2911,95 @@ def validate_diffsheg_report(
             observed["path"],
             f"DiffSHEG {metric_name} autoencoder path",
         )
+        if Path(observed["path"]) != checkpoint_path:
+            raise SelectionContractError(
+                "DiffSHEG checkpoint input/provenance path mismatch"
+            )
+    if Path(inputs["weights_dir"]) != checkpoint_path.parent:
+        raise SelectionContractError(
+            "DiffSHEG weights directory/checkpoint path mismatch"
+        )
+    adapter = require_exact_keys(
+        provenance["adapter"],
+        {"path", "sha256", "repository_root", "repository_git_head"},
+        "DiffSHEG adapter provenance",
+    )
+    require_absolute_path(adapter["path"], "DiffSHEG adapter path")
+    require_absolute_path(
+        adapter["repository_root"],
+        "DiffSHEG adapter repository root",
+    )
+    require_sha256(adapter["sha256"], "DiffSHEG adapter SHA-256")
+    require_git_oid(
+        adapter["repository_git_head"],
+        "DiffSHEG adapter repository commit",
+    )
+    if expected_pipeline is not None:
+        pipeline_source = require_exact_keys(
+            expected_pipeline.get("source"),
+            {
+                "origin",
+                "source_root",
+                "commit",
+                "tree",
+                "clean",
+                "detached",
+                "local_branches_at_commit",
+            },
+            "fresh Base pipeline source",
+        )
+        source_closure = expected_pipeline.get("source_closure")
+        relative_adapter = (
+            "scripts/show_base/evaluate_diffsheg_val_fgd.py"
+        )
+        if (
+            not isinstance(source_closure, dict)
+            or relative_adapter not in source_closure
+        ):
+            raise SelectionContractError(
+                "fresh Base pipeline omits the DiffSHEG adapter source"
+            )
+        expected_adapter = require_exact_keys(
+            source_closure[relative_adapter],
+            {
+                "path",
+                "sha256",
+                "bytes",
+                "git_mode",
+                "git_blob_sha1",
+            },
+            "fresh Base pipeline DiffSHEG adapter source",
+        )
+        if (
+            pipeline_source["origin"]
+            != "git@github.com:Xiangyue-Zhang/SemTalk.git"
+            or pipeline_source["clean"] is not True
+            or pipeline_source["detached"] is not True
+            or pipeline_source["local_branches_at_commit"] != []
+            or adapter["path"] != expected_adapter["path"]
+            or adapter["sha256"] != expected_adapter["sha256"]
+            or adapter["repository_root"]
+            != pipeline_source["source_root"]
+            or adapter["repository_git_head"]
+            != pipeline_source["commit"]
+        ):
+            raise SelectionContractError(
+                "DiffSHEG adapter provenance is not the frozen pipeline "
+                "source"
+            )
+    device = provenance["device"]
+    if not isinstance(device, str) or not device:
+        raise SelectionContractError("DiffSHEG evaluator device is invalid")
+    runtime_versions = require_exact_keys(
+        provenance["runtime_versions"],
+        {"python", "numpy", "torch", "scipy"},
+        "DiffSHEG runtime provenance",
+    )
+    if any(
+        value is not None and (not isinstance(value, str) or not value)
+        for value in runtime_versions.values()
+    ):
+        raise SelectionContractError("DiffSHEG runtime provenance mismatch")
     return validated_metrics, {
         "clip_count": clip_count,
         "frame_count": frame_count,
@@ -2971,6 +3191,11 @@ def _measurement_artifact(
         report,
         expected_coverage=common_val_inputs["coverage"],
         inference_lineage=inference,
+        expected_pipeline=(
+            common_pipeline["payload"]
+            if "source_closure" in common_pipeline["payload"]
+            else None
+        ),
     )
     row = {
         "epoch": epoch,

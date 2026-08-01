@@ -29,16 +29,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.show_base import base_fresh_val_orchestrator as orchestrator
-from scripts.show_base import (
-    deterministic_replication_gate as replication,
-)
+from scripts.show_base import base_long_val_contract as formal_validation
 from scripts.show_base import run_base_val_inference as engine
 from scripts.show_base import select_base_training_topology as topology
 from scripts.show_base import train_base_official_adapt_long as training
 
-FORMAT = "semtalk_show_base_short_quality_val_preflight_v1"
-COMPLETION_FORMAT = "semtalk_show_base_short_quality_val_completion_v1"
+FORMAT = "semtalk_show_base_short_quality_val_preflight_v2"
+COMPLETION_FORMAT = "semtalk_show_base_short_quality_val_completion_v2"
 QUALITY_EPOCHS = topology.QUALITY_EPOCHS
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 SOURCE_FILES = (
@@ -46,6 +43,9 @@ SOURCE_FILES = (
     "scripts/show_base/base_short_quality_val_8shard.sh",
     "scripts/show_base/run_base_val_inference.py",
     "scripts/show_base/semtalk_base_inference_core.py",
+    "scripts/show_base/base_long_val_contract.py",
+    "scripts/show_base/select_base_official_adapt.py",
+    "scripts/show_base/evaluate_diffsheg_val_fgd.py",
 )
 
 
@@ -303,10 +303,10 @@ def _build_bound_payload(
             quality_gate_spec_sha256=quality_gate["sha256"],
         )
     )
-    val_artifact, coverage = engine.selector.validate_val_inputs(
+    val_artifact, coverage = formal_validation.validate_val_inputs(
         val_inputs_path, val_inputs_sha
     )
-    pipeline_artifact, pipeline = engine.selector.validate_pipeline(
+    pipeline_artifact, pipeline = formal_validation.validate_pipeline(
         pipeline_path, pipeline_sha
     )
     first, frozen, ready_manifest = _ready_inputs(ready)
@@ -508,60 +508,6 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         return engine.finalize(args)
 
 
-def distribution(args: argparse.Namespace) -> dict[str, Any]:
-    _preflight_art, preflight = _preflight_artifact(
-        args.preflight, args.expected_preflight_sha256
-    )
-    checkpoint = preflight["candidate_bundle"]["candidates"][str(args.epoch)]
-    gate_artifact, gate = replication.load_gate(
-        args.validation_gate,
-        args.expected_validation_gate_sha256,
-        expected_scope="validation_candidate_family",
-    )
-    pipeline = engine.selector.validate_pipeline(
-        Path(preflight["pipeline_receipt"]["path"]),
-        preflight["pipeline_receipt"]["sha256"],
-    )[1]
-    expected_checkpoints = {
-        "base": checkpoint,
-        **{
-            stage: {
-                key: pipeline["fixed_checkpoints"][stage][key]
-                for key in ("path", "sha256", "bytes")
-            }
-            for stage in ("face", "hands", "upper", "lower", "global")
-        },
-    }
-    if (
-        gate.get("model_bundle", {}).get("checkpoints") != expected_checkpoints
-        or gate.get("source_closure", {}).get("commit") != pipeline["source"]["commit"]
-        or gate.get("source_closure", {}).get("tree") != pipeline["source"]["tree"]
-    ):
-        raise ShortQualityValError(
-            "validation gate is not bound to Base plus selected five/source"
-        )
-    lineage_payload = args.lineage.read_bytes()
-    lineage = json.loads(lineage_payload)
-    lineage_artifact = {
-        "path": str(args.lineage),
-        "sha256": _sha(args.expected_lineage_sha256, "lineage SHA"),
-        "bytes": len(lineage_payload),
-        "receipt_payload_sha256": _sha(
-            lineage.get("receipt_payload_sha256"), "lineage payload SHA"
-        ),
-    }
-    result = orchestrator.build_distribution(
-        lineage_artifact=lineage_artifact,
-        gate_path=Path(gate_artifact["path"]),
-        expected_gate_sha256=gate_artifact["sha256"],
-        checkpoint=checkpoint,
-    )
-    if not args.output.is_absolute() or os.path.lexists(args.output):
-        raise FileExistsError(f"refusing non-new absolute output {args.output}")
-    engine._write_new(args.output, _canonical_bytes(result))
-    return engine._artifact(args.output, payload_sha=result["receipt_payload_sha256"])
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -608,16 +554,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             command.add_argument("--seed", type=int, default=20260731)
             command.add_argument("--progress-every", type=int, default=20)
 
-    dist = commands.add_parser("distribution", allow_abbrev=False)
-    dist.add_argument("--split", choices=("val",), required=True)
-    dist.add_argument("--preflight", type=Path, required=True)
-    dist.add_argument("--expected-preflight-sha256", required=True)
-    dist.add_argument("--epoch", type=_epoch, required=True)
-    dist.add_argument("--lineage", type=Path, required=True)
-    dist.add_argument("--expected-lineage-sha256", required=True)
-    dist.add_argument("--validation-gate", type=Path, required=True)
-    dist.add_argument("--expected-validation-gate-sha256", required=True)
-    dist.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -631,8 +567,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_shard(args)
     elif args.command == "finalize":
         result = finalize(args)
-    elif args.command == "distribution":
-        result = distribution(args)
     else:  # pragma: no cover
         raise AssertionError(args.command)
     print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)

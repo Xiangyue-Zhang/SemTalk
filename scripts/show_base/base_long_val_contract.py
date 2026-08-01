@@ -91,6 +91,58 @@ TOPOLOGY_SPECS = {
         "precision": "bf16",
         "formal_training_eligible": True,
     },
+    "validation_gated_w8_l128_g1024_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 128,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "validation_gated_w8_l256_g2048_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 256,
+        "global_batch_size": 2_048,
+        "updates_per_epoch": 62,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "validation_gated_w16_l64_g1024_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 6e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
 }
 
 
@@ -157,10 +209,26 @@ canonical_clip_id = talkshow.canonical_clip_id
 public_val_coverage = diffsheg.public_val_coverage
 validate_val_inputs = diffsheg.validate_val_inputs
 validate_val_inference_lineage = diffsheg.validate_val_inference_lineage
-validate_diffsheg_report = diffsheg.validate_diffsheg_report
 _strict_json_bytes = diffsheg._strict_json_bytes
 _strict_jsonl = diffsheg._strict_jsonl
 SelectionContractError = diffsheg.SelectionContractError
+
+
+def validate_diffsheg_report(
+    report: Any,
+    *,
+    expected_coverage: Mapping[str, Any],
+    inference_lineage: Mapping[str, Any] | None = None,
+    expected_pipeline: Mapping[str, Any],
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Validate FGD while mandatorily binding the fresh source closure."""
+
+    return diffsheg.validate_diffsheg_report(
+        report,
+        expected_coverage=expected_coverage,
+        inference_lineage=inference_lineage,
+        expected_pipeline=expected_pipeline,
+    )
 
 
 def reject_test_path(path: Path, label: str) -> None:
@@ -241,6 +309,18 @@ def _validate_frozen(
         else None
     )
     topology = TOPOLOGY_SPECS.get(topology_mode)
+    expected_optimizer = (
+        {
+            "name": "Adam",
+            "learning_rate": topology["learning_rate"],
+            "betas": [0.5, 0.999],
+            "weight_decay": 0.0,
+            "gradient_clip_norm": 0.99,
+            "scheduler": "constant",
+        }
+        if isinstance(topology, dict)
+        else None
+    )
     if (
         frozen.get("format") not in FROZEN_INPUTS_FORMATS
         or not isinstance(protocol, dict)
@@ -261,6 +341,7 @@ def _validate_frozen(
         or protocol.get("local_batch_size") != topology["local_batch_size"]
         or protocol.get("global_batch_size") != topology["global_batch_size"]
         or protocol.get("precision") != topology["precision"]
+        or protocol.get("optimizer") != expected_optimizer
         or not isinstance(topology_receipt, dict)
         or topology_receipt.get("topology_mode") != topology_mode
         or topology_receipt.get("classification")

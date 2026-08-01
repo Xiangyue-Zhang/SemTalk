@@ -641,20 +641,19 @@ def _selected_updates_per_epoch(preflight: Mapping[str, Any]) -> int:
         )
     updates = bundle.get("updates_per_epoch")
     topology = bundle.get("selected_topology")
+    mode = topology.get("mode") if isinstance(topology, dict) else None
+    specification = val_contract.TOPOLOGY_SPECS.get(mode)
     if (
         type(updates) is not int
-        or updates not in {248, 1988}
+        or updates not in {62, 124, 248, 1988}
         or not isinstance(topology, dict)
         or topology.get("updates_per_epoch") != updates
-        or topology.get("mode") not in {
-            "official_objective_w8_l8_g64_ddp_adaptation",
-            "official_objective_w16_l4_g64_ddp_adaptation",
-            "validation_gated_w8_l64_g512_empirical_acceleration",
-            "validation_gated_w16_l32_g512_empirical_acceleration",
-        }
+        or not isinstance(specification, dict)
+        or specification.get("formal_training_eligible") is not True
+        or specification.get("updates_per_epoch") != updates
     ):
         raise BaseFreshValOrchestratorError(
-            "preflight lacks one selected non-W1 Base topology"
+            "preflight lacks one selected formal Base topology"
         )
     return updates
 
@@ -2447,7 +2446,12 @@ def build_candidate_evidence(
     update_rates = {
         row["optimizer_updates"] // row["epoch"] for row in rows
     }
-    if len(update_rates) != 1 or next(iter(update_rates)) not in {248, 1988}:
+    if len(update_rates) != 1 or next(iter(update_rates)) not in {
+        62,
+        124,
+        248,
+        1988,
+    }:
         raise BaseFreshValOrchestratorError(
             "candidate seals mix Base training topologies"
         )
@@ -2515,7 +2519,12 @@ def _candidate_seal_envelope(
         or not isinstance(row, dict)
         or row.get("epoch") != expected_epoch
         or row.get("optimizer_updates")
-        not in {expected_epoch * 248, expected_epoch * 1988}
+        not in {
+            expected_epoch * 62,
+            expected_epoch * 124,
+            expected_epoch * 248,
+            expected_epoch * 1988,
+        }
     ):
         raise BaseFreshValOrchestratorError(
             f"Base e{expected_epoch} candidate seal identity changed"

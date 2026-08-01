@@ -682,6 +682,27 @@ class CandidateTransactionFixture:
 
 
 class BaseFreshValOrchestratorCpuTests(unittest.TestCase):
+    def test_every_formal_topology_is_valid_for_downstream_validation(self) -> None:
+        observed_updates = set()
+        for mode, specification in ORCHESTRATOR.val_contract.TOPOLOGY_SPECS.items():
+            with self.subTest(mode=mode):
+                updates = specification["updates_per_epoch"]
+                preflight = {
+                    "candidate_bundle": {
+                        "updates_per_epoch": updates,
+                        "selected_topology": {
+                            "mode": mode,
+                            "updates_per_epoch": updates,
+                        },
+                    }
+                }
+                self.assertEqual(
+                    ORCHESTRATOR._selected_updates_per_epoch(preflight),
+                    updates,
+                )
+                observed_updates.add(updates)
+        self.assertEqual(observed_updates, {62, 124, 248, 1988})
+
     def test_create_new_run_root_is_dirfd_bound_and_nonreusable(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="semtalk-create-root-", dir="/private/tmp"

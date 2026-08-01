@@ -50,7 +50,7 @@ def _validate_candidate_rows(
 ) -> list[dict[str, Any]]:
     if expected_updates_per_epoch is None:
         expected_updates_per_epoch = authority.BASE_UPDATES_PER_EPOCH
-    if expected_updates_per_epoch not in {248, 1988}:
+    if expected_updates_per_epoch not in {62, 124, 248, 1988}:
         raise PublishedBaseSelectionError(
             "selected Base topology updates per epoch changed"
         )
@@ -326,7 +326,7 @@ def build_published_base_winner_selection(
         or evidence["test_visible"] is not False
         or evidence["candidate_epochs"]
         != list(authority.BASE_CANDIDATE_EPOCHS)
-        or updates_per_epoch not in {248, 1988}
+        or updates_per_epoch not in {62, 124, 248, 1988}
         or evidence["prerequisite_selection"] != prerequisite_artifact
         or evidence["continuation_decision"] != continuation_artifact
     ):

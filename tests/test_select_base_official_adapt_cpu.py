@@ -558,6 +558,15 @@ class SelectionFixture:
                 "clip_order": (
                     f"explicit_manifest:{inference['clip_manifest_path']}"
                 ),
+                "selection_split": "val",
+                "test_visible": False,
+                "metric_scope": "fgd_only",
+                "parameter_order": (
+                    "PASPA/BEAT2 poses[165] -> DiffSHEG "
+                    "ShowDataset.extract_pose gesture[129]"
+                ),
+                "normalization": "DiffSHEG talkshow_mean_std.npy",
+                "tail_policy": "drop_incomplete_tail",
             },
             "inputs": {
                 "prediction_dir": inference["prediction_dir"],
@@ -573,13 +582,23 @@ class SelectionFixture:
                 "clip_manifest_sha256": self.coverage[
                     "diffsheg_clip_manifest_sha256"
                 ],
+                "clip_manifest_file_sha256": inference[
+                    "clip_manifest_sha256"
+                ],
                 "stats": {
                     "path": "/assets/talkshow_mean_std.npy",
                     "sha256": pins["stats_sha256"],
                 },
+                "checkpoint_paths": {
+                    "fgd": "/assets/ae_weights/gesture.pth.tar",
+                },
             },
             "metrics": {
                 "fgd": fgd,
+            },
+            "diagnostics": {
+                "gesture_feature_count": self.coverage["window_count"],
+                "gesture_feature_dim": 300,
             },
             "provenance": {
                 "evaluator": {
@@ -587,6 +606,8 @@ class SelectionFixture:
                     "repository_root": "/evaluator",
                     "sha256": pins["paspa"]["evaluator_sha256"],
                     "repository_git_head": pins["paspa"]["commit"],
+                    "repository_git_tree": pins["paspa"]["tree"],
+                    "repository_origin": pins["paspa"]["origin"],
                 },
                 "diffsheg_root": {
                     "path": "/diffsheg",
@@ -595,14 +616,35 @@ class SelectionFixture:
                 "autoencoders": {
                     name: {
                         "path": (
-                            f"/assets/{specification['filename']}"
+                            "/assets/ae_weights/"
+                            f"{specification['filename']}"
                         ),
                         "sha256": specification["sha256"],
                         "input_dim": specification["input_dim"],
+                        "latent_dim": 300,
+                        "state_container": "model_state",
+                        "load_mode": "encoder_only",
+                        "feature_count": self.coverage["window_count"],
                     }
                     for name, specification in pins[
                         "autoencoders"
                     ].items()
+                },
+                "adapter": {
+                    "path": (
+                        "/semtalk/scripts/show_base/"
+                        "evaluate_diffsheg_val_fgd.py"
+                    ),
+                    "sha256": "2" * 64,
+                    "repository_root": "/semtalk",
+                    "repository_git_head": "3" * 40,
+                },
+                "device": "cuda:0",
+                "runtime_versions": {
+                    "python": "3.11.0",
+                    "numpy": "2.0.0",
+                    "torch": "2.6.0",
+                    "scipy": "1.15.0",
                 },
             },
         }
@@ -1304,6 +1346,109 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                     ):
                         SELECTOR.validate_diffsheg_report(
                             non_fgd_only,
+                            expected_coverage=fixture.coverage,
+                        )
+
+    def test_validation_report_adapter_is_bound_to_fresh_pipeline_source(
+        self,
+    ) -> None:
+        with _canonical_temporary_directory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            report = fixture.report(1)
+            adapter = report["provenance"]["adapter"]
+            relative = (
+                "scripts/show_base/evaluate_diffsheg_val_fgd.py"
+            )
+            pipeline = {
+                "source": {
+                    "origin": (
+                        "git@github.com:Xiangyue-Zhang/SemTalk.git"
+                    ),
+                    "source_root": adapter["repository_root"],
+                    "commit": adapter["repository_git_head"],
+                    "tree": "4" * 40,
+                    "clean": True,
+                    "detached": True,
+                    "local_branches_at_commit": [],
+                },
+                "source_closure": {
+                    relative: {
+                        "path": adapter["path"],
+                        "sha256": adapter["sha256"],
+                        "bytes": 1,
+                        "git_mode": "100644",
+                        "git_blob_sha1": "5" * 40,
+                    }
+                },
+            }
+            SELECTOR.validate_diffsheg_report(
+                report,
+                expected_coverage=fixture.coverage,
+                expected_pipeline=pipeline,
+            )
+            for field, changed in (
+                ("sha256", "0" * 64),
+                ("repository_git_head", "1" * 40),
+                ("path", "/semtalk/scripts/show_base/forged.py"),
+                ("repository_root", "/another/semtalk"),
+            ):
+                forged = fixture.report(1)
+                forged["provenance"]["adapter"][field] = changed
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    SELECTOR.SelectionContractError,
+                    "frozen pipeline source",
+                ):
+                    SELECTOR.validate_diffsheg_report(
+                        forged,
+                        expected_coverage=fixture.coverage,
+                        expected_pipeline=pipeline,
+                    )
+
+    def test_validation_report_protocol_is_strict_val_only(self) -> None:
+        with _canonical_temporary_directory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            for field, changed in (
+                ("selection_split", "test"),
+                ("test_visible", True),
+                ("metric_scope", "all_metrics"),
+            ):
+                report = fixture.report(1)
+                report["protocol"][field] = changed
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    SELECTOR.SelectionContractError,
+                    "protocol mismatch",
+                ):
+                    SELECTOR.validate_diffsheg_report(
+                        report,
+                        expected_coverage=fixture.coverage,
+                    )
+
+    def test_validation_report_rejects_unknown_test_fields(self) -> None:
+        with _canonical_temporary_directory() as temporary:
+            fixture = SelectionFixture(Path(temporary))
+            mutations = (
+                ("top", "test_metrics", True),
+                ("protocol", "test_metric_used", True),
+                (
+                    "inputs",
+                    "test_ground_truth_dir",
+                    "/secret/test/ground-truth",
+                ),
+                ("provenance", "test_source", "/secret/test"),
+            )
+            for section, field, value in mutations:
+                report = fixture.report(1)
+                if section == "top":
+                    report[field] = value
+                else:
+                    report[section][field] = value
+                with self.subTest(section=section, field=field):
+                    with self.assertRaisesRegex(
+                        SELECTOR.SelectionContractError,
+                        "schema mismatch",
+                    ):
+                        SELECTOR.validate_diffsheg_report(
+                            report,
                             expected_coverage=fixture.coverage,
                         )
 

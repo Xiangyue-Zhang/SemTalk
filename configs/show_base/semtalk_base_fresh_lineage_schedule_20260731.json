@@ -15,7 +15,7 @@
   },
   "training": {
     "total_epochs": 400,
-    "topology_source": "sealed_five_mode_topology_gate_v1",
+    "topology_source": "sealed_nine_mode_topology_gate_v1",
     "topology_matrix": {
       "official_w1_b64_reference": {
         "classification": "exact_official_runtime_topology_reference",
@@ -79,6 +79,58 @@
         "updates_per_epoch": 248,
         "unique_samples_per_epoch": 126976,
         "learning_rate": 0.00003,
+        "precision": "bf16",
+        "formal_training_eligible": true
+      },
+      "validation_gated_w8_l128_g1024_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 128,
+        "global_batch_size": 1024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126976,
+        "learning_rate": 0.00003,
+        "precision": "bf16",
+        "formal_training_eligible": true
+      },
+      "validation_gated_w8_l256_g2048_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 256,
+        "global_batch_size": 2048,
+        "updates_per_epoch": 62,
+        "unique_samples_per_epoch": 126976,
+        "learning_rate": 0.00003,
+        "precision": "bf16",
+        "formal_training_eligible": true
+      },
+      "validation_gated_w16_l64_g1024_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126976,
+        "learning_rate": 0.00003,
+        "precision": "bf16",
+        "formal_training_eligible": true
+      },
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration": {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126976,
+        "learning_rate": 0.00006,
         "precision": "bf16",
         "formal_training_eligible": true
       }

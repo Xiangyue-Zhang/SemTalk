@@ -38,6 +38,25 @@ def _write_probe(path: Path, mode: str, eta: float) -> Path:
     world_size = int(specification["world_size"])
     global_batch_size = int(specification["global_batch_size"])
     probe_samples = contract.TRAJECTORY_PROBE_UPDATES * global_batch_size
+    probe_epoch_updates = list(
+        contract._probe_epoch_update_counts(
+            int(specification["updates_per_epoch"])
+        )
+    )
+    probe_epoch_samples = [
+        updates * global_batch_size for updates in probe_epoch_updates
+    ]
+    cross_epoch_duplicates = 0 if len(probe_epoch_updates) == 1 else 1
+    median_seconds = (
+        float(eta)
+        / float(specification["updates_per_epoch"])
+        / float(contract.TOTAL_EPOCHS)
+    )
+    derived_eta = (
+        median_seconds
+        * float(specification["updates_per_epoch"])
+        * float(contract.TOTAL_EPOCHS)
+    )
     body: dict[str, object] = {
         "format": contract.GATE_FORMAT,
         "status": "pass",
@@ -65,11 +84,13 @@ def _write_probe(path: Path, mode: str, eta: float) -> Path:
         "all_losses_finite": True,
         "all_gradients_finite": True,
         "oom": False,
-        "median_seconds": 0.5,
-        "p90_seconds": 0.6,
-        "p99_seconds": 0.7,
-        "estimated_training_seconds": eta,
-        "samples_per_second": 1024.0,
+        "seconds_per_update": median_seconds,
+        "median_seconds": median_seconds,
+        "p90_seconds": median_seconds * 1.1,
+        "p99_seconds": median_seconds * 1.2,
+        "estimated_training_seconds": derived_eta,
+        "estimated_epochs": contract.TOTAL_EPOCHS,
+        "samples_per_second": global_batch_size / median_seconds,
         "peak_cuda_memory_bytes_all_ranks": [1024] * world_size,
         "data_wait_seconds": {"median": 0.01, "p99": 0.02},
         "collective_seconds": {
@@ -96,7 +117,12 @@ def _write_probe(path: Path, mode: str, eta: float) -> Path:
             "sampler_drop_last": True,
             "padding_duplicates": 0,
             "probe_samples": probe_samples,
-            "probe_unique_samples": probe_samples,
+            "probe_unique_samples": probe_samples - cross_epoch_duplicates,
+            "probe_sampler_epochs": list(range(len(probe_epoch_updates))),
+            "probe_epoch_updates": probe_epoch_updates,
+            "probe_epoch_samples": probe_epoch_samples,
+            "probe_epoch_unique_samples": probe_epoch_samples,
+            "probe_cross_epoch_duplicates": cross_epoch_duplicates,
             "full_epoch_samples": specification["unique_samples_per_epoch"],
             "full_epoch_unique_samples": specification[
                 "unique_samples_per_epoch"
@@ -299,16 +325,17 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                         "report_sha256": "f" * 64,
                         "topology_independent_input_sha256": "a" * 64,
                         "short_trajectory_receipt": {},
-                        "canonical_manifest": {
-                            "path": "/val/canonical.jsonl",
+                        "val_inputs_receipt": {
+                            "path": "/val/inputs.json",
                             "sha256": "5" * 64,
                             "bytes": 10,
+                            "receipt_payload_sha256": "6" * 64,
                         },
-                        "real_feature_cache": {
-                            "path": "/val/cache.json",
-                            "sha256": "6" * 64,
+                        "pipeline_receipt": {
+                            "path": "/val/pipeline.json",
+                            "sha256": "7" * 64,
                             "bytes": 10,
-                            "receipt_payload_sha256": "7" * 64,
+                            "receipt_payload_sha256": "8" * 64,
                         },
                         "candidate_fgd": {
                             str(epoch): 0.5

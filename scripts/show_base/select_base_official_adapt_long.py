@@ -51,6 +51,9 @@ def _profile_values() -> dict[str, Any]:
         "validate_val_inference_lineage": (
             long_contract.validate_val_inference_lineage
         ),
+        "validate_diffsheg_report": (
+            long_contract.validate_diffsheg_report
+        ),
         "public_val_coverage": long_contract.public_val_coverage,
         "VAL_INFERENCE_LINEAGE_FORMAT": (
             long_contract.VAL_INFERENCE_LINEAGE_FORMAT

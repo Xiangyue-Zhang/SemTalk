@@ -7,15 +7,15 @@ export PYTHONDONTWRITEBYTECODE=1
 #
 # The preflight is produced by base_short_quality_val_adapter.py and contains
 # exactly e1/e2/e4/e8.  Each candidate uses eight exact modulo shards.  The
-# launcher publishes prediction, distribution, released2 screen, and raw
-# replay artifacts; it never accepts a test path.
+# launcher publishes the formal inference lineage and pinned DiffSHEG SHOW
+# validation FGD report; it never accepts a test path.
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 REPO_ROOT PYTHON PREFLIGHT PREFLIGHT_SHA RUN_ROOT SOURCE_COMMIT SOURCE_TREE TALKSHOW_ROOT FEATURE_EXTRACTOR SMPLX_ASSET REAL_CACHE REAL_CACHE_SHA REAL_CACHE_BYTES REAL_CACHE_PAYLOAD E1_GATE E1_GATE_SHA E2_GATE E2_GATE_SHA E4_GATE E4_GATE_SHA E8_GATE E8_GATE_SHA"
+        "Usage: $0 REPO_ROOT PYTHON PREFLIGHT PREFLIGHT_SHA RUN_ROOT SOURCE_COMMIT SOURCE_TREE PASPA_ROOT DIFFSHEG_ROOT DIFFSHEG_BATCH_SIZE"
 }
 
-if [[ $# -ne 22 ]]; then
+if [[ $# -ne 10 ]]; then
     usage >&2
     exit 2
 fi
@@ -27,32 +27,18 @@ preflight_sha=$4
 run_root=$5
 source_commit=$6
 source_tree=$7
-metric_root=$8
-feature_extractor=$9
-smplx_asset=${10}
-real_cache=${11}
-real_cache_sha=${12}
-real_cache_bytes=${13}
-real_cache_payload=${14}
-gate1=${15}
-gate1_sha=${16}
-gate2=${17}
-gate2_sha=${18}
-gate4=${19}
-gate4_sha=${20}
-gate8=${21}
-gate8_sha=${22}
+paspa_root=$8
+diffsheg_root=$9
+diffsheg_batch_size=${10}
 
 for path in "$repo_root" "$python_bin" "$preflight" "$run_root" \
-    "$metric_root" "$feature_extractor" "$smplx_asset" "$real_cache" \
-    "$gate1" "$gate2" "$gate4" "$gate8"; do
+    "$paspa_root" "$diffsheg_root"; do
     if [[ "$path" != /* ]]; then
         printf 'all paths must be absolute: %s\n' "$path" >&2
         exit 2
     fi
 done
-for digest in "$preflight_sha" "$real_cache_sha" "$real_cache_payload" \
-    "$gate1_sha" "$gate2_sha" "$gate4_sha" "$gate8_sha"; do
+for digest in "$preflight_sha"; do
     if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
         printf 'invalid SHA-256 argument\n' >&2
         exit 2
@@ -64,8 +50,8 @@ for oid in "$source_commit" "$source_tree"; do
         exit 2
     fi
 done
-if [[ ! "$real_cache_bytes" =~ ^[1-9][0-9]*$ ]]; then
-    printf 'real-cache byte count must be positive\n' >&2
+if [[ ! "$diffsheg_batch_size" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'DiffSHEG batch size must be positive\n' >&2
     exit 2
 fi
 if [[ ! -x "$python_bin" || ! -f "$preflight" || -L "$preflight" || \
@@ -75,9 +61,9 @@ if [[ ! -x "$python_bin" || ! -f "$preflight" || -L "$preflight" || \
 fi
 
 adapter="$repo_root/scripts/show_base/base_short_quality_val_adapter.py"
-replay="$repo_root/scripts/show_base/replay_released2_primary.py"
+evaluator="$repo_root/scripts/show_base/evaluate_diffsheg_val_fgd.py"
 launcher_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-for required in "$adapter" "$replay" \
+for required in "$adapter" "$evaluator" \
     "$launcher_dir/guarded_runner_contract.sh"; do
     if [[ ! -f "$required" || -L "$required" ]]; then
         printf 'required source is missing or symlinked: %s\n' "$required" >&2
@@ -104,7 +90,10 @@ for tracked in \
     scripts/show_base/base_short_quality_val_adapter.py \
     scripts/show_base/base_short_quality_val_8shard.sh \
     scripts/show_base/run_base_val_inference.py \
-    scripts/show_base/replay_released2_primary.py \
+    scripts/show_base/semtalk_base_inference_core.py \
+    scripts/show_base/base_long_val_contract.py \
+    scripts/show_base/select_base_official_adapt.py \
+    scripts/show_base/evaluate_diffsheg_val_fgd.py \
     scripts/show_base/guarded_runner_contract.sh; do
     if [[ "$(git -C "$repo_root" ls-files --error-unmatch "$tracked")" != \
           "$tracked" ]]; then
@@ -118,38 +107,6 @@ mkdir "$run_root/logs" "$run_root/candidates"
 "$python_bin" "$adapter" validate --split val \
     --preflight "$preflight" --expected-preflight-sha256 "$preflight_sha" \
     >"$run_root/logs/preflight-replay.log" 2>&1
-
-# The validated preflight is safe to project.  NUL delimiters preserve exact
-# canonical paths and avoid shell word splitting.
-mapfile -d '' -t common < <(
-    "$python_bin" - "$preflight" "$preflight_sha" <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-payload = path.read_bytes()
-if hashlib.sha256(payload).hexdigest() != sys.argv[2]:
-    raise SystemExit("preflight changed after validation")
-value = json.loads(payload)
-canonical = json.loads(Path(value["val_inputs_receipt"]["path"]).read_bytes())["canonical_manifest"]
-fields = [canonical["path"], canonical["sha256"]]
-canonical_payload = Path(canonical["path"]).read_bytes()
-fields.append(str(len(canonical_payload)))
-for field in fields:
-    sys.stdout.write(str(field))
-    sys.stdout.write("\0")
-PY
-)
-if [[ ${#common[@]} -ne 3 || ! ${common[1]} =~ ^[0-9a-f]{64}$ || \
-      ! ${common[2]} =~ ^[1-9][0-9]*$ ]]; then
-    printf 'canonical val projection failed\n' >&2
-    exit 1
-fi
-canonical_manifest=${common[0]}
-canonical_manifest_sha=${common[1]}
-canonical_manifest_bytes=${common[2]}
 
 artifact_fields() {
     local path=$1
@@ -296,12 +253,6 @@ launch_registered() {
     LAST_CHILD_PID=$pid
 }
 
-declare -A gate_path gate_sha
-gate_path[1]=$gate1; gate_sha[1]=$gate1_sha
-gate_path[2]=$gate2; gate_sha[2]=$gate2_sha
-gate_path[4]=$gate4; gate_sha[4]=$gate4_sha
-gate_path[8]=$gate8; gate_sha[8]=$gate8_sha
-
 for epoch in 1 2 4 8; do
     candidate_root="$run_root/candidates/e$epoch"
     mkdir "$candidate_root"
@@ -331,75 +282,28 @@ for epoch in 1 2 4 8; do
         --epoch "$epoch" --output-root "$candidate_root" --num-shards 8 \
         >"$run_root/logs/e${epoch}-finalize.log" 2>&1
     lineage="$candidate_root/final/val-inference-lineage.json"
-    manifest="$candidate_root/final/final_manifest.jsonl"
+    clip_manifest="$candidate_root/final/diffsheg_eval_clip_ids.txt"
     artifact_fields "$lineage" true
-    lineage_sha=${artifact_result[0]}
-    artifact_fields "$manifest"
-    manifest_sha=${artifact_result[0]}
-    manifest_bytes=${artifact_result[1]}
+    artifact_fields "$clip_manifest"
+    clip_manifest_sha=${artifact_result[0]}
 
-    distribution="$candidate_root/distribution.json"
-    "$python_bin" "$adapter" distribution --split val \
-        --preflight "$preflight" --expected-preflight-sha256 "$preflight_sha" \
-        --epoch "$epoch" --lineage "$lineage" \
-        --expected-lineage-sha256 "$lineage_sha" \
-        --validation-gate "${gate_path[$epoch]}" \
-        --expected-validation-gate-sha256 "${gate_sha[$epoch]}" \
-        --output "$distribution" \
-        >"$run_root/logs/e${epoch}-distribution.log" 2>&1
-    artifact_fields "$distribution" true
-    distribution_sha=${artifact_result[0]}
-    distribution_bytes=${artifact_result[1]}
-    distribution_payload=${artifact_result[2]}
-
-    screen="$candidate_root/released2-primary-screen.json"
+    report="$candidate_root/diffsheg-val-fgd.json"
     command=(
-        "$python_bin" "$replay" screen
-        --talkshow-metric-root "$metric_root"
-        --feature-extractor "$feature_extractor" --smplx-asset "$smplx_asset"
-        --device cuda:0 --split val --expected-clip-count 1715
-        --canonical-manifest "$canonical_manifest"
-        --expected-canonical-manifest-sha256 "$canonical_manifest_sha"
-        --expected-canonical-manifest-bytes "$canonical_manifest_bytes"
-        --prediction-manifest "$manifest"
-        --expected-prediction-manifest-sha256 "$manifest_sha"
-        --expected-prediction-manifest-bytes "$manifest_bytes"
-        --distribution-json "$distribution"
-        --expected-distribution-sha256 "$distribution_sha"
-        --expected-distribution-bytes "$distribution_bytes"
-        --expected-distribution-payload-sha256 "$distribution_payload"
-        --real-feature-cache-json "$real_cache"
-        --expected-real-feature-cache-sha256 "$real_cache_sha"
-        --expected-real-feature-cache-bytes "$real_cache_bytes"
-        --expected-real-feature-cache-payload-sha256 "$real_cache_payload"
-        --output-json "$screen"
+        "$python_bin" "$evaluator"
+        --pred-dir "$candidate_root/final/predictions/val"
+        --gt-dir "$candidate_root/final/ground-truth/val"
+        --clip-manifest "$clip_manifest"
+        --clip-manifest-sha256 "$clip_manifest_sha"
+        --paspa-root "$paspa_root" --diffsheg-root "$diffsheg_root"
+        --device cuda:0 --batch-size "$diffsheg_batch_size"
+        --output "$report"
     )
-    launch_registered "$run_root/logs/e${epoch}-screen.log" "${command[@]}"
-    wait "$LAST_CHILD_PID"
-    artifact_fields "$screen" true
-    screen_sha=${artifact_result[0]}
-    screen_bytes=${artifact_result[1]}
-
-    raw_replay="$candidate_root/released2-primary-raw-replay.json"
-    command=(
-        "$python_bin" "$replay" replay
-        --talkshow-metric-root "$metric_root"
-        --feature-extractor "$feature_extractor" --smplx-asset "$smplx_asset"
-        --device cuda:0 --split val --expected-clip-count 1715
-        --report-json "$screen" --expected-report-sha256 "$screen_sha"
-        --expected-report-bytes "$screen_bytes"
-        --prediction-manifest "$manifest"
-        --expected-prediction-manifest-sha256 "$manifest_sha"
-        --expected-prediction-manifest-bytes "$manifest_bytes"
-        --real-feature-cache-json "$real_cache"
-        --expected-real-feature-cache-sha256 "$real_cache_sha"
-        --expected-real-feature-cache-bytes "$real_cache_bytes"
-        --expected-real-feature-cache-payload-sha256 "$real_cache_payload"
-        --output-json "$raw_replay"
-    )
-    launch_registered "$run_root/logs/e${epoch}-raw-replay.log" "${command[@]}"
-    wait "$LAST_CHILD_PID"
-    artifact_fields "$raw_replay" true
+    launch_registered "$run_root/logs/e${epoch}-diffsheg-fgd.log" "${command[@]}"
+    if ! wait "$LAST_CHILD_PID"; then
+        printf 'DiffSHEG validation FGD failed for e%s\n' "$epoch" >&2
+        exit 1
+    fi
+    artifact_fields "$report"
 done
 
 "$python_bin" - "$run_root" "$preflight" "$preflight_sha" <<'PY'
@@ -416,20 +320,18 @@ for epoch in (1, 2, 4, 8):
     candidate = root / "candidates" / f"e{epoch}"
     artifacts = {}
     for name, relative in (
-        ("prediction_manifest", "final/final_manifest.jsonl"),
-        ("distribution_receipt", "distribution.json"),
-        ("primary_screen_receipt", "released2-primary-screen.json"),
-        ("primary_replay_receipt", "released2-primary-raw-replay.json"),
+        ("inference_lineage", "final/val-inference-lineage.json"),
+        ("diffsheg_report", "diffsheg-val-fgd.json"),
     ):
         path = candidate / relative
         data = path.read_bytes()
         artifact = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
-        if path.suffix == ".json":
+        if name == "inference_lineage":
             artifact["receipt_payload_sha256"] = json.loads(data)["receipt_payload_sha256"]
         artifacts[name] = artifact
     rows.append({"epoch": epoch, **artifacts})
 body = {
-    "format": "semtalk_show_base_short_quality_val_completion_v1",
+    "format": "semtalk_show_base_short_quality_val_completion_v2",
     "status": "complete",
     "split": "val",
     "test_visible": False,

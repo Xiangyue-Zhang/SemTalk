@@ -14,7 +14,168 @@ from scripts.show_base import select_base_official_adapt as legacy
 from scripts.show_base import select_base_official_adapt_long as selector
 
 
+def _frozen_for_topology(
+    mode: str,
+    *,
+    optimizer_learning_rate: float | None = None,
+) -> dict[str, object]:
+    topology = contract.TOPOLOGY_SPECS[mode]
+    optimizer_learning_rate = (
+        topology["learning_rate"]
+        if optimizer_learning_rate is None
+        else optimizer_learning_rate
+    )
+    selected = {
+        stage: character * 64
+        for stage, character in zip(
+            ("face", "hands", "upper", "lower", "global"),
+            "12345",
+        )
+    }
+    identity = {
+        "device": 1,
+        "inode": 2,
+        "size": 3,
+        "mtime_ns": 4,
+        "ctime_ns": 5,
+    }
+    node_bindings = []
+    for node_rank in range(topology["node_count"]):
+        node_bindings.append(
+            {
+                "node_rank": node_rank,
+                "hostname": f"show-base-node-{node_rank}",
+                "binding": {
+                    "format": "semtalk_show_base_lmdb_inode_binding_v1",
+                    "directory_identity": dict(identity),
+                    "files": {
+                        "data.mdb": {
+                            "sha256": "6" * 64,
+                            "identity": dict(identity),
+                        },
+                        "lock.mdb": {
+                            "sha256": "7" * 64,
+                            "identity": dict(identity),
+                        },
+                    },
+                },
+            }
+        )
+    topology_receipt = {
+        "format": "semtalk_show_base_topology_receipt_v1",
+        "topology_mode": mode,
+        "classification": topology["classification"],
+        "node_count": topology["node_count"],
+        "local_world_size": topology["local_world_size"],
+        "world_size": topology["world_size"],
+        "local_batch_size": topology["local_batch_size"],
+        "global_batch_size": topology["global_batch_size"],
+        "updates_per_epoch": topology["updates_per_epoch"],
+        "unique_samples_per_epoch": topology["unique_samples_per_epoch"],
+    }
+    topology_receipt["receipt_sha256"] = contract.canonical_json_sha256(
+        topology_receipt
+    )
+    protocol = {
+        "format": contract.PROTOCOL_FORMAT,
+        "target_dataset": "SHOW",
+        "target_speaker_scope": "All",
+        "candidate_epochs": list(contract.EXPECTED_CANDIDATE_EPOCHS),
+        "epochs": contract.TOTAL_EPOCHS,
+        "expected_updates_per_epoch": topology["updates_per_epoch"],
+        "expected_unique_samples_per_epoch": topology[
+            "unique_samples_per_epoch"
+        ],
+        "node_count": topology["node_count"],
+        "local_world_size": topology["local_world_size"],
+        "world_size": topology["world_size"],
+        "local_batch_size": topology["local_batch_size"],
+        "global_batch_size": topology["global_batch_size"],
+        "precision": topology["precision"],
+        "distributed_topology": {"mode": mode},
+        "optimizer": {
+            "name": "Adam",
+            "learning_rate": optimizer_learning_rate,
+            "betas": [0.5, 0.999],
+            "weight_decay": 0.0,
+            "gradient_clip_norm": 0.99,
+            "scheduler": "constant",
+        },
+        "vq_models_in_training_graph": False,
+    }
+    dataset = {
+        "format": "semtalk_show_base_selected_feature_dataset_receipt_v1",
+        "entries": 127_286,
+        "train_clips": 13_687,
+        "prerequisite_source": "show_val_selected_v1",
+        "global_verified_not_consumed": True,
+        "selected_prerequisite_sha256": selected,
+        "lmdb": "/local/base-features.lmdb",
+        "summary": "/local/base-summary.json",
+        "summary_sha256": "8" * 64,
+        "lineage": "/local/base-lineage.json",
+        "lineage_sha256": "9" * 64,
+        "split": "train",
+        "test_visible": False,
+        "data_mdb_sha256": "6" * 64,
+        "lock_mdb_sha256": "7" * 64,
+        "prerequisite_selection": {
+            "path": "/efs/prerequisite-selection.json",
+            "sha256": "a" * 64,
+            "receipt_payload_sha256": "b" * 64,
+        },
+        "lmdb_binding_scope": (
+            "ordered_node_local_inode_bindings_with_global_content_sha256"
+        ),
+        "node_lmdb_inode_bindings": node_bindings,
+    }
+    frozen = {
+        "format": next(iter(contract.FROZEN_INPUTS_FORMATS)),
+        "protocol": protocol,
+        "dataset": dataset,
+        "source": {
+            "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            "branch": None,
+            "clean": True,
+        },
+        "official_base": {
+            "sha256": contract.OFFICIAL_BASE_SHA256,
+            "speaker_scope": "All-Speakers",
+        },
+        "topology": topology_receipt,
+    }
+    frozen["receipt_sha256"] = contract.canonical_json_sha256(frozen)
+    return frozen
+
+
 class BaseDiffSHEGLongClosureTests(unittest.TestCase):
+    def test_frozen_topology_binds_the_exact_adam_learning_rate(self) -> None:
+        modes = (
+            "validation_gated_w16_l64_g1024_empirical_acceleration",
+            "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration",
+        )
+        for mode in modes:
+            with self.subTest(mode=mode):
+                accepted = _frozen_for_topology(mode)
+                _claimed, _selected, topology, _dataset = (
+                    contract._validate_frozen(accepted)
+                )
+                self.assertEqual(topology["mode"], mode)
+                wrong_learning_rate = (
+                    6e-5
+                    if contract.TOPOLOGY_SPECS[mode]["learning_rate"] == 3e-5
+                    else 3e-5
+                )
+                forged = _frozen_for_topology(
+                    mode,
+                    optimizer_learning_rate=wrong_learning_rate,
+                )
+                with self.assertRaisesRegex(
+                    contract.LongCandidateContractError,
+                    "frozen inputs do not bind",
+                ):
+                    contract._validate_frozen(forged)
+
     def test_long_profile_is_one_coherent_diffsheg_producer_abi(self) -> None:
         profile = selector._profile_values()
         self.assertIs(profile["validate_val_inputs"], contract.validate_val_inputs)

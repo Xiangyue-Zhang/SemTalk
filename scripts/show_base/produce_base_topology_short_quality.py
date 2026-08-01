@@ -2,10 +2,10 @@
 """Seal one formal SemTalk Base short-trajectory SHOW quality report.
 
 This CPU-only producer accepts the immutable e1/e2/e4/e8 checkpoints and
-their already-computed full-SHOW validation artifacts.  It freshly validates
-the checkpoint -> prediction -> deterministic distribution -> released2
-screen -> independent raw replay chain, then publishes one immutable report
-consumable by ``select_base_training_topology.py``.
+their already-computed full-SHOW validation artifacts.  It freshly reuses the
+formal long-run validators for checkpoint -> val inference lineage -> pinned
+DiffSHEG FGD, then publishes one immutable report consumable by
+``select_base_training_topology.py``.
 """
 
 from __future__ import annotations
@@ -68,21 +68,6 @@ def _artifact4(values: Sequence[str], label: str) -> dict[str, Any]:
         "receipt_payload_sha256": _sha256(
             payload_digest,
             f"{label} payload SHA-256",
-        ),
-    }
-
-
-def _canonical_artifact(values: Sequence[str]) -> dict[str, Any]:
-    path, digest, size, rows, selected = values
-    return {
-        **_artifact3(
-            (path, digest, size),
-            "canonical manifest",
-        ),
-        "rows": _positive_int(rows, "canonical manifest rows"),
-        "selected_rows": _positive_int(
-            selected,
-            "canonical manifest selected rows",
         ),
     }
 
@@ -156,42 +141,31 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument(
-        "--canonical-manifest",
-        nargs=5,
-        metavar=("PATH", "SHA256", "BYTES", "ROWS", "SELECTED_ROWS"),
-        required=True,
-    )
-    parser.add_argument(
-        "--real-feature-cache",
+        "--val-inputs-receipt",
         nargs=4,
         metavar=("PATH", "SHA256", "BYTES", "PAYLOAD_SHA256"),
         required=True,
     )
     parser.add_argument(
-        "--prediction-manifest",
+        "--pipeline-receipt",
+        nargs=4,
+        metavar=("PATH", "SHA256", "BYTES", "PAYLOAD_SHA256"),
+        required=True,
+    )
+    parser.add_argument(
+        "--inference-lineage",
+        nargs=5,
+        action="append",
+        metavar=("EPOCH", "PATH", "SHA256", "BYTES", "PAYLOAD_SHA256"),
+        required=True,
+    )
+    parser.add_argument(
+        "--diffsheg-report",
         nargs=4,
         action="append",
         metavar=("EPOCH", "PATH", "SHA256", "BYTES"),
         required=True,
     )
-    for name in (
-        "distribution-receipt",
-        "primary-screen-receipt",
-        "primary-replay-receipt",
-    ):
-        parser.add_argument(
-            f"--{name}",
-            nargs=5,
-            action="append",
-            metavar=(
-                "EPOCH",
-                "PATH",
-                "SHA256",
-                "BYTES",
-                "PAYLOAD_SHA256",
-            ),
-            required=True,
-        )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -288,34 +262,26 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         raise selector.TopologySelectionError(
             "constructed short-trajectory receipt changed during publish"
         )
-    canonical = selector._canonical_manifest_artifact(
-        _canonical_artifact(args.canonical_manifest),
-        "canonical manifest",
+    (
+        val_inputs_source,
+        val_inputs_artifact,
+        coverage,
+        pipeline_source,
+        pipeline_artifact,
+        pipeline_payload,
+    ) = selector.validate_quality_common_authority(
+        _artifact4(args.val_inputs_receipt, "val-input receipt"),
+        _artifact4(args.pipeline_receipt, "pipeline receipt"),
     )
-    cache, _cache_payload = selector._artifact(
-        _artifact4(args.real_feature_cache, "real feature cache"),
-        "real feature cache",
+    lineages = _epoch_artifacts(
+        args.inference_lineage,
+        label="inference lineage",
         payload=True,
     )
-    predictions = _epoch_artifacts(
-        args.prediction_manifest,
-        label="prediction manifest",
+    reports = _epoch_artifacts(
+        args.diffsheg_report,
+        label="DiffSHEG report",
         payload=False,
-    )
-    distributions = _epoch_artifacts(
-        args.distribution_receipt,
-        label="distribution receipt",
-        payload=True,
-    )
-    screens = _epoch_artifacts(
-        args.primary_screen_receipt,
-        label="primary screen receipt",
-        payload=True,
-    )
-    replays = _epoch_artifacts(
-        args.primary_replay_receipt,
-        label="primary replay receipt",
-        payload=True,
     )
 
     candidates: list[dict[str, Any]] = []
@@ -328,12 +294,14 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
             short_trajectory_receipt=short,
             expected_checkpoint=short_checkpoints[epoch],
             candidate_checkpoint=short_checkpoints[epoch],
-            prediction_manifest=predictions[epoch],
-            distribution_receipt=distributions[epoch],
-            primary_screen_receipt=screens[epoch],
-            primary_replay_receipt=replays[epoch],
-            canonical_manifest=canonical,
-            real_feature_cache=cache,
+            val_inputs_receipt=val_inputs_source,
+            val_inputs_artifact=val_inputs_artifact,
+            pipeline_receipt=pipeline_source,
+            pipeline_artifact=pipeline_artifact,
+            pipeline_payload=pipeline_payload,
+            expected_coverage=coverage,
+            inference_lineage=lineages[epoch],
+            diffsheg_report=reports[epoch],
         )
         candidates.append(
             {
@@ -341,18 +309,8 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
                 "candidate_checkpoint": validated[
                     "candidate_checkpoint"
                 ],
-                "prediction_manifest": validated[
-                    "prediction_manifest"
-                ],
-                "distribution_receipt": validated[
-                    "distribution_receipt"
-                ],
-                "primary_screen_receipt": validated[
-                    "primary_screen_receipt"
-                ],
-                "primary_replay_receipt": validated[
-                    "primary_replay_receipt"
-                ],
+                "inference_lineage": validated["inference_lineage"],
+                "diffsheg_report": validated["diffsheg_report"],
                 "provenance": validated["provenance"],
             }
         )
@@ -366,8 +324,8 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         "trajectory_epochs": list(selector.QUALITY_EPOCHS),
         "topology_independent_input_sha256": semantic_sha,
         "short_trajectory_receipt": short,
-        "canonical_manifest": canonical,
-        "real_feature_cache": cache,
+        "val_inputs_receipt": val_inputs_source,
+        "pipeline_receipt": pipeline_source,
         "candidates": candidates,
     }
     report["receipt_sha256"] = contract.canonical_json_sha256(report)

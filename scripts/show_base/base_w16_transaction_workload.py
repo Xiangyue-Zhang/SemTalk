@@ -55,6 +55,16 @@ W16_TOPOLOGIES = {
         "learning_rate": 0.00003,
         "precision": "bf16",
     },
+    "validation_gated_w16_l64_g1024_empirical_acceleration": {
+        "local_batch_size": 64,
+        "learning_rate": 0.00003,
+        "precision": "bf16",
+    },
+    "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration": {
+        "local_batch_size": 64,
+        "learning_rate": 0.00006,
+        "precision": "bf16",
+    },
 }
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 SAFE_MASTER = re.compile(r"^[A-Za-z0-9.-]+$")

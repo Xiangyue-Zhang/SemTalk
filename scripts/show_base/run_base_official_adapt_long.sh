@@ -59,6 +59,34 @@ case "$topology_mode" in
         learning_rate=0.00003
         precision=bf16
         ;;
+    validation_gated_w8_l128_g1024_empirical_acceleration)
+        nnodes=1
+        nproc_per_node=8
+        local_batch_size=128
+        learning_rate=0.00003
+        precision=bf16
+        ;;
+    validation_gated_w8_l256_g2048_empirical_acceleration)
+        nnodes=1
+        nproc_per_node=8
+        local_batch_size=256
+        learning_rate=0.00003
+        precision=bf16
+        ;;
+    validation_gated_w16_l64_g1024_empirical_acceleration)
+        nnodes=2
+        nproc_per_node=8
+        local_batch_size=64
+        learning_rate=0.00003
+        precision=bf16
+        ;;
+    validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration)
+        nnodes=2
+        nproc_per_node=8
+        local_batch_size=64
+        learning_rate=0.00006
+        precision=bf16
+        ;;
     *)
         printf 'unknown immutable Base topology mode: %s\n' \
             "$topology_mode" >&2

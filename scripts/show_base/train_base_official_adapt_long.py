@@ -168,6 +168,8 @@ CANDIDATE_EPOCHS = (
 )
 SHORT_QUALITY_TOTAL_EPOCHS = 8
 SHORT_QUALITY_EPOCHS = (1, 2, 4, 8)
+MAX_ABSOLUTE_FGD_REGRESSION = 0.01
+MAX_RELATIVE_FGD_REGRESSION = 0.02
 SHORT_QUALITY_MODE = "short_quality"
 RUN_PURPOSE_THROUGHPUT = "topology_throughput_gate"
 RUN_PURPOSE_SHORT_QUALITY = "topology_short_quality"
@@ -179,6 +181,12 @@ W8_GLOBAL64_MODE = "official_objective_w8_l8_g64_ddp_adaptation"
 W16_GLOBAL64_MODE = "official_objective_w16_l4_g64_ddp_adaptation"
 W8_GLOBAL512_MODE = "validation_gated_w8_l64_g512_empirical_acceleration"
 W16_GLOBAL512_MODE = "validation_gated_w16_l32_g512_empirical_acceleration"
+W8_GLOBAL1024_MODE = "validation_gated_w8_l128_g1024_empirical_acceleration"
+W8_GLOBAL2048_MODE = "validation_gated_w8_l256_g2048_empirical_acceleration"
+W16_GLOBAL1024_MODE = "validation_gated_w16_l64_g1024_empirical_acceleration"
+W16_GLOBAL1024_LR6E5_MODE = (
+    "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
+)
 TOPOLOGY_SPECS = {
     OFFICIAL_W1_REFERENCE_MODE: {
         "classification": "exact_official_runtime_topology_reference",
@@ -246,6 +254,58 @@ TOPOLOGY_SPECS = {
         "updates_per_epoch": 248,
         "unique_samples_per_epoch": 126_976,
         "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W8_GLOBAL1024_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 128,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W8_GLOBAL2048_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 1,
+        "local_world_size": 8,
+        "world_size": 8,
+        "local_batch_size": 256,
+        "global_batch_size": 2_048,
+        "updates_per_epoch": 62,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W16_GLOBAL1024_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 3e-5,
+        "precision": "bf16",
+        "formal_training_eligible": True,
+    },
+    W16_GLOBAL1024_LR6E5_MODE: {
+        "classification": "validation_gated_empirical_acceleration",
+        "node_count": 2,
+        "local_world_size": 8,
+        "world_size": 16,
+        "local_batch_size": 64,
+        "global_batch_size": 1_024,
+        "updates_per_epoch": 124,
+        "unique_samples_per_epoch": 126_976,
+        "learning_rate": 6e-5,
         "precision": "bf16",
         "formal_training_eligible": True,
     },
@@ -335,6 +395,35 @@ LOSS_COMPONENTS = tuple(
 
 class AdaptationContractError(RuntimeError):
     """Raised before work begins when an immutable contract is violated."""
+
+
+def _probe_epoch_update_counts(
+    updates_per_epoch: int,
+    probe_updates: int = TRAJECTORY_PROBE_UPDATES,
+) -> tuple[int, ...]:
+    """Partition the fixed probe exactly as formal epoch iteration does.
+
+    Global batch 2048 has only 62 complete, non-padded batches per SHOW
+    epoch.  The fixed 70-update trajectory gate therefore crosses once into
+    the next deterministic ``DistributedSampler`` epoch.  Keeping this
+    arithmetic explicit prevents a hidden iterator restart or a duplicated
+    tail batch while preserving the formal sampler unchanged.
+    """
+
+    if (
+        type(updates_per_epoch) is not int
+        or updates_per_epoch <= 0
+        or type(probe_updates) is not int
+        or probe_updates <= 0
+    ):
+        raise AdaptationContractError(
+            "probe/epoch update counts must be positive exact integers"
+        )
+    complete_epochs, remainder = divmod(probe_updates, updates_per_epoch)
+    counts = [updates_per_epoch] * complete_epochs
+    if remainder:
+        counts.append(remainder)
+    return tuple(counts)
 
 
 def _run_purpose(args: argparse.Namespace) -> str:
@@ -1582,7 +1671,7 @@ def validate_long_contract_receipts(
         or not isinstance(training, dict)
         or training.get("total_epochs") != TOTAL_EPOCHS
         or training.get("topology_source")
-        != "sealed_five_mode_topology_gate_v1"
+        != "sealed_nine_mode_topology_gate_v1"
         or training.get("topology_matrix") != TOPOLOGY_SPECS
         or training.get("precision_source")
         != "selected_topology_matrix_entry"
@@ -3174,7 +3263,7 @@ def _cpu_tree(value: Any) -> Any:
 def validate_topology_gate_spec(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    """Replay the immutable five-mode gate before any GPU probe/train work."""
+    """Replay the immutable nine-mode gate before any GPU probe/train work."""
 
     payload, path, observed_sha = _load_json_receipt(
         Path(args.topology_gate_spec),
@@ -3365,6 +3454,7 @@ def validate_throughput_gate(
         or report.get("all_gradients_finite") is not True
         or report.get("oom") is not False
         or not isinstance(report.get("samples_per_second"), (int, float))
+        or isinstance(report.get("samples_per_second"), bool)
         or float(report["samples_per_second"]) <= 0.0
         or any(
             not isinstance(report.get(key), (int, float))
@@ -3377,6 +3467,25 @@ def validate_throughput_gate(
             <= float(report["p90_seconds"])
             <= float(report["p99_seconds"])
         )
+        or not isinstance(report.get("seconds_per_update"), (int, float))
+        or isinstance(report.get("seconds_per_update"), bool)
+        or not math.isfinite(float(report["seconds_per_update"]))
+        or float(report["seconds_per_update"])
+        != float(report["median_seconds"])
+        or float(report["samples_per_second"])
+        != GLOBAL_BATCH_SIZE / float(report["median_seconds"])
+        or not isinstance(
+            report.get("estimated_training_seconds"), (int, float)
+        )
+        or isinstance(report.get("estimated_training_seconds"), bool)
+        or not math.isfinite(float(report["estimated_training_seconds"]))
+        or float(report["estimated_training_seconds"])
+        != (
+            float(report["median_seconds"])
+            * EXPECTED_UPDATES_PER_EPOCH
+            * TOTAL_EPOCHS
+        )
+        or report.get("estimated_epochs") != TOTAL_EPOCHS
         or not isinstance(report.get("peak_cuda_memory_bytes_all_ranks"), list)
         or len(report["peak_cuda_memory_bytes_all_ranks"]) != WORLD_SIZE
         or any(
@@ -3436,12 +3545,238 @@ def validate_throughput_gate(
     }
 
 
+def _finite_nonnegative_quality_fgd(
+    value: Any,
+) -> dict[str, float] | None:
+    expected_keys = {str(epoch) for epoch in SHORT_QUALITY_EPOCHS}
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        return None
+    normalized: dict[str, float] = {}
+    for epoch in SHORT_QUALITY_EPOCHS:
+        raw = value[str(epoch)]
+        if (
+            not isinstance(raw, (int, float))
+            or isinstance(raw, bool)
+            or not math.isfinite(float(raw))
+            or float(raw) < 0.0
+        ):
+            return None
+        normalized[str(epoch)] = float(raw)
+    return normalized
+
+
+def _maximum_allowed_quality_fgd(reference_fgd: float) -> float:
+    return reference_fgd + max(
+        MAX_ABSOLUTE_FGD_REGRESSION,
+        abs(reference_fgd) * MAX_RELATIVE_FGD_REGRESSION,
+    )
+
+
+def _replay_topology_quality_decisions(
+    *,
+    matrix_modes: Sequence[str],
+    probe_by_mode: Mapping[str, Any],
+    quality_reports: Any,
+    quality_skips: Any,
+) -> dict[str, dict[str, Any]] | None:
+    """Recompute every quality decision from the four raw DiffSHEG FGDs."""
+
+    if not isinstance(quality_reports, list) or not isinstance(
+        quality_skips, list
+    ):
+        return None
+    if any(not isinstance(item, dict) for item in quality_reports):
+        return None
+    if any(not isinstance(item, dict) for item in quality_skips):
+        return None
+    report_by_mode = {
+        item.get("mode"): item for item in quality_reports
+    }
+    skip_by_mode = {item.get("mode"): item for item in quality_skips}
+    if (
+        len(report_by_mode) != len(quality_reports)
+        or len(skip_by_mode) != len(quality_skips)
+        or set(report_by_mode) & set(skip_by_mode)
+        or set(report_by_mode) | set(skip_by_mode) != set(matrix_modes)
+        or OFFICIAL_W1_REFERENCE_MODE not in report_by_mode
+    ):
+        return None
+    reference_fgd = _finite_nonnegative_quality_fgd(
+        report_by_mode[OFFICIAL_W1_REFERENCE_MODE].get("candidate_fgd")
+    )
+    if reference_fgd is None:
+        return None
+
+    replayed: dict[str, dict[str, Any]] = {}
+    for mode in matrix_modes:
+        probe = probe_by_mode.get(mode)
+        if not isinstance(probe, dict):
+            return None
+        if mode in skip_by_mode:
+            skip = skip_by_mode[mode]
+            eta = probe.get("estimated_training_seconds")
+            if (
+                not isinstance(eta, (int, float))
+                or isinstance(eta, bool)
+                or not math.isfinite(float(eta))
+                or float(eta) <= 0.0
+            ):
+                return None
+            replayed[mode] = {
+                "status": "skipped_over_eta_budget",
+                "quality_evaluated": False,
+                "selection_eligible": False,
+                "skip_receipt_path": skip.get("receipt_path"),
+                "skip_receipt_sha256": skip.get("receipt_sha256"),
+                "estimated_training_seconds": float(eta),
+                "maximum_estimated_training_seconds": 86_400,
+            }
+            continue
+
+        quality = report_by_mode[mode]
+        candidate_fgd = _finite_nonnegative_quality_fgd(
+            quality.get("candidate_fgd")
+        )
+        if candidate_fgd is None:
+            return None
+        comparisons: list[dict[str, Any]] = []
+        for epoch in SHORT_QUALITY_EPOCHS:
+            reference = reference_fgd[str(epoch)]
+            candidate = candidate_fgd[str(epoch)]
+            allowed = _maximum_allowed_quality_fgd(reference)
+            comparisons.append(
+                {
+                    "epoch": epoch,
+                    "reference_fgd": reference,
+                    "candidate_fgd": candidate,
+                    "maximum_allowed_fgd": allowed,
+                    "pass": candidate <= allowed,
+                }
+            )
+        replayed[mode] = {
+            "status": "measured",
+            "quality_evaluated": True,
+            "selection_eligible": True,
+            "report_path": quality.get("report_path"),
+            "report_sha256": quality.get("report_sha256"),
+            "comparisons": comparisons,
+            "all_trajectory_epochs_pass": all(
+                item["pass"] for item in comparisons
+            ),
+        }
+    return replayed
+
+
+def _reload_topology_selection_artifacts(
+    report: Mapping[str, Any],
+    *,
+    topology_gate_spec_sha256: str,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Reload every ranked probe/quality artifact from its pinned file hash."""
+
+    embedded_probes = report.get("probes")
+    embedded_quality = report.get("quality_reports")
+    embedded_skips = report.get("quality_skips")
+    quality_gate_spec_sha256 = report.get("quality_gate_spec_sha256")
+    if (
+        not isinstance(embedded_probes, list)
+        or not isinstance(embedded_quality, list)
+        or not isinstance(embedded_skips, list)
+        or not isinstance(quality_gate_spec_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", quality_gate_spec_sha256) is None
+    ):
+        return None
+    try:
+        from scripts.show_base import (
+            select_base_training_topology as topology_selector,
+        )
+
+        probes: list[dict[str, Any]] = []
+        for embedded in embedded_probes:
+            if not isinstance(embedded, dict):
+                return None
+            mode = embedded.get("mode")
+            path = embedded.get("report_path")
+            digest = embedded.get("report_sha256")
+            if (
+                mode not in TOPOLOGY_SPECS
+                or not isinstance(path, str)
+                or not isinstance(digest, str)
+            ):
+                return None
+            probes.append(
+                topology_selector.validate_probe(
+                    mode,
+                    Path(path),
+                    digest,
+                    gate_spec_sha256=topology_gate_spec_sha256,
+                )
+            )
+
+        quality_reports: list[dict[str, Any]] = []
+        for embedded in embedded_quality:
+            if not isinstance(embedded, dict):
+                return None
+            mode = embedded.get("mode")
+            path = embedded.get("report_path")
+            digest = embedded.get("report_sha256")
+            if (
+                mode not in TOPOLOGY_SPECS
+                or not isinstance(path, str)
+                or not isinstance(digest, str)
+            ):
+                return None
+            quality_reports.append(
+                topology_selector.validate_quality_report(
+                    mode,
+                    Path(path),
+                    digest,
+                    quality_gate_spec_sha256=quality_gate_spec_sha256,
+                    topology_gate_spec_sha256=(
+                        topology_gate_spec_sha256
+                    ),
+                )
+            )
+
+        quality_skips: list[dict[str, Any]] = []
+        for embedded in embedded_skips:
+            if not isinstance(embedded, dict):
+                return None
+            mode = embedded.get("mode")
+            path = embedded.get("receipt_path")
+            digest = embedded.get("receipt_sha256")
+            if (
+                mode not in TOPOLOGY_SPECS
+                or not isinstance(path, str)
+                or not isinstance(digest, str)
+            ):
+                return None
+            quality_skips.append(
+                topology_selector.validate_quality_skip(
+                    mode,
+                    Path(path),
+                    digest,
+                    topology_gate_spec_sha256=(
+                        topology_gate_spec_sha256
+                    ),
+                    quality_gate_spec_sha256=quality_gate_spec_sha256,
+                )
+            )
+    except Exception:
+        return None
+    return {
+        "probes": probes,
+        "quality_reports": quality_reports,
+        "quality_skips": quality_skips,
+    }
+
+
 def validate_topology_selection(
     args: argparse.Namespace,
     *,
     throughput_gate: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind formal training to the sealed result of all five real probes."""
+    """Bind formal training to the sealed result of all nine real probes."""
 
     report, path, observed_sha = _load_json_receipt(
         Path(args.topology_selection_report),
@@ -3454,24 +3789,98 @@ def validate_topology_selection(
     quality_skips = report.get("quality_skips")
     quality_decisions = report.get("quality_decisions")
     matrix_modes = list(TOPOLOGY_SPECS)
-    report_modes = (
-        [quality.get("mode") for quality in quality_reports]
-        if isinstance(quality_reports, list)
+    reloaded_artifacts = _reload_topology_selection_artifacts(
+        report,
+        topology_gate_spec_sha256=(
+            args.expected_topology_gate_spec_sha256
+        ),
+    )
+    verified_probes = (
+        reloaded_artifacts["probes"]
+        if reloaded_artifacts is not None
         else []
+    )
+    verified_quality_reports = (
+        reloaded_artifacts["quality_reports"]
+        if reloaded_artifacts is not None
+        else []
+    )
+    verified_quality_skips = (
+        reloaded_artifacts["quality_skips"]
+        if reloaded_artifacts is not None
+        else []
+    )
+    canonical_selection_replay: dict[str, Any] | None = None
+    if reloaded_artifacts is not None:
+        try:
+            from scripts.show_base import (
+                select_base_training_topology as topology_selector,
+            )
+
+            canonical_selection_replay = topology_selector.select_topology(
+                verified_probes,
+                verified_quality_reports,
+                gate_spec_sha256=(
+                    args.expected_topology_gate_spec_sha256
+                ),
+                quality_gate_spec_sha256=str(
+                    report.get("quality_gate_spec_sha256", "")
+                ),
+                quality_skips=verified_quality_skips,
+            )
+        except Exception:
+            canonical_selection_replay = None
+    embedded_artifacts_match = (
+        reloaded_artifacts is not None
+        and probes == verified_probes
+        and quality_reports == verified_quality_reports
+        and quality_skips == verified_quality_skips
+    )
+    report_modes = (
+        [quality.get("mode") for quality in verified_quality_reports]
     )
     skip_modes = (
-        [skip.get("mode") for skip in quality_skips]
-        if isinstance(quality_skips, list)
-        else []
+        [skip.get("mode") for skip in verified_quality_skips]
     )
-    probe_by_mode = (
-        {probe.get("mode"): probe for probe in probes}
-        if isinstance(probes, list)
-        else {}
+    probe_by_mode = {
+        probe.get("mode"): probe for probe in verified_probes
+    }
+    throughput_projection_fields = (
+        "samples_per_second",
+        "median_seconds",
+        "p90_seconds",
+        "p99_seconds",
+        "estimated_training_seconds",
+    )
+    selected_throughput_projection_valid = (
+        isinstance(selected, dict)
+        and selected.get("report_sha256") == throughput_gate.get("sha256")
+        and selected.get("mode") == throughput_gate.get("topology_mode")
+        and all(
+            selected.get(field) == throughput_gate.get(field)
+            for field in throughput_projection_fields
+        )
+    )
+    selected_specification = TOPOLOGY_SPECS.get(args.topology_mode)
+    actual_eta = throughput_gate.get("estimated_training_seconds")
+    actual_p99 = throughput_gate.get("p99_seconds")
+    actual_throughput_gate_valid = (
+        selected_specification is not None
+        and isinstance(actual_eta, (int, float))
+        and not isinstance(actual_eta, bool)
+        and math.isfinite(float(actual_eta))
+        and 0.0 < float(actual_eta) <= 86_400.0
+        and isinstance(actual_p99, (int, float))
+        and not isinstance(actual_p99, bool)
+        and math.isfinite(float(actual_p99))
+        and float(actual_p99) > 0.0
+        and float(actual_p99)
+        * int(selected_specification["updates_per_epoch"])
+        * TOTAL_EPOCHS
+        <= 79_200.0
     )
     quality_authority_valid = (
-        isinstance(quality_reports, list)
-        and isinstance(quality_skips, list)
+        embedded_artifacts_match
         and len(set(report_modes)) == len(report_modes)
         and len(set(skip_modes)) == len(skip_modes)
         and report_modes
@@ -3502,7 +3911,9 @@ def validate_topology_selection(
                     break
             elif mode in skip_modes:
                 skip = next(
-                    item for item in quality_skips if item.get("mode") == mode
+                    item
+                    for item in verified_quality_skips
+                    if item.get("mode") == mode
                 )
                 probe_report = skip.get("probe_report")
                 source_binding = skip.get("source_binding")
@@ -3549,6 +3960,52 @@ def validate_topology_selection(
                 ):
                     quality_authority_valid = False
                     break
+    replayed_quality_decisions = _replay_topology_quality_decisions(
+        matrix_modes=matrix_modes,
+        probe_by_mode=probe_by_mode,
+        quality_reports=verified_quality_reports,
+        quality_skips=verified_quality_skips,
+    )
+    replay_safe_candidates: list[
+        tuple[float, float, int, dict[str, Any]]
+    ] = []
+    if replayed_quality_decisions is not None:
+        for matrix_position, mode in enumerate(matrix_modes):
+            probe = probe_by_mode.get(mode)
+            decision = replayed_quality_decisions[mode]
+            specification = TOPOLOGY_SPECS[mode]
+            if not isinstance(probe, dict):
+                continue
+            eta = probe.get("estimated_training_seconds")
+            p99 = probe.get("p99_seconds")
+            if (
+                isinstance(eta, (int, float))
+                and not isinstance(eta, bool)
+                and math.isfinite(float(eta))
+                and 0.0 < float(eta) <= 86_400.0
+                and isinstance(p99, (int, float))
+                and not isinstance(p99, bool)
+                and math.isfinite(float(p99))
+                and float(p99) > 0.0
+                and float(p99)
+                * int(specification["updates_per_epoch"])
+                * TOTAL_EPOCHS
+                <= 79_200.0
+                and probe.get("status") == "pass"
+                and probe.get("formal_training_eligible") is True
+                and decision["status"] == "measured"
+                and decision["quality_evaluated"] is True
+                and decision["all_trajectory_epochs_pass"] is True
+                and decision["selection_eligible"] is True
+            ):
+                replay_safe_candidates.append(
+                    (float(eta), float(p99), matrix_position, probe)
+                )
+    replay_selected = (
+        min(replay_safe_candidates, key=lambda item: item[:3])[3]
+        if replay_safe_candidates
+        else None
+    )
     if (
         report.get("format") != TOPOLOGY_SELECTION_FORMAT
         or report.get("status") != "pass"
@@ -3556,6 +4013,7 @@ def validate_topology_selection(
         != args.expected_topology_gate_spec_sha256
         or report.get("reference_mode") != OFFICIAL_W1_REFERENCE_MODE
         or report.get("candidate_modes") != list(TOPOLOGY_SPECS)
+        or canonical_selection_replay != report
         or not isinstance(probes, list)
         or [probe.get("mode") for probe in probes]
         != list(TOPOLOGY_SPECS)
@@ -3571,28 +4029,20 @@ def validate_topology_selection(
             not isinstance(quality, dict)
             or quality.get("report_sha256") is None
             or len(str(quality.get("report_sha256"))) != 64
-            or quality.get("candidate_fgd") is None
-            or set(quality["candidate_fgd"]) != {"1", "2", "4", "8"}
-            for quality in quality_reports
+            or _finite_nonnegative_quality_fgd(
+                quality.get("candidate_fgd")
+            )
+            is None
+            for quality in verified_quality_reports
         )
         or not isinstance(quality_decisions, dict)
         or set(quality_decisions) != set(TOPOLOGY_SPECS)
-        or any(
-            not isinstance(quality_decisions[mode], dict)
-            for mode in matrix_modes
-        )
-        or any(
-            quality_decisions[mode].get("status")
-            != (
-                "skipped_over_eta_budget"
-                if mode in skip_modes
-                else "measured"
-            )
-            for mode in matrix_modes
-        )
+        or replayed_quality_decisions is None
+        or quality_decisions != replayed_quality_decisions
         or not isinstance(selected, dict)
         or selected.get("mode") != args.topology_mode
-        or selected.get("report_sha256") != throughput_gate["sha256"]
+        or not selected_throughput_projection_valid
+        or not actual_throughput_gate_valid
         or selected.get("classification")
         != TOPOLOGY_SPECS[args.topology_mode]["classification"]
         or selected.get("precision")
@@ -3607,6 +4057,7 @@ def validate_topology_selection(
             ),
             None,
         )
+        or selected != replay_selected
         or report.get("w1_trajectory_equivalence_claimed_for_selected")
         is not False
         or report.get("selection_policy")
@@ -3614,13 +4065,37 @@ def validate_topology_selection(
         or report.get("selection_decision_branch")
         != "fastest_quality_safe_finite_under_24h"
         or report.get("quality_gate_policy", {}).get(
-            "raw_prediction_replay_required"
+            "diffsheg_validation_measurement_required"
         )
         is not True
+        or report.get("quality_gate_policy", {}).get("validation_protocol")
+        != "diffsheg_show_validation_fgd_v1"
+        or report.get("quality_gate_policy", {}).get("primary_metric")
+        != "validation.diffsheg.metrics.fgd"
+        or report.get("quality_gate_policy", {}).get(
+            "trajectory_epochs"
+        )
+        != list(SHORT_QUALITY_EPOCHS)
+        or report.get("quality_gate_policy", {}).get(
+            "maximum_absolute_fgd_regression"
+        )
+        != MAX_ABSOLUTE_FGD_REGRESSION
+        or report.get("quality_gate_policy", {}).get(
+            "maximum_relative_fgd_regression"
+        )
+        != MAX_RELATIVE_FGD_REGRESSION
         or report.get("quality_gate_policy", {}).get(
             "maximum_training_seconds"
         )
         != 86_400
+        or report.get("quality_gate_policy", {}).get(
+            "maximum_p99_training_seconds"
+        )
+        != 79_200
+        or report.get("quality_gate_policy", {}).get(
+            "p99_total_updates_required"
+        )
+        is not True
         or report.get("quality_gate_policy", {}).get(
             "w1_quality_report_required"
         )
@@ -3845,7 +4320,7 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         raise AdaptationContractError(
             "formal training requires one topology selected by the sealed "
-            "five-mode gate"
+            "nine-mode gate"
         )
 
 
@@ -4284,15 +4759,38 @@ def _run_throughput_gate(
     torch.cuda.reset_peak_memory_stats(device)
     sampler.set_epoch(0)
     iterator = iter(loader)
+    sampler_epoch = 0
+    updates_in_sampler_epoch = 0
     last_metrics: dict[str, float] = {}
     sample_order = hashlib.sha256()
     sample_count = 0
     observed_indices: list[int] = []
+    observed_indices_by_epoch: dict[int, list[int]] = {0: []}
     optimizer_update = 0
     batchnorm_before = _batchnorm_inventory(model)
+
+    def next_probe_batch() -> tuple[Any, int]:
+        nonlocal iterator, sampler_epoch, updates_in_sampler_epoch
+        if updates_in_sampler_epoch == EXPECTED_UPDATES_PER_EPOCH:
+            sampler_epoch += 1
+            sampler.set_epoch(sampler_epoch)
+            iterator = iter(loader)
+            updates_in_sampler_epoch = 0
+            observed_indices_by_epoch[sampler_epoch] = []
+        try:
+            batch = next(iterator)
+        except StopIteration as error:
+            raise AdaptationContractError(
+                "probe loader ended before the selected topology epoch"
+            ) from error
+        updates_in_sampler_epoch += 1
+        return batch, sampler_epoch
+
     for _ in range(THROUGHPUT_WARMUP_UPDATES):
-        batch = next(iterator)
-        observed_indices.extend(_batch_sample_indices(batch))
+        batch, batch_sampler_epoch = next_probe_batch()
+        batch_indices = _batch_sample_indices(batch)
+        observed_indices.extend(batch_indices)
+        observed_indices_by_epoch[batch_sampler_epoch].extend(batch_indices)
         optimizer_update += 1
         sample_count += _record_sample_order(
             sample_order,
@@ -4306,7 +4804,7 @@ def _run_throughput_gate(
             _move_batch(batch, device),
             device=device,
             precision=args.precision,
-            epoch=0,
+            epoch=batch_sampler_epoch,
         )
     torch.cuda.synchronize(device)
     dist.barrier()
@@ -4315,9 +4813,11 @@ def _run_throughput_gate(
     data_wait_seconds: list[float] = []
     for _ in range(THROUGHPUT_TIMED_UPDATES):
         wait_started = time.perf_counter()
-        batch = next(iterator)
+        batch, batch_sampler_epoch = next_probe_batch()
         data_wait_seconds.append(time.perf_counter() - wait_started)
-        observed_indices.extend(_batch_sample_indices(batch))
+        batch_indices = _batch_sample_indices(batch)
+        observed_indices.extend(batch_indices)
+        observed_indices_by_epoch[batch_sampler_epoch].extend(batch_indices)
         optimizer_update += 1
         sample_count += _record_sample_order(
             sample_order,
@@ -4332,7 +4832,7 @@ def _run_throughput_gate(
             _move_batch(batch, device),
             device=device,
             precision=args.precision,
-            epoch=0,
+            epoch=batch_sampler_epoch,
         )
         torch.cuda.synchronize(device)
         update_seconds.append(time.perf_counter() - update_started)
@@ -4373,6 +4873,7 @@ def _run_throughput_gate(
         collective_seconds.append(time.perf_counter() - collective_started)
 
     consumed_per_rank = EXPECTED_UPDATES_PER_EPOCH * LOCAL_BATCH_SIZE
+    sampler.set_epoch(0)
     full_epoch_indices = list(iter(sampler))[:consumed_per_rank]
     local_observation = {
         "rank": rank,
@@ -4394,6 +4895,7 @@ def _run_throughput_gate(
         "batchnorm_after": _batchnorm_inventory(model),
         "rng_after": _rng_state_hashes(device),
         "observed_indices": observed_indices,
+        "observed_indices_by_epoch": observed_indices_by_epoch,
         "full_epoch_indices": full_epoch_indices,
     }
     gathered_observations: list[Any] = [None for _ in range(WORLD_SIZE)]
@@ -4420,10 +4922,42 @@ def _run_throughput_gate(
         for observation in gathered_observations
         for index in observation["full_epoch_indices"]
     ]
+    expected_probe_epoch_updates = _probe_epoch_update_counts(
+        EXPECTED_UPDATES_PER_EPOCH
+    )
+    probe_epoch_samples: list[int] = []
+    probe_epoch_unique_samples: list[int] = []
+    for epoch_index, expected_updates in enumerate(
+        expected_probe_epoch_updates
+    ):
+        epoch_indices = [
+            index
+            for observation in gathered_observations
+            for index in observation["observed_indices_by_epoch"].get(
+                epoch_index, []
+            )
+        ]
+        expected_samples = expected_updates * GLOBAL_BATCH_SIZE
+        probe_epoch_samples.append(len(epoch_indices))
+        probe_epoch_unique_samples.append(len(set(epoch_indices)))
+        if (
+            len(epoch_indices) != expected_samples
+            or len(set(epoch_indices)) != expected_samples
+        ):
+            raise AdaptationContractError(
+                "DistributedSampler probe epoch is padded or duplicated"
+            )
+    if any(
+        set(observation["observed_indices_by_epoch"])
+        != set(range(len(expected_probe_epoch_updates)))
+        for observation in gathered_observations
+    ):
+        raise AdaptationContractError(
+            "DistributedSampler probe epoch inventory changed"
+        )
     expected_probe_samples = TRAJECTORY_PROBE_UPDATES * GLOBAL_BATCH_SIZE
     if (
         len(all_observed_indices) != expected_probe_samples
-        or len(set(all_observed_indices)) != expected_probe_samples
         or len(all_epoch_indices) != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
         or len(set(all_epoch_indices)) != EXPECTED_UNIQUE_SAMPLES_PER_EPOCH
         or any(
@@ -4560,6 +5094,15 @@ def _run_throughput_gate(
                 "padding_duplicates": 0,
                 "probe_samples": expected_probe_samples,
                 "probe_unique_samples": len(set(all_observed_indices)),
+                "probe_sampler_epochs": list(
+                    range(len(expected_probe_epoch_updates))
+                ),
+                "probe_epoch_updates": list(expected_probe_epoch_updates),
+                "probe_epoch_samples": probe_epoch_samples,
+                "probe_epoch_unique_samples": probe_epoch_unique_samples,
+                "probe_cross_epoch_duplicates": (
+                    expected_probe_samples - len(set(all_observed_indices))
+                ),
                 "full_epoch_samples": len(all_epoch_indices),
                 "full_epoch_unique_samples": len(set(all_epoch_indices)),
                 "dataset_samples": EXPECTED_TRAIN_SAMPLES,

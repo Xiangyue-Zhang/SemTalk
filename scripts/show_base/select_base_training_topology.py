@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal the fastest safe SemTalk Base topology after all five real probes."""
+"""Seal the fastest safe SemTalk Base topology after all nine real probes."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.show_base import base_long_val_contract as formal_validation
 from scripts.show_base import train_base_official_adapt_long as contract
 
 
@@ -26,8 +27,8 @@ class TopologySelectionError(RuntimeError):
     """Raised when any measured topology is absent, unsafe, or stale."""
 
 
-QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v1"
-QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v1"
+QUALITY_GATE_FORMAT = "semtalk_show_base_topology_quality_gate_spec_v2"
+QUALITY_REPORT_FORMAT = "semtalk_show_base_topology_quality_report_v2"
 QUALITY_SKIP_FORMAT = (
     "semtalk_show_base_topology_quality_skipped_over_eta_budget_v1"
 )
@@ -35,36 +36,23 @@ SHORT_TRAJECTORY_FORMAT = (
     "semtalk_show_base_topology_short_trajectory_v1"
 )
 QUALITY_PROVENANCE_FORMAT = (
-    "semtalk_show_base_topology_quality_provenance_v1"
+    "semtalk_show_base_topology_quality_provenance_v2"
 )
 QUALITY_EPOCHS = (1, 2, 4, 8)
-EXPECTED_VAL_CLIPS = 1_715
-PRIMARY_METRIC_PATH = "body.released2.metrics.FGD"
+EXPECTED_VAL_CLIPS = formal_validation.EXPECTED_VAL_CLIPS
+PRIMARY_METRIC_PATH = "validation.diffsheg.metrics.fgd"
+VALIDATION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
 MAX_TRAINING_SECONDS = 24 * 60 * 60
+MAX_P99_TRAINING_SECONDS = 22 * 60 * 60
 MAX_ABSOLUTE_FGD_REGRESSION = 0.01
 MAX_RELATIVE_FGD_REGRESSION = 0.02
 SELECTION_PROTOCOL = {
     "primary_metric": PRIMARY_METRIC_PATH,
+    "validation_protocol": VALIDATION_PROTOCOL,
     "mode": "min",
     "validation_only_for_selection": True,
     "test_evaluations": 0,
 }
-
-
-def _metrics_module() -> Any:
-    # Topology policy and its CPU tests remain stdlib-only.  NumPy/torch are
-    # loaded only when the selector validates actual raw-NPZ replay receipts.
-    from scripts.show_base import evaluate_talkshow_show_metrics as module
-
-    return module
-
-
-def _replication_module() -> Any:
-    # NumPy is loaded only when a formal quality row freshly replays its
-    # deterministic-replication gate.
-    from scripts.show_base import deterministic_replication_gate as module
-
-    return module
 
 
 def _artifact(
@@ -141,34 +129,6 @@ def _artifact(
     ):
         raise TopologySelectionError(f"{label} payload hash changed")
     return normalized, parsed
-
-
-def _canonical_manifest_artifact(
-    value: Any,
-    label: str,
-) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "path",
-        "sha256",
-        "bytes",
-        "rows",
-        "selected_rows",
-    }:
-        raise TopologySelectionError(f"{label} artifact schema mismatch")
-    normalized, _ = _artifact(
-        {key: value[key] for key in ("path", "sha256", "bytes")},
-        label,
-    )
-    rows = value.get("rows")
-    selected = value.get("selected_rows")
-    if (
-        type(rows) is not int
-        or rows < EXPECTED_VAL_CLIPS
-        or type(selected) is not int
-        or selected != EXPECTED_VAL_CLIPS
-    ):
-        raise TopologySelectionError(f"{label} coverage changed")
-    return {**normalized, "rows": rows, "selected_rows": selected}
 
 
 def _strict_jsonl_rows(
@@ -1159,6 +1119,86 @@ def validate_short_trajectory_receipt(
     return artifact, payload, normalized
 
 
+def _formal_artifact_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "path": value["path"],
+        "sha256": value["sha256"],
+        "receipt_payload_sha256": value["receipt_payload_sha256"],
+    }
+
+
+def _validate_formal_receipt(
+    value: Any,
+    label: str,
+    validator: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    source_artifact, _payload = _artifact(value, label, payload=True)
+    try:
+        formal_artifact, validated = validator(
+            Path(source_artifact["path"]), source_artifact["sha256"]
+        )
+    except Exception as error:
+        raise TopologySelectionError(f"{label} validation failed") from error
+    if formal_artifact != _formal_artifact_projection(source_artifact):
+        raise TopologySelectionError(f"{label} identity changed")
+    return source_artifact, formal_artifact, validated
+
+
+def validate_quality_common_authority(
+    val_inputs_receipt: Any,
+    pipeline_receipt: Any,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Replay the exact formal val-input and inference-pipeline authority."""
+
+    val_source, val_artifact, coverage = _validate_formal_receipt(
+        val_inputs_receipt,
+        "topology quality val-input receipt",
+        formal_validation.validate_val_inputs,
+    )
+    pipeline_source, pipeline_artifact, pipeline = _validate_formal_receipt(
+        pipeline_receipt,
+        "topology quality pipeline receipt",
+        formal_validation.validate_pipeline,
+    )
+    return (
+        val_source,
+        val_artifact,
+        coverage,
+        pipeline_source,
+        pipeline_artifact,
+        pipeline,
+    )
+
+
+def _strict_diffsheg_report(
+    value: Any,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    artifact, _ = _artifact(value, label)
+    path = Path(artifact["path"])
+    try:
+        formal_validation.reject_test_path(path, label)
+        payload = path.read_bytes()
+        if (
+            len(payload) != artifact["bytes"]
+            or hashlib.sha256(payload).hexdigest() != artifact["sha256"]
+        ):
+            raise TopologySelectionError(f"{label} changed during validation")
+        report = formal_validation._strict_json_bytes(payload, label)
+    except TopologySelectionError:
+        raise
+    except Exception as error:
+        raise TopologySelectionError(f"{label} validation failed") from error
+    return artifact, report
+
+
 def validate_quality_candidate_provenance(
     mode: str,
     epoch: int,
@@ -1167,226 +1207,85 @@ def validate_quality_candidate_provenance(
     short_trajectory_receipt: Mapping[str, Any],
     expected_checkpoint: Mapping[str, Any],
     candidate_checkpoint: Any,
-    prediction_manifest: Any,
-    distribution_receipt: Any,
-    primary_screen_receipt: Any,
-    primary_replay_receipt: Any,
-    canonical_manifest: Mapping[str, Any],
-    real_feature_cache: Mapping[str, Any],
+    val_inputs_receipt: Mapping[str, Any],
+    val_inputs_artifact: Mapping[str, Any],
+    pipeline_receipt: Mapping[str, Any],
+    pipeline_artifact: Mapping[str, Any],
+    pipeline_payload: Mapping[str, Any],
+    expected_coverage: Mapping[str, Any],
+    inference_lineage: Any,
+    diffsheg_report: Any,
 ) -> dict[str, Any]:
-    """Freshly bind one e1/e2/e4/e8 quality result end to end.
-
-    The metric receipts already prove raw released2 replay.  This additional
-    layer closes the authority gap they intentionally do not own: which short
-    training checkpoint produced the validation manifest whose distribution,
-    screen, and independent replay are being selected.
-    """
+    """Bind one short checkpoint to the formal DiffSHEG val-FGD chain."""
 
     label = f"{mode} e{epoch}"
-    checkpoint, _ = _artifact(
-        candidate_checkpoint,
-        f"{label} checkpoint",
-    )
+    checkpoint, _ = _artifact(candidate_checkpoint, f"{label} checkpoint")
     if checkpoint != dict(expected_checkpoint):
         raise TopologySelectionError(
             f"{label} checkpoint differs from short trajectory"
         )
-
-    prediction, _ = _artifact(
-        prediction_manifest,
-        f"{label} prediction",
-    )
-    prediction_rows = _strict_jsonl_rows(
-        prediction,
-        f"{label} prediction",
-    )
-    expected_prediction_keys = {
-        "global_index",
-        "split",
-        "source_clip_id",
-        "canonical_clip_id",
-        "frames",
-        "epoch",
-        "candidate_checkpoint_sha256",
-        "prediction",
-        "ground_truth",
-    }
-    canonical_ids: set[str] = set()
-    global_indices: list[int] = []
-    for index, row in enumerate(prediction_rows):
-        clip_id = row.get("canonical_clip_id")
-        global_index = row.get("global_index")
-        if (
-            set(row) != expected_prediction_keys
-            or row.get("split") != "val"
-            or row.get("epoch") != epoch
-            or row.get("candidate_checkpoint_sha256")
-            != checkpoint["sha256"]
-            or not isinstance(clip_id, str)
-            or not clip_id
-            or clip_id in canonical_ids
-            or type(global_index) is not int
-            or global_index < 0
-            or type(row.get("frames")) is not int
-            or row["frames"] <= 0
-        ):
-            raise TopologySelectionError(
-                f"{label} prediction row {index} authority changed"
-            )
-        for role in ("prediction", "ground_truth"):
-            artifact = row.get(role)
-            if (
-                not isinstance(artifact, dict)
-                or set(artifact) != {"path", "sha256", "bytes"}
-                or not isinstance(artifact.get("path"), str)
-                or not Path(artifact["path"]).is_absolute()
-                or re.fullmatch(
-                    r"[0-9a-f]{64}", str(artifact.get("sha256"))
-                )
-                is None
-                or type(artifact.get("bytes")) is not int
-                or artifact["bytes"] <= 0
-            ):
-                raise TopologySelectionError(
-                    f"{label} prediction row {index} {role} changed"
-                )
-        canonical_ids.add(clip_id)
-        global_indices.append(global_index)
     if (
-        len(prediction_rows) != EXPECTED_VAL_CLIPS
-        or len(canonical_ids) != EXPECTED_VAL_CLIPS
-        or len(set(global_indices)) != EXPECTED_VAL_CLIPS
+        _formal_artifact_projection(val_inputs_receipt)
+        != dict(val_inputs_artifact)
+        or _formal_artifact_projection(pipeline_receipt)
+        != dict(pipeline_artifact)
     ):
-        raise TopologySelectionError(
-            f"{label} prediction coverage changed"
-        )
+        raise TopologySelectionError(f"{label} common validation authority changed")
 
-    distribution, distribution_payload = _artifact(
-        distribution_receipt,
-        f"{label} distribution",
+    lineage_source, _ = _artifact(
+        inference_lineage,
+        f"{label} inference lineage",
         payload=True,
     )
-    assert distribution_payload is not None
-    validation_gate_value = distribution_payload.get("validation_gate")
-    if (
-        distribution_payload.get("prediction_manifest") != prediction
-        or not isinstance(validation_gate_value, dict)
-    ):
-        raise TopologySelectionError(
-            f"{label} distribution authority changed"
-        )
-    validation_gate, _ = _artifact(
-        validation_gate_value,
-        f"{label} validation gate",
-        payload=True,
-    )
-    replication = _replication_module()
     try:
-        replayed_gate, gate_payload = replication.load_gate(
-            Path(validation_gate["path"]),
-            validation_gate["sha256"],
-            expected_scope="validation_candidate_family",
+        lineage_artifact, lineage = (
+            formal_validation.validate_val_inference_lineage(
+                Path(lineage_source["path"]),
+                lineage_source["sha256"],
+                epoch=epoch,
+                expected_candidate=checkpoint,
+                val_inputs_artifact=val_inputs_artifact,
+                pipeline_artifact=pipeline_artifact,
+                expected_coverage=expected_coverage,
+            )
         )
     except Exception as error:
         raise TopologySelectionError(
-            f"{label} validation gate fresh replay failed"
+            f"{label} DiffSHEG inference lineage validation failed"
         ) from error
-    base_checkpoint = (
-        gate_payload.get("model_bundle", {})
-        .get("checkpoints", {})
-        .get("base")
-    )
-    if (
-        replayed_gate != validation_gate
-        or gate_payload.get("status") != "pass"
-        or gate_payload.get("split") != "val"
-        or gate_payload.get("test_visible") is not False
-        or base_checkpoint != checkpoint
-    ):
-        raise TopologySelectionError(
-            f"{label} checkpoint/gate authority changed"
-        )
+    if lineage_artifact != _formal_artifact_projection(lineage_source):
+        raise TopologySelectionError(f"{label} inference lineage identity changed")
 
-    screen, screen_payload = _artifact(
-        primary_screen_receipt,
-        f"{label} primary screen",
-        payload=True,
+    report_artifact, report = _strict_diffsheg_report(
+        diffsheg_report,
+        f"{label} DiffSHEG report",
     )
-    replay, replay_payload = _artifact(
-        primary_replay_receipt,
-        f"{label} raw replay",
-        payload=True,
-    )
-    assert screen_payload is not None and replay_payload is not None
-    if (
-        screen_payload.get("split") != "val"
-        or screen_payload.get("test_visible") is not False
-        or screen_payload.get("clip_count") != EXPECTED_VAL_CLIPS
-        or screen_payload.get("canonical_manifest")
-        != dict(canonical_manifest)
-        or screen_payload.get("prediction_manifest") != prediction
-        or screen_payload.get("distribution_receipt") != distribution
-        or screen_payload.get("real_feature_cache")
-        != dict(real_feature_cache)
-        or replay_payload.get("split") != "val"
-        or replay_payload.get("clip_count") != EXPECTED_VAL_CLIPS
-        or replay_payload.get("report_payload_sha256")
-        != screen_payload.get("receipt_payload_sha256")
-        or replay_payload.get("canonical_manifest")
-        != dict(canonical_manifest)
-        or replay_payload.get("prediction_manifest") != prediction
-        or replay_payload.get("distribution_receipt_payload_sha256")
-        != distribution_payload.get("receipt_payload_sha256")
-        or replay_payload.get("real_feature_cache")
-        != dict(real_feature_cache)
-    ):
-        raise TopologySelectionError(
-            f"{label} prediction/distribution/screen/replay chain changed"
-        )
-
-    metrics = _metrics_module()
     try:
-        screen_validation = (
-            metrics.validate_released2_primary_screen_receipt(
-                screen,
-                expected_prediction_manifest=prediction,
-                expected_distribution_receipt=distribution,
-                expected_real_feature_cache=real_feature_cache,
-                expected_canonical_manifest=canonical_manifest,
-                expected_selection_protocol=SELECTION_PROTOCOL,
-                expected_split="val",
-                expected_clip_count=EXPECTED_VAL_CLIPS,
-            )
+        metrics, coverage = formal_validation.validate_diffsheg_report(
+            report,
+            expected_coverage=expected_coverage,
+            inference_lineage=lineage,
+            expected_pipeline=pipeline_payload,
         )
-        replay_validation = (
-            metrics.validate_released2_primary_screen_replay_receipt(
-                replay,
-                expected_screen_artifact=screen,
-                expected_screen=screen_payload,
-                screen_validation=screen_validation,
-                expected_prediction_manifest=prediction,
-                expected_distribution_receipt=distribution,
-                expected_selection_protocol=SELECTION_PROTOCOL,
-                expected_split="val",
-                expected_clip_count=EXPECTED_VAL_CLIPS,
-            )
-        )
-        value = float(replay_validation["primary_metric"])
     except Exception as error:
         raise TopologySelectionError(
-            f"{label} raw released2 replay validation failed"
+            f"{label} DiffSHEG report validation failed"
         ) from error
-    if not math.isfinite(value) or value < 0:
-        raise TopologySelectionError(f"{label} replay FGD is invalid")
+    value = float(metrics["fgd"])
+    if (
+        not math.isfinite(value)
+        or value < 0.0
+        or coverage.get("clip_count") != EXPECTED_VAL_CLIPS
+    ):
+        raise TopologySelectionError(f"{label} DiffSHEG FGD is invalid")
 
     chain = {
         "short_trajectory_receipt": dict(short_trajectory_receipt),
         "candidate_checkpoint": checkpoint,
-        "prediction_manifest": prediction,
-        "validation_gate": validation_gate,
-        "distribution_receipt": distribution,
-        "primary_screen_receipt": screen,
-        "primary_replay_receipt": replay,
+        "val_inputs_receipt": dict(val_inputs_receipt),
+        "pipeline_receipt": dict(pipeline_receipt),
+        "inference_lineage": lineage_source,
+        "diffsheg_report": report_artifact,
     }
     provenance = {
         "format": QUALITY_PROVENANCE_FORMAT,
@@ -1394,7 +1293,7 @@ def validate_quality_candidate_provenance(
         "epoch": epoch,
         "split": "val",
         "test_visible": False,
-        "clip_count": EXPECTED_VAL_CLIPS,
+        "clip_count": coverage["clip_count"],
         "topology_independent_input_sha256": (
             topology_independent_input_sha256
         ),
@@ -1405,35 +1304,29 @@ def validate_quality_candidate_provenance(
             short_trajectory_receipt["receipt_payload_sha256"]
         ),
         "checkpoint_sha256": checkpoint["sha256"],
-        "prediction_manifest_sha256": prediction["sha256"],
-        "prediction_rows": len(prediction_rows),
-        "prediction_checkpoint_sha256": checkpoint["sha256"],
-        "validation_gate_sha256": validation_gate["sha256"],
-        "validation_gate_payload_sha256": validation_gate[
+        "val_inputs_receipt_sha256": val_inputs_receipt["sha256"],
+        "val_inputs_receipt_payload_sha256": val_inputs_receipt[
             "receipt_payload_sha256"
         ],
-        "distribution_receipt_sha256": distribution["sha256"],
-        "distribution_receipt_payload_sha256": distribution[
+        "pipeline_receipt_sha256": pipeline_receipt["sha256"],
+        "pipeline_receipt_payload_sha256": pipeline_receipt[
             "receipt_payload_sha256"
         ],
-        "primary_screen_receipt_sha256": screen["sha256"],
-        "primary_screen_receipt_payload_sha256": screen[
+        "inference_lineage_sha256": lineage_source["sha256"],
+        "inference_lineage_payload_sha256": lineage_source[
             "receipt_payload_sha256"
         ],
-        "primary_replay_receipt_sha256": replay["sha256"],
-        "primary_replay_receipt_payload_sha256": replay[
-            "receipt_payload_sha256"
-        ],
+        "diffsheg_report_sha256": report_artifact["sha256"],
+        "primary_metric": PRIMARY_METRIC_PATH,
+        "validation_protocol": VALIDATION_PROTOCOL,
         "chain_sha256": contract.canonical_json_sha256(chain),
     }
     return {
         "candidate_checkpoint": checkpoint,
-        "prediction_manifest": prediction,
-        "distribution_receipt": distribution,
-        "primary_screen_receipt": screen,
-        "primary_replay_receipt": replay,
+        "inference_lineage": lineage_source,
+        "diffsheg_report": report_artifact,
         "provenance": provenance,
-        "body_released2_fgd": value,
+        "diffsheg_fgd": value,
     }
 
 
@@ -1453,11 +1346,14 @@ def validate_quality_gate_spec(
         "test_visible": False,
         "trajectory_epochs": list(QUALITY_EPOCHS),
         "primary_metric": PRIMARY_METRIC_PATH,
-        "raw_prediction_replay_required": True,
+        "validation_protocol": VALIDATION_PROTOCOL,
+        "diffsheg_validation_measurement_required": True,
         "comparison_reference": contract.OFFICIAL_W1_REFERENCE_MODE,
         "measured_eta_constraint": {
             "modes": list(contract.TOPOLOGY_SPECS),
             "maximum_estimated_training_seconds": MAX_TRAINING_SECONDS,
+            "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
+            "p99_total_updates_required": True,
             "finite_probe_required": True,
             "policy": (
                 "all_quality_safe_finite_modes_compete_by_measured_eta_"
@@ -1533,8 +1429,8 @@ def validate_quality_report(
         "trajectory_epochs",
         "topology_independent_input_sha256",
         "short_trajectory_receipt",
-        "canonical_manifest",
-        "real_feature_cache",
+        "val_inputs_receipt",
+        "pipeline_receipt",
         "candidates",
         "receipt_sha256",
     }
@@ -1584,11 +1480,16 @@ def validate_quality_report(
         != report["topology_independent_input_sha256"]
     ):
         raise TopologySelectionError(f"{mode} short trajectory changed")
-    canonical = _canonical_manifest_artifact(
-        report["canonical_manifest"], f"{mode} canonical manifest"
-    )
-    cache, _cache_payload = _artifact(
-        report["real_feature_cache"], f"{mode} real feature cache", payload=True
+    (
+        val_inputs_source,
+        val_inputs_artifact,
+        coverage,
+        pipeline_source,
+        pipeline_artifact,
+        pipeline_payload,
+    ) = validate_quality_common_authority(
+        report["val_inputs_receipt"],
+        report["pipeline_receipt"],
     )
     values: dict[int, float] = {}
     normalized_rows: list[dict[str, Any]] = []
@@ -1596,10 +1497,8 @@ def validate_quality_report(
         row_keys = {
             "epoch",
             "candidate_checkpoint",
-            "prediction_manifest",
-            "distribution_receipt",
-            "primary_screen_receipt",
-            "primary_replay_receipt",
+            "inference_lineage",
+            "diffsheg_report",
             "provenance",
         }
         if not isinstance(row, dict) or set(row) != row_keys:
@@ -1619,18 +1518,20 @@ def validate_quality_report(
             short_trajectory_receipt=short_trajectory,
             expected_checkpoint=short_checkpoints[expected_epoch],
             candidate_checkpoint=row["candidate_checkpoint"],
-            prediction_manifest=row["prediction_manifest"],
-            distribution_receipt=row["distribution_receipt"],
-            primary_screen_receipt=row["primary_screen_receipt"],
-            primary_replay_receipt=row["primary_replay_receipt"],
-            canonical_manifest=canonical,
-            real_feature_cache=cache,
+            val_inputs_receipt=val_inputs_source,
+            val_inputs_artifact=val_inputs_artifact,
+            pipeline_receipt=pipeline_source,
+            pipeline_artifact=pipeline_artifact,
+            pipeline_payload=pipeline_payload,
+            expected_coverage=coverage,
+            inference_lineage=row["inference_lineage"],
+            diffsheg_report=row["diffsheg_report"],
         )
         if row["provenance"] != validated["provenance"]:
             raise TopologySelectionError(
                 f"{mode} e{expected_epoch} provenance changed"
             )
-        value = validated["body_released2_fgd"]
+        value = validated["diffsheg_fgd"]
         values[expected_epoch] = value
         normalized_rows.append(
             {
@@ -1646,8 +1547,8 @@ def validate_quality_report(
             "topology_independent_input_sha256"
         ],
         "short_trajectory_receipt": short_trajectory,
-        "canonical_manifest": canonical,
-        "real_feature_cache": cache,
+        "val_inputs_receipt": val_inputs_source,
+        "pipeline_receipt": pipeline_source,
         "candidate_fgd": {str(epoch): values[epoch] for epoch in QUALITY_EPOCHS},
         "candidates": normalized_rows,
     }
@@ -1689,6 +1590,15 @@ def validate_probe(
     collective = payload.get("collective_seconds")
     batchnorm = payload.get("batchnorm_inventory")
     rng = payload.get("rng_inventory")
+    probe_epoch_updates = list(
+        contract._probe_epoch_update_counts(
+            int(specification["updates_per_epoch"])
+        )
+    )
+    probe_epoch_samples = [
+        updates * int(specification["global_batch_size"])
+        for updates in probe_epoch_updates
+    ]
     if (
         payload.get("format") != contract.GATE_FORMAT
         or payload.get("status") != "pass"
@@ -1723,6 +1633,7 @@ def validate_probe(
         or not all(
             _finite_positive(payload.get(key))
             for key in (
+                "seconds_per_update",
                 "median_seconds",
                 "p90_seconds",
                 "p99_seconds",
@@ -1735,6 +1646,20 @@ def validate_probe(
             <= float(payload["p90_seconds"])
             <= float(payload["p99_seconds"])
         )
+        or float(payload["seconds_per_update"])
+        != float(payload["median_seconds"])
+        or float(payload["samples_per_second"])
+        != (
+            float(specification["global_batch_size"])
+            / float(payload["median_seconds"])
+        )
+        or float(payload["estimated_training_seconds"])
+        != (
+            float(payload["median_seconds"])
+            * int(specification["updates_per_epoch"])
+            * contract.TOTAL_EPOCHS
+        )
+        or payload.get("estimated_epochs") != contract.TOTAL_EPOCHS
         or float(payload["p99_seconds"])
         > 4.0 * float(payload["median_seconds"])
         or not isinstance(payload.get("peak_cuda_memory_bytes_all_ranks"), list)
@@ -1777,8 +1702,28 @@ def validate_probe(
         or sample_inventory.get("probe_samples")
         != contract.TRAJECTORY_PROBE_UPDATES
         * specification["global_batch_size"]
-        or sample_inventory.get("probe_unique_samples")
-        != sample_inventory.get("probe_samples")
+        or type(sample_inventory.get("probe_unique_samples")) is not int
+        or sample_inventory["probe_unique_samples"] <= 0
+        or sample_inventory["probe_unique_samples"]
+        > sample_inventory["probe_samples"]
+        or sample_inventory.get("probe_sampler_epochs")
+        != list(range(len(probe_epoch_updates)))
+        or sample_inventory.get("probe_epoch_updates")
+        != probe_epoch_updates
+        or sample_inventory.get("probe_epoch_samples")
+        != probe_epoch_samples
+        or sample_inventory.get("probe_epoch_unique_samples")
+        != probe_epoch_samples
+        or type(sample_inventory.get("probe_cross_epoch_duplicates"))
+        is not int
+        or sample_inventory["probe_cross_epoch_duplicates"] < 0
+        or sample_inventory["probe_unique_samples"]
+        + sample_inventory["probe_cross_epoch_duplicates"]
+        != sample_inventory["probe_samples"]
+        or (
+            len(probe_epoch_updates) == 1
+            and sample_inventory["probe_cross_epoch_duplicates"] != 0
+        )
         or sample_inventory.get("full_epoch_samples")
         != specification["unique_samples_per_epoch"]
         or sample_inventory.get("full_epoch_unique_samples")
@@ -2088,7 +2033,7 @@ def select_topology(
     if [probe.get("mode") for probe in probes] != list(
         contract.TOPOLOGY_SPECS
     ):
-        raise TopologySelectionError("all five probes must be ordered exactly")
+        raise TopologySelectionError("all nine probes must be ordered exactly")
     semantic_hashes = {
         probe["topology_independent_input_sha256"] for probe in probes
     }
@@ -2113,7 +2058,7 @@ def select_topology(
         or set(report_modes) | set(skip_modes) != set(order)
     ):
         raise TopologySelectionError(
-            "quality reports/skips must cover all five modes exactly once "
+            "quality reports/skips must cover all nine modes exactly once "
             "in matrix order"
         )
     if contract.OFFICIAL_W1_REFERENCE_MODE not in report_modes:
@@ -2186,27 +2131,28 @@ def select_topology(
     } | {
         skip["topology_independent_input_sha256"] for skip in quality_skips
     }
-    canonical_manifests = {
+    val_input_receipts = {
         (
-            report["canonical_manifest"]["sha256"],
-            report["canonical_manifest"]["bytes"],
+            report["val_inputs_receipt"]["sha256"],
+            report["val_inputs_receipt"]["receipt_payload_sha256"],
         )
         for report in quality_reports
     }
-    feature_caches = {
+    pipeline_receipts = {
         (
-            report["real_feature_cache"]["sha256"],
-            report["real_feature_cache"]["receipt_payload_sha256"],
+            report["pipeline_receipt"]["sha256"],
+            report["pipeline_receipt"]["receipt_payload_sha256"],
         )
         for report in quality_reports
     }
     if (
         quality_semantic_hashes != semantic_hashes
-        or len(canonical_manifests) != 1
-        or len(feature_caches) != 1
+        or len(val_input_receipts) != 1
+        or len(pipeline_receipts) != 1
     ):
         raise TopologySelectionError(
-            "quality reports do not share the measured five-stage/val authority"
+            "quality reports do not share the formal DiffSHEG val/pipeline "
+            "authority"
         )
     by_mode = {report["mode"]: report for report in quality_reports}
     reference = by_mode[contract.OFFICIAL_W1_REFERENCE_MODE]
@@ -2268,6 +2214,10 @@ def select_topology(
         and _finite_positive(probe.get("p99_seconds"))
         and float(probe["estimated_training_seconds"])
         <= MAX_TRAINING_SECONDS
+        and float(probe["p99_seconds"])
+        * int(contract.TOPOLOGY_SPECS[probe["mode"]]["updates_per_epoch"])
+        * contract.TOTAL_EPOCHS
+        <= MAX_P99_TRAINING_SECONDS
         and probe["mode"] in by_mode
         and quality_decisions[probe["mode"]][
             "all_trajectory_epochs_pass"
@@ -2275,8 +2225,8 @@ def select_topology(
     ]
     if not safe_under_budget:
         raise TopologySelectionError(
-            "no quality-safe finite topology meets the 24-hour measured "
-            "ETA limit"
+            "no quality-safe finite topology meets the 24-hour median and "
+            "22-hour p99 measured ETA limits"
         )
     selected = min(safe_under_budget, key=rank_key)
     decision_branch = "fastest_quality_safe_finite_under_24h"
@@ -2295,8 +2245,11 @@ def select_topology(
         "quality_gate_policy": {
             "trajectory_epochs": list(QUALITY_EPOCHS),
             "primary_metric": PRIMARY_METRIC_PATH,
-            "raw_prediction_replay_required": True,
+            "validation_protocol": VALIDATION_PROTOCOL,
+            "diffsheg_validation_measurement_required": True,
             "maximum_training_seconds": MAX_TRAINING_SECONDS,
+            "maximum_p99_training_seconds": MAX_P99_TRAINING_SECONDS,
+            "p99_total_updates_required": True,
             "maximum_absolute_fgd_regression": (
                 MAX_ABSOLUTE_FGD_REGRESSION
             ),
@@ -2322,7 +2275,7 @@ def select_topology(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Seal the five-mode SemTalk Base topology gate"
+        description="Seal the nine-mode SemTalk Base topology gate"
     )
     parser.allow_abbrev = False
     parser.add_argument("--gate-spec", type=Path, required=True)
@@ -2361,7 +2314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     modes = [probe[0] for probe in args.probe]
     if modes != list(contract.TOPOLOGY_SPECS):
         raise TopologySelectionError(
-            "--probe must name all five measured modes exactly once"
+            "--probe must name all nine measured modes exactly once"
         )
     quality_modes = [report[0] for report in args.quality_report]
     skip_modes = [receipt[0] for receipt in args.quality_skip]

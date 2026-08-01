@@ -401,6 +401,37 @@ class AuthorityFixture:
                 stage: self.checkpoints[stage]["sha256"]
                 for stage in AUTH.REPRESENTATION_STAGES
             },
+            "selected_dataset": {
+                "format": (
+                    "semtalk_show_base_selected_feature_dataset_receipt_v1"
+                ),
+                "lmdb": str((root / "base-features.lmdb").resolve()),
+                "summary": str((root / "base-summary.json").resolve()),
+                "summary_sha256": "1" * 64,
+                "lineage": str((root / "base-lineage.json").resolve()),
+                "lineage_sha256": "2" * 64,
+                "entries": 127232,
+                "train_clips": 127232,
+                "split": "train",
+                "test_visible": False,
+                "data_mdb_sha256": "3" * 64,
+                "lock_mdb_sha256": "4" * 64,
+                "prerequisite_selection": {
+                    "path": str(
+                        (root / "prerequisite-selection.json").resolve()
+                    ),
+                    "sha256": "5" * 64,
+                    "receipt_payload_sha256": "6" * 64,
+                },
+                "selected_prerequisite_sha256": {
+                    stage: self.checkpoints[stage]["sha256"]
+                    for stage in AUTH.REPRESENTATION_STAGES
+                },
+                "lmdb_binding_scope": (
+                    "ordered_node_local_inode_bindings_with_global_content_sha256"
+                ),
+                "node_lmdb_inode_bindings": [],
+            },
             "candidate_epochs": list(LONG.EXPECTED_CANDIDATE_EPOCHS),
             "updates_per_epoch": LONG.EXPECTED_UPDATES_PER_EPOCH,
             "selected_topology": {
@@ -750,6 +781,9 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                 "selected_topology": copy.deepcopy(
                     fixture.base_long_bundle["selected_topology"]
                 ),
+                "selected_dataset": copy.deepcopy(
+                    fixture.base_long_bundle["selected_dataset"]
+                ),
                 "updates_per_epoch": fixture.base_long_bundle[
                     "updates_per_epoch"
                 ],
@@ -818,6 +852,35 @@ class BaseFinalAuthorityTest(unittest.TestCase):
                 raw_source,
                 inference_source=fixture.inference_source,
             )
+            forged = copy.deepcopy(replayed)
+            forged["selected_dataset"][
+                "selected_prerequisite_sha256"
+            ]["face"] = "0" * 64
+            module.validate_candidate_bundle = mock.Mock(
+                return_value=forged
+            )
+            with (
+                mock.patch.object(
+                    AUTH,
+                    "_control_module",
+                    return_value=module,
+                ),
+                mock.patch.object(
+                    AUTH,
+                    "_validate_official_training_source",
+                    return_value=fixture.base_long_bundle[
+                        "producer_source"
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    AUTH.BaseFinalAuthorityError,
+                    "non-canonical 22-candidate authority",
+                ):
+                    AUTH._replay_base_long_candidate_bundle(
+                        fixture.base_long_candidate_artifacts,
+                        inference_source=fixture.inference_source,
+                    )
 
     def test_long_claim_replay_has_checkpoint_free_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

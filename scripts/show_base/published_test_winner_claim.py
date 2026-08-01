@@ -1633,7 +1633,7 @@ def _validate_actual_model_receipts(
         base_artifact != checkpoint
         or base["stage"] != "base"
         or base["candidate_epoch"] != epoch
-        or updates_per_epoch not in {248, 1988}
+        or updates_per_epoch not in {62, 124, 248, 1988}
         or base["updates_per_epoch"] != updates_per_epoch
         or base["optimizer_updates"] != epoch * updates_per_epoch
         or base["frozen_receipt_sha256"] != frozen_receipt_sha
@@ -2681,7 +2681,7 @@ def _validate_winner_selection(
         "test_feedback_into_selection": False,
     }
     if (
-        updates_per_epoch not in {248, 1988}
+        updates_per_epoch not in {62, 124, 248, 1988}
         or selection["selection_policy"] != expected_policy
     ):
         raise PublishedWinnerClaimError(

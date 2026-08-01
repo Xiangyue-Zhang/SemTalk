@@ -1132,7 +1132,7 @@ def _load_models(
         bundle.get("updates_per_epoch"),
         "selected Base topology updates per epoch",
     )
-    if updates_per_epoch not in {248, 1988}:
+    if updates_per_epoch not in {62, 124, 248, 1988}:
         raise ValInferenceContractError(
             "selected Base topology updates per epoch changed"
         )

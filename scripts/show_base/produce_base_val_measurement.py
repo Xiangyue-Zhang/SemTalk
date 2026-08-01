@@ -172,6 +172,7 @@ def produce(args: argparse.Namespace) -> dict[str, Any]:
         report,
         expected_coverage=val_coverage,
         inference_lineage=inference,
+        expected_pipeline=pipeline,
     )
     measurement = build_measurement(
         epoch=args.epoch,

@@ -1,5 +1,5 @@
 {
-  "format": "semtalk_show_base_topology_quality_gate_spec_v1",
+  "format": "semtalk_show_base_topology_quality_gate_spec_v2",
   "scope": "SemTalk Base on SHOW validation only",
   "split": "val",
   "test_visible": false,
@@ -9,8 +9,9 @@
     4,
     8
   ],
-  "primary_metric": "body.released2.metrics.FGD",
-  "raw_prediction_replay_required": true,
+  "primary_metric": "validation.diffsheg.metrics.fgd",
+  "validation_protocol": "diffsheg_show_validation_fgd_v1",
+  "diffsheg_validation_measurement_required": true,
   "comparison_reference": "official_w1_b64_reference",
   "measured_eta_constraint": {
     "modes": [
@@ -18,9 +19,15 @@
       "official_objective_w8_l8_g64_ddp_adaptation",
       "official_objective_w16_l4_g64_ddp_adaptation",
       "validation_gated_w8_l64_g512_empirical_acceleration",
-      "validation_gated_w16_l32_g512_empirical_acceleration"
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
     ],
     "maximum_estimated_training_seconds": 86400,
+    "maximum_p99_training_seconds": 79200,
+    "p99_total_updates_required": true,
     "finite_probe_required": true,
     "policy": "all_quality_safe_finite_modes_compete_by_measured_eta_under_24h"
   },
@@ -30,7 +37,11 @@
       "official_objective_w8_l8_g64_ddp_adaptation",
       "official_objective_w16_l4_g64_ddp_adaptation",
       "validation_gated_w8_l64_g512_empirical_acceleration",
-      "validation_gated_w16_l32_g512_empirical_acceleration"
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
     ],
     "per_epoch_comparison": "candidate_fgd_lte_reference_fgd_plus_max_of_absolute_or_relative_margin",
     "maximum_absolute_fgd_regression": 0.01,
@@ -43,7 +54,11 @@
       "official_objective_w8_l8_g64_ddp_adaptation",
       "official_objective_w16_l4_g64_ddp_adaptation",
       "validation_gated_w8_l64_g512_empirical_acceleration",
-      "validation_gated_w16_l32_g512_empirical_acceleration"
+      "validation_gated_w16_l32_g512_empirical_acceleration",
+      "validation_gated_w8_l128_g1024_empirical_acceleration",
+      "validation_gated_w8_l256_g2048_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_empirical_acceleration",
+      "validation_gated_w16_l64_g1024_lr6e5_empirical_acceleration"
     ],
     "condition": "estimated_training_seconds_strictly_greater_than_maximum",
     "w1_quality_report_required": true,

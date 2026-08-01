@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -123,6 +125,15 @@ def _gate_report(
     _activate(mode)
     spec = ADAPT.TOPOLOGY_SPECS[mode]
     world = int(spec["world_size"])
+    probe_epoch_updates = list(
+        ADAPT._probe_epoch_update_counts(int(spec["updates_per_epoch"]))
+    )
+    probe_epoch_samples = [
+        updates * int(spec["global_batch_size"])
+        for updates in probe_epoch_updates
+    ]
+    probe_samples = sum(probe_epoch_samples)
+    cross_epoch_duplicates = 0 if len(probe_epoch_updates) == 1 else 1
     before = [{"name": "hubert", "running_mean_sha256": "1" * 64}]
     report: dict[str, object] = {
         "format": ADAPT.GATE_FORMAT,
@@ -155,12 +166,15 @@ def _gate_report(
         "all_losses_finite": True,
         "all_gradients_finite": True,
         "oom": False,
-        "samples_per_second": 1024.0,
+        "samples_per_second": spec["global_batch_size"] / 0.5,
         "seconds_per_update": 0.5,
         "median_seconds": 0.5,
         "p90_seconds": 0.6,
         "p99_seconds": 0.7,
-        "estimated_training_seconds": 1000.0,
+        "estimated_training_seconds": (
+            0.5 * spec["updates_per_epoch"] * ADAPT.TOTAL_EPOCHS
+        ),
+        "estimated_epochs": ADAPT.TOTAL_EPOCHS,
         "last_metrics": {"total": 1.0},
         "peak_cuda_memory_bytes_all_ranks": [1024] * world,
         "data_wait_seconds": {"median": 0.01, "p99": 0.02},
@@ -180,10 +194,13 @@ def _gate_report(
         "sample_inventory": {
             "sampler_drop_last": True,
             "padding_duplicates": 0,
-            "probe_samples": ADAPT.TRAJECTORY_PROBE_UPDATES
-            * int(spec["global_batch_size"]),
-            "probe_unique_samples": ADAPT.TRAJECTORY_PROBE_UPDATES
-            * int(spec["global_batch_size"]),
+            "probe_samples": probe_samples,
+            "probe_unique_samples": probe_samples - cross_epoch_duplicates,
+            "probe_sampler_epochs": list(range(len(probe_epoch_updates))),
+            "probe_epoch_updates": probe_epoch_updates,
+            "probe_epoch_samples": probe_epoch_samples,
+            "probe_epoch_unique_samples": probe_epoch_samples,
+            "probe_cross_epoch_duplicates": cross_epoch_duplicates,
             "full_epoch_samples": spec["unique_samples_per_epoch"],
             "full_epoch_unique_samples": spec["unique_samples_per_epoch"],
             "dataset_samples": ADAPT.EXPECTED_TRAIN_SAMPLES,
@@ -282,9 +299,9 @@ def _topology_selection_inputs(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     modes = list(ADAPT.TOPOLOGY_SPECS)
     if set(estimated_training_seconds) != set(modes):
-        raise AssertionError("test ETA fixture must cover all five modes")
+        raise AssertionError("test ETA fixture must cover all nine modes")
     p99_seconds = p99_seconds or {
-        mode: 1.2 + index for index, mode in enumerate(modes)
+        mode: 0.01 + index * 0.001 for index, mode in enumerate(modes)
     }
     failing_quality_modes = failing_quality_modes or set()
     probes: list[dict[str, object]] = []
@@ -321,16 +338,17 @@ def _topology_selection_inputs(
                 "report_sha256": f"{index + 6:x}" * 64,
                 "topology_independent_input_sha256": "a" * 64,
                 "short_trajectory_receipt": {},
-                "canonical_manifest": {
-                    "path": "/val/canonical.jsonl",
+                "val_inputs_receipt": {
+                    "path": "/val/inputs.json",
                     "sha256": "c" * 64,
                     "bytes": 10,
+                    "receipt_payload_sha256": "d" * 64,
                 },
-                "real_feature_cache": {
-                    "path": "/val/cache.json",
-                    "sha256": "d" * 64,
+                "pipeline_receipt": {
+                    "path": "/val/pipeline.json",
+                    "sha256": "e" * 64,
                     "bytes": 10,
-                    "receipt_payload_sha256": "e" * 64,
+                    "receipt_payload_sha256": "f" * 64,
                 },
                 "candidate_fgd": fgd,
                 "candidates": [],
@@ -376,12 +394,62 @@ def _over_budget_quality_skip(
     }
 
 
+def _validated_throughput_projection(
+    selected: dict[str, object],
+    **overrides: object,
+) -> dict[str, object]:
+    projection = {
+        "sha256": selected["report_sha256"],
+        "topology_mode": selected["mode"],
+        "samples_per_second": selected["samples_per_second"],
+        "median_seconds": selected["median_seconds"],
+        "p90_seconds": selected["p90_seconds"],
+        "p99_seconds": selected["p99_seconds"],
+        "estimated_training_seconds": selected[
+            "estimated_training_seconds"
+        ],
+    }
+    projection.update(overrides)
+    return projection
+
+
+def _consume_topology_selection(
+    *,
+    selection: dict[str, object],
+    path: Path,
+    topology_mode: str,
+    throughput_gate: dict[str, object],
+    verified_selection: dict[str, object] | None = None,
+) -> dict[str, object]:
+    verified = verified_selection or selection
+    reloaded = {
+        "probes": copy.deepcopy(verified["probes"]),
+        "quality_reports": copy.deepcopy(verified["quality_reports"]),
+        "quality_skips": copy.deepcopy(verified["quality_skips"]),
+    }
+    with mock.patch.object(
+        ADAPT,
+        "_reload_topology_selection_artifacts",
+        return_value=reloaded,
+    ):
+        return ADAPT.validate_topology_selection(
+            argparse.Namespace(
+                topology_selection_report=path,
+                expected_topology_selection_sha256=_sha(path),
+                expected_topology_gate_spec_sha256="b" * 64,
+                topology_mode=topology_mode,
+            ),
+            throughput_gate=throughput_gate,
+        )
+
+
 class OfficialBaseAdaptStaticContracts(unittest.TestCase):
     def test_formal_val_control_is_diffsheg_only_and_topology_exact(self) -> None:
         from scripts.show_base import base_final_authority as final_authority
         from scripts.show_base import base_long_val_contract as base_long
         from scripts.show_base import evaluate_diffsheg_val_fgd as evaluator
         from scripts.show_base import select_base_official_adapt as diffsheg
+        from scripts.show_base import select_base_official_adapt_long as long_selector
         from scripts.show_base import talkshow_base_val_contract as talkshow
 
         self.assertEqual(base_long.TOPOLOGY_SPECS, ADAPT.TOPOLOGY_SPECS)
@@ -393,9 +461,17 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             base_long.validate_val_inference_lineage,
             diffsheg.validate_val_inference_lineage,
         )
-        self.assertIs(
+        self.assertIsNot(
             base_long.validate_diffsheg_report,
             diffsheg.validate_diffsheg_report,
+        )
+        self.assertIn(
+            "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+            talkshow.FRESH_PIPELINE_SOURCE_FILES,
+        )
+        self.assertIs(
+            long_selector._profile_values()["validate_diffsheg_report"],
+            base_long.validate_diffsheg_report,
         )
         self.assertEqual(
             base_long.VAL_INFERENCE_LINEAGE_FORMAT,
@@ -642,8 +718,8 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             [True, False, True],
         )
 
-    def test_five_mode_parallelism_candidates_and_gate_lengths(self) -> None:
-        self.assertEqual(len(ADAPT.TOPOLOGY_SPECS), 5)
+    def test_nine_mode_parallelism_candidates_and_gate_lengths(self) -> None:
+        self.assertEqual(len(ADAPT.TOPOLOGY_SPECS), 9)
         self.assertEqual(
             {
                 (
@@ -661,6 +737,10 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                 (16, 4, 64, 1988, 5e-5),
                 (8, 64, 512, 248, 3e-5),
                 (16, 32, 512, 248, 3e-5),
+                (8, 128, 1024, 124, 3e-5),
+                (8, 256, 2048, 62, 3e-5),
+                (16, 64, 1024, 124, 3e-5),
+                (16, 64, 1024, 124, 6e-5),
             },
         )
         self.assertEqual(
@@ -677,6 +757,14 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertEqual(ADAPT.THROUGHPUT_WARMUP_UPDATES, 20)
         self.assertEqual(ADAPT.THROUGHPUT_TIMED_UPDATES, 50)
+        self.assertEqual(
+            ADAPT._probe_epoch_update_counts(124),
+            (70,),
+        )
+        self.assertEqual(
+            ADAPT._probe_epoch_update_counts(62),
+            (62, 8),
+        )
         self.assertEqual(
             ADAPT.CHECKPOINT_FORMAT,
             "semtalk_show_base_official_adapt_checkpoint_v1",
@@ -727,11 +815,11 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
         )
         self.assertEqual(
             _sha(FRESH_SCHEDULE),
-            "2bffa2b17d4fb17d219bcbb63041a67eb29f408fb4fe0f6d466e8dcaf6e705b1",
+            "6006fe341e5e5e5e1af4e0ae8ef7c67207c213b2d5cf8efb77fcd0054f39e7a6",
         )
         self.assertEqual(
             _sha(TOPOLOGY_GATE_SPEC),
-            "521ca9908f25745e35c3514dc3697fb1f551095672cac3446cc37aded3033d01",
+            "1ee9ae31e2ca735265972022c26a82ba2789f7538a128631168af4e86f7808c4",
         )
 
     def test_protocol_is_three_forward_and_vq_free(self) -> None:
@@ -1105,11 +1193,18 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             ):
                 ADAPT.validate_args(args)
 
-    def test_short_quality_requires_gate_not_topology_selection_w8_w16(
+    def test_short_quality_requires_gate_not_selection_for_accelerations(
         self,
     ) -> None:
         parser = ADAPT.build_parser()
-        for mode in (ADAPT.W8_GLOBAL512_MODE, ADAPT.W16_GLOBAL512_MODE):
+        for mode in (
+            ADAPT.W8_GLOBAL512_MODE,
+            ADAPT.W16_GLOBAL512_MODE,
+            ADAPT.W8_GLOBAL1024_MODE,
+            ADAPT.W8_GLOBAL2048_MODE,
+            ADAPT.W16_GLOBAL1024_MODE,
+            ADAPT.W16_GLOBAL1024_LR6E5_MODE,
+        ):
             with self.subTest(mode=mode):
                 specification = ADAPT.TOPOLOGY_SPECS[mode]
                 args = parser.parse_args(_base_cli())
@@ -1139,6 +1234,19 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
                     ADAPT._target_epochs(args),
                     list(ADAPT.SHORT_QUALITY_EPOCHS),
                 )
+
+    def test_throughput_probe_passes_sampler_epoch_to_every_update(self) -> None:
+        source = inspect.getsource(ADAPT._run_throughput_gate)
+        self.assertEqual(
+            source.count("epoch=batch_sampler_epoch,"),
+            2,
+            "warmup and timed throughput updates must both use the sampler epoch",
+        )
+        self.assertNotIn("precision=args.precision,\n            epoch=0,", source)
+        self.assertEqual(
+            ADAPT._probe_epoch_update_counts(62),
+            (62, 8),
+        )
 
     def test_short_quality_rejects_selection_and_non_e8_target(self) -> None:
         parser = ADAPT.build_parser()
@@ -1291,7 +1399,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             )
         )
 
-    def test_every_w1_w8_w16_topology_can_win_by_measured_eta(self) -> None:
+    def test_every_registered_topology_lr_pair_can_win_by_measured_eta(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
         for expected in modes:
             with self.subTest(expected=expected):
@@ -1339,21 +1447,67 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            receipt = ADAPT.validate_topology_selection(
-                argparse.Namespace(
-                    topology_selection_report=path,
-                    expected_topology_selection_sha256=_sha(path),
-                    expected_topology_gate_spec_sha256="b" * 64,
-                    topology_mode=ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+            receipt = _consume_topology_selection(
+                selection=selection,
+                path=path,
+                topology_mode=ADAPT.OFFICIAL_W1_REFERENCE_MODE,
+                throughput_gate=_validated_throughput_projection(
+                    selection["selected"]
                 ),
-                throughput_gate={
-                    "sha256": selection["selected"]["report_sha256"]
-                },
             )
         self.assertEqual(
             receipt["selected"]["mode"],
             ADAPT.OFFICIAL_W1_REFERENCE_MODE,
         )
+
+    def test_training_consumer_replays_cross_mode_validation_authority(
+        self,
+    ) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 1_000.0 + index for index, mode in enumerate(modes)}
+        probes, quality = _topology_selection_inputs(eta)
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        selection["quality_reports"][1]["val_inputs_receipt"][
+            "sha256"
+        ] = "0" * 64
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-cross-mode-authority-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    path=path,
+                    topology_mode=str(selection["selected"]["mode"]),
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
 
     def test_no_quality_safe_topology_under_24h_fails_closed(self) -> None:
         probes, quality = _topology_selection_inputs(
@@ -1364,7 +1518,8 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             SELECTOR.TopologySelectionError,
-            "no quality-safe finite topology meets the 24-hour",
+            "no quality-safe finite topology meets the 24-hour median and "
+            "22-hour p99",
         ):
             SELECTOR.select_topology(
                 probes,
@@ -1380,6 +1535,10 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             ADAPT.W16_GLOBAL64_MODE: 90_000.0,
             ADAPT.W8_GLOBAL512_MODE: 7_000.0,
             ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+            ADAPT.W8_GLOBAL1024_MODE: 8_500.0,
+            ADAPT.W8_GLOBAL2048_MODE: 8_600.0,
+            ADAPT.W16_GLOBAL1024_MODE: 8_400.0,
+            ADAPT.W16_GLOBAL1024_LR6E5_MODE: 8_450.0,
         }
         probes, quality = _topology_selection_inputs(eta)
         skip_modes = {
@@ -1467,6 +1626,10 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             ADAPT.W16_GLOBAL64_MODE: 90_000.0,
             ADAPT.W8_GLOBAL512_MODE: 7_000.0,
             ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+            ADAPT.W8_GLOBAL1024_MODE: 8_500.0,
+            ADAPT.W8_GLOBAL2048_MODE: 8_600.0,
+            ADAPT.W16_GLOBAL1024_MODE: 8_400.0,
+            ADAPT.W16_GLOBAL1024_LR6E5_MODE: 8_450.0,
         }
         probes, quality = _topology_selection_inputs(eta)
         skip_modes = {
@@ -1502,16 +1665,13 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            receipt = ADAPT.validate_topology_selection(
-                argparse.Namespace(
-                    topology_selection_report=path,
-                    expected_topology_selection_sha256=_sha(path),
-                    expected_topology_gate_spec_sha256="b" * 64,
-                    topology_mode=ADAPT.W8_GLOBAL512_MODE,
+            receipt = _consume_topology_selection(
+                selection=selection,
+                path=path,
+                topology_mode=ADAPT.W8_GLOBAL512_MODE,
+                throughput_gate=_validated_throughput_projection(
+                    selection["selected"]
                 ),
-                throughput_gate={
-                    "sha256": selection["selected"]["report_sha256"]
-                },
             )
         self.assertEqual(
             receipt["selected"]["mode"], ADAPT.W8_GLOBAL512_MODE
@@ -1520,8 +1680,8 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
     def test_selection_tiebreak_is_p99_then_matrix_order(self) -> None:
         modes = list(ADAPT.TOPOLOGY_SPECS)
         eta = {mode: 10_000.0 for mode in modes}
-        p99 = {mode: 10.0 for mode in modes}
-        p99[ADAPT.W16_GLOBAL64_MODE] = 1.0
+        p99 = {mode: 0.05 for mode in modes}
+        p99[ADAPT.W16_GLOBAL64_MODE] = 0.01
         probes, quality = _topology_selection_inputs(
             eta, p99_seconds=p99
         )
@@ -1536,7 +1696,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         )
 
         probes, quality = _topology_selection_inputs(
-            eta, p99_seconds={mode: 1.0 for mode in modes}
+            eta, p99_seconds={mode: 0.01 for mode in modes}
         )
         selection = SELECTOR.select_topology(
             probes,
@@ -1548,6 +1708,488 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             selection["selected"]["mode"],
             ADAPT.OFFICIAL_W1_REFERENCE_MODE,
         )
+
+    def test_p99_total_updates_is_a_hard_22_hour_gate(self) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 10_000.0 for mode in modes}
+        eta[ADAPT.W8_GLOBAL2048_MODE] = 1.0
+        eta[ADAPT.W16_GLOBAL1024_MODE] = 2.0
+        p99 = {mode: 0.01 for mode in modes}
+        g2048_updates = ADAPT.TOPOLOGY_SPECS[
+            ADAPT.W8_GLOBAL2048_MODE
+        ]["updates_per_epoch"]
+        p99[ADAPT.W8_GLOBAL2048_MODE] = (
+            SELECTOR.MAX_P99_TRAINING_SECONDS
+            / (g2048_updates * ADAPT.TOTAL_EPOCHS)
+            + 0.001
+        )
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds=p99,
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(
+            selection["selected"]["mode"],
+            ADAPT.W16_GLOBAL1024_MODE,
+        )
+
+    def test_training_consumer_replays_p99_gate_and_selected_rank(self) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        p99 = {mode: 0.01 for mode in modes}
+        rejected_mode = ADAPT.W16_GLOBAL1024_MODE
+        rejected_updates = ADAPT.TOPOLOGY_SPECS[rejected_mode][
+            "updates_per_epoch"
+        ]
+        p99[rejected_mode] = (
+            SELECTOR.MAX_P99_TRAINING_SECONDS
+            / (rejected_updates * ADAPT.TOTAL_EPOCHS)
+            + 0.5
+        )
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds=p99,
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertNotEqual(selection["selected"]["mode"], rejected_mode)
+        selection["selected"] = next(
+            probe for probe in selection["probes"] if probe["mode"] == rejected_mode
+        )
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-forged-p99-selection-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    path=path,
+                    topology_mode=rejected_mode,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
+
+    def test_training_consumer_rejects_forged_low_p99_projection(self) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        selected_mode = ADAPT.W16_GLOBAL1024_MODE
+        eta[selected_mode] = 1.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(selection["selected"]["mode"], selected_mode)
+        updates = ADAPT.TOPOLOGY_SPECS[selected_mode]["updates_per_epoch"]
+        raw_p99 = (
+            SELECTOR.MAX_P99_TRAINING_SECONDS
+            / (updates * ADAPT.TOTAL_EPOCHS)
+            + 0.5
+        )
+        raw_eta = raw_p99 * updates * ADAPT.TOTAL_EPOCHS
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-forged-low-p99-projection-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    path=path,
+                    topology_mode=selected_mode,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"],
+                        p99_seconds=raw_p99,
+                        estimated_training_seconds=raw_eta,
+                    ),
+                )
+
+    def test_training_consumer_recomputes_raw_quality_fgd(self) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        selected_mode = ADAPT.W8_GLOBAL512_MODE
+        eta = {
+            mode: 10_000.0 + index for index, mode in enumerate(modes)
+        }
+        eta[selected_mode] = 1.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        self.assertEqual(selection["selected"]["mode"], selected_mode)
+        verified_selection = copy.deepcopy(selection)
+        selected_quality = next(
+            item
+            for item in selection["quality_reports"]
+            if item["mode"] == selected_mode
+        )
+        selected_quality["candidate_fgd"]["4"] = 999.0
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-forged-quality-fgd-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    verified_selection=verified_selection,
+                    path=path,
+                    topology_mode=selected_mode,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
+
+    def test_training_consumer_rejects_extra_quality_decision_fields(
+        self,
+    ) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 1_000.0 + index for index, mode in enumerate(modes)}
+        selected_mode = ADAPT.W16_GLOBAL1024_MODE
+        eta[selected_mode] = 1.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        selection["quality_decisions"][selected_mode]["forged_extra"] = True
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-extra-quality-decision-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(
+                    selection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    path=path,
+                    topology_mode=selected_mode,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
+
+    def test_training_consumer_reloads_every_competitor_probe(self) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        fast = ADAPT.W8_GLOBAL512_MODE
+        second = ADAPT.W16_GLOBAL512_MODE
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        eta[fast] = 1.0
+        eta[second] = 2.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        verified_selection = copy.deepcopy(selection)
+        fast_probe = next(
+            item for item in selection["probes"] if item["mode"] == fast
+        )
+        fast_probe["estimated_training_seconds"] = 20_000.0
+        selection["selected"] = next(
+            item for item in selection["probes"] if item["mode"] == second
+        )
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-forged-competitor-probe-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(selection, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    verified_selection=verified_selection,
+                    path=path,
+                    topology_mode=second,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
+
+    def test_reload_opens_every_probe_report_and_skip_exactly_once(self) -> None:
+        from scripts.show_base import (
+            select_base_training_topology as canonical_selector,
+        )
+
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        eta = {mode: 1_000.0 + index for index, mode in enumerate(modes)}
+        probes, quality = _topology_selection_inputs(eta)
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        probe_by_mode = {row["mode"]: row for row in selection["probes"]}
+        quality_by_mode = {
+            row["mode"]: row for row in selection["quality_reports"]
+        }
+        with (
+            mock.patch.object(
+                canonical_selector,
+                "validate_probe",
+                side_effect=lambda mode, *_args, **_kwargs: copy.deepcopy(
+                    probe_by_mode[mode]
+                ),
+            ) as probe_validator,
+            mock.patch.object(
+                canonical_selector,
+                "validate_quality_report",
+                side_effect=lambda mode, *_args, **_kwargs: copy.deepcopy(
+                    quality_by_mode[mode]
+                ),
+            ) as quality_validator,
+            mock.patch.object(
+                canonical_selector,
+                "validate_quality_skip",
+            ) as skip_validator,
+        ):
+            reloaded = ADAPT._reload_topology_selection_artifacts(
+                selection,
+                topology_gate_spec_sha256="b" * 64,
+            )
+        self.assertIsNotNone(reloaded)
+        self.assertEqual(probe_validator.call_count, len(modes))
+        self.assertEqual(quality_validator.call_count, len(modes))
+        self.assertEqual(skip_validator.call_count, 0)
+
+        skip_mode = ADAPT.W16_GLOBAL64_MODE
+        skip_eta = dict(eta)
+        skip_eta[skip_mode] = SELECTOR.MAX_TRAINING_SECONDS + 1.0
+        skip_probes, skip_quality = _topology_selection_inputs(skip_eta)
+        skip_receipts = [
+            _over_budget_quality_skip(
+                next(row for row in skip_probes if row["mode"] == skip_mode),
+                position=modes.index(skip_mode),
+            )
+        ]
+        skip_selection = SELECTOR.select_topology(
+            skip_probes,
+            [row for row in skip_quality if row["mode"] != skip_mode],
+            quality_skips=skip_receipts,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        skip_probe_by_mode = {
+            row["mode"]: row for row in skip_selection["probes"]
+        }
+        measured_by_mode = {
+            row["mode"]: row for row in skip_selection["quality_reports"]
+        }
+        skip_by_mode = {
+            row["mode"]: row for row in skip_selection["quality_skips"]
+        }
+        with (
+            mock.patch.object(
+                canonical_selector,
+                "validate_probe",
+                side_effect=lambda mode, *_args, **_kwargs: copy.deepcopy(
+                    skip_probe_by_mode[mode]
+                ),
+            ) as probe_validator,
+            mock.patch.object(
+                canonical_selector,
+                "validate_quality_report",
+                side_effect=lambda mode, *_args, **_kwargs: copy.deepcopy(
+                    measured_by_mode[mode]
+                ),
+            ) as quality_validator,
+            mock.patch.object(
+                canonical_selector,
+                "validate_quality_skip",
+                side_effect=lambda mode, *_args, **_kwargs: copy.deepcopy(
+                    skip_by_mode[mode]
+                ),
+            ) as skip_validator,
+        ):
+            skip_reloaded = ADAPT._reload_topology_selection_artifacts(
+                skip_selection,
+                topology_gate_spec_sha256="b" * 64,
+            )
+        self.assertIsNotNone(skip_reloaded)
+        self.assertEqual(probe_validator.call_count, len(modes))
+        self.assertEqual(quality_validator.call_count, len(modes) - 1)
+        self.assertEqual(skip_validator.call_count, 1)
+
+    def test_training_consumer_reloads_every_competitor_quality_report(
+        self,
+    ) -> None:
+        modes = list(ADAPT.TOPOLOGY_SPECS)
+        fast = ADAPT.W8_GLOBAL512_MODE
+        second = ADAPT.W16_GLOBAL512_MODE
+        eta = {mode: 10_000.0 + index for index, mode in enumerate(modes)}
+        eta[fast] = 1.0
+        eta[second] = 2.0
+        probes, quality = _topology_selection_inputs(
+            eta,
+            p99_seconds={mode: 0.01 for mode in modes},
+        )
+        selection = SELECTOR.select_topology(
+            probes,
+            quality,
+            gate_spec_sha256="b" * 64,
+            quality_gate_spec_sha256="f" * 64,
+        )
+        verified_selection = copy.deepcopy(selection)
+        fast_quality = next(
+            item
+            for item in selection["quality_reports"]
+            if item["mode"] == fast
+        )
+        fast_quality["candidate_fgd"]["4"] = 999.0
+        fast_decision = selection["quality_decisions"][fast]
+        epoch_four = next(
+            item
+            for item in fast_decision["comparisons"]
+            if item["epoch"] == 4
+        )
+        epoch_four["candidate_fgd"] = 999.0
+        epoch_four["pass"] = False
+        fast_decision["all_trajectory_epochs_pass"] = False
+        selection["selected"] = next(
+            item for item in selection["probes"] if item["mode"] == second
+        )
+        selection["receipt_sha256"] = ADAPT.canonical_json_sha256(
+            {
+                key: value
+                for key, value in selection.items()
+                if key != "receipt_sha256"
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="semtalk-forged-competitor-quality-", dir="/private/tmp"
+        ) as raw:
+            path = Path(raw) / "selection.json"
+            path.write_text(
+                json.dumps(selection, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ADAPT.AdaptationContractError,
+                "missing, forged, or stale",
+            ):
+                _consume_topology_selection(
+                    selection=selection,
+                    verified_selection=verified_selection,
+                    path=path,
+                    topology_mode=second,
+                    throughput_gate=_validated_throughput_projection(
+                        selection["selected"]
+                    ),
+                )
 
     def test_quality_margin_formula_is_max_not_sum(self) -> None:
         # At low FGD the absolute margin dominates; at high FGD the relative
@@ -1564,6 +2206,10 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.W16_GLOBAL64_MODE: 200_002.0,
                 ADAPT.W8_GLOBAL512_MODE: 1_000.0,
                 ADAPT.W16_GLOBAL512_MODE: 1_001.0,
+                ADAPT.W8_GLOBAL1024_MODE: 1_002.0,
+                ADAPT.W8_GLOBAL2048_MODE: 1_003.0,
+                ADAPT.W16_GLOBAL1024_MODE: 1_004.0,
+                ADAPT.W16_GLOBAL1024_LR6E5_MODE: 1_005.0,
             },
             failing_quality_modes={ADAPT.W8_GLOBAL512_MODE},
         )
@@ -1590,6 +2236,10 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.W16_GLOBAL64_MODE: 2_000.0,
                 ADAPT.W8_GLOBAL512_MODE: 90_000.0,
                 ADAPT.W16_GLOBAL512_MODE: 90_001.0,
+                ADAPT.W8_GLOBAL1024_MODE: 90_002.0,
+                ADAPT.W8_GLOBAL2048_MODE: 90_003.0,
+                ADAPT.W16_GLOBAL1024_MODE: 90_004.0,
+                ADAPT.W16_GLOBAL1024_LR6E5_MODE: 90_005.0,
             },
             failing_quality_modes={
                 ADAPT.W8_GLOBAL64_MODE,
@@ -1622,6 +2272,10 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 ADAPT.W16_GLOBAL64_MODE: 2_000.0,
                 ADAPT.W8_GLOBAL512_MODE: 3_000.0,
                 ADAPT.W16_GLOBAL512_MODE: 4_000.0,
+                ADAPT.W8_GLOBAL1024_MODE: 5_000.0,
+                ADAPT.W8_GLOBAL2048_MODE: 6_000.0,
+                ADAPT.W16_GLOBAL1024_MODE: 7_000.0,
+                ADAPT.W16_GLOBAL1024_LR6E5_MODE: 8_000.0,
             }
         )
         selection = SELECTOR.select_topology(
@@ -1642,7 +2296,25 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         self.assertEqual(
             receipt["payload"]["trajectory_epochs"], [1, 2, 4, 8]
         )
-        self.assertTrue(receipt["payload"]["raw_prediction_replay_required"])
+        self.assertEqual(
+            receipt["payload"]["format"],
+            "semtalk_show_base_topology_quality_gate_spec_v2",
+        )
+        self.assertNotIn(
+            "raw_prediction_replay_required",
+            receipt["payload"],
+        )
+        self.assertTrue(
+            receipt["payload"]["diffsheg_validation_measurement_required"]
+        )
+        self.assertEqual(
+            receipt["payload"]["validation_protocol"],
+            "diffsheg_show_validation_fgd_v1",
+        )
+        self.assertEqual(
+            receipt["payload"]["primary_metric"],
+            "validation.diffsheg.metrics.fgd",
+        )
         self.assertEqual(
             receipt["payload"]["candidate_quality_gate"]["modes"],
             list(ADAPT.TOPOLOGY_SPECS),
@@ -1652,6 +2324,17 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
                 "maximum_estimated_training_seconds"
             ],
             86_400,
+        )
+        self.assertEqual(
+            receipt["payload"]["measured_eta_constraint"][
+                "maximum_p99_training_seconds"
+            ],
+            79_200,
+        )
+        self.assertTrue(
+            receipt["payload"]["measured_eta_constraint"][
+                "p99_total_updates_required"
+            ]
         )
         skip_policy = receipt["payload"]["over_eta_budget_quality_skip"]
         self.assertTrue(skip_policy["w1_quality_report_required"])
@@ -2351,6 +3034,72 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             "does not reproduce",
         ):
             ADAPT._require_matching_trajectory_probe(expected, changed)
+
+    def test_probe_eta_must_be_derived_from_measured_median(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gate_frozen = _frozen_gate_fixture(
+                receipt_sha256="a" * 64,
+                topology_receipt_sha256="t" * 64,
+                trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
+                run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
+                target_epochs=[],
+            )
+            training_frozen = {
+                **gate_frozen,
+                "receipt_sha256": "b" * 64,
+                "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
+                "target_epochs": list(ADAPT.SHORT_QUALITY_EPOCHS),
+            }
+            report = _gate_report(
+                frozen_sha256="a" * 64,
+                frozen_compatibility_sha256=(
+                    ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
+                ),
+                topology_independent_input_sha256=(
+                    ADAPT._topology_independent_gate_semantic_sha256(
+                        gate_frozen
+                    )
+                ),
+                topology_receipt_sha256="t" * 64,
+                trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
+                trajectory_probe=None,
+            )
+            report["estimated_training_seconds"] = 1.0
+            report["receipt_sha256"] = ADAPT.canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key != "receipt_sha256"
+                }
+            )
+            path = root / "forged-eta-gate.json"
+            path.write_text(
+                json.dumps(report, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SELECTOR.TopologySelectionError):
+                SELECTOR.validate_probe(
+                    ADAPT.W8_GLOBAL512_MODE,
+                    path,
+                    _sha(path),
+                    gate_spec_sha256=_sha(TOPOLOGY_GATE_SPEC),
+                )
+            args = argparse.Namespace(
+                throughput_gate_report=str(path),
+                expected_throughput_gate_sha256=_sha(path),
+                precision="bf16",
+                learning_rate=3e-5,
+                topology_mode=ADAPT.W8_GLOBAL512_MODE,
+                expected_topology_gate_spec_sha256=_sha(
+                    TOPOLOGY_GATE_SPEC
+                ),
+            )
+            with self.assertRaises(ADAPT.AdaptationContractError):
+                ADAPT.validate_throughput_gate(
+                    args,
+                    frozen_receipt=training_frozen,
+                )
 
     def test_rank_local_buffers_preserve_parameter_and_adam_consensus(self) -> None:
         probe = _probe()
