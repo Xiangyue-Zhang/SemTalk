@@ -846,7 +846,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         len(short_payload["candidate_ready_receipts"]),
-                        4,
+                        len(selector.QUALITY_EPOCHS),
                     )
                     validated = selector.validate_quality_report(
                         mode,
@@ -857,14 +857,18 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         validated["candidate_fgd"],
-                        {"1": 1.01, "2": 1.02, "4": 1.04, "8": 1.08},
+                        {
+                            str(epoch): 1.0 + epoch / 100.0
+                            for epoch in selector.QUALITY_EPOCHS
+                        },
                     )
                     self.assertEqual(
                         [
                             row["provenance"]["format"]
                             for row in validated["candidates"]
                         ],
-                        [selector.QUALITY_PROVENANCE_FORMAT] * 4,
+                        [selector.QUALITY_PROVENANCE_FORMAT]
+                        * len(selector.QUALITY_EPOCHS),
                     )
                     report_text = output.read_text(encoding="utf-8")
                     self.assertNotIn("released2", report_text.lower())
@@ -933,7 +937,9 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
                         )
                     )
 
-    def test_provisional_epoch_set_is_exact_e1_e2_e4_e8(self) -> None:
+    def test_provisional_epoch_set_is_exact_e1_e2_e4_e8_e16_e32(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = QualityFixture(Path(directory))
             mode = next(iter(contract.TOPOLOGY_SPECS))
@@ -1015,7 +1021,7 @@ class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
-                    "e1/e2/e4/e8 exactly in order",
+                    "e1/e2/e4/e8/e16/e32 exactly in order",
                 ):
                     producer.main(argv)
 

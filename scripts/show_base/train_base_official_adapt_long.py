@@ -27,7 +27,8 @@ The executable modes are:
 ``short_quality``
     Require the matching throughput receipt, but deliberately do not consume
     a topology-selection receipt.  Restart from the official Base checkpoint
-    and publish only the provisional e1/e2/e4/e8 validation candidates needed
+    and publish only the provisional e1/e2/e4/e8/e16/e32 validation candidates
+    needed
     to decide that topology.  These artifacts use a separate namespace and
     cannot be consumed as a final 400-epoch training bundle.
 """
@@ -166,8 +167,8 @@ CANDIDATE_EPOCHS = (
     1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80, 100, 120, 140, 160,
     180, 200, 240, 280, 320, 360, 400,
 )
-SHORT_QUALITY_TOTAL_EPOCHS = 8
-SHORT_QUALITY_EPOCHS = (1, 2, 4, 8)
+SHORT_QUALITY_TOTAL_EPOCHS = 32
+SHORT_QUALITY_EPOCHS = (1, 2, 4, 8, 16, 32)
 MAX_ABSOLUTE_FGD_REGRESSION = 0.01
 MAX_RELATIVE_FGD_REGRESSION = 0.02
 SHORT_QUALITY_MODE = "short_quality"

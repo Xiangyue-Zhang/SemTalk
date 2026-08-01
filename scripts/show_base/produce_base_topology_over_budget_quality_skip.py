@@ -6,7 +6,7 @@ usable only for a non-W1 topology whose validated 400-epoch ETA is strictly
 greater than 24 hours.  It binds the skip to the frozen source authority, both
 gate specifications, the exact probe artifact, and the shared five-stage SHOW
 input identity.  W1 and every within-budget topology still require the formal
-e1/e2/e4/e8 quality trajectory.
+e1/e2/e4/e8/e16/e32 quality trajectory.
 """
 
 from __future__ import annotations

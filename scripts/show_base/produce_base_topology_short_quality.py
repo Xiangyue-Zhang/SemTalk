@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Seal one formal SemTalk Base short-trajectory SHOW quality report.
 
-This CPU-only producer accepts the immutable e1/e2/e4/e8 checkpoints and
+This CPU-only producer accepts immutable e1/e2/e4/e8/e16/e32 checkpoints and
 their already-computed full-SHOW validation artifacts.  It freshly reuses the
 formal long-run validators for checkpoint -> val inference lineage -> pinned
 DiffSHEG FGD, then publishes one immutable report consumable by
@@ -100,7 +100,7 @@ def _epoch_artifacts(
         )
     if epochs != list(selector.QUALITY_EPOCHS):
         raise selector.TopologySelectionError(
-            f"{label} must name e1/e2/e4/e8 exactly in order"
+            f"{label} must name e1/e2/e4/e8/e16/e32 exactly in order"
         )
     return normalized
 

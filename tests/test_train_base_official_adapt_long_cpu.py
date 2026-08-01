@@ -1248,7 +1248,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             (62, 8),
         )
 
-    def test_short_quality_rejects_selection_and_non_e8_target(self) -> None:
+    def test_short_quality_rejects_selection_and_non_e32_target(self) -> None:
         parser = ADAPT.build_parser()
         args = parser.parse_args(_base_cli())
         args.mode = ADAPT.SHORT_QUALITY_MODE
@@ -1274,7 +1274,7 @@ class OfficialBaseAdaptStaticContracts(unittest.TestCase):
             args.epochs = ADAPT.TOTAL_EPOCHS
             with self.assertRaisesRegex(
                 ADAPT.AdaptationContractError,
-                "exactly 8 epochs",
+                "exactly 32 epochs",
             ):
                 ADAPT.validate_args(args)
 
@@ -1651,7 +1651,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
         measured = quality[1:]
         with self.assertRaisesRegex(
             SELECTOR.TopologySelectionError,
-            "W1 full e1/e2/e4/e8 quality reference is mandatory",
+            "W1 full e1/e2/e4/e8/e16/e32 quality reference is mandatory",
         ):
             SELECTOR.select_topology(
                 probes,
@@ -2303,7 +2303,7 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             self.assertFalse(decision["all_trajectory_epochs_pass"])
             self.assertEqual(
                 [row["epoch"] for row in decision["comparisons"]],
-                [1, 2, 4, 8],
+                list(SELECTOR.QUALITY_EPOCHS),
             )
 
     def test_nonfinite_eta_is_never_ranked(self) -> None:
@@ -2336,7 +2336,8 @@ class OfficialBaseTopologyGateContracts(unittest.TestCase):
             _sha(TOPOLOGY_QUALITY_GATE_SPEC),
         )
         self.assertEqual(
-            receipt["payload"]["trajectory_epochs"], [1, 2, 4, 8]
+            receipt["payload"]["trajectory_epochs"],
+            list(SELECTOR.QUALITY_EPOCHS),
         )
         self.assertEqual(
             receipt["payload"]["format"],

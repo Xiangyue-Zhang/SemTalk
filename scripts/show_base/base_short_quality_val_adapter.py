@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run canonical SHOW validation for provisional Base e1/e2/e4/e8.
+"""Run canonical SHOW validation for provisional Base e1/e2/e4/e8/e16/e32.
 
 This adapter is deliberately separate from the formal 22-candidate/e400
 producer.  It validates the trainer-owned short-quality publications and then
@@ -98,7 +98,8 @@ def _epoch(value: str) -> int:
     except ValueError as error:
         raise argparse.ArgumentTypeError("epoch must be an integer") from error
     if parsed not in QUALITY_EPOCHS:
-        raise argparse.ArgumentTypeError("epoch must be one of 1,2,4,8")
+        choices = ",".join(str(epoch) for epoch in QUALITY_EPOCHS)
+        raise argparse.ArgumentTypeError(f"epoch must be one of {choices}")
     return parsed
 
 
@@ -251,7 +252,7 @@ def _normalize_ready(values: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
         )
     if tuple(epochs) != QUALITY_EPOCHS:
         raise ShortQualityValError(
-            "candidate-ready epochs must be e1/e2/e4/e8 in order"
+            "candidate-ready epochs must be e1/e2/e4/e8/e16/e32 in order"
         )
     return result
 

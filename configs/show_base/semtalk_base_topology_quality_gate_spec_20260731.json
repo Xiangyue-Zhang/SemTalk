@@ -7,7 +7,9 @@
     1,
     2,
     4,
-    8
+    8,
+    16,
+    32
   ],
   "primary_metric": "validation.diffsheg.metrics.fgd",
   "validation_protocol": "diffsheg_show_validation_fgd_v1",

@@ -38,7 +38,7 @@ SHORT_TRAJECTORY_FORMAT = (
 QUALITY_PROVENANCE_FORMAT = (
     "semtalk_show_base_topology_quality_provenance_v2"
 )
-QUALITY_EPOCHS = (1, 2, 4, 8)
+QUALITY_EPOCHS = (1, 2, 4, 8, 16, 32)
 EXPECTED_VAL_CLIPS = formal_validation.EXPECTED_VAL_CLIPS
 PRIMARY_METRIC_PATH = "validation.diffsheg.metrics.fgd"
 VALIDATION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
@@ -333,7 +333,7 @@ def validate_candidate_ready_receipts(
     str,
     dict[int, dict[str, Any]],
 ]:
-    """Freshly replay the trainer-owned e1/e2/e4/e8 publications."""
+    """Freshly replay trainer-owned e1/e2/e4/e8/e16/e32 publications."""
 
     if len(values) != len(QUALITY_EPOCHS):
         raise TopologySelectionError(
@@ -789,7 +789,7 @@ def validate_short_quality_training_bundle(
     str,
     dict[int, dict[str, Any]],
 ]:
-    """Validate one completed provisional e1/e2/e4/e8 trainer bundle."""
+    """Validate a completed provisional e1/e2/e4/e8/e16/e32 bundle."""
 
     artifact, status = _artifact(
         value,
@@ -1008,11 +1008,11 @@ def validate_short_quality_training_bundle(
             )
         ):
             raise TopologySelectionError(
-                f"{mode} short-quality metrics are not exact e1..e8"
+                f"{mode} short-quality metrics are not exact e1..e32"
             )
     if len(rows) != contract.SHORT_QUALITY_TOTAL_EPOCHS:
         raise TopologySelectionError(
-            f"{mode} short-quality metrics are not exact e1..e8"
+            f"{mode} short-quality metrics are not exact e1..e32"
         )
     return artifact, ready, semantic_sha, checkpoints
 
@@ -1874,7 +1874,8 @@ def build_quality_skip_receipt(
     estimated = float(probe["estimated_training_seconds"])
     if estimated <= MAX_TRAINING_SECONDS:
         raise TopologySelectionError(
-            f"{mode} ETA is within 24 hours and requires full e1/e2/e4/e8 "
+            f"{mode} ETA is within 24 hours and requires full "
+            "e1/e2/e4/e8/e16/e32 "
             "quality"
         )
     receipt: dict[str, Any] = {
@@ -2063,7 +2064,7 @@ def select_topology(
         )
     if contract.OFFICIAL_W1_REFERENCE_MODE not in report_modes:
         raise TopologySelectionError(
-            "W1 full e1/e2/e4/e8 quality reference is mandatory"
+            "W1 full e1/e2/e4/e8/e16/e32 quality reference is mandatory"
         )
     probe_by_mode = {probe["mode"]: probe for probe in eligible}
     skip_by_mode = {skip["mode"]: skip for skip in quality_skips}

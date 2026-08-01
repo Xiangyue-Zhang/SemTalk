@@ -32,7 +32,7 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             "cuda:0",
         ]
         self.assertEqual(ADAPTER.parse_args(common).epoch, 1)
-        for epoch in ("2", "4", "8"):
+        for epoch in ("2", "4", "8", "16", "32"):
             argv = list(common)
             argv[argv.index("1")] = epoch
             self.assertEqual(ADAPTER.parse_args(argv).epoch, int(epoch))
@@ -55,7 +55,7 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             for epoch in ADAPTER.QUALITY_EPOCHS:
                 values.append((str(epoch), f"/frozen/val/e{epoch}.json", "a" * 64))
             result = ADAPTER._normalize_ready(values)
-            self.assertEqual(len(result), 4)
+            self.assertEqual(len(result), len(ADAPTER.QUALITY_EPOCHS))
             with self.assertRaises(ADAPTER.ShortQualityValError):
                 ADAPTER._normalize_ready(list(reversed(values)))
             bad = list(values)
@@ -125,7 +125,7 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             "status": "complete",
             "split": "val",
             "test_visible": False,
-            "candidate_epochs": [1, 2, 4, 8],
+            "candidate_epochs": list(ADAPTER.QUALITY_EPOCHS),
             "candidate_bundle": {},
             "val_inputs_receipt": {},
             "pipeline_receipt": {},
@@ -154,8 +154,10 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
             "status": "complete",
             "split": "val",
             "test_visible": False,
-            "candidate_epochs": [1, 2, 4, 8],
-            "candidate_bundle": {"candidates": {str(e): {} for e in (1, 2, 4, 8)}},
+            "candidate_epochs": list(ADAPTER.QUALITY_EPOCHS),
+            "candidate_bundle": {
+                "candidates": {str(e): {} for e in ADAPTER.QUALITY_EPOCHS}
+            },
             "val_inputs_receipt": {
                 "path": "/frozen/val/inputs.json",
                 "sha256": "1" * 64,
@@ -179,7 +181,8 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
                 },
                 "short_quality_status": {"path": "/frozen/val/status.json"},
                 "candidate_ready_receipts": [
-                    {"path": f"/frozen/val/e{e}.json"} for e in (1, 2, 4, 8)
+                    {"path": f"/frozen/val/e{e}.json"}
+                    for e in ADAPTER.QUALITY_EPOCHS
                 ],
             },
             "adapter_source": {},
@@ -205,7 +208,9 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
         self.assertEqual(artifact["sha256"], "a" * 64)
         kwargs = fresh.call_args.kwargs
         self.assertEqual(kwargs["mode"], "w8_b8")
-        self.assertEqual(len(kwargs["ready_artifacts"]), 4)
+        self.assertEqual(
+            len(kwargs["ready_artifacts"]), len(ADAPTER.QUALITY_EPOCHS)
+        )
         self.assertEqual(kwargs["topology_gate_sha"], "3" * 64)
         self.assertEqual(kwargs["quality_gate_sha"], "4" * 64)
 
@@ -220,7 +225,7 @@ class BaseShortQualityValAdapterCpuTest(unittest.TestCase):
         self.assertIn("semtalk_require_exact_guarded_runner_all_gpus", source)
         self.assertIn("for shard_id in 0 1 2 3 4 5 6 7", source)
         self.assertIn("--num-shards 8", source)
-        self.assertIn("for epoch in 1 2 4 8", source)
+        self.assertIn("for epoch in 1 2 4 8 16 32", source)
         self.assertIn("--split val", source)
         for required in (
             "evaluate_diffsheg_val_fgd.py",

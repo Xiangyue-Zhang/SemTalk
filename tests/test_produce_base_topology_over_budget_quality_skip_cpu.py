@@ -200,7 +200,8 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
                 probe = _write_probe(root / "probe.json", mode, eta)
                 with self.assertRaisesRegex(
                     selector.TopologySelectionError,
-                    "within 24 hours and requires full e1/e2/e4/e8",
+                    "within 24 hours and requires full "
+                    "e1/e2/e4/e8/e16/e32",
                 ):
                     producer.main(_argv(mode, probe, root / "skip.json"))
 

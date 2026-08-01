@@ -6,7 +6,7 @@ export PYTHONDONTWRITEBYTECODE=1
 #   /tmp/globaldiff_guarded_runner.py --gpus 0,1,2,3,4,5,6,7 -- ...
 #
 # The preflight is produced by base_short_quality_val_adapter.py and contains
-# exactly e1/e2/e4/e8.  Each candidate uses eight exact modulo shards.  The
+# exactly e1/e2/e4/e8/e16/e32.  Each candidate uses eight exact modulo shards.
 # launcher publishes the formal inference lineage and pinned DiffSHEG SHOW
 # validation FGD report; it never accepts a test path.
 
@@ -253,7 +253,7 @@ launch_registered() {
     LAST_CHILD_PID=$pid
 }
 
-for epoch in 1 2 4 8; do
+for epoch in 1 2 4 8 16 32; do
     candidate_root="$run_root/candidates/e$epoch"
     mkdir "$candidate_root"
     shard_pids=()
@@ -316,7 +316,7 @@ import sys
 root = Path(sys.argv[1])
 preflight = Path(sys.argv[2])
 rows = []
-for epoch in (1, 2, 4, 8):
+for epoch in (1, 2, 4, 8, 16, 32):
     candidate = root / "candidates" / f"e{epoch}"
     artifacts = {}
     for name, relative in (
@@ -335,7 +335,7 @@ body = {
     "status": "complete",
     "split": "val",
     "test_visible": False,
-    "candidate_epochs": [1, 2, 4, 8],
+    "candidate_epochs": [1, 2, 4, 8, 16, 32],
     "preflight": {"path": str(preflight), "sha256": sys.argv[3]},
     "candidates": rows,
 }
