@@ -13,9 +13,10 @@ Only after the producer publishes the e400 reconciliation receipt may the
 candidate bundle and call the audited 22-way selector.  No command accepts a
 test split, a test path, or a test result.
 
-The GPU-facing ``shard`` and ``finalize`` commands dynamically import the
-unchanged inference engine from the clean detached 4066f20 source root bound
-by the work authority.  The bridge itself contains no model implementation.
+The immutable pipeline evidence remains bound to the clean detached 4066f20
+source.  GPU-facing commands and DiffSHEG report validation dynamically import
+only the clean detached 70a70f4 provenance-fix successor.  The work authority
+keeps these roles separate; the bridge itself contains no model implementation.
 """
 
 from __future__ import annotations
@@ -42,14 +43,45 @@ import uuid
 sys.dont_write_bytecode = True
 
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
-VALIDATION_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
-VALIDATION_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
-WORK_FORMAT = "semtalk_show_base_live_val_candidate_work_authority_v1"
-RECONCILIATION_FORMAT = "semtalk_show_base_live_val_reconciliation_v1"
-PREFLIGHT_FORMAT = "semtalk_show_base_live_val_execution_preflight_v1"
-CLAIM_FORMAT = "semtalk_show_base_live_val_consumer_claim_v1"
-MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v1"
-SELECTION_FORMAT = "semtalk_show_base_live_val_22way_selection_v1"
+VALIDATION_EVIDENCE_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
+VALIDATION_EVIDENCE_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
+RUNTIME_VALIDATION_SOURCE_COMMIT = "70a70f452bdf743e317b583a7770980f0ce744c3"
+RUNTIME_VALIDATION_SOURCE_TREE = "bdf7680f56f9f53c92e7ab0bf6c6a84ef4f83d69"
+VALIDATION_EVIDENCE_CONTRACT_SHA256 = (
+    "3983eb7adf2f8cbfcf738fca8cc1cf8f3b34acab274bb5dfd2e23964550f8daa"
+)
+VALIDATION_EVIDENCE_SELECTOR_SHA256 = (
+    "1b76579d54efc99ac0d0d63f3d1a68ff671216e693ef9ada4714c9fcda004121"
+)
+RUNTIME_VALIDATION_CONTRACT_SHA256 = (
+    "0168e7f9ab2b9a122656ed98c36dc36777f577816ef08b0186ffc892813d2c70"
+)
+RUNTIME_VALIDATION_SELECTOR_SHA256 = (
+    "1857460c188096fcd4b24a9f8f5a0b0390a80eacd20744a46098195ac0f39ddf"
+)
+RUNTIME_VALIDATION_INFERENCE_SHA256 = (
+    "ec3de79ce1e45ff5385db40797bbcfa0dc91ab3e61d265e8f975180515190b56"
+)
+RUNTIME_VALIDATION_MEASUREMENT_SHA256 = (
+    "e985056c889c9803212a236597066877726826badfcd1fa91f329e5b00e56550"
+)
+RUNTIME_VALIDATION_LONG_SELECTOR_SHA256 = (
+    "d813864a33a5ff2109096453f956329a96480dd11f26c8a9144228df34d67269"
+)
+EXPECTED_DIFFSHEG_FGD_PROVENANCE = {
+    "filename": "gesture.pth.tar",
+    "sha256": "5eaf9b882a5ccd5f6eb4385aaadf3d28f3ee4382360ecb13c12f4904b3c3216e",
+    "input_dim": 129,
+    "latent_dim": 300,
+    "state_container": "state_dict",
+    "load_mode": "full_half_embedding_net",
+}
+WORK_FORMAT = "semtalk_show_base_live_val_candidate_work_authority_v2"
+RECONCILIATION_FORMAT = "semtalk_show_base_live_val_reconciliation_v2"
+PREFLIGHT_FORMAT = "semtalk_show_base_live_val_execution_preflight_v2"
+CLAIM_FORMAT = "semtalk_show_base_live_val_consumer_claim_v2"
+MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v2"
+SELECTION_FORMAT = "semtalk_show_base_live_val_22way_selection_v2"
 
 CANDIDATE_EPOCHS = (
     1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80,
@@ -70,7 +102,9 @@ WORK_KEYS = frozenset(
         "producer_ready_receipt", "producer_manifest_snapshot",
         "producer_manifest_entry", "candidate_checkpoint", "frozen_inputs",
         "protocol", "schedule", "trajectory_contract", "throughput_gate",
-        "producer_source", "validation_source", "selected_topology",
+        "producer_source", "validation_evidence_source",
+        "runtime_validation_source", "runtime_validation_proof",
+        "selected_topology",
         "selected_prerequisite_sha256", "val_inputs_receipt", "coverage",
         "pipeline_receipt", "pipeline_source", "inference_entrypoint",
         "execution_contract", "published_unix", "receipt_payload_sha256",
@@ -81,7 +115,8 @@ RECONCILIATION_KEYS = frozenset(
         "format", "status", "split", "test_visible", "selection_eligible",
         "candidate_epochs", "all_exact", "producer_manifest",
         "producer_status", "frozen_inputs", "producer_source",
-        "validation_source", "selected_topology", "schedule",
+        "validation_evidence_source", "runtime_validation_source",
+        "runtime_validation_proof", "selected_topology", "schedule",
         "trajectory_contract", "val_inputs_receipt", "pipeline_receipt",
         "pipeline_source", "work_authorities", "test_evaluations_observed",
         "completed_unix", "receipt_payload_sha256",
@@ -490,11 +525,17 @@ def _git(root: Path, *arguments: str, allow_failure: bool = False) -> tuple[int,
     return process.returncode, process.stdout.strip()
 
 
-def _validate_source(value: Any) -> Path:
-    source = _exact_keys(value, SOURCE_KEYS, "validation source")
-    root = _canonical_path(source["source_root"], "validation source root")
+def _validate_source(
+    value: Any,
+    *,
+    expected_commit: str,
+    expected_tree: str,
+    role: str,
+) -> Path:
+    source = _exact_keys(value, SOURCE_KEYS, role)
+    root = _canonical_path(source["source_root"], f"{role} root")
     if not root.is_dir():
-        raise LiveConsumerError("validation source root is not a directory")
+        raise LiveConsumerError(f"{role} root is not a directory")
     remotes = _git(root, "remote")[1].splitlines()
     origin = _git(root, "remote", "get-url", "origin")[1]
     push = _git(root, "remote", "get-url", "--push", "origin")[1]
@@ -506,8 +547,8 @@ def _validate_source(value: Any) -> Path:
     expected = {
         "origin": EXPECTED_ORIGIN,
         "source_root": str(root),
-        "commit": VALIDATION_SOURCE_COMMIT,
-        "tree": VALIDATION_SOURCE_TREE,
+        "commit": expected_commit,
+        "tree": expected_tree,
         "clean": True,
         "detached": True,
         "local_branches_at_commit": [],
@@ -517,17 +558,110 @@ def _validate_source(value: Any) -> Path:
         or remotes != ["origin"]
         or origin != EXPECTED_ORIGIN
         or push != EXPECTED_ORIGIN
-        or commit != VALIDATION_SOURCE_COMMIT
-        or tree != VALIDATION_SOURCE_TREE
+        or commit != expected_commit
+        or tree != expected_tree
         or status
         or symbolic_rc == 0
         or symbolic
         or heads
     ):
         raise LiveConsumerError(
-            "validation source must be exact clean detached branchless SemTalk 4066f20"
+            f"{role} must be the exact clean detached branchless SemTalk source"
         )
     return root
+
+
+def _validate_evidence_source(value: Any) -> Path:
+    return _validate_source(
+        value,
+        expected_commit=VALIDATION_EVIDENCE_SOURCE_COMMIT,
+        expected_tree=VALIDATION_EVIDENCE_SOURCE_TREE,
+        role="validation evidence source",
+    )
+
+
+def _validate_runtime_source(value: Any) -> Path:
+    return _validate_source(
+        value,
+        expected_commit=RUNTIME_VALIDATION_SOURCE_COMMIT,
+        expected_tree=RUNTIME_VALIDATION_SOURCE_TREE,
+        role="runtime validation source",
+    )
+
+
+def _expected_runtime_validation_proof() -> dict[str, Any]:
+    unchanged = {
+        "scripts/show_base/run_base_val_inference.py": (
+            RUNTIME_VALIDATION_INFERENCE_SHA256,
+            RUNTIME_VALIDATION_INFERENCE_SHA256,
+        ),
+        "scripts/show_base/produce_base_val_measurement.py": (
+            RUNTIME_VALIDATION_MEASUREMENT_SHA256,
+            RUNTIME_VALIDATION_MEASUREMENT_SHA256,
+        ),
+        "scripts/show_base/select_base_official_adapt_long.py": (
+            RUNTIME_VALIDATION_LONG_SELECTOR_SHA256,
+            RUNTIME_VALIDATION_LONG_SELECTOR_SHA256,
+        ),
+        "scripts/show_base/base_long_val_contract.py": (
+            VALIDATION_EVIDENCE_CONTRACT_SHA256,
+            RUNTIME_VALIDATION_CONTRACT_SHA256,
+        ),
+        "scripts/show_base/select_base_official_adapt.py": (
+            VALIDATION_EVIDENCE_SELECTOR_SHA256,
+            RUNTIME_VALIDATION_SELECTOR_SHA256,
+        ),
+    }
+    return {
+        "format": "semtalk_show_base_runtime_validation_successor_proof_v1",
+        "evidence_source": {
+            "commit": VALIDATION_EVIDENCE_SOURCE_COMMIT,
+            "tree": VALIDATION_EVIDENCE_SOURCE_TREE,
+        },
+        "runtime_source": {
+            "commit": RUNTIME_VALIDATION_SOURCE_COMMIT,
+            "tree": RUNTIME_VALIDATION_SOURCE_TREE,
+        },
+        "ancestry_verified": True,
+        "file_projection": {
+            relative: {
+                "evidence_sha256": evidence_sha,
+                "runtime_sha256": runtime_sha,
+            }
+            for relative, (evidence_sha, runtime_sha) in unchanged.items()
+        },
+    }
+
+
+def _validate_runtime_validation_roles(authority: Mapping[str, Any]) -> tuple[Path, Path]:
+    evidence_root = _validate_evidence_source(
+        authority["validation_evidence_source"]
+    )
+    runtime_root = _validate_runtime_source(
+        authority["runtime_validation_source"]
+    )
+    if evidence_root == runtime_root:
+        raise LiveConsumerError(
+            "validation evidence and runtime source roots must be distinct"
+        )
+    if not _strict_equal(
+        authority["runtime_validation_proof"],
+        _expected_runtime_validation_proof(),
+    ):
+        raise LiveConsumerError("runtime validation successor proof changed")
+    ancestry_rc, _ancestry_output = _git(
+        runtime_root,
+        "merge-base",
+        "--is-ancestor",
+        VALIDATION_EVIDENCE_SOURCE_COMMIT,
+        RUNTIME_VALIDATION_SOURCE_COMMIT,
+        allow_failure=True,
+    )
+    if ancestry_rc != 0:
+        raise LiveConsumerError(
+            "runtime validation no longer descends from evidence source"
+        )
+    return evidence_root, runtime_root
 
 
 def _validate_execution_contract(value: Any, epoch: int) -> dict[str, Any]:
@@ -591,17 +725,38 @@ def _load_validation_modules(source_root: Path) -> dict[str, ModuleType]:
             ),
         }
         _project_modules_are_from(source_root)
-        _validate_source(
+        _validate_runtime_source(
             {
                 "origin": EXPECTED_ORIGIN,
                 "source_root": str(source_root),
-                "commit": VALIDATION_SOURCE_COMMIT,
-                "tree": VALIDATION_SOURCE_TREE,
+                "commit": RUNTIME_VALIDATION_SOURCE_COMMIT,
+                "tree": RUNTIME_VALIDATION_SOURCE_TREE,
                 "clean": True,
                 "detached": True,
                 "local_branches_at_commit": [],
             }
         )
+        contract_path = source_root / "scripts/show_base/base_long_val_contract.py"
+        selector_path = source_root / "scripts/show_base/select_base_official_adapt.py"
+        if (
+            _safe_file(contract_path, "runtime validation contract")[2]
+            != RUNTIME_VALIDATION_CONTRACT_SHA256
+            or _safe_file(selector_path, "runtime validation selector")[2]
+            != RUNTIME_VALIDATION_SELECTOR_SHA256
+        ):
+            raise LiveConsumerError("runtime validation entrypoint bytes changed")
+        pins = getattr(modules["legacy"], "DIFFSHEG_PINNED_RECEIPT", None)
+        fgd_specification = (
+            pins.get("autoencoders", {}).get("fgd")
+            if isinstance(pins, dict)
+            else None
+        )
+        if not _strict_equal(
+            fgd_specification, EXPECTED_DIFFSHEG_FGD_PROVENANCE
+        ):
+            raise LiveConsumerError(
+                "runtime validation lacks exact official DiffSHEG provenance"
+            )
         return modules
     finally:
         if sys.path and sys.path[0] == str(source_root):
@@ -785,9 +940,12 @@ def _validate_work_authority(
     _sha(coverage["clip_ids_sha256"], "clip IDs SHA")
     _sha(coverage["diffsheg_clip_manifest_sha256"], "DiffSHEG manifest SHA")
 
-    if not _strict_equal(authority["pipeline_source"], authority["validation_source"]):
-        raise LiveConsumerError("pipeline and validation source differ")
-    source_root = _validate_source(authority["validation_source"])
+    if not _strict_equal(
+        authority["pipeline_source"],
+        authority["validation_evidence_source"],
+    ):
+        raise LiveConsumerError("pipeline and validation evidence source differ")
+    evidence_root, runtime_root = _validate_runtime_validation_roles(authority)
     entrypoint = _exact_keys(
         authority["inference_entrypoint"],
         frozenset({"path", "sha256", "bytes", "git_mode", "git_blob_sha1"}),
@@ -800,25 +958,48 @@ def _validate_work_authority(
         expected_bytes=entrypoint["bytes"],
     )
     try:
-        relative = entry_path.relative_to(source_root)
+        relative = entry_path.relative_to(evidence_root)
     except ValueError as error:
-        raise LiveConsumerError("inference entrypoint escaped validation source") from error
+        raise LiveConsumerError(
+            "inference entrypoint escaped validation evidence source"
+        ) from error
     if entrypoint["git_mode"] not in {"100644", "100755"}:
         raise LiveConsumerError("inference entrypoint Git mode changed")
     blob = hashlib.sha1(f"blob {len(entry_bytes)}\0".encode() + entry_bytes).hexdigest()
     if blob != entrypoint["git_blob_sha1"]:
         raise LiveConsumerError("inference entrypoint Git blob changed")
     committed = subprocess.run(
-        ["git", "-C", str(source_root), "show", f"{VALIDATION_SOURCE_COMMIT}:{relative.as_posix()}"],
+        [
+            "git",
+            "-C",
+            str(evidence_root),
+            "show",
+            f"{VALIDATION_EVIDENCE_SOURCE_COMMIT}:{relative.as_posix()}",
+        ],
         capture_output=True,
         check=False,
     )
     if committed.returncode != 0 or committed.stdout != entry_bytes:
         raise LiveConsumerError("inference entrypoint differs from 4066f20")
+    runtime_committed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(runtime_root),
+            "show",
+            f"{RUNTIME_VALIDATION_SOURCE_COMMIT}:{relative.as_posix()}",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if runtime_committed.returncode != 0 or runtime_committed.stdout != entry_bytes:
+        raise LiveConsumerError(
+            "runtime inference entrypoint differs from pipeline evidence"
+        )
 
     modules: dict[str, ModuleType] | None = None
     if load_modules:
-        modules = _load_validation_modules(source_root)
+        modules = _load_validation_modules(runtime_root)
         contract = modules["contract"]
         val_artifact, full_coverage = contract.validate_val_inputs(
             Path(authority["val_inputs_receipt"]["path"]),
@@ -827,7 +1008,7 @@ def _validate_work_authority(
         pipeline_artifact, pipeline = contract.validate_pipeline(
             Path(authority["pipeline_receipt"]["path"]),
             authority["pipeline_receipt"]["sha256"],
-            expected_source=authority["validation_source"],
+            expected_source=authority["validation_evidence_source"],
         )
         if (
             not _strict_equal(val_artifact, authority["val_inputs_receipt"])
@@ -836,7 +1017,8 @@ def _validate_work_authority(
             )
             or not _strict_equal(contract.public_val_coverage(full_coverage), coverage)
             or not _strict_equal(
-                pipeline.get("source"), authority["validation_source"]
+                pipeline.get("source"),
+                authority["validation_evidence_source"],
             )
             or not _strict_equal(pipeline.get("inference_entrypoint"), entrypoint)
             or any(
@@ -1116,8 +1298,11 @@ def _engine_command(args: argparse.Namespace, command: str) -> dict[str, Any]:
     epoch = preflight["candidate_epochs"][0]
     if args.epoch != epoch or args.num_shards != 8:
         raise LiveConsumerError("engine command differs from one-candidate eight-shard work")
-    source_root = _validate_source(preflight["pipeline_source"])
-    modules = _load_validation_modules(source_root)
+    authority = preflight["work_authority"]
+    _authority_artifact, _authority, modules = _validate_work_authority(
+        Path(authority["path"]), authority["sha256"]
+    )
+    assert modules is not None
     engine = modules["engine"]
     with _engine_adapter(engine):
         if command == "shard":
@@ -1376,9 +1561,11 @@ def _validate_reconciliation(path: Path, expected_sha: str) -> tuple[dict[str, A
     ):
         raise LiveConsumerError("reconciliation is not exact e400 val-only authority")
     _finite(value["completed_unix"], "reconciliation completion time", positive=True)
-    if not _strict_equal(value["pipeline_source"], value["validation_source"]):
-        raise LiveConsumerError("reconciliation source roles differ")
-    _validate_source(value["validation_source"])
+    if not _strict_equal(
+        value["pipeline_source"], value["validation_evidence_source"]
+    ):
+        raise LiveConsumerError("reconciliation evidence source roles differ")
+    _validate_runtime_validation_roles(value)
     _artifact(
         value["producer_manifest"],
         frozenset({"path", "sha256", "bytes"}),
@@ -1441,7 +1628,8 @@ def _validate_reconciliation(path: Path, expected_sha: str) -> tuple[dict[str, A
     authority_paths: set[str] = set()
     authority_shas: set[str] = set()
     common_fields = (
-        "frozen_inputs", "producer_source", "validation_source",
+        "frozen_inputs", "producer_source", "validation_evidence_source",
+        "runtime_validation_source", "runtime_validation_proof",
         "selected_topology", "schedule", "trajectory_contract",
         "val_inputs_receipt", "pipeline_receipt", "pipeline_source",
     )
@@ -1526,13 +1714,15 @@ def reconcile(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise LiveConsumerError("live measurements differ from reconciliation inputs")
 
-    source_root = _validate_source(reconciliation["validation_source"])
-    modules = _load_validation_modules(source_root)
+    _evidence_root, runtime_root = _validate_runtime_validation_roles(
+        reconciliation
+    )
+    modules = _load_validation_modules(runtime_root)
     contract = modules["contract"]
     pipeline_artifact, pipeline = contract.validate_pipeline(
         Path(reconciliation["pipeline_receipt"]["path"]),
         reconciliation["pipeline_receipt"]["sha256"],
-        expected_source=reconciliation["validation_source"],
+        expected_source=reconciliation["validation_evidence_source"],
     )
     if not _strict_equal(
         pipeline_artifact, reconciliation["pipeline_receipt"]

@@ -268,6 +268,8 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
     def _source_git(
         self,
         *,
+        expected_commit: str,
+        expected_tree: str,
         dirty: bool = False,
         attached: bool = False,
         heads: bool = False,
@@ -283,9 +285,9 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             if arguments == ("remote", "get-url", "--push", "origin"):
                 return 0, ("git@example.invalid/other.git" if wrong_origin else BRIDGE.EXPECTED_ORIGIN)
             if arguments == ("rev-parse", "HEAD"):
-                return 0, ("f" * 40 if wrong_commit else BRIDGE.VALIDATION_SOURCE_COMMIT)
+                return 0, ("f" * 40 if wrong_commit else expected_commit)
             if arguments == ("rev-parse", "HEAD^{tree}"):
-                return 0, BRIDGE.VALIDATION_SOURCE_TREE
+                return 0, expected_tree
             if arguments == ("status", "--porcelain=v1", "--untracked-files=all"):
                 return 0, (" M dirty.py" if dirty else "")
             if arguments == ("symbolic-ref", "-q", "HEAD"):
@@ -298,39 +300,114 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
 
         return run
 
-    def test_validation_source_is_exact_clean_detached_and_branchless(self) -> None:
+    def test_validation_sources_are_exact_clean_detached_and_branchless(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="live-source-", dir="/private/tmp"
         ) as raw:
-            source = {
-                "origin": BRIDGE.EXPECTED_ORIGIN,
-                "source_root": raw,
-                "commit": BRIDGE.VALIDATION_SOURCE_COMMIT,
-                "tree": BRIDGE.VALIDATION_SOURCE_TREE,
-                "clean": True,
-                "detached": True,
-                "local_branches_at_commit": [],
-            }
-            with mock.patch.object(BRIDGE, "_git", side_effect=self._source_git()):
-                self.assertEqual(BRIDGE._validate_source(source), Path(raw))
-            for variant in (
-                {"dirty": True},
-                {"attached": True},
-                {"heads": True},
-                {"wrong_origin": True},
-                {"wrong_commit": True},
+            for validator, commit, tree in (
+                (
+                    BRIDGE._validate_evidence_source,
+                    BRIDGE.VALIDATION_EVIDENCE_SOURCE_COMMIT,
+                    BRIDGE.VALIDATION_EVIDENCE_SOURCE_TREE,
+                ),
+                (
+                    BRIDGE._validate_runtime_source,
+                    BRIDGE.RUNTIME_VALIDATION_SOURCE_COMMIT,
+                    BRIDGE.RUNTIME_VALIDATION_SOURCE_TREE,
+                ),
             ):
-                with self.subTest(variant=variant):
-                    with mock.patch.object(
-                        BRIDGE, "_git", side_effect=self._source_git(**variant)
-                    ):
-                        with self.assertRaises(BRIDGE.LiveConsumerError):
-                            BRIDGE._validate_source(source)
-            malformed = dict(source)
-            malformed["clean"] = 1
-            with mock.patch.object(BRIDGE, "_git", side_effect=self._source_git()):
-                with self.assertRaises(BRIDGE.LiveConsumerError):
-                    BRIDGE._validate_source(malformed)
+                source = {
+                    "origin": BRIDGE.EXPECTED_ORIGIN,
+                    "source_root": raw,
+                    "commit": commit,
+                    "tree": tree,
+                    "clean": True,
+                    "detached": True,
+                    "local_branches_at_commit": [],
+                }
+                valid_git = self._source_git(
+                    expected_commit=commit, expected_tree=tree
+                )
+                with mock.patch.object(BRIDGE, "_git", side_effect=valid_git):
+                    self.assertEqual(validator(source), Path(raw))
+                for variant in (
+                    {"dirty": True},
+                    {"attached": True},
+                    {"heads": True},
+                    {"wrong_origin": True},
+                    {"wrong_commit": True},
+                ):
+                    with self.subTest(validator=validator.__name__, variant=variant):
+                        side_effect = self._source_git(
+                            expected_commit=commit,
+                            expected_tree=tree,
+                            **variant,
+                        )
+                        with mock.patch.object(
+                            BRIDGE, "_git", side_effect=side_effect
+                        ):
+                            with self.assertRaises(BRIDGE.LiveConsumerError):
+                                validator(source)
+                malformed = dict(source)
+                malformed["clean"] = 1
+                valid_git = self._source_git(
+                    expected_commit=commit, expected_tree=tree
+                )
+                with mock.patch.object(BRIDGE, "_git", side_effect=valid_git):
+                    with self.assertRaises(BRIDGE.LiveConsumerError):
+                        validator(malformed)
+
+    def test_runtime_validation_roles_are_distinct_and_proof_exact(self) -> None:
+        authority = {
+            "validation_evidence_source": {"role": "evidence"},
+            "runtime_validation_source": {"role": "runtime"},
+            "runtime_validation_proof": (
+                BRIDGE._expected_runtime_validation_proof()
+            ),
+        }
+        with (
+            mock.patch.object(
+                BRIDGE, "_validate_evidence_source", return_value=Path("/evidence")
+            ),
+            mock.patch.object(
+                BRIDGE, "_validate_runtime_source", return_value=Path("/runtime")
+            ),
+            mock.patch.object(BRIDGE, "_git", return_value=(0, "")),
+        ):
+            self.assertEqual(
+                BRIDGE._validate_runtime_validation_roles(authority),
+                (Path("/evidence"), Path("/runtime")),
+            )
+
+        with (
+            mock.patch.object(
+                BRIDGE, "_validate_evidence_source", return_value=Path("/same")
+            ),
+            mock.patch.object(
+                BRIDGE, "_validate_runtime_source", return_value=Path("/same")
+            ),
+        ):
+            with self.assertRaisesRegex(
+                BRIDGE.LiveConsumerError, "must be distinct"
+            ):
+                BRIDGE._validate_runtime_validation_roles(authority)
+
+        tampered = copy.deepcopy(authority)
+        tampered["runtime_validation_proof"]["runtime_source"]["commit"] = (
+            BRIDGE.VALIDATION_EVIDENCE_SOURCE_COMMIT
+        )
+        with (
+            mock.patch.object(
+                BRIDGE, "_validate_evidence_source", return_value=Path("/evidence")
+            ),
+            mock.patch.object(
+                BRIDGE, "_validate_runtime_source", return_value=Path("/runtime")
+            ),
+        ):
+            with self.assertRaisesRegex(
+                BRIDGE.LiveConsumerError, "successor proof changed"
+            ):
+                BRIDGE._validate_runtime_validation_roles(tampered)
 
     @staticmethod
     def _reconcile_fixture(root: Path):
@@ -388,17 +465,31 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                     "receipt_payload_sha256": f"{index + 280:064x}",
                 }
             )
-        source = {
+        evidence_source = {
             "origin": BRIDGE.EXPECTED_ORIGIN,
-            "source_root": str(root),
-            "commit": BRIDGE.VALIDATION_SOURCE_COMMIT,
-            "tree": BRIDGE.VALIDATION_SOURCE_TREE,
+            "source_root": str(root / "evidence"),
+            "commit": BRIDGE.VALIDATION_EVIDENCE_SOURCE_COMMIT,
+            "tree": BRIDGE.VALIDATION_EVIDENCE_SOURCE_TREE,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+        }
+        runtime_source = {
+            "origin": BRIDGE.EXPECTED_ORIGIN,
+            "source_root": str(root / "runtime"),
+            "commit": BRIDGE.RUNTIME_VALIDATION_SOURCE_COMMIT,
+            "tree": BRIDGE.RUNTIME_VALIDATION_SOURCE_TREE,
             "clean": True,
             "detached": True,
             "local_branches_at_commit": [],
         }
         reconciliation = {
-            "validation_source": source,
+            "validation_evidence_source": evidence_source,
+            "runtime_validation_source": runtime_source,
+            "runtime_validation_proof": (
+                BRIDGE._expected_runtime_validation_proof()
+            ),
+            "pipeline_source": evidence_source,
             "pipeline_receipt": pipeline,
             "val_inputs_receipt": val,
             "producer_manifest": {
@@ -605,7 +696,9 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                     BRIDGE, "_validate_live_measurement", side_effect=validate
                 ),
                 mock.patch.object(
-                    BRIDGE, "_validate_source", return_value=root
+                    BRIDGE,
+                    "_validate_runtime_validation_roles",
+                    return_value=(root, root),
                 ),
                 mock.patch.object(
                     BRIDGE, "_load_validation_modules", return_value=modules
