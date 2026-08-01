@@ -85,11 +85,19 @@ def _fixture_topology_bindings(
     *,
     formal_run_id: str,
     master_port: int,
+    host_slots: list[int] | None = None,
+    hostnames: list[str] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     specification = contract.TOPOLOGY_SPECS[mode]
     node_count = int(specification["node_count"])
     local_world_size = int(specification["local_world_size"])
     world_size = int(specification["world_size"])
+    if host_slots is None:
+        host_slots = list(range(node_count))
+    if hostnames is None:
+        hostnames = [f"fixture-host-{rank}" for rank in range(node_count)]
+    if len(host_slots) != node_count or len(hostnames) != node_count:
+        raise AssertionError("fixture host binding coverage changed")
     nodes: list[dict[str, object]] = []
     ranks: list[dict[str, object]] = []
     for node_rank in range(node_count):
@@ -102,8 +110,8 @@ def _fixture_topology_bindings(
         nodes.append(
             {
                 "node_rank": node_rank,
-                "host_slot": node_rank,
-                "hostname": f"fixture-host-{node_rank}",
+                "host_slot": host_slots[node_rank],
+                "hostname": hostnames[node_rank],
                 "rank_range": rank_range,
             }
         )
@@ -113,8 +121,8 @@ def _fixture_topology_bindings(
                     "rank": rank,
                     "local_rank": local_rank,
                     "node_rank": node_rank,
-                    "host_slot": node_rank,
-                    "hostname": f"fixture-host-{node_rank}",
+                    "host_slot": host_slots[node_rank],
+                    "hostname": hostnames[node_rank],
                     "master_addr": "fixture-master.example",
                     "master_port": master_port,
                     "formal_run_id": formal_run_id,
@@ -131,6 +139,35 @@ def _fixture_topology_bindings(
         "master_addr": "fixture-master.example",
         "master_port": master_port,
         "formal_run_id": formal_run_id,
+        "official_reference": {
+            "mode": contract.OFFICIAL_W1_REFERENCE_MODE,
+            **contract.TOPOLOGY_SPECS[
+                contract.OFFICIAL_W1_REFERENCE_MODE
+            ],
+            "optimizer_updates_400_epochs": (
+                contract.TOTAL_EPOCHS
+                * contract.TOPOLOGY_SPECS[
+                    contract.OFFICIAL_W1_REFERENCE_MODE
+                ]["updates_per_epoch"]
+            ),
+            "adam_learning_rate": 5e-5,
+        },
+        "trajectory_equivalence_to_official_w1": (
+            mode == contract.OFFICIAL_W1_REFERENCE_MODE
+        ),
+        "fp32_numeric_equivalence_to_official_w1": (
+            mode == contract.OFFICIAL_W1_REFERENCE_MODE
+        ),
+        "ddp_differences": (
+            []
+            if mode == contract.OFFICIAL_W1_REFERENCE_MODE
+            else [
+                "per_rank_batchnorm_statistics",
+                "dropout_and_rng_streams",
+                "distributed_sampler_order",
+                "floating_point_gradient_reduction",
+            ]
+        ),
     }
     topology: dict[str, object] = {
         "format": "semtalk_show_base_topology_receipt_v1",
@@ -489,6 +526,14 @@ class QualityFixture:
         ):
             (run_root / directory).mkdir(exist_ok=True)
         specification = contract.TOPOLOGY_SPECS[mode]
+        source_clones = self.frozen_payload.get("source", {}).get(
+            "node_local_clones"
+        )
+        fixture_host_slots = None
+        fixture_hostnames = None
+        if isinstance(source_clones, list):
+            fixture_host_slots = [row["host_slot"] for row in source_clones]
+            fixture_hostnames = [row["hostname"] for row in source_clones]
         training_run_id = f"fixture-{mode}-quality"
         gate_run_id = f"fixture-{mode}-throughput"
         training_distributed, training_topology = (
@@ -496,12 +541,16 @@ class QualityFixture:
                 mode,
                 formal_run_id=training_run_id,
                 master_port=27201,
+                host_slots=fixture_host_slots,
+                hostnames=fixture_hostnames,
             )
         )
         gate_distributed, gate_topology = _fixture_topology_bindings(
             mode,
             formal_run_id=gate_run_id,
             master_port=27101,
+            host_slots=fixture_host_slots,
+            hostnames=fixture_hostnames,
         )
         frozen_body = json.loads(json.dumps(self.frozen_payload))
         frozen_body.pop("receipt_sha256")
@@ -540,6 +589,9 @@ class QualityFixture:
         frozen, frozen_payload = _write_contract_receipt(
             run_root / "frozen_inputs.json", frozen_body
         )
+        trajectory_anchor_sha256 = frozen_payload["long_contract"][
+            "trajectory_anchor"
+        ]["sha256"]
         gate_frozen_body = json.loads(json.dumps(frozen_body))
         gate_frozen_body["run_purpose"] = (
             contract.RUN_PURPOSE_THROUGHPUT
@@ -809,7 +861,7 @@ class QualityFixture:
                     "receipt_sha256"
                 ],
                 "schedule_sha256": "a" * 64,
-                "trajectory_anchor_sha256": "b" * 64,
+                "trajectory_anchor_sha256": trajectory_anchor_sha256,
                 "throughput_gate": throughput,
                 "trajectory_mode": contract.FRESH_TRAJECTORY_MODE,
                 "trajectory_probe_verified": True,
@@ -882,7 +934,7 @@ class QualityFixture:
                     "receipt_sha256"
                 ],
                 "schedule_sha256": "a" * 64,
-                "trajectory_anchor_sha256": "b" * 64,
+                "trajectory_anchor_sha256": trajectory_anchor_sha256,
                 "trajectory_anchor_match": None,
                 "published_unix": 1_700_000_000.0 + epoch,
             }
@@ -977,7 +1029,7 @@ class QualityFixture:
             "epoch_metrics_sha256": metrics_artifact["sha256"],
             "epoch_metrics_records": quality_total_epochs,
             "schedule_sha256": "a" * 64,
-            "trajectory_anchor_sha256": "b" * 64,
+            "trajectory_anchor_sha256": trajectory_anchor_sha256,
             "trajectory_mode": contract.FRESH_TRAJECTORY_MODE,
             "trajectory_probe_verified": True,
             "trajectory_probe": trajectory_probe,

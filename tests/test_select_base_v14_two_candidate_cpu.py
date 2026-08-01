@@ -121,10 +121,80 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         )
         base_frozen_payload = copy.deepcopy(cls.fixture.frozen_payload)
         cls.report_specs = []
+        cls.frozen_by_mode = {}
         with cls._formal_patches():
             for index, mode in enumerate(selection.MODES):
                 specification = contract.TOPOLOGY_SPECS[mode]
                 mode_frozen = copy.deepcopy(base_frozen_payload)
+                host_slot = 1 if mode == selection.MODE_P1 else 0
+                entrypoint = (
+                    "/frozen/semtalk/scripts/show_base/"
+                    "train_base_official_adapt_long.py"
+                )
+                mode_frozen["source"].update(
+                    {
+                        "entrypoint_sha256": (
+                            selection.TRAINING_SEMANTICS_TRAINER_SHA256
+                        ),
+                        "node_local_clones": [
+                            {
+                                "node_rank": 0,
+                                "host_slot": host_slot,
+                                "hostname": contract.FORMAL_HOST_BY_SLOT[
+                                    host_slot
+                                ],
+                                "entrypoint": entrypoint,
+                                "branch": None,
+                            }
+                        ],
+                    }
+                )
+                mode_frozen["source"].pop("branch", None)
+                mode_frozen["source"].pop("entrypoint", None)
+                fixture_distributed, fixture_topology = (
+                    quality_fixture_module._fixture_topology_bindings(
+                        mode,
+                        formal_run_id=f"selector-fixture-{index}",
+                        master_port=28000 + index,
+                        host_slots=[host_slot],
+                        hostnames=[
+                            contract.FORMAL_HOST_BY_SLOT[host_slot]
+                        ],
+                    )
+                )
+                trajectory_binding = {
+                    "format": contract.FRESH_TRAJECTORY_FORMAT,
+                    "mode": contract.FRESH_TRAJECTORY_MODE,
+                    "topology_mode": mode,
+                    "topology_classification": specification[
+                        "classification"
+                    ],
+                    "node_count": specification["node_count"],
+                    "local_world_size": specification["local_world_size"],
+                    "world_size": specification["world_size"],
+                    "local_batch_size": specification["local_batch_size"],
+                    "global_batch_size": specification["global_batch_size"],
+                    "updates_per_epoch": specification[
+                        "updates_per_epoch"
+                    ],
+                    "unique_samples_per_epoch": specification[
+                        "unique_samples_per_epoch"
+                    ],
+                    "precision": specification["precision"],
+                    "learning_rate": specification["learning_rate"],
+                    "loader_workers": 4,
+                    "common_lineage_sha256": "e" * 64,
+                }
+                trajectory_sha = selection._canonical_sha(
+                    trajectory_binding
+                )
+                mode_frozen["long_contract"]["trajectory_anchor"] = {
+                    **trajectory_binding,
+                    "path": None,
+                    "sha256": trajectory_sha,
+                    "payload_sha256": trajectory_sha,
+                    "entries": {},
+                }
                 mode_frozen["protocol"].update(
                     {
                         "node_count": specification["node_count"],
@@ -138,32 +208,39 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                         "expected_unique_samples_per_epoch": specification[
                             "unique_samples_per_epoch"
                         ],
-                        "distributed_topology": {"mode": mode},
+                        "distributed_topology": fixture_distributed,
                         "optimizer": {
                             "name": "Adam",
                             "learning_rate": specification["learning_rate"],
                         },
                         "precision": specification["precision"],
+                        "topology_gate_spec": {
+                            "path": str(
+                                REPOSITORY
+                                / "configs/show_base/"
+                                "semtalk_base_topology_gate_spec_20260731.json"
+                            ),
+                            "sha256": selection.TOPOLOGY_GATE_SHA256,
+                            "payload_sha256": (
+                                selection.TOPOLOGY_GATE_PAYLOAD_SHA256
+                            ),
+                            "selected_probe_mode": mode,
+                        },
+                        "trajectory_anchor": {
+                            "mode": contract.FRESH_TRAJECTORY_MODE,
+                            "path": None,
+                            "sha256": trajectory_sha,
+                            "external": False,
+                        },
                     }
                 )
-                mode_frozen["topology"] = {
-                    "topology_mode": mode,
-                    "node_count": specification["node_count"],
-                    "local_world_size": specification["local_world_size"],
-                    "world_size": specification["world_size"],
-                    "local_batch_size": specification["local_batch_size"],
-                    "global_batch_size": specification["global_batch_size"],
-                    "updates_per_epoch": specification["updates_per_epoch"],
-                    "unique_samples_per_epoch": specification[
-                        "unique_samples_per_epoch"
-                    ],
-                    "receipt_sha256": "7" * 64,
-                }
+                mode_frozen["topology"] = fixture_topology
                 unsigned = dict(mode_frozen)
                 unsigned.pop("receipt_sha256")
                 mode_frozen["receipt_sha256"] = (
                     contract.canonical_json_sha256(unsigned)
                 )
+                cls.frozen_by_mode[mode] = copy.deepcopy(mode_frozen)
                 cls.fixture.frozen_payload = mode_frozen
                 ready = cls.fixture.candidate_ready_receipts(mode)
                 report = cls.root / f"quality-report-{index}.json"
@@ -1237,11 +1314,190 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         ):
             changed = json.loads(json.dumps(frozen[selection.MODE_P2]))
             changed[section][key] = value
-            projection = selection._authority_projection(
-                changed, selection.MODE_P2, contract
-            )
             with self.subTest(section=section):
-                self.assertNotEqual(projection, baseline)
+                if section == "source":
+                    with self.assertRaises(selection.SelectionError):
+                        selection._authority_projection(
+                            changed, selection.MODE_P2, contract
+                        )
+                else:
+                    projection = selection._authority_projection(
+                        changed, selection.MODE_P2, contract
+                    )
+                    self.assertNotEqual(projection, baseline)
+
+    def test_topology_locators_are_validated_then_excluded_narrowly(
+        self,
+    ) -> None:
+        projections = {
+            mode: selection._authority_projection(
+                copy.deepcopy(self.frozen_by_mode[mode]), mode, contract
+            )
+            for mode in selection.MODES
+        }
+        self.assertEqual(
+            projections[selection.MODE_P1],
+            projections[selection.MODE_P2],
+        )
+        self.assertNotEqual(
+            self.frozen_by_mode[selection.MODE_P1]["source"][
+                "node_local_clones"
+            ],
+            self.frozen_by_mode[selection.MODE_P2]["source"][
+                "node_local_clones"
+            ],
+        )
+        self.assertNotEqual(
+            self.frozen_by_mode[selection.MODE_P1]["protocol"][
+                "topology_gate_spec"
+            ]["selected_probe_mode"],
+            self.frozen_by_mode[selection.MODE_P2]["protocol"][
+                "topology_gate_spec"
+            ]["selected_probe_mode"],
+        )
+        self.assertNotEqual(
+            self.frozen_by_mode[selection.MODE_P1]["protocol"][
+                "trajectory_anchor"
+            ]["sha256"],
+            self.frozen_by_mode[selection.MODE_P2]["protocol"][
+                "trajectory_anchor"
+            ]["sha256"],
+        )
+
+        attacks = []
+
+        def rehash_topology(changed: dict[str, object]) -> None:
+            topology = changed["topology"]
+            unsigned = {
+                key: value
+                for key, value in topology.items()
+                if key != "receipt_sha256"
+            }
+            topology["receipt_sha256"] = selection._canonical_sha(unsigned)
+
+        for field, value in (
+            ("node_rank", True),
+            ("host_slot", 0),
+            ("hostname", "forged-host"),
+            ("entrypoint", "/forged/trainer.py"),
+            ("branch", "forged-branch"),
+        ):
+            changed = copy.deepcopy(
+                self.frozen_by_mode[selection.MODE_P1]
+            )
+            changed["source"]["node_local_clones"][0][field] = value
+            attacks.append((f"node_local_clones.{field}", changed))
+
+        for field, value in (
+            ("selected_probe_mode", selection.MODE_P2),
+            ("sha256", "0" * 64),
+            ("payload_sha256", "0" * 64),
+            ("path", "relative/gate.json"),
+        ):
+            changed = copy.deepcopy(
+                self.frozen_by_mode[selection.MODE_P1]
+            )
+            changed["protocol"]["topology_gate_spec"][field] = value
+            attacks.append((f"topology_gate_spec.{field}", changed))
+
+        for location, field, value in (
+            ("protocol", "sha256", "0" * 64),
+            ("long_contract", "sha256", "0" * 64),
+            ("long_contract", "payload_sha256", "0" * 64),
+            ("long_contract", "topology_mode", selection.MODE_P2),
+        ):
+            changed = copy.deepcopy(
+                self.frozen_by_mode[selection.MODE_P1]
+            )
+            changed[location]["trajectory_anchor"][field] = value
+            attacks.append((f"{location}.trajectory_anchor.{field}", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        changed["source"]["entrypoint_sha256"] = "0" * 64
+        attacks.append(("source.entrypoint_sha256", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        changed["protocol"]["distributed_topology"]["nodes"][0][
+            "hostname"
+        ] = "forged-host"
+        attacks.append(("distributed_topology.nodes.hostname", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        changed["topology"]["ranks"][0]["host_slot"] = 0
+        attacks.append(("topology.ranks.host_slot", changed))
+
+        for field, value in (
+            ("backend", "gloo"),
+            ("classification", "forged-classification"),
+        ):
+            changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+            changed["protocol"]["distributed_topology"][field] = value
+            attacks.append((f"distributed_topology.{field}", changed))
+
+        for field in (
+            "expected_updates_per_epoch",
+            "expected_unique_samples_per_epoch",
+        ):
+            changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+            changed["protocol"][field] = 999
+            attacks.append((f"protocol.{field}", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        changed["topology"]["receipt_sha256"] = "0" * 64
+        attacks.append(("topology.receipt_sha256", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        changed["topology"]["classification"] = "forged-classification"
+        rehash_topology(changed)
+        attacks.append(("rehashed-topology.classification", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        for location in (
+            changed["protocol"],
+            changed["protocol"]["distributed_topology"],
+            changed["topology"],
+        ):
+            location["node_count"] = True
+        rehash_topology(changed)
+        attacks.append(("cross-bound-bool-node-count", changed))
+
+        for field, value in (
+            ("master_addr", ""),
+            ("master_port", -1),
+            ("formal_run_id", "x"),
+        ):
+            changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+            changed["protocol"]["distributed_topology"][field] = value
+            changed["topology"][field] = value
+            for rank in changed["topology"]["ranks"]:
+                rank[field] = value
+            rehash_topology(changed)
+            attacks.append((f"cross-bound-rendezvous.{field}", changed))
+
+        changed = copy.deepcopy(self.frozen_by_mode[selection.MODE_P1])
+        long_anchor = changed["long_contract"]["trajectory_anchor"]
+        long_anchor["topology_mode"] = selection.MODE_P2
+        rehashed = selection._canonical_sha(
+            {
+                key: value
+                for key, value in long_anchor.items()
+                if key not in {
+                    "path", "sha256", "payload_sha256", "entries"
+                }
+            }
+        )
+        long_anchor["sha256"] = rehashed
+        long_anchor["payload_sha256"] = rehashed
+        changed["protocol"]["trajectory_anchor"]["sha256"] = rehashed
+        attacks.append(("rehashed-long-trajectory-topology-mode", changed))
+
+        for label, changed in attacks:
+            with self.subTest(label=label), self.assertRaises(
+                selection.SelectionError
+            ):
+                selection._authority_projection(
+                    changed, selection.MODE_P1, contract
+                )
 
     def test_output_is_create_new_and_never_overwritten(self) -> None:
         output = self.root / "exclusive-output.json"

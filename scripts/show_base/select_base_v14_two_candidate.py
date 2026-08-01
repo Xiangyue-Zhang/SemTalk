@@ -55,6 +55,9 @@ OFFICIAL_SELECTOR_SHA256 = (
 OFFICIAL_TRAIN_CONTRACT_SHA256 = (
     "29fdd5d3e9bdfc61904f649b71d4dae1766b42a4a6a5a40b2bbd37a4c6b33173"
 )
+TRAINING_SEMANTICS_TRAINER_SHA256 = (
+    "65cb565ceaf70f5c744b5c85db50e41d728f507d12cac28b06a5cc3756b65dba"
+)
 OFFICIAL_VALIDATION_CONTRACT_SHA256 = (
     "0168e7f9ab2b9a122656ed98c36dc36777f577816ef08b0186ffc892813d2c70"
 )
@@ -63,6 +66,9 @@ OFFICIAL_DIFFSHEG_ADAPTER_SHA256 = (
 )
 TOPOLOGY_GATE_SHA256 = (
     "1ee9ae31e2ca735265972022c26a82ba2789f7538a128631168af4e86f7808c4"
+)
+TOPOLOGY_GATE_PAYLOAD_SHA256 = (
+    "38a0294567103fb1b18a02471c40d28b29c997b27d0a848061669c7cc4c3b10c"
 )
 QUALITY_GATE_SHA256 = (
     "bd5286d8845b04c20f2e954334ac4d4907c6837d60ca5101ca5ec735291af78f"
@@ -629,6 +635,315 @@ def _without_keys(value: Mapping[str, Any], keys: set[str]) -> dict[str, Any]:
     return {key: copy.deepcopy(item) for key, item in value.items() if key not in keys}
 
 
+def _exact_value(value: Any, expected: Any) -> bool:
+    return type(value) is type(expected) and value == expected
+
+
+def _validate_topology_execution_authority(
+    distributed: Mapping[str, Any],
+    topology: Mapping[str, Any],
+    mode: str,
+    expected: Mapping[str, Any],
+    contract: ModuleType,
+) -> None:
+    distributed_keys = {
+        "backend", "classification", "ddp_differences", "formal_run_id",
+        "fp32_numeric_equivalence_to_official_w1", "local_world_size",
+        "master_addr", "master_port", "mode", "node_count", "nodes",
+        "official_reference", "trajectory_equivalence_to_official_w1",
+        "world_size",
+    }
+    topology_keys = {
+        "backend", "classification", "formal_run_id", "format",
+        "global_batch_size", "local_batch_size", "local_world_size",
+        "master_addr", "master_port", "node_count", "ranks",
+        "receipt_sha256", "topology_mode", "unique_samples_per_epoch",
+        "updates_per_epoch", "world_size",
+    }
+    specification_keys = (
+        "node_count", "local_world_size", "world_size", "local_batch_size",
+        "global_batch_size", "updates_per_epoch", "unique_samples_per_epoch",
+    )
+    official_mode = getattr(contract, "OFFICIAL_W1_REFERENCE_MODE", None)
+    all_specs = getattr(contract, "TOPOLOGY_SPECS", None)
+    total_epochs = getattr(contract, "TOTAL_EPOCHS", None)
+    if (
+        set(distributed) != distributed_keys
+        or set(topology) != topology_keys
+        or not isinstance(official_mode, str)
+        or not isinstance(all_specs, dict)
+        or official_mode not in all_specs
+        or type(total_epochs) is not int
+    ):
+        raise SelectionError(f"{mode} distributed topology schema changed")
+    official_spec = all_specs[official_mode]
+    expected_official = {
+        "mode": official_mode,
+        **official_spec,
+        "optimizer_updates_400_epochs": (
+            total_epochs * official_spec["updates_per_epoch"]
+        ),
+        "adam_learning_rate": 5e-5,
+    }
+    is_official = mode == official_mode
+    expected_ddp_differences = (
+        []
+        if is_official
+        else [
+            "per_rank_batchnorm_statistics",
+            "dropout_and_rng_streams",
+            "distributed_sampler_order",
+            "floating_point_gradient_reduction",
+        ]
+    )
+    formal_run_id = distributed.get("formal_run_id")
+    master_addr = distributed.get("master_addr")
+    master_port = distributed.get("master_port")
+    if (
+        distributed.get("mode") != mode
+        or distributed.get("backend") != "nccl"
+        or not _exact_value(
+            distributed.get("classification"), expected.get("classification")
+        )
+        or any(
+            not _exact_value(distributed.get(key), expected.get(key))
+            for key in ("node_count", "local_world_size", "world_size")
+        )
+        or _canonical_sha(distributed.get("official_reference"))
+        != _canonical_sha(expected_official)
+        or _canonical_sha(distributed.get("ddp_differences"))
+        != _canonical_sha(expected_ddp_differences)
+        or distributed.get("trajectory_equivalence_to_official_w1")
+        is not is_official
+        or distributed.get("fp32_numeric_equivalence_to_official_w1")
+        is not is_official
+        or type(formal_run_id) is not str
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,128}", formal_run_id) is None
+        or type(master_addr) is not str
+        or not master_addr
+        or type(master_port) is not int
+        or not 1024 <= master_port <= 65535
+        or topology.get("format")
+        != "semtalk_show_base_topology_receipt_v1"
+        or topology.get("topology_mode") != mode
+        or topology.get("backend") != "nccl"
+        or not _exact_value(
+            topology.get("classification"), expected.get("classification")
+        )
+        or any(
+            not _exact_value(topology.get(key), expected.get(key))
+            for key in specification_keys
+        )
+        or topology.get("formal_run_id") != formal_run_id
+        or topology.get("master_addr") != master_addr
+        or topology.get("master_port") != master_port
+    ):
+        raise SelectionError(f"{mode} distributed topology authority changed")
+    claimed_topology_sha = _require_sha(
+        topology.get("receipt_sha256"), f"{mode} topology receipt SHA-256"
+    )
+    unsigned_topology = dict(topology)
+    unsigned_topology.pop("receipt_sha256")
+    if _canonical_sha(unsigned_topology) != claimed_topology_sha:
+        raise SelectionError(f"{mode} topology receipt self-hash mismatch")
+
+
+def _portable_source_authority(
+    source: Mapping[str, Any],
+    distributed: Mapping[str, Any],
+    topology: Mapping[str, Any],
+    mode: str,
+    expected: Mapping[str, Any],
+    contract: ModuleType,
+) -> dict[str, Any]:
+    expected_keys = {
+        "origin", "commit", "tree", "clean", "entrypoint_sha256",
+        "node_local_clones",
+    }
+    clones = source.get("node_local_clones")
+    hostnames = getattr(contract, "FORMAL_HOST_BY_SLOT", None)
+    node_count = expected.get("node_count")
+    local_world_size = expected.get("local_world_size")
+    world_size = expected.get("world_size")
+    nodes = distributed.get("nodes")
+    ranks = topology.get("ranks")
+    if (
+        set(source) != expected_keys
+        or source.get("origin") != SOURCE_ORIGIN
+        or source.get("commit") != TRAINING_SOURCE_COMMIT
+        or source.get("tree") != TRAINING_SOURCE_TREE
+        or source.get("clean") is not True
+        or source.get("entrypoint_sha256")
+        != TRAINING_SEMANTICS_TRAINER_SHA256
+        or type(node_count) is not int
+        or type(local_world_size) is not int
+        or type(world_size) is not int
+        or not isinstance(hostnames, dict)
+        or not isinstance(clones, list)
+        or len(clones) != node_count
+        or not isinstance(nodes, list)
+        or len(nodes) != node_count
+        or not isinstance(ranks, list)
+        or len(ranks) != world_size
+    ):
+        raise SelectionError(f"{mode} source authority changed")
+    observed_slots: set[int] = set()
+    for node_rank, clone in enumerate(clones):
+        node = nodes[node_rank]
+        if type(clone) is not dict or set(clone) != {
+            "node_rank", "host_slot", "hostname", "entrypoint", "branch"
+        } or type(node) is not dict or set(node) != {
+            "node_rank", "host_slot", "hostname", "rank_range"
+        }:
+            raise SelectionError(f"{mode} node-local source schema changed")
+        host_slot = clone.get("host_slot")
+        clone_entrypoint = clone.get("entrypoint")
+        expected_rank_range = list(
+            range(
+                node_rank * local_world_size,
+                (node_rank + 1) * local_world_size,
+            )
+        )
+        if (
+            type(clone.get("node_rank")) is not int
+            or clone.get("node_rank") != node_rank
+            or type(host_slot) is not int
+            or host_slot in observed_slots
+            or host_slot not in hostnames
+            or clone.get("hostname") != hostnames[host_slot]
+            or type(clone_entrypoint) is not str
+            or not Path(clone_entrypoint).is_absolute()
+            or ".." in Path(clone_entrypoint).parts
+            or Path(clone_entrypoint).parts[-3:]
+            != ("scripts", "show_base", "train_base_official_adapt_long.py")
+            or clone.get("branch") is not None
+            or type(node.get("node_rank")) is not int
+            or node.get("node_rank") != node_rank
+            or type(node.get("host_slot")) is not int
+            or node.get("host_slot") != host_slot
+            or node.get("hostname") != clone.get("hostname")
+            or not isinstance(node.get("rank_range"), list)
+            or any(type(value) is not int for value in node.get("rank_range", []))
+            or node.get("rank_range") != expected_rank_range
+        ):
+            raise SelectionError(f"{mode} node-local source authority changed")
+        for local_rank, rank in enumerate(expected_rank_range):
+            rank_receipt = ranks[rank]
+            if type(rank_receipt) is not dict or set(rank_receipt) != {
+                "rank", "local_rank", "node_rank", "host_slot", "hostname",
+                "master_addr", "master_port", "formal_run_id",
+            } or (
+                type(rank_receipt.get("rank")) is not int
+                or type(rank_receipt.get("local_rank")) is not int
+                or type(rank_receipt.get("node_rank")) is not int
+                or type(rank_receipt.get("host_slot")) is not int
+                or type(rank_receipt.get("master_port")) is not int
+                or type(rank_receipt.get("master_addr")) is not str
+                or type(rank_receipt.get("formal_run_id")) is not str
+                or rank_receipt.get("rank") != rank
+                or rank_receipt.get("local_rank") != local_rank
+                or rank_receipt.get("node_rank") != node_rank
+                or rank_receipt.get("host_slot") != host_slot
+                or rank_receipt.get("hostname") != clone.get("hostname")
+                or rank_receipt.get("master_addr")
+                != distributed.get("master_addr")
+                or rank_receipt.get("master_port")
+                != distributed.get("master_port")
+                or rank_receipt.get("formal_run_id")
+                != distributed.get("formal_run_id")
+            ):
+                raise SelectionError(
+                    f"{mode} rank/node/source authority changed"
+                )
+        observed_slots.add(host_slot)
+    return _without_keys(source, {"node_local_clones"})
+
+
+def _portable_topology_gate_authority(
+    protocol: Mapping[str, Any], mode: str,
+) -> dict[str, Any]:
+    gate = protocol.get("topology_gate_spec")
+    if type(gate) is not dict or set(gate) != {
+        "path", "sha256", "payload_sha256", "selected_probe_mode"
+    }:
+        raise SelectionError(f"{mode} topology-gate receipt schema changed")
+    gate_path = gate.get("path")
+    if (
+        type(gate_path) is not str
+        or not Path(gate_path).is_absolute()
+        or ".." in Path(gate_path).parts
+        or gate.get("sha256") != TOPOLOGY_GATE_SHA256
+        or gate.get("payload_sha256") != TOPOLOGY_GATE_PAYLOAD_SHA256
+        or gate.get("selected_probe_mode") != mode
+    ):
+        raise SelectionError(f"{mode} topology-gate authority changed")
+    return _without_keys(gate, {"selected_probe_mode"})
+
+
+def _normalize_trajectory_authority(
+    protocol: Mapping[str, Any],
+    long_contract: Mapping[str, Any],
+    mode: str,
+    expected: Mapping[str, Any],
+    contract: ModuleType,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    protocol_anchor = protocol.get("trajectory_anchor")
+    long_anchor = long_contract.get("trajectory_anchor")
+    fresh_mode = getattr(contract, "FRESH_TRAJECTORY_MODE", None)
+    if (
+        type(protocol_anchor) is not dict
+        or set(protocol_anchor) != {"mode", "path", "sha256", "external"}
+        or type(long_anchor) is not dict
+    ):
+        raise SelectionError(f"{mode} trajectory authority schema changed")
+    protocol_sha = _require_sha(
+        protocol_anchor.get("sha256"), f"{mode} protocol trajectory SHA-256"
+    )
+    long_sha = _require_sha(
+        long_anchor.get("sha256"), f"{mode} long trajectory SHA-256"
+    )
+    long_payload_sha = _require_sha(
+        long_anchor.get("payload_sha256"),
+        f"{mode} long trajectory payload SHA-256",
+    )
+    topology_keys = (
+        "node_count", "local_world_size", "world_size", "local_batch_size",
+        "global_batch_size", "updates_per_epoch", "unique_samples_per_epoch",
+        "precision", "learning_rate",
+    )
+    if (
+        not isinstance(fresh_mode, str)
+        or protocol_anchor.get("mode") != fresh_mode
+        or protocol_anchor.get("path") is not None
+        or protocol_anchor.get("external") is not False
+        or long_anchor.get("mode") != fresh_mode
+        or long_anchor.get("path") is not None
+        or long_anchor.get("entries") != {}
+        or long_anchor.get("topology_mode") != mode
+        or long_anchor.get("topology_classification")
+        != expected.get("classification")
+        or any(
+            type(long_anchor.get(key)) is not type(expected.get(key))
+            or long_anchor.get(key) != expected.get(key)
+            for key in topology_keys
+        )
+        or protocol_sha != long_sha
+        or long_payload_sha != long_sha
+        or _canonical_sha(
+            _without_keys(
+                long_anchor,
+                {"path", "sha256", "payload_sha256", "entries"},
+            )
+        )
+        != long_sha
+    ):
+        raise SelectionError(f"{mode} topology-specific trajectory authority changed")
+    return (
+        _without_keys(protocol_anchor, {"sha256"}),
+        _without_keys(long_anchor, TOPOLOGY_VARYING_TRAJECTORY_KEYS),
+    )
+
+
 def _authority_projection(frozen: Mapping[str, Any], mode: str, contract: ModuleType) -> dict[str, str]:
     source = frozen.get("source")
     dataset = frozen.get("dataset")
@@ -641,14 +956,6 @@ def _authority_projection(frozen: Mapping[str, Any], mode: str, contract: Module
         source, dataset, official, initialization, protocol, long_contract, topology
     )):
         raise SelectionError(f"{mode} frozen authority schema changed")
-    if source != {
-        **source,
-        "origin": SOURCE_ORIGIN,
-        "commit": TRAINING_SOURCE_COMMIT,
-        "tree": TRAINING_SOURCE_TREE,
-        "clean": True,
-    }:
-        raise SelectionError(f"{mode} source authority changed")
     expected = contract.TOPOLOGY_SPECS.get(mode)
     fixed = MODE_PROTOCOL[mode]
     if not isinstance(expected, dict) or any(
@@ -656,20 +963,34 @@ def _authority_projection(frozen: Mapping[str, Any], mode: str, contract: Module
         for key in ("world_size", "local_batch_size", "global_batch_size")
     ):
         raise SelectionError(f"{mode} registered topology changed")
-    if any(protocol.get(key) != expected[key] for key in (
+    if any(not _exact_value(protocol.get(key), expected[key]) for key in (
         "node_count", "local_world_size", "world_size", "local_batch_size",
         "global_batch_size", "precision"
-    )):
+    )) or any(
+        not _exact_value(protocol.get(protocol_key), expected[expected_key])
+        for protocol_key, expected_key in (
+            ("expected_updates_per_epoch", "updates_per_epoch"),
+            (
+                "expected_unique_samples_per_epoch",
+                "unique_samples_per_epoch",
+            ),
+        )
+    ):
         raise SelectionError(f"{mode} frozen runtime topology changed")
     distributed = protocol.get("distributed_topology")
-    if not isinstance(distributed, dict) or distributed.get("mode") != mode:
+    if not isinstance(distributed, dict):
         raise SelectionError(f"{mode} distributed topology identity changed")
-    if any(topology.get(key) != expected[key] for key in (
-        "node_count", "local_world_size", "world_size", "local_batch_size",
-        "global_batch_size", "updates_per_epoch", "unique_samples_per_epoch"
-    )) or topology.get("topology_mode") != mode:
-        raise SelectionError(f"{mode} topology receipt changed")
+    _validate_topology_execution_authority(
+        distributed, topology, mode, expected, contract
+    )
 
+    portable_source = _portable_source_authority(
+        source, distributed, topology, mode, expected, contract
+    )
+    portable_gate = _portable_topology_gate_authority(protocol, mode)
+    protocol_trajectory, long_trajectory = _normalize_trajectory_authority(
+        protocol, long_contract, mode, expected, contract
+    )
     portable_dataset = _without_keys(
         dataset, {"lmdb_binding_scope", "node_lmdb_inode_bindings"}
     )
@@ -677,14 +998,12 @@ def _authority_projection(frozen: Mapping[str, Any], mode: str, contract: Module
         official, {"file_binding_scope", "node_local_files"}
     )
     runtime = _without_keys(protocol, TOPOLOGY_VARYING_PROTOCOL_KEYS)
+    runtime["topology_gate_spec"] = portable_gate
+    runtime["trajectory_anchor"] = protocol_trajectory
     normalized_long = copy.deepcopy(long_contract)
-    trajectory = normalized_long.get("trajectory_anchor")
-    if isinstance(trajectory, dict):
-        normalized_long["trajectory_anchor"] = _without_keys(
-            trajectory, TOPOLOGY_VARYING_TRAJECTORY_KEYS
-        )
+    normalized_long["trajectory_anchor"] = long_trajectory
     return {
-        "source_sha256": _canonical_sha(source),
+        "source_sha256": _canonical_sha(portable_source),
         "data_vq_sha256": _canonical_sha({
             "dataset": portable_dataset,
             "official_base": portable_official,
