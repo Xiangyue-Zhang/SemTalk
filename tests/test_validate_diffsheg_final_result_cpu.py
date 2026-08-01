@@ -24,13 +24,32 @@ class FinalResultFixture:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.inference_root = self.root / "inference"
-        self.output_root = self.inference_root / "diffsheg-final-metrics"
+        self.output_root = self.inference_root / "combined-final-metrics"
         self.inference_root.mkdir()
         self.output_root.mkdir()
         self.preflight_path = self.root / "preflight.json"
         self.claim_path = producer._claim_path(self.inference_root)
         self.paspa_path = self.output_root / "paspa_diffsheg_show_metrics.json"
+        self.talkshow_path = (
+            self.output_root / "talkshow_show_body_face_metrics.json"
+        )
         self.final_path = self.output_root / "final_metrics.json"
+        self.prediction_manifest_path = self.inference_root / "final_manifest.jsonl"
+        self.prediction_lineage_path = self.inference_root / "final_lineage.json"
+        self.prediction_manifest_path.write_bytes(b'{"fixture":true}\n')
+        self.prediction_lineage_path.write_bytes(b'{"fixture":true}\n')
+        self.prediction_manifest = {
+            "path": str(self.prediction_manifest_path),
+            "sha256": producer.sha256_file(self.prediction_manifest_path),
+            "bytes": self.prediction_manifest_path.stat().st_size,
+        }
+        self.prediction_lineage = {
+            "path": str(self.prediction_lineage_path),
+            "sha256": producer.sha256_file(self.prediction_lineage_path),
+            "bytes": self.prediction_lineage_path.stat().st_size,
+            "contract_sha256": "a" * 64,
+            "runtime_sha256": "b" * 64,
+        }
         self.authority = {
             "fresh_test_authority": {
                 "path": str(self.root / "authority.json"),
@@ -61,18 +80,25 @@ class FinalResultFixture:
                 "window_count": 123,
                 "uncovered_tail_frames": 7,
                 "paspa_clip_manifest_sha256": "6" * 64,
+                "manifest": self.prediction_manifest,
+                "lineage": self.prediction_lineage,
             },
             "protocol": {
                 "name": "diffsheg_show_reconstructed",
                 "version": 1,
                 "compatibility_reports": {
                     "talkshow_body_face": {
-                        "status": "separate",
+                        "status": "required_same_event",
                         "primary": False,
                         "selection_feedback": False,
                         "metric_spaces_must_not_be_mixed": True,
+                        "shared_prediction_bundle": True,
+                        "separate_test_evaluation": False,
                     }
                 },
+                "final_metric_event": (
+                    producer.final_test.final_authority.FINAL_METRIC_EVENT
+                ),
             },
             "assets": {
                 "paspa": {
@@ -101,6 +127,51 @@ class FinalResultFixture:
                     "sha256": producer.SMPLX_NEUTRAL_SHA256,
                 },
                 "audio": {"root": "/assets/audio"},
+                "talkshow_metrics": {
+                    "canonical_manifest": {
+                        "path": str(self.root / "canonical.jsonl"),
+                        "sha256": "e" * 64,
+                        "bytes": 1,
+                    },
+                    "prediction_manifest": self.prediction_manifest,
+                    "prediction_lineage": self.prediction_lineage,
+                    "validation_gate": {
+                        "path": str(self.root / "winner-gate.json"),
+                        "sha256": "f" * 64,
+                        "bytes": 1,
+                        "receipt_payload_sha256": "0" * 64,
+                    },
+                    "distribution_receipt": {
+                        "receipt_payload_sha256": "c" * 64,
+                    },
+                    "test_authority": {
+                        "path": str(self.root / "authority.json"),
+                        "sha256": "1" * 64,
+                        "bytes": 1,
+                        "receipt_payload_sha256": "2" * 64,
+                    },
+                    "metric_root": {
+                        "path": str(self.root / "metric-root"),
+                        "commit": "3" * 40,
+                    },
+                    "feature_extractor": {
+                        "path": str(self.root / "feature.bin"),
+                        "sha256": "4" * 64,
+                        "bytes": 1,
+                    },
+                    "smplx_asset": {
+                        "path": str(self.root / "SMPLX_NEUTRAL.npz"),
+                        "sha256": "5" * 64,
+                        "bytes": 1,
+                    },
+                    "device": "cuda:0",
+                    "torch_threads": 1,
+                },
+            },
+            "runtime": {
+                "device": "cuda:0",
+                "paspa_batch_size": 64,
+                "talkshow_torch_threads": 1,
             },
         }
         self.preflight["receipt_payload_sha256"] = (
@@ -180,9 +251,95 @@ class FinalResultFixture:
             "output_root": str(self.output_root),
             "test_evaluations": 1,
             "test_feedback_into_selection": False,
+            "final_metric_event": (
+                producer.final_test.final_authority.FINAL_METRIC_EVENT
+            ),
+            "shared_predictions": {
+                "manifest": self.prediction_manifest,
+                "lineage": self.prediction_lineage,
+            },
+            "claim_consumed_before_metrics": True,
+            "failure_consumes_claim": True,
+            "retry_allowed": False,
             "input_set_sha256": "5" * 64,
         }
         producer._atomic_new(self.claim_path, self.claim, "fixture claim")
+        self.claim_artifact = {
+            "path": str(self.claim_path),
+            "sha256": producer.sha256_file(self.claim_path),
+            "bytes": self.claim_path.stat().st_size,
+        }
+        self.paspa_artifact = {
+            "path": str(self.paspa_path),
+            "sha256": producer.sha256_file(self.paspa_path),
+            "bytes": self.paspa_path.stat().st_size,
+        }
+        self.suite_start_path = (
+            self.output_root
+            / producer.talkshow_metrics.COMBINED_TALKSHOW_START_NAME
+        )
+        self.suite_start = {
+            "format": (
+                producer.talkshow_metrics.COMBINED_TALKSHOW_START_FORMAT
+            ),
+            "status": "started",
+            "combined_claim": self.claim_artifact,
+            "paspa_report": self.paspa_artifact,
+            "test_authority": self.preflight["assets"]["talkshow_metrics"][
+                "test_authority"
+            ],
+            "prediction_manifest": {
+                "path": self.prediction_manifest["path"],
+                "sha256": self.prediction_manifest["sha256"],
+            },
+            "prediction_lineage": {
+                "path": self.prediction_lineage["path"],
+                "sha256": self.prediction_lineage["sha256"],
+            },
+            "final_metric_event": (
+                producer.final_test.final_authority.FINAL_METRIC_EVENT
+            ),
+            "created_before_talkshow_metrics": True,
+            "failure_consumes_event": True,
+            "retry_allowed": False,
+        }
+        producer._atomic_new(
+            self.suite_start_path,
+            self.suite_start,
+            "fixture TalkSHOW suite start",
+        )
+        self.combined_event = {
+            "claim": self.claim_artifact,
+            "paspa_report": self.paspa_artifact,
+            "suite_start": {
+                "path": str(self.suite_start_path),
+                "sha256": producer.sha256_file(self.suite_start_path),
+                "bytes": self.suite_start_path.stat().st_size,
+            },
+        }
+        self.talkshow_metrics = {
+            "body": {
+                "released2": {"metrics": {"FGD": 1.0, "Variation": 0.0, "BC": 0.5}},
+                "paper16": {"metrics": {"FGD": 1.0, "Variation": 0.0, "BC": 0.5}},
+            },
+            "face": {
+                "metrics": {
+                    "released": {"jaw_l1": 0.1, "landmark_l1": 0.2, "LVD": 0.3},
+                    "derived": {"face_l2_combined": 0.3},
+                }
+            },
+            "rs": {"status": "N/A/unreleased", "value": None},
+        }
+        self.talkshow_report = {
+            "inputs": {
+                "prediction_manifest": self.prediction_manifest,
+                "prediction_lineage": self.prediction_lineage,
+                "combined_event": self.combined_event,
+            },
+            **self.talkshow_metrics,
+            "report_payload_sha256": "d" * 64,
+        }
+        _write_json(self.talkshow_path, self.talkshow_report)
         self.final = {
             "format": producer.RESULT_FORMAT,
             "status": "complete",
@@ -192,14 +349,34 @@ class FinalResultFixture:
                 "sha256": producer.sha256_file(self.claim_path),
             },
             "preflight": self.claim["preflight"],
-            "paspa_report": {
-                "path": str(self.paspa_path),
-                "sha256": producer.sha256_file(self.paspa_path),
-                "bytes": self.paspa_path.stat().st_size,
+            "paspa_report": self.paspa_artifact,
+            "talkshow_suite_start": self.combined_event["suite_start"],
+            "talkshow_report": {
+                "path": str(self.talkshow_path),
+                "sha256": producer.sha256_file(self.talkshow_path),
+                "bytes": self.talkshow_path.stat().st_size,
+                "report_payload_sha256": "d" * 64,
             },
-            "evaluator_command_sha256": "7" * 64,
+            "evaluator_command_sha256": hashlib.sha256(
+                b"\0".join(
+                    argument.encode("utf-8")
+                    for argument in producer._paspa_command(
+                        SimpleNamespace(device="cuda:0", batch_size=64),
+                        self.preflight,
+                        self.paspa_path,
+                    )
+                )
+            ).hexdigest(),
+            "talkshow_evaluator_call_sha256": producer.canonical_json_sha256(
+                producer._talkshow_call_receipt(
+                    self.preflight,
+                    "cuda:0",
+                    self.combined_event,
+                )
+            ),
             "protocol": self.preflight["protocol"],
             "assets": self.preflight["assets"],
+            "runtime": self.preflight["runtime"],
             "coverage": {
                 "clip_count": 1_708,
                 "exact_once": True,
@@ -207,15 +384,20 @@ class FinalResultFixture:
                 "window_length": 88,
                 "window_stride": 88,
                 "window_count": 123,
+                "generation_passes": 1,
+                "shared_prediction_bundle": True,
             },
-            "metrics": self.metrics,
+            "metrics": {
+                "diffsheg": self.metrics,
+                "talkshow": self.talkshow_metrics,
+            },
             "all_metrics_finite": True,
             "test_evaluations": 1,
             "validation_only_for_selection": True,
             "test_feedback_into_selection": False,
-            "compatibility_report_policy": self.preflight["protocol"][
-                "compatibility_reports"
-            ],
+            "final_metric_event": (
+                producer.final_test.final_authority.FINAL_METRIC_EVENT
+            ),
         }
         self.final["receipt_payload_sha256"] = producer.canonical_json_sha256(
             self.final
@@ -230,6 +412,7 @@ class FinalResultFixture:
             expected_final_metrics_canonical_payload_sha256=self.final[
                 "receipt_payload_sha256"
             ],
+            batch_size=64,
         )
         self.source_receipt = {
             "source_root": str(validator.PROJECT_ROOT),
@@ -251,6 +434,10 @@ class FinalResultFixture:
             validator,
             "_validate_validator_source_closure",
             return_value=self.source_receipt,
+        ), mock.patch.object(
+            producer.talkshow_metrics,
+            "validate_report",
+            return_value={"status": "pass"},
         ):
             return validator.validate_final_result(
                 self.args,
@@ -289,7 +476,15 @@ class FinalResultValidationTests(unittest.TestCase):
                         "selection_feedback": False,
                         "num_shards": 8,
                         "canonical_test_clips": 1_708,
+                        "final_metric_event": (
+                            producer.final_test.final_authority.FINAL_METRIC_EVENT
+                        ),
                     }
+                },
+                "contract": {
+                    "final_metric_event": (
+                        producer.final_test.final_authority.FINAL_METRIC_EVENT
+                    ),
                 },
                 "checkpoints": {
                     stage: {
@@ -363,6 +558,12 @@ class FinalResultValidationTests(unittest.TestCase):
             "--talkshow-root", "/talkshow",
             "--source-audio-root", "/audio",
             "--smplx-path", "/smplx.npz",
+            "--talkshow-metric-root", "/talkshow-metric",
+            "--talkshow-feature-extractor", "/feature-extractor.bin",
+            "--talkshow-validation-gate-json", "/final-winner-gate.json",
+            "--expected-talkshow-validation-gate-sha256", "9" * 64,
+            "--expected-talkshow-validation-gate-receipt-payload-sha256",
+            "a" * 64,
             "--expected-audio-set-sha256", "3" * 64,
             "--preflight-json", "/preflight.json",
             "--expected-preflight-sha256", "4" * 64,
@@ -381,6 +582,54 @@ class FinalResultValidationTests(unittest.TestCase):
                 "8" * 64,
             ),
         )
+        parsed = validator.build_parser().parse_args(base)
+        self.assertEqual(parsed.device, "cuda:0")
+        with (
+            mock.patch.object(
+                producer,
+                "_load_current_authority",
+                return_value=({}, {"selection": {}}),
+            ),
+            mock.patch.object(
+                producer,
+                "_validate_inference_bundle",
+                return_value=({}, []),
+            ),
+            mock.patch.object(
+                producer,
+                "_load_pinned_paspa",
+                return_value=(object(), {}),
+            ),
+            mock.patch.object(
+                producer,
+                "_validate_assets",
+                return_value={},
+            ),
+            mock.patch.object(
+                producer,
+                "_validate_protocol_inputs",
+                return_value=(
+                    SimpleNamespace(
+                        total_frames=1,
+                        total_windows=1,
+                        uncovered_tail_frames=0,
+                        clip_manifest_sha256="1" * 64,
+                    ),
+                    {},
+                ),
+            ),
+            mock.patch.object(
+                producer,
+                "_talkshow_metric_preflight",
+                return_value={},
+            ),
+        ):
+            rebuilt = producer.build_preflight(parsed)
+        self.assertEqual(rebuilt["runtime"]["device"], "cuda:0")
+        with self.assertRaises(SystemExit):
+            validator.build_parser().parse_args(
+                [*base, "--device", "cuda:1"]
+            )
         for option in prepared_options:
             with self.subTest(option=option[0]), mock.patch.object(
                 producer, "build_preflight"
@@ -461,8 +710,11 @@ class FinalResultValidationTests(unittest.TestCase):
             fixture = FinalResultFixture(Path(temporary))
             result = fixture.validate()
             self.assertEqual(result["status"], "complete")
-            self.assertEqual(result["metrics"], fixture.metrics)
-            self.assertEqual(result["metric_count"], 7)
+            self.assertEqual(result["metrics"]["diffsheg"], fixture.metrics)
+            self.assertEqual(
+                result["metrics"]["talkshow"], fixture.talkshow_metrics
+            )
+            self.assertEqual(result["diffsheg_metric_count"], 7)
             self.assertEqual(
                 result["final_metrics"]["sha256"],
                 fixture.args.expected_final_metrics_sha256,
@@ -470,6 +722,22 @@ class FinalResultValidationTests(unittest.TestCase):
             self.assertTrue(
                 result["one_shot_claim"]["exclusive_0600_single_link"]
             )
+            self.assertTrue(
+                result["talkshow_suite_start"][
+                    "exclusive_0600_single_link"
+                ]
+            )
+
+    def test_rejects_replaced_talkshow_suite_start_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = FinalResultFixture(Path(temporary))
+            fixture.suite_start_path.write_bytes(b'{"status":"forged"}\n')
+            fixture.suite_start_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                validator.FinalResultValidationError,
+                "suite-start marker SHA-256 mismatch",
+            ):
+                fixture.validate()
 
     def test_rejects_nonempty_evaluator_output_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -501,7 +769,7 @@ class FinalResultValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = FinalResultFixture(Path(temporary))
             changed = copy.deepcopy(fixture.final)
-            changed["metrics"]["fgd"] = 9.9
+            changed["metrics"]["diffsheg"]["fgd"] = 9.9
             _write_json(fixture.final_path, changed)
             fixture.args.expected_final_metrics_sha256 = producer.sha256_file(
                 fixture.final_path
@@ -589,7 +857,7 @@ class FinalResultValidationTests(unittest.TestCase):
         )
         self.assertLess(
             shell.index("validate_diffsheg_final_result.py"),
-            shell.index("SemTalk SHOW DiffSHEG final test complete"),
+            shell.index("SemTalk SHOW combined final test complete"),
         )
         self.assertIn("observed_validation_sha=$(sha256sum", shell)
         self.assertIn("observed_validation_bytes=$(stat -c %s", shell)

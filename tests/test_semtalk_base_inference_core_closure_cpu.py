@@ -117,9 +117,9 @@ class NeutralBaseInferenceClosureTest(unittest.TestCase):
             LEGACY_RELATIVE,
             contract.FRESH_PIPELINE_SOURCE_FILES,
         )
-        # The archived released2 evaluator remains hash-pinned for internal
-        # compatibility runs.  Presence in that source snapshot must not be
-        # confused with runtime reachability from the formal protocol.
+        # Both TalkSHOW metric modules remain hash-pinned.  The metric adapter
+        # is now the sole in-process TalkSHOW suite in the combined final
+        # event; only the archived replay CLI remains compatibility-only.
         self.assertTrue(
             INTERNAL_RELEASED2_EVALUATORS.issubset(
                 contract.FRESH_PIPELINE_SOURCE_FILES
@@ -141,7 +141,10 @@ class NeutralBaseInferenceClosureTest(unittest.TestCase):
         }
         formal_closure = local_show_base_import_closure(formal_roots)
         self.assertTrue(FORMAL_DIFFSHEG_ROOTS.issubset(formal_closure))
-        self.assertFalse(INTERNAL_RELEASED2_EVALUATORS & formal_closure)
+        self.assertEqual(
+            INTERNAL_RELEASED2_EVALUATORS & formal_closure,
+            {"scripts/show_base/evaluate_talkshow_show_metrics.py"},
+        )
         self.assertNotIn(LEGACY_RELATIVE, formal_closure)
         self.assertEqual(
             {
@@ -149,7 +152,8 @@ class NeutralBaseInferenceClosureTest(unittest.TestCase):
                 for relative in formal_closure
                 if Path(relative).name.startswith("evaluate_")
             },
-            set(FORMAL_DIFFSHEG_ROOTS),
+            set(FORMAL_DIFFSHEG_ROOTS)
+            | {"scripts/show_base/evaluate_talkshow_show_metrics.py"},
         )
 
     def test_neutral_core_exports_exact_pinned_callable_closure(self) -> None:

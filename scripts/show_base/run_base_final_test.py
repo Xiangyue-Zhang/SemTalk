@@ -478,6 +478,8 @@ def _validate_authority_identity(authority: Any) -> dict[str, Any]:
         or authority.get("contract", {}).get("split") != "test"
         or authority.get("contract", {}).get("test_clips") != TEST_CLIPS
         or authority.get("contract", {}).get("num_shards") != NUM_SHARDS
+        or authority.get("contract", {}).get("final_metric_event")
+        != final_authority.FINAL_METRIC_EVENT
         or set(authority.get("checkpoints", {})) != set(CHECKPOINT_STAGES)
     ):
         raise FinalTestContractError("test authority identity changed")
@@ -1090,6 +1092,7 @@ def _contract(
             "test_evaluations": 1,
             "test_feedback_into_selection": False,
         },
+        "final_metric_event": final_authority.FINAL_METRIC_EVENT,
         "speaker_mapping": dict(SHOW_SPEAKER_IDS),
         "split": "test",
         "test_clips": TEST_CLIPS,

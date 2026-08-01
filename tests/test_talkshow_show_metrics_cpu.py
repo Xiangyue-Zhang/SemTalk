@@ -1827,6 +1827,177 @@ class OfflineAdapterTest(unittest.TestCase):
             "semtalk_show_deterministic_distribution_receipt_v2",
         )
 
+    def test_standalone_test_cli_is_fail_closed(self) -> None:
+        argv = [
+            "--canonical-manifest", "/canonical.jsonl",
+            "--expected-canonical-manifest-sha256", "1" * 64,
+            "--prediction-manifest", "/predictions.jsonl",
+            "--expected-prediction-manifest-sha256", "2" * 64,
+            "--prediction-lineage", "/lineage.json",
+            "--expected-prediction-lineage-sha256", "3" * 64,
+            "--validation-gate-json", "/gate.json",
+            "--expected-validation-gate-sha256", "4" * 64,
+            "--expected-validation-gate-receipt-payload-sha256", "5" * 64,
+            "--distribution-declaration-json", "/distribution.json",
+            "--expected-distribution-declaration-sha256", "6" * 64,
+            "--test-authority-json", "/authority.json",
+            "--expected-test-authority-sha256", "7" * 64,
+            "--expected-test-authority-bytes", "1",
+            "--expected-test-authority-receipt-payload-sha256", "8" * 64,
+            "--talkshow-metric-root", "/metric-root",
+            "--feature-extractor", "/feature.bin",
+            "--smplx-asset", "/SMPLX_NEUTRAL.npz",
+            "--device", "cuda:0",
+            "--split", "test",
+            "--expected-clip-count", "1708",
+            "--output-json", "/report.json",
+        ]
+        with self.assertRaises(SystemExit) as raised:
+            METRICS.parse_args(argv)
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_formal_test_programmatic_api_requires_consumed_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with (
+                mock.patch.object(
+                    METRICS,
+                    "_require_concrete_formal_backend",
+                ),
+                mock.patch.object(
+                    METRICS,
+                    "_validated_test_authority",
+                    return_value={
+                        "expected_output_root": str(root / "inference"),
+                        "contract": {"final_metric_event": {}},
+                    },
+                ),
+                self.assertRaisesRegex(
+                    METRICS.MetricAdapterContractError,
+                    "pre-consumed combined one-shot claim",
+                ),
+            ):
+                METRICS.evaluate_canonical_bundle(
+                    canonical_manifest=root / "canonical.jsonl",
+                    expected_canonical_manifest_sha256="1" * 64,
+                    prediction_manifest=root / "predictions.jsonl",
+                    expected_prediction_manifest_sha256="2" * 64,
+                    prediction_lineage=root / "lineage.json",
+                    expected_prediction_lineage_sha256="3" * 64,
+                    validation_gate={},
+                    distribution_declaration={},
+                    backend=object(),
+                    split="test",
+                    expected_clip_count=1_708,
+                    test_authority={},
+                )
+
+    def test_combined_talkshow_suite_start_is_non_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            inference_root = root / "inference"
+            output_root = root / "metrics"
+            inference_root.mkdir()
+            output_root.mkdir()
+            manifest_path = inference_root / "manifest.jsonl"
+            lineage_path = inference_root / "lineage.json"
+            paspa_path = output_root / "paspa_diffsheg_show_metrics.json"
+            manifest_path.write_bytes(b'{"fixture":true}\n')
+            lineage_path.write_bytes(b'{"fixture":true}\n')
+            paspa_path.write_bytes(b'{"status":"complete"}\n')
+            manifest = {
+                "path": str(manifest_path),
+                "sha256": sha256_file(manifest_path),
+                "bytes": manifest_path.stat().st_size,
+            }
+            lineage = {
+                "path": str(lineage_path),
+                "sha256": sha256_file(lineage_path),
+                "bytes": lineage_path.stat().st_size,
+            }
+            authority_receipt = {
+                "path": str(root / "authority.json"),
+                "sha256": "4" * 64,
+                "bytes": 1,
+                "receipt_payload_sha256": "5" * 64,
+            }
+            event = {
+                "authorized_events": 1,
+                "generation_passes": 1,
+                "shared_prediction_bundle": True,
+                "single_claim_required": True,
+                "all_suites_required": True,
+            }
+            claim = {
+                "format": METRICS.COMBINED_CLAIM_FORMAT,
+                "status": "claimed",
+                "authority": {"fresh_test_authority": authority_receipt},
+                "preflight": {},
+                "output_root": str(output_root),
+                "test_evaluations": 1,
+                "test_feedback_into_selection": False,
+                "final_metric_event": event,
+                "shared_predictions": {
+                    "manifest": manifest,
+                    "lineage": lineage,
+                },
+                "claim_consumed_before_metrics": True,
+                "failure_consumes_claim": True,
+                "retry_allowed": False,
+                "input_set_sha256": "6" * 64,
+            }
+            claim_path = inference_root / METRICS.COMBINED_CLAIM_NAME
+            claim_path.write_bytes(METRICS.canonical_json_bytes(claim))
+            claim_path.chmod(0o600)
+            claim_receipt = {
+                "path": str(claim_path),
+                "sha256": sha256_file(claim_path),
+                "bytes": claim_path.stat().st_size,
+            }
+            validated_claim = METRICS._validated_combined_claim(
+                claim_receipt,
+                test_authority_receipt=authority_receipt,
+                validated_test_authority={
+                    "expected_output_root": str(inference_root),
+                    "contract": {"final_metric_event": event},
+                },
+                prediction_manifest=manifest_path,
+                expected_prediction_manifest_sha256=manifest["sha256"],
+                prediction_lineage=lineage_path,
+                expected_prediction_lineage_sha256=lineage["sha256"],
+            )
+            paspa = {
+                "path": str(paspa_path),
+                "sha256": sha256_file(paspa_path),
+                "bytes": paspa_path.stat().st_size,
+            }
+            kwargs = {
+                "claim_artifact": validated_claim[0],
+                "claim": validated_claim[1],
+                "paspa_report": paspa,
+                "test_authority_receipt": authority_receipt,
+                "prediction_manifest": manifest_path,
+                "expected_prediction_manifest_sha256": manifest["sha256"],
+                "prediction_lineage": lineage_path,
+                "expected_prediction_lineage_sha256": lineage["sha256"],
+            }
+            evidence = METRICS._consume_combined_talkshow_suite_start(
+                **kwargs
+            )
+            self.assertEqual(evidence["claim"], claim_receipt)
+            self.assertEqual(
+                (output_root / METRICS.COMBINED_TALKSHOW_START_NAME)
+                .stat()
+                .st_mode
+                & 0o777,
+                0o600,
+            )
+            with self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "already started; replay refused",
+            ):
+                METRICS._consume_combined_talkshow_suite_start(**kwargs)
+
     def test_same_path_cached_final_authority_is_ignored(self) -> None:
         expected = (
             Path(METRICS.__file__).resolve().parent
@@ -1847,7 +2018,7 @@ class OfflineAdapterTest(unittest.TestCase):
         self.assertIsNot(observed, fake)
         self.assertEqual(
             observed.FORMAT,
-            "semtalk_show_base_final_test_authority_v1",
+            "semtalk_show_base_final_test_authority_v2",
         )
 
     def test_same_path_cached_talkshow_contract_is_ignored(self) -> None:
@@ -1971,7 +2142,7 @@ class OfflineAdapterTest(unittest.TestCase):
             [" M nets/__init__.py", "?? marker.json"],
         )
 
-    def test_production_dependency_closure_excludes_legacy_evaluator(self) -> None:
+    def test_production_dependency_closure_uses_one_combined_evaluator(self) -> None:
         validation = importlib.import_module(
             "scripts.show_base.evaluate_diffsheg_val_fgd"
         )
@@ -1982,8 +2153,9 @@ class OfflineAdapterTest(unittest.TestCase):
             "scripts.show_base.base_final_authority"
         )
 
-        # released2 remains callable for explicitly internal compatibility
-        # reports, but it is not the validation or final-test authority.
+        # released2 remains callable for validation and is also required in
+        # the same final event as PASPA DiffSHEG.  The replay-only CLI stays
+        # outside the production closure.
         self.assertEqual(
             METRICS.PRIMARY_METRIC_PATH,
             "body.released2.metrics.FGD",
@@ -2004,7 +2176,10 @@ class OfflineAdapterTest(unittest.TestCase):
             *(f"scripts/show_base/{name}.py" for name in control_modules),
         }
         formal_closure = local_show_base_import_closure(formal_roots)
-        self.assertFalse(INTERNAL_RELEASED2_MODULES & formal_closure)
+        self.assertEqual(
+            INTERNAL_RELEASED2_MODULES & formal_closure,
+            {"scripts/show_base/evaluate_talkshow_show_metrics.py"},
+        )
         self.assertEqual(
             {
                 relative
@@ -2014,6 +2189,7 @@ class OfflineAdapterTest(unittest.TestCase):
             {
                 "scripts/show_base/evaluate_diffsheg_val_fgd.py",
                 "scripts/show_base/evaluate_diffsheg_final_test.py",
+                "scripts/show_base/evaluate_talkshow_show_metrics.py",
             },
         )
         for launcher_name in (
@@ -2024,13 +2200,15 @@ class OfflineAdapterTest(unittest.TestCase):
                 ROOT / "scripts" / "show_base" / launcher_name
             ).read_text(encoding="utf-8")
             self.assertIn("evaluate_diffsheg_final_test.py", launcher)
+            # Neither launcher starts a second TalkSHOW CLI process.  The
+            # combined producer imports the module from verified source.
             for internal in INTERNAL_RELEASED2_MODULES:
                 self.assertNotIn(Path(internal).name, launcher)
 
         # Validation and final evaluation share one audited PASPA entrypoint
-        # and one DiffSHEG statistics/FGD asset lineage.  Final evaluation
-        # extends that exact lineage with the other two published AEs and the
-        # TalkSHOW/SMPL-X inputs needed only for the DiffSHEG BA metric.
+        # and one DiffSHEG statistics/FGD asset lineage.  The combined final
+        # event extends that lineage with both the remaining published AEs
+        # and the TalkSHOW body/face evaluator over the same predictions.
         self.assertEqual(
             validation.PASPA_EVALUATOR_RELATIVE,
             Path("scripts/diffsheg_show_eval.py"),

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Fail closed over the sole SemTalk SHOW DiffSHEG final result.
+"""Fail closed over the sole combined SemTalk SHOW final-test result.
 
 The metric producer returns an external SHA/byte/canonical-payload pin for
 ``final_metrics.json``.  This independent terminal validator freshly replays
 the full final-test authority and frozen preflight, then binds those external
-pins to the exclusive one-shot claim, the exact PASPA report, and exactly the
-seven finite paper-facing DiffSHEG metrics.  It never imports or reads the
-TalkSHOW compatibility evaluator.
+pins to the exclusive one-shot claim, the exact PASPA report, exactly seven
+finite DiffSHEG metrics, and the TalkSHOW released2/paper16 body plus released
+face report.  Both reports must bind the same finalized predictions and the
+same authority; neither is valid as a separate test evaluation.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from scripts.show_base import evaluate_diffsheg_final_test as producer
 from scripts.show_base import run_base_final_test as final_test
 
 
-FORMAT = "semtalk_show_diffsheg_final_result_validation_v1"
+FORMAT = "semtalk_show_combined_final_result_validation_v1"
 
 
 class FinalResultValidationError(RuntimeError):
@@ -205,7 +206,7 @@ def _recheck_snapshot(
         raise FinalResultValidationError(f"{label} changed before completion")
 
 
-def _validate_metrics(value: Any, label: str) -> dict[str, float]:
+def _validate_diffsheg_metrics(value: Any, label: str) -> dict[str, float]:
     if type(value) is not dict or set(value) != set(producer.EXPECTED_METRICS):
         raise FinalResultValidationError(
             f"{label} must contain exactly the seven DiffSHEG metrics"
@@ -383,16 +384,20 @@ def validate_final_result(
         "one_shot_claim",
         "preflight",
         "paspa_report",
+        "talkshow_suite_start",
+        "talkshow_report",
         "evaluator_command_sha256",
+        "talkshow_evaluator_call_sha256",
         "protocol",
         "assets",
+        "runtime",
         "coverage",
         "metrics",
         "all_metrics_finite",
         "test_evaluations",
         "validation_only_for_selection",
         "test_feedback_into_selection",
-        "compatibility_report_policy",
+        "final_metric_event",
         "receipt_payload_sha256",
     }
     if (
@@ -402,17 +407,24 @@ def validate_final_result(
         or final_result.get("authority") != current_preflight.get("authority")
         or final_result.get("protocol") != current_preflight.get("protocol")
         or final_result.get("assets") != current_preflight.get("assets")
+        or final_result.get("runtime") != current_preflight.get("runtime")
         or final_result.get("all_metrics_finite") is not True
         or final_result.get("test_evaluations") != 1
         or final_result.get("validation_only_for_selection") is not True
         or final_result.get("test_feedback_into_selection") is not False
-        or final_result.get("compatibility_report_policy")
-        != current_preflight["protocol"]["compatibility_reports"]
+        or final_result.get("final_metric_event")
+        != producer.final_test.final_authority.FINAL_METRIC_EVENT
+        or current_preflight["protocol"].get("final_metric_event")
+        != producer.final_test.final_authority.FINAL_METRIC_EVENT
     ):
         raise FinalResultValidationError("final metric authority/schema changed")
     _sha256(
         final_result.get("evaluator_command_sha256"),
         "evaluator command SHA-256",
+    )
+    _sha256(
+        final_result.get("talkshow_evaluator_call_sha256"),
+        "TalkSHOW evaluator call SHA-256",
     )
     expected_preflight_receipt = {
         "path": str(preflight_path),
@@ -434,6 +446,8 @@ def validate_final_result(
         "window_length": producer.WINDOW_LENGTH,
         "window_stride": producer.WINDOW_STRIDE,
         "window_count": inference.get("window_count"),
+        "generation_passes": 1,
+        "shared_prediction_bundle": True,
     }
     if final_result.get("coverage") != expected_coverage:
         raise FinalResultValidationError("final metric coverage changed")
@@ -444,10 +458,10 @@ def validate_final_result(
     claim_path = producer._claim_path(inference_root)
     claim_path, claim_payload, claim_sha256, claim_metadata = _safe_snapshot(
         claim_path,
-        "exclusive DiffSHEG one-shot claim",
+        "exclusive combined one-shot claim",
         exclusive_claim=True,
     )
-    claim = _strict_json(claim_payload, "exclusive DiffSHEG one-shot claim")
+    claim = _strict_json(claim_payload, "exclusive combined one-shot claim")
     expected_claim = {
         "format": producer.CLAIM_FORMAT,
         "status": "claimed",
@@ -456,6 +470,18 @@ def validate_final_result(
         "output_root": str(formal_output_root.resolve()),
         "test_evaluations": 1,
         "test_feedback_into_selection": False,
+        "final_metric_event": producer.final_test.final_authority.FINAL_METRIC_EVENT,
+        "shared_predictions": {
+            "manifest": current_preflight["assets"]["talkshow_metrics"][
+                "prediction_manifest"
+            ],
+            "lineage": current_preflight["assets"]["talkshow_metrics"][
+                "prediction_lineage"
+            ],
+        },
+        "claim_consumed_before_metrics": True,
+        "failure_consumes_claim": True,
+        "retry_allowed": False,
         "input_set_sha256": inference.get("input_set_sha256"),
     }
     if claim != expected_claim:
@@ -478,6 +504,30 @@ def validate_final_result(
     expected_paspa_path = formal_output_root / "paspa_diffsheg_show_metrics.json"
     if Path(str(paspa_receipt.get("path", ""))) != expected_paspa_path:
         raise FinalResultValidationError("PASPA report path changed")
+    frozen_device = current_preflight["assets"]["talkshow_metrics"].get(
+        "device"
+    )
+    if frozen_device != "cuda:0":
+        raise FinalResultValidationError(
+            "combined metric device is not the frozen cuda:0 device"
+        )
+    expected_paspa_command = producer._paspa_command(
+        argparse.Namespace(device=frozen_device, batch_size=args.batch_size),
+        current_preflight,
+        expected_paspa_path,
+    )
+    expected_paspa_command_sha256 = hashlib.sha256(
+        b"\0".join(
+            argument.encode("utf-8") for argument in expected_paspa_command
+        )
+    ).hexdigest()
+    if (
+        final_result["evaluator_command_sha256"]
+        != expected_paspa_command_sha256
+    ):
+        raise FinalResultValidationError(
+            "PASPA evaluator command receipt changed"
+        )
     paspa_path, paspa_payload, paspa_sha256, paspa_metadata = _safe_snapshot(
         expected_paspa_path,
         "pinned PASPA DiffSHEG report",
@@ -491,10 +541,195 @@ def validate_final_result(
         )
     except producer.FinalDiffSHEGError as error:
         raise FinalResultValidationError(str(error)) from error
-    final_metrics = _validate_metrics(final_result.get("metrics"), "metrics")
-    if final_metrics != paspa_metrics:
+    metric_bundle = final_result.get("metrics")
+    if type(metric_bundle) is not dict or set(metric_bundle) != {
+        "diffsheg",
+        "talkshow",
+    }:
         raise FinalResultValidationError(
-            "final metrics differ from the pinned PASPA report"
+            "combined metric bundle must contain both required suites"
+        )
+    final_diffsheg_metrics = _validate_diffsheg_metrics(
+        metric_bundle["diffsheg"],
+        "metrics.diffsheg",
+    )
+    if final_diffsheg_metrics != paspa_metrics:
+        raise FinalResultValidationError(
+            "final DiffSHEG metrics differ from the pinned PASPA report"
+        )
+
+    suite_start_receipt = final_result.get("talkshow_suite_start")
+    if type(suite_start_receipt) is not dict or set(suite_start_receipt) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise FinalResultValidationError(
+            "TalkSHOW suite-start receipt schema changed"
+        )
+    expected_suite_start_path = (
+        formal_output_root
+        / producer.talkshow_metrics.COMBINED_TALKSHOW_START_NAME
+    )
+    if Path(str(suite_start_receipt.get("path", ""))) != (
+        expected_suite_start_path
+    ):
+        raise FinalResultValidationError(
+            "TalkSHOW suite-start marker path changed"
+        )
+    (
+        suite_start_path,
+        suite_start_payload,
+        suite_start_sha256,
+        suite_start_metadata,
+    ) = _safe_snapshot(
+        expected_suite_start_path,
+        "exclusive TalkSHOW suite-start marker",
+        expected_sha256=suite_start_receipt["sha256"],
+        expected_bytes=suite_start_receipt["bytes"],
+        exclusive_claim=True,
+    )
+    suite_start = _strict_json(
+        suite_start_payload,
+        "exclusive TalkSHOW suite-start marker",
+    )
+    claim_artifact = {
+        "path": str(claim_path),
+        "sha256": claim_sha256,
+        "bytes": len(claim_payload),
+    }
+    paspa_artifact = {
+        "path": str(paspa_path),
+        "sha256": paspa_sha256,
+        "bytes": len(paspa_payload),
+    }
+    talkshow_suite = current_preflight["assets"]["talkshow_metrics"]
+    expected_suite_start = {
+        "format": producer.talkshow_metrics.COMBINED_TALKSHOW_START_FORMAT,
+        "status": "started",
+        "combined_claim": claim_artifact,
+        "paspa_report": paspa_artifact,
+        "test_authority": talkshow_suite["test_authority"],
+        "prediction_manifest": {
+            "path": talkshow_suite["prediction_manifest"]["path"],
+            "sha256": talkshow_suite["prediction_manifest"]["sha256"],
+        },
+        "prediction_lineage": {
+            "path": talkshow_suite["prediction_lineage"]["path"],
+            "sha256": talkshow_suite["prediction_lineage"]["sha256"],
+        },
+        "final_metric_event": (
+            producer.final_test.final_authority.FINAL_METRIC_EVENT
+        ),
+        "created_before_talkshow_metrics": True,
+        "failure_consumes_event": True,
+        "retry_allowed": False,
+    }
+    if suite_start != expected_suite_start:
+        raise FinalResultValidationError(
+            "TalkSHOW suite-start marker binding changed"
+        )
+    combined_event = {
+        "claim": claim_artifact,
+        "paspa_report": paspa_artifact,
+        "suite_start": {
+            "path": str(suite_start_path),
+            "sha256": suite_start_sha256,
+            "bytes": len(suite_start_payload),
+        },
+    }
+
+    talkshow_receipt = final_result.get("talkshow_report")
+    if type(talkshow_receipt) is not dict or set(talkshow_receipt) != {
+        "path",
+        "sha256",
+        "bytes",
+        "report_payload_sha256",
+    }:
+        raise FinalResultValidationError(
+            "TalkSHOW report receipt schema changed"
+        )
+    expected_talkshow_path = (
+        formal_output_root / "talkshow_show_body_face_metrics.json"
+    )
+    if Path(str(talkshow_receipt.get("path", ""))) != expected_talkshow_path:
+        raise FinalResultValidationError("TalkSHOW report path changed")
+    (
+        talkshow_path,
+        talkshow_payload,
+        talkshow_sha256,
+        talkshow_metadata,
+    ) = _safe_snapshot(
+        expected_talkshow_path,
+        "pinned TalkSHOW body/face report",
+        expected_sha256=talkshow_receipt["sha256"],
+        expected_bytes=talkshow_receipt["bytes"],
+    )
+    talkshow_report = _strict_json(
+        talkshow_payload,
+        "pinned TalkSHOW body/face report",
+    )
+    expected_talkshow_call_sha256 = producer.canonical_json_sha256(
+        producer._talkshow_call_receipt(
+            current_preflight,
+            frozen_device,
+            combined_event,
+        )
+    )
+    if (
+        final_result["talkshow_evaluator_call_sha256"]
+        != expected_talkshow_call_sha256
+    ):
+        raise FinalResultValidationError(
+            "TalkSHOW evaluator call receipt changed"
+        )
+    expected_prediction_manifest = {
+        key: talkshow_suite["prediction_manifest"][key]
+        for key in ("path", "sha256", "bytes")
+    }
+    expected_selection_protocol = {
+        "primary_metric": producer.talkshow_metrics.PRIMARY_METRIC_PATH,
+        "mode": "min",
+        "validation_only_for_selection": True,
+        "test_evaluations": 1,
+    }
+    try:
+        producer.talkshow_metrics.validate_report(
+            talkshow_report,
+            expected_split="test",
+            expected_clip_count=producer.EXPECTED_TEST_CLIPS,
+            expected_prediction_manifest=expected_prediction_manifest,
+            expected_distribution_receipt=talkshow_suite[
+                "distribution_receipt"
+            ],
+            expected_selection_protocol=expected_selection_protocol,
+            expected_test_authority=talkshow_suite["test_authority"],
+            expected_combined_event=combined_event,
+        )
+    except producer.talkshow_metrics.MetricAdapterContractError as error:
+        raise FinalResultValidationError(
+            f"TalkSHOW report fresh validation failed: {error}"
+        ) from error
+    if (
+        talkshow_receipt["report_payload_sha256"]
+        != talkshow_report.get("report_payload_sha256")
+        or metric_bundle["talkshow"]
+        != {
+            "body": talkshow_report.get("body"),
+            "face": talkshow_report.get("face"),
+            "rs": talkshow_report.get("rs"),
+        }
+        or talkshow_report.get("inputs", {}).get("prediction_manifest", {}).get(
+            "sha256"
+        )
+        != inference["manifest"]["sha256"]
+        or talkshow_report.get("inputs", {}).get("prediction_lineage", {}).get(
+            "sha256"
+        )
+        != inference["lineage"]["sha256"]
+    ):
+        raise FinalResultValidationError(
+            "TalkSHOW report does not share the claimed prediction bundle"
         )
 
     _recheck_snapshot(
@@ -509,7 +744,7 @@ def validate_final_result(
         claim_payload,
         claim_sha256,
         claim_metadata,
-        "exclusive DiffSHEG one-shot claim",
+        "exclusive combined one-shot claim",
         exclusive_claim=True,
     )
     _recheck_snapshot(
@@ -518,6 +753,21 @@ def validate_final_result(
         paspa_sha256,
         paspa_metadata,
         "pinned PASPA DiffSHEG report",
+    )
+    _recheck_snapshot(
+        suite_start_path,
+        suite_start_payload,
+        suite_start_sha256,
+        suite_start_metadata,
+        "exclusive TalkSHOW suite-start marker",
+        exclusive_claim=True,
+    )
+    _recheck_snapshot(
+        talkshow_path,
+        talkshow_payload,
+        talkshow_sha256,
+        talkshow_metadata,
+        "pinned TalkSHOW body/face report",
     )
     _recheck_snapshot(
         final_path,
@@ -548,18 +798,37 @@ def validate_final_result(
             "sha256": paspa_sha256,
             "bytes": len(paspa_payload),
         },
+        "talkshow_suite_start": {
+            "path": str(suite_start_path),
+            "sha256": suite_start_sha256,
+            "bytes": len(suite_start_payload),
+            "exclusive_0600_single_link": True,
+        },
+        "talkshow_report": {
+            "path": str(talkshow_path),
+            "sha256": talkshow_sha256,
+            "bytes": len(talkshow_payload),
+            "report_payload_sha256": talkshow_report[
+                "report_payload_sha256"
+            ],
+        },
         "final_metrics": {
             "path": str(final_path),
             "sha256": final_sha256,
             "bytes": len(final_payload),
             "canonical_payload_sha256": canonical_payload_sha256,
         },
-        "metrics": final_metrics,
-        "metric_names": list(producer.EXPECTED_METRICS),
-        "metric_count": len(producer.EXPECTED_METRICS),
+        "metrics": metric_bundle,
+        "metric_suites": [
+            "paspa_diffsheg_show_seven",
+            "talkshow_show_body_face",
+        ],
+        "diffsheg_metric_names": list(producer.EXPECTED_METRICS),
+        "diffsheg_metric_count": len(producer.EXPECTED_METRICS),
         "all_metrics_finite": True,
         "test_evaluations": 1,
         "test_feedback_into_selection": False,
+        "shared_prediction_bundle": expected_prediction_manifest,
     }
     validation["receipt_payload_sha256"] = producer.canonical_json_sha256(
         validation
@@ -576,6 +845,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--talkshow-root", type=Path, required=True)
     parser.add_argument("--source-audio-root", type=Path, required=True)
     parser.add_argument("--smplx-path", type=Path, required=True)
+    parser.add_argument("--talkshow-metric-root", type=Path, required=True)
+    parser.add_argument(
+        "--talkshow-feature-extractor", type=Path, required=True
+    )
+    parser.add_argument(
+        "--talkshow-validation-gate-json", type=Path, required=True
+    )
+    parser.add_argument(
+        "--expected-talkshow-validation-gate-sha256", required=True
+    )
+    parser.add_argument(
+        "--expected-talkshow-validation-gate-receipt-payload-sha256",
+        required=True,
+    )
+    parser.add_argument("--talkshow-torch-threads", type=int, default=1)
     parser.add_argument("--expected-audio-set-sha256", required=True)
     parser.add_argument("--preflight-json", type=Path, required=True)
     parser.add_argument("--expected-preflight-sha256", required=True)
@@ -587,14 +871,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
+    # The producer preflight schema includes the formal device.  Terminal
+    # replay is CPU-only but must reconstruct that immutable CUDA identity;
+    # it is deliberately a non-overridable parser default.
+    parser.set_defaults(device="cuda:0")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.batch_size < 1 or args.seed < 0:
-        parser.error("--batch-size must be positive and --seed non-negative")
+    if (
+        args.batch_size < 1
+        or args.talkshow_torch_threads < 1
+        or args.seed < 0
+    ):
+        parser.error(
+            "--batch-size/--talkshow-torch-threads must be positive and "
+            "--seed non-negative"
+        )
     prepared_values = (
         args.prepared_authority,
         args.expected_prepared_authority_sha256,
@@ -614,6 +909,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.expected_preflight_sha256 = _sha256(
             args.expected_preflight_sha256,
             "--expected-preflight-sha256",
+        )
+        args.expected_talkshow_validation_gate_sha256 = _sha256(
+            args.expected_talkshow_validation_gate_sha256,
+            "--expected-talkshow-validation-gate-sha256",
+        )
+        args.expected_talkshow_validation_gate_receipt_payload_sha256 = (
+            _sha256(
+                args.expected_talkshow_validation_gate_receipt_payload_sha256,
+                "--expected-talkshow-validation-gate-receipt-payload-sha256",
+            )
         )
         current = producer.build_preflight(args)
         validation = validate_final_result(args, current)

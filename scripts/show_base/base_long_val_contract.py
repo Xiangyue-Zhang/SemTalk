@@ -230,7 +230,6 @@ COMPATIBILITY_ONLY_ENTRYPOINTS = (
     "scripts/show_base/select_published_base_winner.py",
     "scripts/show_base/published_test_winner_claim.py",
     "scripts/show_base/replay_released2_primary.py",
-    "scripts/show_base/evaluate_talkshow_show_metrics.py",
 )
 
 # Re-export the exact formal validation ABI used by the 22-way producer.  The

@@ -22,8 +22,8 @@ import types
 from typing import Any, Mapping, Sequence
 
 
-FORMAT = "semtalk_show_base_final_test_authority_v1"
-INPUTS_FORMAT = "semtalk_show_base_final_authority_inputs_v1"
+FORMAT = "semtalk_show_base_final_test_authority_v2"
+INPUTS_FORMAT = "semtalk_show_base_final_authority_inputs_v2"
 PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_newline_v1"
 BASE_SELECTION_METRIC = "validation.diffsheg.metrics.fgd"
 BASE_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
@@ -48,6 +48,49 @@ SHOW_SPEAKER_IDS = {
     "chemistry": 1,
     "seth": 2,
     "conan": 3,
+}
+FINAL_METRIC_EVENT = {
+    "format": "semtalk_show_combined_final_metric_event_v1",
+    "authorized_events": 1,
+    "generation_passes": 1,
+    "shared_prediction_bundle": True,
+    "single_claim_required": True,
+    "claim_consumed_before_metrics": True,
+    "failure_consumes_claim": True,
+    "retry_allowed": False,
+    "all_suites_required": True,
+    "metric_suites": [
+        {
+            "name": "paspa_diffsheg_show_seven",
+            "metrics": [
+                "fmd",
+                "fed",
+                "expression_diversity",
+                "fgd",
+                "ba",
+                "pcm",
+                "gesture_diversity",
+            ],
+        },
+        {
+            "name": "talkshow_show_body_face",
+            "body_protocols": ["released2", "paper16"],
+            "body_metrics": ["FGD", "Variation", "BC"],
+            "face_protocol": "released_face_sample0",
+            "face_metrics": [
+                "jaw_l1",
+                "landmark_l1",
+                "LVD",
+                "face_l2_combined",
+            ],
+            "rs": "N/A/unreleased",
+        },
+    ],
+}
+FINAL_TEST_POLICY = {
+    "test_evaluations": 1,
+    "test_feedback_into_selection": False,
+    "final_metric_event": FINAL_METRIC_EVENT,
 }
 ARTIFACT_KEYS = {"path", "sha256", "bytes"}
 SOURCE_INPUT_KEYS = {
@@ -2141,6 +2184,7 @@ def _control_authority(
                     **dict(published["test_policy"]),
                     "num_shards": NUM_SHARDS,
                     "canonical_test_clips": TEST_CLIPS,
+                    "final_metric_event": FINAL_METRIC_EVENT,
                 },
             },
             "base_long_candidate_bundle": dict(
@@ -2245,6 +2289,7 @@ def _authority_inputs(
             "selection_split": "val",
             "test_evaluations": 1,
             "test_feedback_into_selection": False,
+            "final_metric_event": FINAL_METRIC_EVENT,
             "forbidden_generator_identities": list(
                 FORBIDDEN_IDENTITIES
             ),
@@ -2598,11 +2643,7 @@ def _load_authority_inputs(
         or value["format"] != INPUTS_FORMAT
         or value["status"] != "ready"
         or value["selection_protocol"] != BASE_SELECTION_PROTOCOL
-        or value["test_policy"]
-        != {
-            "test_evaluations": 1,
-            "test_feedback_into_selection": False,
-        }
+        or value["test_policy"] != FINAL_TEST_POLICY
     ):
         raise BaseFinalAuthorityError(
             "final authority inputs identity/policy mismatch"

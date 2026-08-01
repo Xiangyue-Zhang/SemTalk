@@ -54,6 +54,9 @@ def fake_authority(root: Path) -> dict[str, object]:
             "split": "test",
             "test_clips": target.TEST_CLIPS,
             "num_shards": target.NUM_SHARDS,
+            "final_metric_event": (
+                target.final_authority.FINAL_METRIC_EVENT
+            ),
         },
         "expected_output_root": str(root.resolve()),
         "canonical": {

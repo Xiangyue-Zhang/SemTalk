@@ -594,6 +594,8 @@ class TrainerWatcherCompatibilityContracts(unittest.TestCase):
         }
         observed_modules = {Path(relative).stem for relative in python_closure}
         self.assertFalse(forbidden_modules & observed_modules)
+        self.assertIn("evaluate_talkshow_show_metrics", observed_modules)
+        self.assertNotIn("replay_released2_primary", observed_modules)
         self.assertNotIn("talkshow_base_val_contract", observed_modules)
         self.assertNotIn(WATCHER_PATH.stem, observed_modules)
 

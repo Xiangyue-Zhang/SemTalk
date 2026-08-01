@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BaseFinalLauncherProtocolTests(unittest.TestCase):
-    def test_formal_entrypoints_expose_only_diffsheg_test_evaluation(self) -> None:
+    def test_formal_entrypoints_expose_one_combined_test_evaluation(self) -> None:
         launcher = (
             ROOT / "scripts" / "show_base" / "run_base_final_test.sh"
         ).read_text(encoding="utf-8")
@@ -19,20 +19,19 @@ class BaseFinalLauncherProtocolTests(unittest.TestCase):
             ROOT / "scripts" / "show_base" / "base_final_authority.py"
         ).read_text(encoding="utf-8")
 
-        forbidden = (
-            "evaluate_talkshow_show_metrics",
-            "talkshow_metrics",
-            "released2",
-            "paper16",
-        )
-        for token in forbidden:
-            self.assertNotIn(token, launcher.lower())
-            self.assertNotIn(token, consumer.lower())
-            self.assertNotIn(token, authority.lower())
-
         self.assertNotIn('add_parser("seal"', consumer)
         self.assertNotIn('args.command == "seal"', consumer)
         self.assertIn("evaluate_diffsheg_final_test.py", launcher)
+        # TalkSHOW is called in-process by the sole combined producer; the
+        # shell must never launch a second metric evaluator.
+        self.assertNotIn("evaluate_talkshow_show_metrics.py", launcher)
+        self.assertIn("sole formal test-metric process", launcher)
+        self.assertIn("both required", launcher)
+        self.assertIn("released2", authority.lower())
+        self.assertIn("paper16", authority.lower())
+        self.assertIn("paspa_diffsheg_show_seven", authority)
+        self.assertIn("talkshow_show_body_face", authority)
+        self.assertIn("final_metric_event", consumer)
         self.assertIn("prepare_diffsheg_audio_view.py", launcher)
         self.assertLess(
             launcher.index('"$adapter" finalize'),
@@ -46,8 +45,7 @@ class BaseFinalLauncherProtocolTests(unittest.TestCase):
             '--source-audio-root "$diffsheg_audio_view"',
             launcher,
         )
-        self.assertNotIn("validation-gate", launcher)
-        self.assertNotIn("distribution", launcher.lower())
+        self.assertIn("--talkshow-validation-gate-json", launcher)
         self.assertNotIn("validation_gate", consumer)
         self.assertNotIn('add_parser("distribution"', consumer)
         self.assertEqual(

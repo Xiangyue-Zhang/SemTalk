@@ -16,8 +16,8 @@ def _write_inputs(path: Path, *, test_evaluations: int = 1) -> dict[str, object]
         "status": "ready",
         "selection_protocol": authority.BASE_SELECTION_PROTOCOL,
         "test_policy": {
+            **authority.FINAL_TEST_POLICY,
             "test_evaluations": test_evaluations,
-            "test_feedback_into_selection": False,
         },
         "expected_output_root": str(path.parent / "formal-output"),
         "canonical_manifest": {},

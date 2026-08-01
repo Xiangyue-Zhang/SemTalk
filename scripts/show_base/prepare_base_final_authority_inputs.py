@@ -181,10 +181,7 @@ def build_inputs(args: argparse.Namespace) -> dict[str, Any]:
         "format": authority.INPUTS_FORMAT,
         "status": "ready",
         "selection_protocol": authority.BASE_SELECTION_PROTOCOL,
-        "test_policy": {
-            "test_evaluations": 1,
-            "test_feedback_into_selection": False,
-        },
+        "test_policy": authority.FINAL_TEST_POLICY,
         "expected_output_root": str(output_root.resolve()),
         "canonical_manifest": canonical_manifest,
         "canonical_summary": canonical_summary,

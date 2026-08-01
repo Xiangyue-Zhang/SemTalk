@@ -74,7 +74,7 @@ class FinalDiffSHEGConstantsTests(unittest.TestCase):
             "bdf06146e27d92022fe5dadad3b9203373f6879eca8e4d8235359ee3ec6a5a74",
         )
 
-    def test_guarded_launcher_excludes_compatibility_protocols(self) -> None:
+    def test_compatibility_launcher_is_preflight_only(self) -> None:
         source = (
             ROOT
             / "scripts"
@@ -84,15 +84,11 @@ class FinalDiffSHEGConstantsTests(unittest.TestCase):
         for token in (
             "--skip-ba",
             "--window-stride",
-            "released2",
-            "paper16",
             "speaker2",
-            "/tmp/globaldiff_guarded_runner.py",
         ):
             self.assertIn(token, source)
         for token in (
             "SOURCE_COMMIT SOURCE_TREE --",
-            "semtalk_require_exact_guarded_runner_all_gpus",
             "formal_python_runtime_contract.sh",
             'semtalk_require_formal_venv_python "$python_bin" semtalk',
             "remote get-url origin",
@@ -103,12 +99,13 @@ class FinalDiffSHEGConstantsTests(unittest.TestCase):
             "for-each-ref --format='%(refname)' refs/heads",
         ):
             self.assertIn(token, source)
-        self.assertIn("if ((preflight_count == 0)); then", source)
-        guarded_block = source.split(
-            "if ((preflight_count == 0)); then", 1
-        )[1].split("fi", 1)[0]
-        self.assertIn("semtalk_require_exact_guarded_runner_all_gpus", guarded_block)
-        self.assertNotIn("semtalk_require_formal_venv_python", guarded_block)
+        self.assertIn("if ((preflight_count != 1)); then", source)
+        self.assertIn(
+            "formal final metrics must run only through "
+            "run_base_final_test.sh",
+            source,
+        )
+        self.assertNotIn("semtalk_require_exact_guarded_runner_all_gpus", source)
         self.assertNotIn("pgrep", source)
         self.assertNotIn("pkill", source)
 
@@ -174,10 +171,18 @@ class CurrentAuthorityTests(unittest.TestCase):
                 "selection_feedback": False,
                 "num_shards": 8,
                 "canonical_test_clips": 1_708,
+                "final_metric_event": (
+                    BRIDGE.final_test.final_authority.FINAL_METRIC_EVENT
+                ),
             }
             authority = {
                 "winner_selection": winner,
                 "test_claim": {"test_policy": policy},
+                "contract": {
+                    "final_metric_event": (
+                        BRIDGE.final_test.final_authority.FINAL_METRIC_EVENT
+                    )
+                },
                 "checkpoints": checkpoints,
                 "inference_source": source,
             }
@@ -735,6 +740,321 @@ class AtomicOutputTests(unittest.TestCase):
                 "refusing to overwrite",
             ):
                 BRIDGE._atomic_new(path, {"status": "second"}, "fixture")
+
+
+class CombinedFormalEventTests(unittest.TestCase):
+    def _fixture(
+        self, root: Path
+    ) -> tuple[SimpleNamespace, dict, Path, Path]:
+        inference_root = root / "final-inference"
+        inference_root.mkdir()
+        preflight_path = root / "combined-preflight.json"
+        preflight_path.write_text("{}\n", encoding="utf-8")
+        output_root = root / "combined-output"
+        manifest = {
+            "path": str(inference_root / "final_manifest.jsonl"),
+            "sha256": "1" * 64,
+            "bytes": 1,
+        }
+        lineage = {
+            "path": str(inference_root / "final_lineage.json"),
+            "sha256": "2" * 64,
+            "bytes": 1,
+        }
+        preflight = {
+            "authority": {"fresh_test_authority": {"sha256": "3" * 64}},
+            "receipt_payload_sha256": "4" * 64,
+            "inference": {
+                "root": str(inference_root),
+                "input_set_sha256": "5" * 64,
+                "window_count": 123,
+            },
+            "protocol": {
+                "final_metric_event": (
+                    BRIDGE.final_test.final_authority.FINAL_METRIC_EVENT
+                )
+            },
+            "assets": {
+                "talkshow_metrics": {
+                    "prediction_manifest": manifest,
+                    "prediction_lineage": lineage,
+                    "device": "cuda:0",
+                }
+            },
+            "runtime": {
+                "device": "cuda:0",
+                "paspa_batch_size": 64,
+                "talkshow_torch_threads": 1,
+            },
+        }
+        args = SimpleNamespace(
+            preflight_json=preflight_path,
+            expected_preflight_sha256="6" * 64,
+            output_root=output_root,
+            device="cuda:0",
+            batch_size=64,
+            talkshow_torch_threads=1,
+        )
+        return args, preflight, inference_root, output_root
+
+    @staticmethod
+    def _diffsheg_metrics() -> dict[str, float]:
+        return {
+            name: float(index + 1) / 10.0
+            for index, name in enumerate(BRIDGE.EXPECTED_METRICS)
+        }
+
+    @staticmethod
+    def _talkshow_report() -> dict:
+        report = {
+            "body": {
+                "released2": {
+                    "metrics": {"FGD": 1.0, "Variation": 2.0, "BC": 3.0}
+                },
+                "paper16": {
+                    "metrics": {"FGD": 4.0, "Variation": 5.0, "BC": 6.0}
+                },
+            },
+            "face": {
+                "metrics": {
+                    "released": {
+                        "jaw_l1": 0.1,
+                        "landmark_l1": 0.2,
+                        "LVD": 0.3,
+                    },
+                    "derived": {"face_l2_combined": 0.4},
+                }
+            },
+            "rs": {"status": "N/A/unreleased", "value": None},
+        }
+        report["report_payload_sha256"] = BRIDGE.canonical_json_sha256(
+            report
+        )
+        return report
+
+    def test_one_claim_precedes_both_suites_and_one_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            args, preflight, inference_root, output_root = self._fixture(root)
+            claim_path = BRIDGE._claim_path(inference_root)
+            diffsheg = self._diffsheg_metrics()
+            talkshow = self._talkshow_report()
+            order: list[str] = []
+
+            def paspa(command: list[str], check: bool) -> SimpleNamespace:
+                self.assertFalse(check)
+                self.assertTrue(claim_path.is_file())
+                self.assertTrue(output_root.is_dir())
+                order.append("paspa")
+                (output_root / "paspa_diffsheg_show_metrics.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                return SimpleNamespace(returncode=0)
+
+            def talkshow_suite(
+                _args: SimpleNamespace,
+                _preflight: dict,
+                observed_output_root: Path,
+                combined_claim: dict,
+                paspa_report: dict,
+            ) -> tuple[Path, bytes, dict, str, dict]:
+                self.assertTrue(claim_path.is_file())
+                self.assertEqual(observed_output_root, output_root)
+                self.assertEqual(
+                    combined_claim,
+                    {
+                        "path": str(claim_path),
+                        "sha256": BRIDGE.sha256_file(claim_path),
+                        "bytes": claim_path.stat().st_size,
+                    },
+                )
+                self.assertEqual(
+                    paspa_report["path"],
+                    str(output_root / "paspa_diffsheg_show_metrics.json"),
+                )
+                order.append("talkshow")
+                path = BRIDGE._atomic_new(
+                    output_root / "talkshow_show_body_face_metrics.json",
+                    talkshow,
+                    "fixture TalkSHOW report",
+                )
+                suite_start = {
+                    "path": str(output_root / "talkshow-suite-started.json"),
+                    "sha256": "8" * 64,
+                    "bytes": 1,
+                }
+                combined_event = {
+                    "claim": combined_claim,
+                    "paspa_report": paspa_report,
+                    "suite_start": suite_start,
+                }
+                return (
+                    path,
+                    path.read_bytes(),
+                    talkshow,
+                    "7" * 64,
+                    combined_event,
+                )
+
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_preflight_file",
+                    return_value=(args.preflight_json, "6" * 64),
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_paspa_command",
+                    return_value=["python", "pinned-paspa"],
+                ),
+                mock.patch.object(
+                    BRIDGE.subprocess,
+                    "run",
+                    side_effect=paspa,
+                ) as paspa_run,
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_paspa_report",
+                    return_value=diffsheg,
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_run_talkshow_suite",
+                    side_effect=talkshow_suite,
+                ) as talkshow_run,
+            ):
+                result = BRIDGE.run_formal(args, preflight)
+
+            self.assertEqual(order, ["paspa", "talkshow"])
+            paspa_run.assert_called_once()
+            talkshow_run.assert_called_once()
+            self.assertTrue(claim_path.is_file())
+            self.assertEqual(result["metrics"]["diffsheg"], diffsheg)
+            self.assertEqual(
+                result["metrics"]["talkshow"],
+                {
+                    "body": talkshow["body"],
+                    "face": talkshow["face"],
+                    "rs": talkshow["rs"],
+                },
+            )
+            self.assertEqual(
+                [path.name for path in output_root.glob("final_metrics.json")],
+                ["final_metrics.json"],
+            )
+
+    def test_paspa_failure_consumes_claim_and_retry_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            args, preflight, inference_root, _output_root = self._fixture(root)
+            claim_path = BRIDGE._claim_path(inference_root)
+
+            def fail_after_claim(*_args: object, **_kwargs: object) -> SimpleNamespace:
+                self.assertTrue(claim_path.is_file())
+                return SimpleNamespace(returncode=17)
+
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_preflight_file",
+                    return_value=(args.preflight_json, "6" * 64),
+                ),
+                mock.patch.object(BRIDGE, "_paspa_command", return_value=["paspa"]),
+                mock.patch.object(
+                    BRIDGE.subprocess,
+                    "run",
+                    side_effect=fail_after_claim,
+                ) as paspa_run,
+                mock.patch.object(BRIDGE, "_run_talkshow_suite") as talkshow_run,
+            ):
+                with self.assertRaisesRegex(
+                    BRIDGE.FinalDiffSHEGError,
+                    "failed with rc=17; one-shot claim remains",
+                ):
+                    BRIDGE.run_formal(args, preflight)
+                self.assertTrue(claim_path.is_file())
+                with self.assertRaisesRegex(
+                    BRIDGE.FinalDiffSHEGError,
+                    "combined one-shot test claim already exists",
+                ):
+                    BRIDGE.run_formal(args, preflight)
+
+            paspa_run.assert_called_once()
+            talkshow_run.assert_not_called()
+
+    def test_talkshow_failure_consumes_claim_and_retry_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            args, preflight, inference_root, output_root = self._fixture(root)
+            claim_path = BRIDGE._claim_path(inference_root)
+
+            def paspa(*_args: object, **_kwargs: object) -> SimpleNamespace:
+                self.assertTrue(claim_path.is_file())
+                (output_root / "paspa_diffsheg_show_metrics.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                return SimpleNamespace(returncode=0)
+
+            def fail_talkshow(*_args: object, **_kwargs: object) -> None:
+                self.assertTrue(claim_path.is_file())
+                raise BRIDGE.FinalDiffSHEGError(
+                    "TalkSHOW suite failed after claim consumption"
+                )
+
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_preflight_file",
+                    return_value=(args.preflight_json, "6" * 64),
+                ),
+                mock.patch.object(BRIDGE, "_paspa_command", return_value=["paspa"]),
+                mock.patch.object(BRIDGE.subprocess, "run", side_effect=paspa),
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_paspa_report",
+                    return_value=self._diffsheg_metrics(),
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_run_talkshow_suite",
+                    side_effect=fail_talkshow,
+                ) as talkshow_run,
+            ):
+                with self.assertRaisesRegex(
+                    BRIDGE.FinalDiffSHEGError,
+                    "TalkSHOW suite failed after claim consumption",
+                ):
+                    BRIDGE.run_formal(args, preflight)
+                self.assertTrue(claim_path.is_file())
+                self.assertFalse((output_root / "final_metrics.json").exists())
+                with self.assertRaisesRegex(
+                    BRIDGE.FinalDiffSHEGError,
+                    "combined one-shot test claim already exists",
+                ):
+                    BRIDGE.run_formal(args, preflight)
+
+            talkshow_run.assert_called_once()
+
+    def test_legacy_claim_blocks_combined_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            args, preflight, inference_root, _output_root = self._fixture(root)
+            legacy = BRIDGE._claim_path(inference_root)
+            legacy.write_text('{"status":"claimed"}\n', encoding="utf-8")
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_preflight_file",
+                    return_value=(args.preflight_json, "6" * 64),
+                ),
+                mock.patch.object(BRIDGE.subprocess, "run") as paspa_run,
+                self.assertRaisesRegex(
+                    BRIDGE.FinalDiffSHEGError,
+                    "combined one-shot test claim already exists",
+                ),
+            ):
+                BRIDGE.run_formal(args, preflight)
+            paspa_run.assert_not_called()
 
 
 if __name__ == "__main__":

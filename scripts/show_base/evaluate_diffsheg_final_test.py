@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the one authorized full-test DiffSHEG-SHOW evaluation.
+"""Run the sole combined SemTalk SHOW final-test metric event.
 
 This is an audit bridge, not another metric implementation.  It:
 
@@ -12,15 +12,16 @@ This is an audit bridge, not another metric implementation.  It:
   three published SHOW autoencoders, and the sealed exact-byte original-WAV
   test-layout view produced by ``prepare_diffsheg_audio_view.py``;
 * pins TalkSHOW and SMPL-X by commit/SHA;
-* atomically consumes one DiffSHEG evaluation claim inside the finalized
-  test namespace; and
-* accepts only the seven DiffSHEG paper-facing metrics.
+* atomically consumes one non-retryable combined claim inside the finalized
+  test namespace before either metric suite executes;
+* accepts exactly the seven DiffSHEG paper-facing metrics; and
+* evaluates TalkSHOW ``released2``/``paper16`` body plus released face by
+  directly calling the pinned metric module over those same prediction
+  artifacts in this same process and event.
 
-TalkSHOW body/face ``released2``/``paper16`` evaluation remains available as
-an explicitly separate compatibility report.  It is never a primary metric,
-is never read by this entry point, and cannot feed back into validation
-selection.  GPU execution of formal mode must be launched under
-``/tmp/globaldiff_guarded_runner.py``.
+There is no separately authorized TalkSHOW test evaluation.  A failure in
+either suite leaves the claim consumed and cannot be retried.  GPU execution
+of formal mode must be launched under ``/tmp/globaldiff_guarded_runner.py``.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.show_base import run_base_final_test as final_test
+from scripts.show_base import evaluate_talkshow_show_metrics as talkshow_metrics
 
 
 EXPECTED_TEST_CLIPS = 1_708
@@ -110,12 +112,13 @@ VALIDATION_PRIMARY_METRIC = "validation.diffsheg.metrics.fgd"
 VALIDATION_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
 INFERENCE_SUMMARY_FORMAT = "semtalk_show_base_inference_final_summary_v1"
 INFERENCE_LINEAGE_FORMAT = "semtalk_show_base_inference_final_lineage_v1"
-PREFLIGHT_FORMAT = "semtalk_show_diffsheg_full_test_preflight_v2"
-CLAIM_FORMAT = "semtalk_show_diffsheg_full_test_claim_v2"
-RESULT_FORMAT = "semtalk_show_diffsheg_full_test_result_v2"
+PREFLIGHT_FORMAT = "semtalk_show_combined_full_test_preflight_v3"
+CLAIM_FORMAT = "semtalk_show_combined_full_test_claim_v3"
+RESULT_FORMAT = "semtalk_show_combined_full_test_result_v3"
 AUDIO_VIEW_FORMAT = "semtalk_show_diffsheg_audio_view_receipt_v1"
 AUDIO_VIEW_MANIFEST_NAME = "diffsheg_audio_view_manifest.jsonl"
 AUDIO_VIEW_RECEIPT_NAME = "diffsheg_audio_view_receipt.json"
+CLAIM_NAME = "diffsheg-full-test-one-shot.claim.json"
 
 PASPA_ORIGIN = "git@github.com:Ly403/PASPA.git"
 PASPA_COMMIT = "0df27e6cab4b5ced19cc923afe352f77d547924b"
@@ -464,10 +467,16 @@ def _load_current_authority(
         "selection_feedback": False,
         "num_shards": EXPECTED_NUM_SHARDS,
         "canonical_test_clips": EXPECTED_TEST_CLIPS,
+        "final_metric_event": final_test.final_authority.FINAL_METRIC_EVENT,
     }
-    if test_claim.get("test_policy") != expected_policy:
+    if (
+        test_claim.get("test_policy") != expected_policy
+        or authority.get("contract", {}).get("final_metric_event")
+        != final_test.final_authority.FINAL_METRIC_EVENT
+    ):
         raise FinalDiffSHEGError(
-            "fresh authority does not authorize one feedback-free test"
+            "fresh authority does not authorize the sole combined final "
+            "metric event"
         )
     authority_artifact = final_test._authority_artifact(args)
     receipt = {
@@ -502,6 +511,7 @@ def _load_current_authority(
             "test_feedback_into_selection": False,
         },
         "test_policy": expected_policy,
+        "final_metric_event": final_test.final_authority.FINAL_METRIC_EVENT,
         "source": {
             key: source[key]
             for key in (
@@ -1302,6 +1312,141 @@ def _validate_protocol_inputs(
     }
 
 
+def _talkshow_metric_preflight(
+    args: argparse.Namespace,
+    authority: Mapping[str, Any],
+    inference: Mapping[str, Any],
+    shared_assets: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Freeze the second suite without consuming a test evaluation.
+
+    The deterministic distribution receipt contains no generated sample.  It
+    only binds the one already-finalized prediction artifact per clip to the
+    released logical-slot interpretation.  Building it during CPU preflight
+    therefore cannot create a second inference or metric observation.
+    """
+
+    gate_path, gate_payload, gate_sha = _verified_file(
+        args.talkshow_validation_gate_json,
+        args.expected_talkshow_validation_gate_sha256,
+        "TalkSHOW final-winner replication gate",
+    )
+    gate = _strict_json_bytes(
+        gate_payload,
+        "TalkSHOW final-winner replication gate",
+    )
+    expected_gate_payload_sha = require_sha256(
+        args.expected_talkshow_validation_gate_receipt_payload_sha256,
+        "TalkSHOW final-winner gate payload SHA",
+    )
+    if (
+        type(gate) is not dict
+        or gate.get("receipt_payload_sha256") != expected_gate_payload_sha
+    ):
+        raise FinalDiffSHEGError(
+            "TalkSHOW final-winner gate payload pin changed"
+        )
+    gate_artifact = {
+        "path": str(gate_path),
+        "sha256": gate_sha,
+        "bytes": len(gate_payload),
+        "receipt_payload_sha256": expected_gate_payload_sha,
+    }
+    try:
+        observed_gate_artifact, _observed_gate = (
+            talkshow_metrics._validate_external_validation_gate(
+                gate_artifact,
+                expected_scope="final_winner",
+            )
+        )
+        metric_root = talkshow_metrics.validate_talkshow_metric_root(
+            args.talkshow_metric_root
+        )
+    except talkshow_metrics.MetricAdapterContractError as error:
+        raise FinalDiffSHEGError(
+            f"TalkSHOW combined preflight failed: {error}"
+        ) from error
+    if observed_gate_artifact != gate_artifact:
+        raise FinalDiffSHEGError(
+            "TalkSHOW final-winner gate artifact changed during replay"
+        )
+
+    feature_path = _regular_file(
+        args.talkshow_feature_extractor,
+        "TalkSHOW released body feature extractor",
+    )
+    feature_sha = sha256_file(feature_path)
+    if feature_sha != talkshow_metrics.FEATURE_EXTRACTOR_SHA256:
+        raise FinalDiffSHEGError(
+            "TalkSHOW released body feature extractor bytes changed"
+        )
+    smplx_asset = _regular_file(
+        shared_assets["smplx"]["asset_path"],
+        "TalkSHOW SMPL-X neutral asset",
+    )
+    if sha256_file(smplx_asset) != talkshow_metrics.SMPLX_SHA256:
+        raise FinalDiffSHEGError("TalkSHOW SMPL-X asset bytes changed")
+
+    manifest_path = Path(inference["manifest"]["path"])
+    rows = _strict_jsonl(manifest_path, "shared final prediction manifest")
+    prediction_records = [
+        {
+            "canonical_clip_id": row["canonical_clip_id"],
+            "prediction_sha256": row["prediction"]["sha256"],
+            "prediction_bytes": row["prediction"]["bytes"],
+        }
+        for row in rows
+    ]
+    if len(prediction_records) != EXPECTED_TEST_CLIPS:
+        raise FinalDiffSHEGError(
+            "TalkSHOW preflight prediction coverage changed"
+        )
+    prediction_manifest = dict(inference["manifest"])
+    try:
+        distribution = talkshow_metrics.build_distribution_receipt(
+            prediction_manifest_artifact=prediction_manifest,
+            prediction_artifacts=prediction_records,
+            validation_gate=gate_artifact,
+            expected_scope="final_winner",
+        )
+    except talkshow_metrics.MetricAdapterContractError as error:
+        raise FinalDiffSHEGError(
+            f"TalkSHOW distribution preflight failed: {error}"
+        ) from error
+    canonical = authority.get("canonical", {}).get("manifest")
+    if type(canonical) is not dict or set(canonical) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise FinalDiffSHEGError(
+            "combined authority canonical manifest receipt changed"
+        )
+    return {
+        "validation_gate": gate_artifact,
+        "distribution_receipt": distribution,
+        "canonical_manifest": dict(canonical),
+        "prediction_manifest": prediction_manifest,
+        "prediction_lineage": dict(inference["lineage"]),
+        "test_authority": dict(
+            final_test._authority_artifact(args)
+        ),
+        "metric_root": metric_root,
+        "feature_extractor": {
+            "path": str(feature_path),
+            "sha256": feature_sha,
+            "bytes": feature_path.stat().st_size,
+        },
+        "smplx_asset": {
+            "path": str(smplx_asset),
+            "sha256": talkshow_metrics.SMPLX_SHA256,
+            "bytes": smplx_asset.stat().st_size,
+        },
+        "device": args.device,
+        "torch_threads": args.talkshow_torch_threads,
+    }
+
+
 def build_preflight(args: argparse.Namespace) -> dict[str, Any]:
     authority, authority_receipt = _load_current_authority(args)
     inference, clip_ids = _validate_inference_bundle(
@@ -1323,6 +1468,12 @@ def build_preflight(args: argparse.Namespace) -> dict[str, Any]:
         args.source_audio_root,
         args.expected_audio_set_sha256,
     )
+    talkshow_suite = _talkshow_metric_preflight(
+        args,
+        authority,
+        inference,
+        assets,
+    )
     preflight: dict[str, Any] = {
         "format": PREFLIGHT_FORMAT,
         "status": "formal_ready",
@@ -1343,6 +1494,9 @@ def build_preflight(args: argparse.Namespace) -> dict[str, Any]:
             "version": 1,
             "split": "test",
             "primary_metric_family": "DiffSHEG SHOW seven-metric protocol",
+            "final_metric_event": (
+                final_test.final_authority.FINAL_METRIC_EVENT
+            ),
             "test_evaluations": 1,
             "test_feedback_into_selection": False,
             "validation_selection": authority_receipt["selection"],
@@ -1359,10 +1513,12 @@ def build_preflight(args: argparse.Namespace) -> dict[str, Any]:
             "input": "full canonical SHOW NPZ",
             "compatibility_reports": {
                 "talkshow_body_face": {
-                    "status": "separate",
+                    "status": "required_same_event",
                     "primary": False,
                     "selection_feedback": False,
                     "metric_spaces_must_not_be_mixed": True,
+                    "shared_prediction_bundle": True,
+                    "separate_test_evaluation": False,
                 }
             },
         },
@@ -1370,6 +1526,12 @@ def build_preflight(args: argparse.Namespace) -> dict[str, Any]:
             "paspa": paspa,
             **assets,
             "audio": audio,
+            "talkshow_metrics": talkshow_suite,
+        },
+        "runtime": {
+            "device": args.device,
+            "paspa_batch_size": args.batch_size,
+            "talkshow_torch_threads": args.talkshow_torch_threads,
         },
     }
     preflight["receipt_payload_sha256"] = canonical_json_sha256(preflight)
@@ -1410,7 +1572,11 @@ def _atomic_new(path_value: Any, payload: Mapping[str, Any], label: str) -> Path
 
 
 def _claim_path(final_root: Path) -> Path:
-    return final_root / "diffsheg-full-test-one-shot.claim.json"
+    # Keep the original DiffSHEG claim leaf as the canonical namespace lock.
+    # Old and combined producers must race on one O_EXCL target; using a new
+    # filename here would let one producer of each generation consume the same
+    # finalized prediction bundle concurrently.
+    return final_root / CLAIM_NAME
 
 
 def _validate_preflight_file(
@@ -1577,6 +1743,127 @@ def _validate_paspa_report(
     return result
 
 
+def _run_talkshow_suite(
+    args: argparse.Namespace,
+    preflight: Mapping[str, Any],
+    output_root: Path,
+    combined_claim: Mapping[str, Any],
+    paspa_report: Mapping[str, Any],
+) -> tuple[Path, bytes, dict[str, Any], str, dict[str, Any]]:
+    suite = preflight["assets"]["talkshow_metrics"]
+    manifest = {
+        key: suite["prediction_manifest"][key]
+        for key in ("path", "sha256", "bytes")
+    }
+    lineage = suite["prediction_lineage"]
+    selection_protocol = {
+        "primary_metric": talkshow_metrics.PRIMARY_METRIC_PATH,
+        "mode": "min",
+        "validation_only_for_selection": True,
+        "test_evaluations": 1,
+    }
+    try:
+        backend = talkshow_metrics.TalkShowCudaMetricBackend(
+            talkshow_root=suite["metric_root"]["path"],
+            feature_extractor=suite["feature_extractor"]["path"],
+            smplx_asset=suite["smplx_asset"]["path"],
+            device=args.device,
+            torch_threads=suite["torch_threads"],
+        )
+        report = talkshow_metrics.evaluate_canonical_bundle(
+            canonical_manifest=suite["canonical_manifest"]["path"],
+            expected_canonical_manifest_sha256=(
+                suite["canonical_manifest"]["sha256"]
+            ),
+            prediction_manifest=manifest["path"],
+            expected_prediction_manifest_sha256=manifest["sha256"],
+            prediction_lineage=lineage["path"],
+            expected_prediction_lineage_sha256=lineage["sha256"],
+            validation_gate=suite["validation_gate"],
+            distribution_declaration=suite["distribution_receipt"],
+            backend=backend,
+            split="test",
+            expected_clip_count=EXPECTED_TEST_CLIPS,
+            test_authority=suite["test_authority"],
+            combined_claim=combined_claim,
+            paspa_report=paspa_report,
+        )
+        combined_event = report.get("inputs", {}).get("combined_event")
+        talkshow_metrics.validate_report(
+            report,
+            expected_split="test",
+            expected_clip_count=EXPECTED_TEST_CLIPS,
+            expected_prediction_manifest=manifest,
+            expected_distribution_receipt=suite[
+                "distribution_receipt"
+            ],
+            expected_selection_protocol=selection_protocol,
+            expected_test_authority=suite["test_authority"],
+            expected_combined_event=combined_event,
+        )
+    except talkshow_metrics.MetricAdapterContractError as error:
+        raise FinalDiffSHEGError(
+            f"TalkSHOW body/face suite failed after claim consumption: {error}"
+        ) from error
+    report_path = _atomic_new(
+        output_root / "talkshow_show_body_face_metrics.json",
+        report,
+        "TalkSHOW body/face report",
+    )
+    payload = report_path.read_bytes()
+    call_receipt = _talkshow_call_receipt(
+        preflight,
+        args.device,
+        combined_event,
+    )
+    return (
+        report_path,
+        payload,
+        report,
+        canonical_json_sha256(call_receipt),
+        combined_event,
+    )
+
+
+def _talkshow_call_receipt(
+    preflight: Mapping[str, Any],
+    device: str,
+    combined_event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize every input to the in-process TalkSHOW suite call."""
+
+    suite = preflight["assets"]["talkshow_metrics"]
+    manifest = {
+        key: suite["prediction_manifest"][key]
+        for key in ("path", "sha256", "bytes")
+    }
+    lineage = suite["prediction_lineage"]
+    return {
+        "callable": (
+            "scripts.show_base.evaluate_talkshow_show_metrics."
+            "evaluate_canonical_bundle"
+        ),
+        "canonical_manifest": suite["canonical_manifest"],
+        "prediction_manifest": manifest,
+        "prediction_lineage": {
+            key: lineage[key] for key in ("path", "sha256", "bytes")
+        },
+        "validation_gate": suite["validation_gate"],
+        "distribution_receipt_payload_sha256": suite[
+            "distribution_receipt"
+        ]["receipt_payload_sha256"],
+        "test_authority": suite["test_authority"],
+        "combined_event": dict(combined_event),
+        "metric_root": suite["metric_root"],
+        "feature_extractor": suite["feature_extractor"],
+        "smplx_asset": suite["smplx_asset"],
+        "device": device,
+        "torch_threads": suite["torch_threads"],
+        "split": "test",
+        "expected_clip_count": EXPECTED_TEST_CLIPS,
+    }
+
+
 def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[str, Any]:
     preflight_path, preflight_file_sha = _validate_preflight_file(
         args.preflight_json,
@@ -1587,16 +1874,29 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
     parent = _directory(output_root.parent, "formal evaluation parent")
     if output_root.parent.resolve() != parent:
         raise FinalDiffSHEGError("formal output parent contains a symlink")
-    if os.path.lexists(output_root):
+    expected_runtime = {
+        "device": args.device,
+        "paspa_batch_size": args.batch_size,
+        "talkshow_torch_threads": args.talkshow_torch_threads,
+    }
+    if preflight.get("runtime") != expected_runtime:
         raise FinalDiffSHEGError(
-            f"refusing to reuse formal output root: {output_root}"
+            "combined metric runtime differs from frozen preflight"
+        )
+    expected_device = expected_runtime["device"]
+    if expected_device != "cuda:0":
+        raise FinalDiffSHEGError(
+            "combined suites must share the frozen cuda:0 device"
         )
     claim_path = _claim_path(Path(preflight["inference"]["root"]))
     if os.path.lexists(claim_path):
         raise FinalDiffSHEGError(
-            f"DiffSHEG one-shot test claim already exists: {claim_path}"
+            f"combined one-shot test claim already exists: {claim_path}"
         )
-    output_root.mkdir(mode=0o700)
+    if os.path.lexists(output_root):
+        raise FinalDiffSHEGError(
+            f"refusing to reuse formal output root: {output_root}"
+        )
     claim = {
         "format": CLAIM_FORMAT,
         "status": "claimed",
@@ -1611,17 +1911,34 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
         "output_root": str(output_root.resolve()),
         "test_evaluations": 1,
         "test_feedback_into_selection": False,
+        "final_metric_event": preflight["protocol"]["final_metric_event"],
+        "shared_predictions": {
+            "manifest": preflight["assets"]["talkshow_metrics"][
+                "prediction_manifest"
+            ],
+            "lineage": preflight["assets"]["talkshow_metrics"][
+                "prediction_lineage"
+            ],
+        },
+        "claim_consumed_before_metrics": True,
+        "failure_consumes_claim": True,
+        "retry_allowed": False,
         "input_set_sha256": preflight["inference"]["input_set_sha256"],
     }
-    try:
-        claim_resolved = _atomic_new(
-            claim_path,
-            claim,
-            "DiffSHEG one-shot test claim",
-        )
-    except BaseException:
-        output_root.rmdir()
-        raise
+    # The non-retryable claim is the first formal mutation.  Even failure to
+    # create the output directory after this point consumes the authority;
+    # there is deliberately no cleanup path for the claim.
+    claim_resolved = _atomic_new(
+        claim_path,
+        claim,
+        "combined one-shot test claim",
+    )
+    combined_claim_artifact = {
+        "path": str(claim_resolved),
+        "sha256": sha256_file(claim_resolved),
+        "bytes": claim_resolved.stat().st_size,
+    }
+    output_root.mkdir(mode=0o700)
     evaluator_output = output_root / "paspa_diffsheg_show_metrics.json"
     command = _paspa_command(args, preflight, evaluator_output)
     result = subprocess.run(command, check=False)
@@ -1640,6 +1957,29 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
         "PASPA DiffSHEG full-test report",
     )
     metrics = _validate_paspa_report(evaluator_report, preflight)
+    paspa_report_artifact = {
+        "path": str(evaluator_path),
+        "sha256": hashlib.sha256(evaluator_payload).hexdigest(),
+        "bytes": len(evaluator_payload),
+    }
+    (
+        talkshow_path,
+        talkshow_payload,
+        talkshow_report,
+        talkshow_call_sha256,
+        combined_event,
+    ) = _run_talkshow_suite(
+        args,
+        preflight,
+        output_root,
+        combined_claim_artifact,
+        paspa_report_artifact,
+    )
+    talkshow_metrics_snapshot = {
+        "body": talkshow_report["body"],
+        "face": talkshow_report["face"],
+        "rs": talkshow_report["rs"],
+    }
     completion: dict[str, Any] = {
         "format": RESULT_FORMAT,
         "status": "complete",
@@ -1655,16 +1995,23 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
                 "receipt_payload_sha256"
             ],
         },
-        "paspa_report": {
-            "path": str(evaluator_path),
-            "sha256": hashlib.sha256(evaluator_payload).hexdigest(),
-            "bytes": len(evaluator_payload),
+        "paspa_report": paspa_report_artifact,
+        "talkshow_suite_start": combined_event["suite_start"],
+        "talkshow_report": {
+            "path": str(talkshow_path),
+            "sha256": hashlib.sha256(talkshow_payload).hexdigest(),
+            "bytes": len(talkshow_payload),
+            "report_payload_sha256": talkshow_report[
+                "report_payload_sha256"
+            ],
         },
         "evaluator_command_sha256": hashlib.sha256(
             b"\0".join(argument.encode("utf-8") for argument in command)
         ).hexdigest(),
+        "talkshow_evaluator_call_sha256": talkshow_call_sha256,
         "protocol": preflight["protocol"],
         "assets": preflight["assets"],
+        "runtime": preflight["runtime"],
         "coverage": {
             "clip_count": EXPECTED_TEST_CLIPS,
             "exact_once": True,
@@ -1672,15 +2019,18 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
             "window_length": WINDOW_LENGTH,
             "window_stride": WINDOW_STRIDE,
             "window_count": preflight["inference"]["window_count"],
+            "generation_passes": 1,
+            "shared_prediction_bundle": True,
         },
-        "metrics": metrics,
+        "metrics": {
+            "diffsheg": metrics,
+            "talkshow": talkshow_metrics_snapshot,
+        },
         "all_metrics_finite": True,
         "test_evaluations": 1,
         "validation_only_for_selection": True,
         "test_feedback_into_selection": False,
-        "compatibility_report_policy": preflight["protocol"][
-            "compatibility_reports"
-        ],
+        "final_metric_event": preflight["protocol"]["final_metric_event"],
     }
     completion["receipt_payload_sha256"] = canonical_json_sha256(completion)
     completion_path = _atomic_new(
@@ -1704,7 +2054,7 @@ def run_formal(args: argparse.Namespace, preflight: Mapping[str, Any]) -> dict[s
         "output": str(completion_path),
         "sha256": completion_file_sha256,
         "bytes": completion_bytes,
-        "metrics": metrics,
+        "metrics": completion["metrics"],
         "receipt_payload_sha256": completion[
             "receipt_payload_sha256"
         ],
@@ -1732,6 +2082,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--smplx-path", type=Path, required=True)
+    parser.add_argument(
+        "--talkshow-metric-root",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--talkshow-feature-extractor",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--talkshow-validation-gate-json",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-talkshow-validation-gate-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--expected-talkshow-validation-gate-receipt-payload-sha256",
+        required=True,
+    )
+    parser.add_argument(
+        "--talkshow-torch-threads",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--expected-audio-set-sha256")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--preflight-json", type=Path)
@@ -1746,8 +2124,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.batch_size < 1:
-        parser.error("--batch-size must be positive")
+    if args.batch_size < 1 or args.talkshow_torch_threads < 1:
+        parser.error("--batch-size/--talkshow-torch-threads must be positive")
     if args.seed < 0:
         parser.error("--seed must be non-negative")
     prepared_values = (
@@ -1765,6 +2143,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.expected_audio_set_sha256,
             "--expected-audio-set-sha256",
         )
+    args.expected_talkshow_validation_gate_sha256 = require_sha256(
+        args.expected_talkshow_validation_gate_sha256,
+        "--expected-talkshow-validation-gate-sha256",
+    )
+    args.expected_talkshow_validation_gate_receipt_payload_sha256 = (
+        require_sha256(
+            args.expected_talkshow_validation_gate_receipt_payload_sha256,
+            "--expected-talkshow-validation-gate-receipt-payload-sha256",
+        )
+    )
     try:
         preflight = build_preflight(args)
         if args.preflight_only:

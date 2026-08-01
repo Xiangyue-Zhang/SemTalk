@@ -44,6 +44,12 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 REPORT_FORMAT = "semtalk_show_talkshow_metrics_v1"
+COMBINED_CLAIM_FORMAT = "semtalk_show_combined_full_test_claim_v3"
+COMBINED_CLAIM_NAME = "diffsheg-full-test-one-shot.claim.json"
+COMBINED_TALKSHOW_START_FORMAT = (
+    "semtalk_show_combined_talkshow_suite_start_v1"
+)
+COMBINED_TALKSHOW_START_NAME = "talkshow-suite-started.json"
 PRIMARY_REAL_FEATURE_CACHE_FORMAT = (
     "semtalk_show_released2_real_feature_cache_v1"
 )
@@ -493,7 +499,7 @@ def _base_final_authority_module() -> Any:
     module = _fresh_local_control_module("base_final_authority.py")
     if (
         getattr(module, "FORMAT", None)
-        != "semtalk_show_base_final_test_authority_v1"
+        != "semtalk_show_base_final_test_authority_v2"
         or not callable(getattr(module, "validate_test_authority", None))
     ):
         raise MetricAdapterContractError(
@@ -3204,6 +3210,461 @@ def _validated_test_authority(
         ) from exc
 
 
+def _validated_combined_claim(
+    receipt: Mapping[str, Any] | None,
+    *,
+    test_authority_receipt: Mapping[str, Any],
+    validated_test_authority: Mapping[str, Any],
+    prediction_manifest: str | Path,
+    expected_prediction_manifest_sha256: str,
+    prediction_lineage: str | Path,
+    expected_prediction_lineage_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Freshly validate the already-consumed combined-event capability.
+
+    The TalkSHOW adapter is a public Python API, so the outer producer's
+    ordering guarantee is not sufficient by itself.  Formal test evaluation
+    must present the exact, mode-0600, single-link claim from the authority's
+    final-inference namespace.  This check happens before any metric input is
+    decoded or observed.
+    """
+
+    if type(receipt) is not dict or set(receipt) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "formal test requires the pre-consumed combined one-shot claim"
+        )
+    expected_root_value = validated_test_authority.get(
+        "expected_output_root"
+    )
+    if type(expected_root_value) is not str:
+        raise MetricAdapterContractError(
+            "test authority expected output root is missing"
+        )
+    expected_root = Path(expected_root_value)
+    if (
+        not expected_root.is_absolute()
+        or expected_root.resolve() != expected_root
+    ):
+        raise MetricAdapterContractError(
+            "test authority expected output root is not canonical"
+        )
+    expected_claim_path = expected_root / COMBINED_CLAIM_NAME
+    claim_path = Path(str(receipt["path"]))
+    if claim_path != expected_claim_path:
+        raise MetricAdapterContractError(
+            "combined one-shot claim is outside its authority namespace"
+        )
+    claim_path, payload = _verified_file_snapshot(
+        claim_path,
+        receipt["sha256"],
+        "combined one-shot claim",
+    )
+    expected_bytes = _require_exact_int(
+        receipt["bytes"],
+        "combined one-shot claim bytes",
+        minimum=1,
+    )
+    metadata = claim_path.stat()
+    if (
+        len(payload) != expected_bytes
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise MetricAdapterContractError(
+            "combined one-shot claim is not exclusive 0600 single-link evidence"
+        )
+    claim = _strict_json_snapshot(payload, "combined one-shot claim")
+    if set(claim) != {
+        "format",
+        "status",
+        "authority",
+        "preflight",
+        "output_root",
+        "test_evaluations",
+        "test_feedback_into_selection",
+        "final_metric_event",
+        "shared_predictions",
+        "claim_consumed_before_metrics",
+        "failure_consumes_claim",
+        "retry_allowed",
+        "input_set_sha256",
+    }:
+        raise MetricAdapterContractError(
+            "combined one-shot claim schema mismatch"
+        )
+    authority_contract = validated_test_authority.get("contract")
+    authority_event = (
+        authority_contract.get("final_metric_event")
+        if type(authority_contract) is dict
+        else None
+    )
+    if (
+        claim["format"] != COMBINED_CLAIM_FORMAT
+        or claim["status"] != "claimed"
+        or claim["test_evaluations"] != 1
+        or claim["test_feedback_into_selection"] is not False
+        or claim["claim_consumed_before_metrics"] is not True
+        or claim["failure_consumes_claim"] is not True
+        or claim["retry_allowed"] is not False
+        or claim["final_metric_event"] != authority_event
+        or type(authority_event) is not dict
+        or authority_event.get("authorized_events") != 1
+        or authority_event.get("generation_passes") != 1
+        or authority_event.get("shared_prediction_bundle") is not True
+        or authority_event.get("single_claim_required") is not True
+        or authority_event.get("all_suites_required") is not True
+    ):
+        raise MetricAdapterContractError(
+            "combined one-shot claim policy mismatch"
+        )
+    claim_authority = claim["authority"]
+    if (
+        type(claim_authority) is not dict
+        or claim_authority.get("fresh_test_authority")
+        != dict(test_authority_receipt)
+    ):
+        raise MetricAdapterContractError(
+            "combined claim authority binding mismatch"
+        )
+    output_root = Path(str(claim["output_root"]))
+    if not output_root.is_absolute() or output_root.resolve() != output_root:
+        raise MetricAdapterContractError(
+            "combined claim output root is not canonical"
+        )
+    shared = claim["shared_predictions"]
+    if type(shared) is not dict or set(shared) != {"manifest", "lineage"}:
+        raise MetricAdapterContractError(
+            "combined claim shared-prediction schema mismatch"
+        )
+
+    def projected(value: Any, label: str) -> dict[str, Any]:
+        if type(value) is not dict or not {
+            "path",
+            "sha256",
+            "bytes",
+        }.issubset(value):
+            raise MetricAdapterContractError(
+                f"combined claim {label} receipt mismatch"
+            )
+        return {key: value[key] for key in ("path", "sha256", "bytes")}
+
+    expected_manifest = {
+        "path": str(Path(prediction_manifest).resolve()),
+        "sha256": _require_sha256(
+            expected_prediction_manifest_sha256,
+            "combined claim prediction-manifest SHA",
+        ),
+    }
+    expected_lineage = {
+        "path": str(Path(prediction_lineage).resolve()),
+        "sha256": _require_sha256(
+            expected_prediction_lineage_sha256,
+            "combined claim prediction-lineage SHA",
+        ),
+    }
+    manifest_receipt = projected(shared["manifest"], "manifest")
+    lineage_receipt = projected(shared["lineage"], "lineage")
+    if (
+        {
+            key: manifest_receipt[key] for key in ("path", "sha256")
+        }
+        != expected_manifest
+        or {key: lineage_receipt[key] for key in ("path", "sha256")}
+        != expected_lineage
+    ):
+        raise MetricAdapterContractError(
+            "combined claim does not bind the requested prediction bundle"
+        )
+    _manifest_path, manifest_payload = _verified_file_snapshot(
+        manifest_receipt["path"],
+        manifest_receipt["sha256"],
+        "combined-claim prediction manifest",
+    )
+    _lineage_path, lineage_payload = _verified_file_snapshot(
+        lineage_receipt["path"],
+        lineage_receipt["sha256"],
+        "combined-claim prediction lineage",
+    )
+    if (
+        manifest_receipt["bytes"] != len(manifest_payload)
+        or lineage_receipt["bytes"] != len(lineage_payload)
+    ):
+        raise MetricAdapterContractError(
+            "combined claim prediction byte count mismatch"
+        )
+    return (
+        {
+            "path": str(claim_path),
+            "sha256": sha256_bytes(payload),
+            "bytes": len(payload),
+        },
+        claim,
+    )
+
+
+def _consume_combined_talkshow_suite_start(
+    *,
+    claim_artifact: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    paspa_report: Mapping[str, Any] | None,
+    test_authority_receipt: Mapping[str, Any],
+    prediction_manifest: str | Path,
+    expected_prediction_manifest_sha256: str,
+    prediction_lineage: str | Path,
+    expected_prediction_lineage_sha256: str,
+) -> dict[str, Any]:
+    """Atomically consume the TalkSHOW half of the combined event once."""
+
+    if type(paspa_report) is not dict or set(paspa_report) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "formal TalkSHOW test requires the preceding PASPA report"
+        )
+    output_root = _resolved_canonical_directory(
+        claim["output_root"],
+        "combined final-metric output root",
+    )
+    expected_paspa_path = output_root / "paspa_diffsheg_show_metrics.json"
+    if Path(str(paspa_report["path"])) != expected_paspa_path:
+        raise MetricAdapterContractError(
+            "preceding PASPA report is outside the combined output root"
+        )
+    paspa_path, paspa_payload = _verified_file_snapshot(
+        paspa_report["path"],
+        paspa_report["sha256"],
+        "preceding PASPA report",
+    )
+    if (
+        _require_exact_int(
+            paspa_report["bytes"],
+            "preceding PASPA report bytes",
+            minimum=1,
+        )
+        != len(paspa_payload)
+    ):
+        raise MetricAdapterContractError(
+            "preceding PASPA report byte count mismatch"
+        )
+    marker = {
+        "format": COMBINED_TALKSHOW_START_FORMAT,
+        "status": "started",
+        "combined_claim": dict(claim_artifact),
+        "paspa_report": {
+            "path": str(paspa_path),
+            "sha256": sha256_bytes(paspa_payload),
+            "bytes": len(paspa_payload),
+        },
+        "test_authority": dict(test_authority_receipt),
+        "prediction_manifest": {
+            "path": str(Path(prediction_manifest).resolve()),
+            "sha256": _require_sha256(
+                expected_prediction_manifest_sha256,
+                "suite-start prediction-manifest SHA",
+            ),
+        },
+        "prediction_lineage": {
+            "path": str(Path(prediction_lineage).resolve()),
+            "sha256": _require_sha256(
+                expected_prediction_lineage_sha256,
+                "suite-start prediction-lineage SHA",
+            ),
+        },
+        "final_metric_event": claim["final_metric_event"],
+        "created_before_talkshow_metrics": True,
+        "failure_consumes_event": True,
+        "retry_allowed": False,
+    }
+    marker_path = output_root / COMBINED_TALKSHOW_START_NAME
+    payload = canonical_json_bytes(marker)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(marker_path, flags, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written < 1:
+                raise OSError("short write for TalkSHOW suite-start marker")
+            offset += written
+        os.fsync(descriptor)
+    except FileExistsError:
+        raise MetricAdapterContractError(
+            "combined TalkSHOW suite was already started; replay refused"
+        ) from None
+    except OSError as exc:
+        # Never remove a partially created marker.  The outer claim is already
+        # consumed, and any failure from here is deliberately non-retryable.
+        raise MetricAdapterContractError(
+            "cannot atomically consume the combined TalkSHOW suite"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    directory_fd = os.open(output_root, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    marker_path, observed_payload = _safe_file_snapshot(
+        marker_path,
+        "combined TalkSHOW suite-start marker",
+    )
+    metadata = marker_path.stat()
+    if (
+        observed_payload != payload
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise MetricAdapterContractError(
+            "combined TalkSHOW suite-start marker is not exclusive evidence"
+        )
+    return {
+        "claim": dict(claim_artifact),
+        "paspa_report": marker["paspa_report"],
+        "suite_start": {
+            "path": str(marker_path),
+            "sha256": sha256_bytes(observed_payload),
+            "bytes": len(observed_payload),
+        },
+    }
+
+
+def _validated_combined_event_evidence(
+    value: Mapping[str, Any] | None,
+    *,
+    test_authority_receipt: Mapping[str, Any],
+    validated_test_authority: Mapping[str, Any],
+    prediction_manifest: Mapping[str, Any],
+    prediction_lineage: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replay the non-reusable TalkSHOW suite-start evidence read-only."""
+
+    if type(value) is not dict or set(value) != {
+        "claim",
+        "paspa_report",
+        "suite_start",
+    }:
+        raise MetricAdapterContractError(
+            "formal test report lacks combined-event evidence"
+        )
+    claim_artifact, claim = _validated_combined_claim(
+        value["claim"],
+        test_authority_receipt=test_authority_receipt,
+        validated_test_authority=validated_test_authority,
+        prediction_manifest=prediction_manifest["path"],
+        expected_prediction_manifest_sha256=prediction_manifest["sha256"],
+        prediction_lineage=prediction_lineage["path"],
+        expected_prediction_lineage_sha256=prediction_lineage["sha256"],
+    )
+    paspa = value["paspa_report"]
+    if type(paspa) is not dict or set(paspa) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "combined-event PASPA receipt schema mismatch"
+        )
+    output_root = Path(claim["output_root"])
+    if Path(str(paspa["path"])) != (
+        output_root / "paspa_diffsheg_show_metrics.json"
+    ):
+        raise MetricAdapterContractError(
+            "combined-event PASPA report path mismatch"
+        )
+    paspa_path, paspa_payload = _verified_file_snapshot(
+        paspa["path"],
+        paspa["sha256"],
+        "combined-event PASPA report",
+    )
+    if paspa["bytes"] != len(paspa_payload):
+        raise MetricAdapterContractError(
+            "combined-event PASPA report bytes mismatch"
+        )
+    marker_artifact = value["suite_start"]
+    if type(marker_artifact) is not dict or set(marker_artifact) != {
+        "path",
+        "sha256",
+        "bytes",
+    }:
+        raise MetricAdapterContractError(
+            "combined-event suite-start receipt schema mismatch"
+        )
+    marker_path = output_root / COMBINED_TALKSHOW_START_NAME
+    if Path(str(marker_artifact["path"])) != marker_path:
+        raise MetricAdapterContractError(
+            "combined-event suite-start path mismatch"
+        )
+    marker_path, marker_payload = _verified_file_snapshot(
+        marker_artifact["path"],
+        marker_artifact["sha256"],
+        "combined TalkSHOW suite-start marker",
+    )
+    metadata = marker_path.stat()
+    if (
+        marker_artifact["bytes"] != len(marker_payload)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise MetricAdapterContractError(
+            "combined TalkSHOW suite-start marker is not exclusive evidence"
+        )
+    marker = _strict_json_snapshot(
+        marker_payload,
+        "combined TalkSHOW suite-start marker",
+    )
+    expected_marker = {
+        "format": COMBINED_TALKSHOW_START_FORMAT,
+        "status": "started",
+        "combined_claim": claim_artifact,
+        "paspa_report": {
+            "path": str(paspa_path),
+            "sha256": sha256_bytes(paspa_payload),
+            "bytes": len(paspa_payload),
+        },
+        "test_authority": dict(test_authority_receipt),
+        "prediction_manifest": {
+            "path": prediction_manifest["path"],
+            "sha256": prediction_manifest["sha256"],
+        },
+        "prediction_lineage": {
+            "path": prediction_lineage["path"],
+            "sha256": prediction_lineage["sha256"],
+        },
+        "final_metric_event": claim["final_metric_event"],
+        "created_before_talkshow_metrics": True,
+        "failure_consumes_event": True,
+        "retry_allowed": False,
+    }
+    if marker != expected_marker:
+        raise MetricAdapterContractError(
+            "combined TalkSHOW suite-start marker binding mismatch"
+        )
+    normalized = {
+        "claim": claim_artifact,
+        "paspa_report": expected_marker["paspa_report"],
+        "suite_start": {
+            "path": str(marker_path),
+            "sha256": sha256_bytes(marker_payload),
+            "bytes": len(marker_payload),
+        },
+    }
+    if dict(value) != normalized:
+        raise MetricAdapterContractError(
+            "combined-event evidence changed during replay"
+        )
+    return normalized
+
+
 def _reject_forbidden_generator_identity(
     value: Any,
     label: str,
@@ -4073,6 +4534,8 @@ def evaluate_canonical_bundle(
     split: str,
     expected_clip_count: int,
     test_authority: Mapping[str, Any] | None = None,
+    combined_claim: Mapping[str, Any] | None = None,
+    paspa_report: Mapping[str, Any] | None = None,
     audio_beat_extractor: Callable[[np.ndarray], np.ndarray] | None = None,
     audio_decoder_16k: Callable[[bytes], np.ndarray] | None = None,
     formal_mode: bool = True,
@@ -4107,9 +4570,11 @@ def evaluate_canonical_bundle(
         )
     if formal_mode:
         _require_concrete_formal_backend(backend)
-    if split == "val" and test_authority is not None:
+    if split == "val" and (
+        test_authority is not None or combined_claim is not None
+    ):
         raise MetricAdapterContractError(
-            "validation metrics must not consume test authority"
+            "validation metrics must not consume test authority or claim"
         )
     validated_test_authority = (
         _validated_test_authority(test_authority)
@@ -4120,6 +4585,47 @@ def evaluate_canonical_bundle(
         raise MetricAdapterContractError(
             "formal test metrics require an externally pinned test authority"
         )
+    validated_claim_bundle = (
+        _validated_combined_claim(
+            combined_claim,
+            test_authority_receipt=test_authority,
+            validated_test_authority=validated_test_authority,
+            prediction_manifest=prediction_manifest,
+            expected_prediction_manifest_sha256=(
+                expected_prediction_manifest_sha256
+            ),
+            prediction_lineage=prediction_lineage,
+            expected_prediction_lineage_sha256=(
+                expected_prediction_lineage_sha256
+            ),
+        )
+        if split == "test" and formal_mode
+        else None
+    )
+    if (combined_claim is not None or paspa_report is not None) and (
+        validated_claim_bundle is None
+    ):
+        raise MetricAdapterContractError(
+            "combined event evidence is valid only for formal test evaluation"
+        )
+    combined_event = (
+        _consume_combined_talkshow_suite_start(
+            claim_artifact=validated_claim_bundle[0],
+            claim=validated_claim_bundle[1],
+            paspa_report=paspa_report,
+            test_authority_receipt=test_authority,
+            prediction_manifest=prediction_manifest,
+            expected_prediction_manifest_sha256=(
+                expected_prediction_manifest_sha256
+            ),
+            prediction_lineage=prediction_lineage,
+            expected_prediction_lineage_sha256=(
+                expected_prediction_lineage_sha256
+            ),
+        )
+        if validated_claim_bundle is not None
+        else None
+    )
     if formal_mode and (
         audio_decoder_16k is not None
         or audio_beat_extractor is not None
@@ -4523,6 +5029,11 @@ def evaluate_canonical_bundle(
                     ],
                 }
             ),
+            **(
+                {"combined_event": combined_event}
+                if split == "test"
+                else {}
+            ),
         },
         "metric_assets": assets,
         "counts": {
@@ -4601,6 +5112,7 @@ def validate_report(
     expected_distribution_receipt: Mapping[str, Any],
     expected_selection_protocol: Mapping[str, Any],
     expected_test_authority: Mapping[str, Any] | None = None,
+    expected_combined_event: Mapping[str, Any] | None = None,
     test_only_allow_four_clip_subset: bool = False,
 ) -> dict[str, Any]:
     """Fresh, fail-closed validator for selector/merge consumers.
@@ -4767,29 +5279,38 @@ def validate_report(
             "distribution receipt payload hash mismatch"
         )
     inputs = report["inputs"]
-    if type(inputs) is not dict or set(inputs) != {
+    expected_input_keys = {
         "canonical_manifest",
         "prediction_manifest",
         "prediction_lineage",
         "test_authority",
-    }:
+    }
+    if expected_split == "test":
+        expected_input_keys.add("combined_event")
+    if type(inputs) is not dict or set(inputs) != expected_input_keys:
         raise MetricAdapterContractError("metric report inputs schema mismatch")
+    validated_report_test_authority: dict[str, Any] | None = None
     if expected_split == "val":
         if (
             expected_test_authority is not None
             or inputs["test_authority"] is not None
+            or expected_combined_event is not None
         ):
             raise MetricAdapterContractError(
-                "validation report must not contain test authority"
+                "validation report must not contain test-event evidence"
             )
     else:
+        validated_report_test_authority = (
+            _validated_test_authority(expected_test_authority)
+            if type(expected_test_authority) is dict
+            else None
+        )
         if (
             type(expected_test_authority) is not dict
             or inputs["test_authority"]
             != dict(expected_test_authority)
-            or _validated_test_authority(
-                expected_test_authority
-            )["receipt_payload_sha256"]
+            or validated_report_test_authority is None
+            or validated_report_test_authority["receipt_payload_sha256"]
             != expected_test_authority["receipt_payload_sha256"]
         ):
             raise MetricAdapterContractError(
@@ -4845,6 +5366,22 @@ def validate_report(
         if artifact["bytes"] != len(payload):
             raise MetricAdapterContractError(
                 f"metric report {role} byte count mismatch"
+            )
+    if expected_split == "test":
+        assert validated_report_test_authority is not None
+        replayed_combined_event = _validated_combined_event_evidence(
+            inputs["combined_event"],
+            test_authority_receipt=expected_test_authority,
+            validated_test_authority=validated_report_test_authority,
+            prediction_manifest=inputs["prediction_manifest"],
+            prediction_lineage=inputs["prediction_lineage"],
+        )
+        if (
+            type(expected_combined_event) is not dict
+            or dict(expected_combined_event) != replayed_combined_event
+        ):
+            raise MetricAdapterContractError(
+                "test report combined-event binding mismatch"
             )
     canonical_input = inputs["canonical_manifest"]
     if (
@@ -6824,6 +7361,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--output-json", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.split == "test":
+        parser.error(
+            "standalone TalkSHOW test evaluation is disabled; test metrics "
+            "are authorized only inside evaluate_diffsheg_final_test.py's "
+            "single pre-claimed combined event"
+        )
     authority_values = (
         args.test_authority_json,
         args.expected_test_authority_sha256,
