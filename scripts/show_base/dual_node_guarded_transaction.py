@@ -37,7 +37,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 import uuid
 
 
@@ -51,6 +51,8 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_RECEIPT_BYTES = 1 << 20
+ESTALE_RETRY_ATTEMPTS = 5
+ESTALE_RETRY_BASE_SECONDS = 0.01
 EXPECTED_RANKS = (0, 1)
 IDENTITY_KEYS = {
     "pid", "ppid", "pgid", "sid", "starttime_ticks", "argv_sha256"
@@ -67,6 +69,7 @@ OUTER_ARTIFACT_BINDING_FORMAT = (
 # installed CLI never exposes a switch that weakens Linux runner ancestry or
 # pinned-fd execution.
 _CPU_TEST_MODE = False
+_T = TypeVar("_T")
 
 
 class TransactionError(RuntimeError):
@@ -81,11 +84,35 @@ class PeerAbort(TransactionError):
     """The peer failed, aborted, became stale, or violated the protocol."""
 
 
+def _is_estale(exc: BaseException) -> bool:
+    """Return whether one exact filesystem syscall reported EFS/NFS ESTALE."""
+    return isinstance(exc, OSError) and exc.errno == errno.ESTALE
+
+
+def _estale_backoff(attempt: int) -> None:
+    """Small bounded delay; enclosing protocol deadlines remain authoritative."""
+    time.sleep(ESTALE_RETRY_BASE_SECONDS * (2 ** attempt))
+
+
+def _retry_estale_syscall(operation: Callable[[], _T]) -> _T:
+    """Retry only a single exact, idempotent filesystem syscall on ESTALE."""
+    for attempt in range(ESTALE_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except OSError as exc:
+            if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                raise
+            _estale_backoff(attempt)
+    raise AssertionError("unreachable ESTALE retry state")
+
+
 def _rename_noreplace(
     source_dir_fd: int,
     source: str,
     target_dir_fd: int,
     target: str,
+    *,
+    expected_source_identity: tuple[int, int] | None = None,
 ) -> None:
     """Atomically rename one entry without replacing an existing target."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -156,6 +183,20 @@ def _rename_noreplace(
             follow_symlinks=False,
         )
         try:
+            if expected_source_identity is not None:
+                source_info = os.stat(
+                    source,
+                    dir_fd=source_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(source_info.st_mode)
+                    or (source_info.st_dev, source_info.st_ino)
+                    != expected_source_identity
+                ):
+                    raise TransactionError(
+                        "terminal temporary identity changed before cleanup"
+                    )
             os.unlink(source, dir_fd=source_dir_fd)
         except OSError:
             # Publication is monotonic.  The unique source alias is harmless
@@ -1343,29 +1384,155 @@ class TransactionDirectory:
             flags |= os.O_NOFOLLOW
         self.root_fd = -1
         self.root_identity: tuple[int, int] | None = None
-        self.namespace_fds = [os.open("/", flags)]
+        self.namespace_fds = [
+            _retry_estale_syscall(lambda: os.open("/", flags))
+        ]
         self.namespace_names: list[str] = []
+        root_info = _retry_estale_syscall(
+            lambda: os.fstat(self.namespace_fds[0])
+        )
+        self.namespace_identities = [(root_info.st_dev, root_info.st_ino)]
         for component in parent.parts[1:]:
-            child_fd = os.open(component, flags, dir_fd=self.namespace_fds[-1])
-            child = os.fstat(child_fd)
+            child_fd = _retry_estale_syscall(
+                lambda component=component: os.open(
+                    component,
+                    flags,
+                    dir_fd=self.namespace_fds[-1],
+                )
+            )
+            child = _retry_estale_syscall(lambda: os.fstat(child_fd))
             if not stat.S_ISDIR(child.st_mode):
                 os.close(child_fd)
                 raise TransactionError("transaction namespace component is not a directory")
             self.namespace_names.append(component)
             self.namespace_fds.append(child_fd)
+            self.namespace_identities.append((child.st_dev, child.st_ino))
         self.parent_fd = self.namespace_fds[-1]
-        namespace = os.fstat(self.parent_fd)
+        namespace = _retry_estale_syscall(lambda: os.fstat(self.parent_fd))
         if namespace.st_uid != os.geteuid() or namespace.st_mode & 0o022:
             self.close()
             raise TransactionError("transaction namespace has unsafe ownership or mode")
 
+    def _refresh_directory_handles(self) -> None:
+        """Reopen the exact pinned namespace/root after one stale file handle.
+
+        New descriptors are swapped in only after every component and the
+        transaction root match the identities captured before ESTALE.  A path
+        replacement therefore fails closed rather than turning a retry into a
+        different transaction.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        refreshed: list[int] = []
+        refreshed_root = -1
+        try:
+            refreshed.append(os.open("/", flags))
+            root_info = os.fstat(refreshed[0])
+            if (root_info.st_dev, root_info.st_ino) != self.namespace_identities[0]:
+                raise TransactionError("filesystem root identity changed during ESTALE retry")
+            for index, component in enumerate(self.namespace_names, start=1):
+                child_fd = os.open(component, flags, dir_fd=refreshed[-1])
+                refreshed.append(child_fd)
+                child = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(child.st_mode)
+                    or (child.st_dev, child.st_ino)
+                    != self.namespace_identities[index]
+                ):
+                    raise TransactionError(
+                        "transaction namespace identity changed during ESTALE retry"
+                    )
+            parent = os.fstat(refreshed[-1])
+            if parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+                raise TransactionError(
+                    "transaction namespace became unsafe during ESTALE retry"
+                )
+            if self.root_identity is not None:
+                refreshed_root = os.open(
+                    self.basename,
+                    flags,
+                    dir_fd=refreshed[-1],
+                )
+                opened = os.fstat(refreshed_root)
+                public = os.stat(
+                    self.basename,
+                    dir_fd=refreshed[-1],
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_mode & 0o022
+                    or (opened.st_dev, opened.st_ino) != self.root_identity
+                    or (public.st_dev, public.st_ino) != self.root_identity
+                ):
+                    raise TransactionError(
+                        "transaction root identity changed during ESTALE retry"
+                    )
+        except BaseException:
+            if refreshed_root >= 0:
+                try:
+                    os.close(refreshed_root)
+                except OSError:
+                    pass
+            for fd in reversed(refreshed):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        previous_root = self.root_fd
+        previous_namespace = self.namespace_fds
+        self.namespace_fds = refreshed
+        self.parent_fd = refreshed[-1]
+        self.root_fd = refreshed_root
+        if previous_root >= 0:
+            try:
+                os.close(previous_root)
+            except OSError:
+                pass
+        for fd in reversed(previous_namespace):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _retry_estale(
+        self,
+        operation: Callable[[], _T],
+        *,
+        refresh_handles: bool = True,
+    ) -> _T:
+        """Retry one idempotent shared-filesystem operation, and nothing else."""
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            try:
+                return operation()
+            except OSError as exc:
+                if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                if refresh_handles:
+                    try:
+                        self._refresh_directory_handles()
+                    except OSError as refresh_exc:
+                        if not _is_estale(refresh_exc):
+                            raise
+                _estale_backoff(attempt)
+        raise AssertionError("unreachable ESTALE retry state")
+
     def _assert_namespace_identity(self) -> None:
         for index, name in enumerate(self.namespace_names):
-            parent_fd = self.namespace_fds[index]
-            child_fd = self.namespace_fds[index + 1]
-            opened = os.fstat(child_fd)
             try:
-                public = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                def snapshot() -> tuple[os.stat_result, os.stat_result]:
+                    opened = os.fstat(self.namespace_fds[index + 1])
+                    public = os.stat(
+                        name,
+                        dir_fd=self.namespace_fds[index],
+                        follow_symlinks=False,
+                    )
+                    return opened, public
+
+                opened, public = self._retry_estale(snapshot)
             except OSError as exc:
                 raise TransactionError("transaction namespace disappeared or changed") from exc
             if (
@@ -1374,12 +1541,44 @@ class TransactionDirectory:
             ):
                 raise TransactionError("public transaction namespace identity changed")
 
+    def _open_root_with_snapshot(
+        self,
+        flags: int,
+    ) -> tuple[int, os.stat_result]:
+        """Open+fstat the root before root_identity exists, without stale FDs."""
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            candidate = -1
+            try:
+                candidate = os.open(
+                    self.basename,
+                    flags,
+                    dir_fd=self.parent_fd,
+                )
+                return candidate, os.fstat(candidate)
+            except BaseException as exc:
+                if candidate >= 0:
+                    try:
+                        os.close(candidate)
+                    except OSError:
+                        pass
+                if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                # root_identity is intentionally still None, so this refresh
+                # replaces only the pinned namespace descriptors.
+                try:
+                    self._refresh_directory_handles()
+                except OSError as refresh_exc:
+                    if not _is_estale(refresh_exc):
+                        raise
+                _estale_backoff(attempt)
+        raise AssertionError("unreachable root open retry state")
+
     def create_or_wait(self, deadline: float) -> None:
         self._assert_namespace_identity()
         if self.rank == 0:
             try:
                 os.mkdir(self.basename, mode=0o700, dir_fd=self.parent_fd)
-                os.fsync(self.parent_fd)
+                self._retry_estale(lambda: os.fsync(self.parent_fd))
             except FileExistsError as exc:
                 raise DuplicateInvocation("transaction root already exists") from exc
         while True:
@@ -1387,7 +1586,7 @@ class TransactionDirectory:
                 flags = os.O_RDONLY | os.O_DIRECTORY
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
-                self.root_fd = os.open(self.basename, flags, dir_fd=self.parent_fd)
+                self.root_fd, opened = self._open_root_with_snapshot(flags)
                 break
             except FileNotFoundError:
                 if time.monotonic() >= deadline:
@@ -1395,7 +1594,6 @@ class TransactionDirectory:
                 time.sleep(0.01)
             except OSError as exc:
                 raise TransactionError("transaction root is not a real directory") from exc
-        opened = os.fstat(self.root_fd)
         if opened.st_uid != os.geteuid() or opened.st_mode & 0o022:
             raise TransactionError("transaction root has unsafe ownership or mode")
         self.root_identity = (opened.st_dev, opened.st_ino)
@@ -1405,13 +1603,17 @@ class TransactionDirectory:
         self._assert_namespace_identity()
         if self.root_fd < 0 or self.root_identity is None:
             raise TransactionError("transaction root is not open")
-        opened = os.fstat(self.root_fd)
         try:
-            public = os.stat(
-                self.basename,
-                dir_fd=self.parent_fd,
-                follow_symlinks=False,
-            )
+            def snapshot() -> tuple[os.stat_result, os.stat_result]:
+                opened = os.fstat(self.root_fd)
+                public = os.stat(
+                    self.basename,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                )
+                return opened, public
+
+            opened, public = self._retry_estale(snapshot)
         except OSError as exc:
             raise TransactionError("transaction root disappeared or changed") from exc
         opened_identity = (opened.st_dev, opened.st_ino)
@@ -1423,8 +1625,9 @@ class TransactionDirectory:
 
     def local_filesystem_evidence(self) -> dict[str, Any]:
         self.assert_identity()
-        opened = os.fstat(self.root_fd)
-        parent = os.fstat(self.parent_fd)
+        opened, parent = self._retry_estale(
+            lambda: (os.fstat(self.root_fd), os.fstat(self.parent_fd))
+        )
         return {
             "root_st_dev": opened.st_dev,
             "root_st_ino": opened.st_ino,
@@ -1440,10 +1643,9 @@ class TransactionDirectory:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            self.root_fd = os.open(self.basename, flags, dir_fd=self.parent_fd)
+            self.root_fd, opened = self._open_root_with_snapshot(flags)
         except OSError as exc:
             raise TransactionError("transaction root is unavailable") from exc
-        opened = os.fstat(self.root_fd)
         if opened.st_uid != os.geteuid() or opened.st_mode & 0o022:
             raise TransactionError("transaction root has unsafe ownership or mode")
         self.root_identity = (opened.st_dev, opened.st_ino)
@@ -1455,12 +1657,21 @@ class TransactionDirectory:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(name, flags, dir_fd=self.root_fd)
+            fd = self._retry_estale(
+                lambda: os.open(name, flags, dir_fd=self.root_fd)
+            )
         except FileNotFoundError:
             raise
         except OSError as exc:
             raise TransactionError(f"unsafe transaction artifact: {name}") from exc
-        info = os.fstat(fd)
+        try:
+            info = self._retry_estale(
+                lambda: os.fstat(fd),
+                refresh_handles=False,
+            )
+        except BaseException:
+            os.close(fd)
+            raise
         expected_mode = 0o600 if name.startswith("HEARTBEAT.rank") else 0o400
         if (
             not stat.S_ISREG(info.st_mode)
@@ -1473,36 +1684,56 @@ class TransactionDirectory:
         return fd
 
     def read_bytes(self, name: str) -> bytes:
-        fd = self._open_readonly(name)
-        try:
-            before = os.fstat(fd)
-            blocks: list[bytes] = []
-            total = 0
-            while True:
-                block = os.read(fd, 65536)
-                if not block:
-                    break
-                total += len(block)
-                if total > MAX_RECEIPT_BYTES:
-                    raise TransactionError(f"transaction artifact too large: {name}")
-                blocks.append(block)
-            raw = b"".join(blocks)
-            after = os.fstat(fd)
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
-                raise TransactionError(f"transaction artifact changed while reading: {name}")
-            return raw
-        finally:
-            os.close(fd)
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            fd = -1
+            try:
+                fd = self._open_readonly(name)
+                before = os.fstat(fd)
+                blocks: list[bytes] = []
+                total = 0
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > MAX_RECEIPT_BYTES:
+                        raise TransactionError(
+                            f"transaction artifact too large: {name}"
+                        )
+                    blocks.append(block)
+                raw = b"".join(blocks)
+                after = os.fstat(fd)
+                if (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                ) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                ):
+                    raise TransactionError(
+                        f"transaction artifact changed while reading: {name}"
+                    )
+                return raw
+            except OSError as exc:
+                if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                try:
+                    self._refresh_directory_handles()
+                except OSError as refresh_exc:
+                    if not _is_estale(refresh_exc):
+                        raise
+                _estale_backoff(attempt)
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        raise AssertionError("unreachable ESTALE read retry state")
 
     def read_json(self, name: str) -> tuple[dict[str, Any], str]:
         raw = self.read_bytes(name)
@@ -1517,62 +1748,397 @@ class TransactionDirectory:
     def exists(self, name: str) -> bool:
         self.assert_identity()
         try:
-            info = os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)
+            info = self._retry_estale(
+                lambda: os.stat(
+                    name,
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+            )
         except FileNotFoundError:
             return False
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise TransactionError(f"unsafe transaction artifact: {name}")
         return True
 
+    def _write_exclusive_temporary(
+        self,
+        name: str,
+        raw: bytes,
+        *,
+        final_mode: int = 0o400,
+    ) -> tuple[int, int]:
+        """Create and durably fill one unique O_EXCL temporary receipt.
+
+        Retried writes use ``pwrite`` at an explicit offset.  Thus an ESTALE
+        reply whose server-side write may have completed can only overwrite
+        the same bytes at the same offset; it can never duplicate bytes or
+        alter the canonical payload.
+        """
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        saw_estale = False
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            try:
+                fd = os.open(name, flags, 0o600, dir_fd=self.root_fd)
+                break
+            except FileExistsError as exc:
+                if saw_estale:
+                    raise TransactionError(
+                        f"ambiguous exclusive temporary creation after ESTALE: {name}"
+                    ) from exc
+                raise
+            except OSError as exc:
+                if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                saw_estale = True
+                try:
+                    self._refresh_directory_handles()
+                except OSError as refresh_exc:
+                    if not _is_estale(refresh_exc):
+                        raise
+                _estale_backoff(attempt)
+        if fd < 0:
+            raise AssertionError("unreachable temporary creation retry state")
+        identity: tuple[int, int] | None = None
+        try:
+            created = _retry_estale_syscall(lambda: os.fstat(fd))
+            identity = (created.st_dev, created.st_ino)
+
+            def reopen(
+                expected_modes: set[int],
+                *,
+                writable: bool = True,
+            ) -> None:
+                nonlocal fd
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+                self._refresh_directory_handles()
+                reopen_flags = os.O_RDWR if writable else os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    reopen_flags |= os.O_NOFOLLOW
+                candidate = os.open(name, reopen_flags, dir_fd=self.root_fd)
+                info = os.fstat(candidate)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) not in expected_modes
+                    or (info.st_dev, info.st_ino) != identity
+                    or info.st_size > len(raw)
+                ):
+                    os.close(candidate)
+                    raise TransactionError(
+                        f"temporary transaction artifact changed after ESTALE: {name}"
+                    )
+                fd = candidate
+
+            def fd_operation(
+                operation: Callable[[int], _T],
+                expected_modes: set[int],
+                *,
+                writable: bool = True,
+            ) -> _T:
+                for attempt in range(ESTALE_RETRY_ATTEMPTS):
+                    try:
+                        return operation(fd)
+                    except OSError as exc:
+                        if (
+                            not _is_estale(exc)
+                            or attempt + 1 == ESTALE_RETRY_ATTEMPTS
+                        ):
+                            raise
+                        for reopen_attempt in range(ESTALE_RETRY_ATTEMPTS):
+                            try:
+                                reopen(expected_modes, writable=writable)
+                                break
+                            except OSError as reopen_exc:
+                                if (
+                                    not _is_estale(reopen_exc)
+                                    or reopen_attempt + 1
+                                    == ESTALE_RETRY_ATTEMPTS
+                                ):
+                                    raise
+                                _estale_backoff(reopen_attempt)
+                        _estale_backoff(attempt)
+                raise AssertionError("unreachable temporary fd retry state")
+
+            offset = 0
+            while offset < len(raw):
+                written = fd_operation(
+                    lambda current_fd, offset=offset: os.pwrite(
+                        current_fd,
+                        raw[offset:],
+                        offset,
+                    ),
+                    {0o600},
+                )
+                if written <= 0:
+                    raise OSError("short transaction artifact write")
+                offset += written
+            # Flush and verify the exact payload while the unique private file
+            # is still owner-writable.  No data write is ever attempted after
+            # the immutable mode transition.
+            fd_operation(lambda current_fd: os.fsync(current_fd), {0o600})
+
+            observed = bytearray()
+            offset = 0
+            while offset < len(raw):
+                block = fd_operation(
+                    lambda current_fd, offset=offset: os.pread(
+                        current_fd,
+                        min(65536, len(raw) - offset),
+                        offset,
+                    ),
+                    {0o600},
+                )
+                if not block:
+                    break
+                observed.extend(block)
+                offset += len(block)
+            final_info = fd_operation(
+                lambda current_fd: os.fstat(current_fd),
+                {0o600},
+            )
+            if (
+                bytes(observed) != raw
+                or final_info.st_size != len(raw)
+                or (final_info.st_dev, final_info.st_ino) != identity
+            ):
+                raise TransactionError(
+                    f"temporary transaction artifact content changed: {name}"
+                )
+            # fchmod may commit remotely and then report ESTALE.  Reopen the
+            # same inode read-only when the exact final mode is already
+            # visible; never try O_RDWR against an already-0400 receipt.
+            for attempt in range(ESTALE_RETRY_ATTEMPTS):
+                try:
+                    os.fchmod(fd, final_mode)
+                    break
+                except OSError as exc:
+                    if not _is_estale(exc):
+                        raise
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = -1
+                    try:
+                        self._refresh_directory_handles()
+                    except OSError as refresh_exc:
+                        if not _is_estale(refresh_exc):
+                            raise
+                    info = self._retry_estale(
+                        lambda: os.stat(
+                            name,
+                            dir_fd=self.root_fd,
+                            follow_symlinks=False,
+                        )
+                    )
+                    observed_mode = stat.S_IMODE(info.st_mode)
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or (info.st_dev, info.st_ino) != identity
+                        or info.st_size != len(raw)
+                        or observed_mode not in {0o600, final_mode}
+                    ):
+                        raise TransactionError(
+                            f"temporary transaction mode changed after ESTALE: {name}"
+                        )
+                    if observed_mode == final_mode:
+                        reopen({final_mode}, writable=False)
+                        break
+                    if attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                        raise
+                    reopen({0o600}, writable=True)
+                    _estale_backoff(attempt)
+            else:
+                raise AssertionError("unreachable temporary chmod retry state")
+
+            fd_operation(
+                lambda current_fd: os.fsync(current_fd),
+                {final_mode},
+                writable=False,
+            )
+            immutable = fd_operation(
+                lambda current_fd: os.fstat(current_fd),
+                {final_mode},
+                writable=False,
+            )
+            if (
+                not stat.S_ISREG(immutable.st_mode)
+                or immutable.st_uid != os.geteuid()
+                or stat.S_IMODE(immutable.st_mode) != final_mode
+                or (immutable.st_dev, immutable.st_ino) != identity
+                or immutable.st_size != len(raw)
+            ):
+                raise TransactionError(
+                    f"temporary transaction artifact is not immutable: {name}"
+                )
+            return identity
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+            if identity is not None:
+                try:
+                    self._unlink_exact(name, identity)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _unlink_exact(
+        self,
+        name: str,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        """Idempotently unlink one exact entry with bounded ESTALE recovery."""
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            try:
+                info = os.stat(
+                    name,
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or (info.st_dev, info.st_ino) != expected_identity
+                ):
+                    raise TransactionError(
+                        f"transaction temporary identity changed: {name}"
+                    )
+                os.unlink(name, dir_fd=self.root_fd)
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                if not _is_estale(exc) or attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                try:
+                    self._refresh_directory_handles()
+                except OSError as refresh_exc:
+                    if not _is_estale(refresh_exc):
+                        raise
+                _estale_backoff(attempt)
+
+    def _published_hardlink_is_exact(
+        self,
+        temporary: str,
+        name: str,
+        identity: tuple[int, int],
+        raw: bytes,
+    ) -> bool:
+        """Prove an ESTALE-ambiguous link committed this exact receipt."""
+        try:
+            temporary_info, target_info = self._retry_estale(
+                lambda: (
+                    os.stat(temporary, dir_fd=self.root_fd, follow_symlinks=False),
+                    os.stat(name, dir_fd=self.root_fd, follow_symlinks=False),
+                )
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(temporary_info.st_mode)
+            or not stat.S_ISREG(target_info.st_mode)
+            or temporary_info.st_uid != os.geteuid()
+            or target_info.st_uid != os.geteuid()
+            or stat.S_IMODE(temporary_info.st_mode) != 0o400
+            or stat.S_IMODE(target_info.st_mode) != 0o400
+            or (temporary_info.st_dev, temporary_info.st_ino) != identity
+            or (target_info.st_dev, target_info.st_ino) != identity
+            or temporary_info.st_size != len(raw)
+            or target_info.st_size != len(raw)
+        ):
+            return False
+        return self.read_bytes(name) == raw
+
+    def _link_immutable_exact(
+        self,
+        temporary: str,
+        name: str,
+        identity: tuple[int, int],
+        raw: bytes,
+    ) -> None:
+        """Atomically publish, resolving only a provably committed ESTALE."""
+        uncertain_commit = False
+        for attempt in range(ESTALE_RETRY_ATTEMPTS):
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=self.root_fd,
+                    dst_dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+                return
+            except FileExistsError as exc:
+                if uncertain_commit and self._published_hardlink_is_exact(
+                    temporary, name, identity, raw
+                ):
+                    return
+                raise DuplicateInvocation(
+                    f"immutable transaction artifact exists: {name}"
+                ) from exc
+            except OSError as exc:
+                if not _is_estale(exc):
+                    raise
+                uncertain_commit = True
+                try:
+                    self._refresh_directory_handles()
+                except OSError as refresh_exc:
+                    if not _is_estale(refresh_exc):
+                        raise
+                if self._published_hardlink_is_exact(
+                    temporary, name, identity, raw
+                ):
+                    return
+                if self.exists(name):
+                    raise DuplicateInvocation(
+                        f"immutable transaction artifact exists: {name}"
+                    )
+                if attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                    raise
+                _estale_backoff(attempt)
+
     def publish_immutable(self, name: str, payload: Mapping[str, Any]) -> str:
         """Publish a complete immutable file atomically without overwriting."""
         self.assert_identity()
         raw = _canonical_json_bytes(payload)
         temporary = f".tmp.{name}.{os.getpid()}.{uuid.uuid4().hex}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(temporary, flags, 0o600, dir_fd=self.root_fd)
-        try:
-            view = memoryview(raw)
-            while view:
-                written = os.write(fd, view)
-                view = view[written:]
-            os.fchmod(fd, 0o400)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        linked = False
         temporary_exists = True
+        identity: tuple[int, int] | None = None
         try:
-            os.link(
-                temporary,
-                name,
-                src_dir_fd=self.root_fd,
-                dst_dir_fd=self.root_fd,
-                follow_symlinks=False,
-            )
-            linked = True
-            os.unlink(temporary, dir_fd=self.root_fd)
+            identity = self._write_exclusive_temporary(temporary, raw)
+            self._link_immutable_exact(temporary, name, identity, raw)
+            self._unlink_exact(temporary, identity)
             temporary_exists = False
-            os.fsync(self.root_fd)
+            self._retry_estale(lambda: os.fsync(self.root_fd))
         except FileExistsError as exc:
             raise DuplicateInvocation(f"immutable transaction artifact exists: {name}") from exc
         except BaseException:
-            # A failed directory durability barrier must not leave a visible
-            # terminal success artifact behind.
-            if linked:
-                try:
-                    os.unlink(name, dir_fd=self.root_fd)
-                    os.fsync(self.root_fd)
-                except OSError:
-                    pass
+            # The no-replace hard link is the irreversible publication commit
+            # point.  A peer may already have observed and validated the exact
+            # immutable receipt, so a later temporary-alias cleanup or
+            # directory-fsync failure must never roll the target back.
             raise
         finally:
-            if temporary_exists:
+            if temporary_exists and identity is not None:
                 try:
-                    os.unlink(temporary, dir_fd=self.root_fd)
-                    os.fsync(self.root_fd)
+                    self._unlink_exact(temporary, identity)
+                    self._retry_estale(lambda: os.fsync(self.root_fd))
                 except FileNotFoundError:
                     pass
         return _sha256_bytes(raw)
@@ -1597,32 +2163,73 @@ class TransactionDirectory:
             raise DuplicateInvocation("immutable transaction artifact exists: OUTCOME.json")
         raw = _canonical_json_bytes(payload)
         temporary = f".tmp.{name}.{os.getpid()}.{uuid.uuid4().hex}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(temporary, flags, 0o600, dir_fd=self.root_fd)
         temporary_exists = True
+        identity: tuple[int, int] | None = None
         try:
-            try:
-                view = memoryview(raw)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        raise OSError("short terminal outcome write")
-                    view = view[written:]
-                os.fchmod(fd, 0o400)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            _rename_noreplace(
-                self.root_fd,
-                temporary,
-                self.root_fd,
-                name,
-            )
-            temporary_exists = False
+            identity = self._write_exclusive_temporary(temporary, raw)
+            uncertain_commit = False
+            for attempt in range(ESTALE_RETRY_ATTEMPTS):
+                try:
+                    _rename_noreplace(
+                        self.root_fd,
+                        temporary,
+                        self.root_fd,
+                        name,
+                        expected_source_identity=identity,
+                    )
+                    temporary_exists = self.exists(temporary)
+                    break
+                except FileExistsError as exc:
+                    if uncertain_commit and (
+                        self._replacement_is_exact(
+                            temporary, name, identity, raw, 0o400
+                        )
+                        or self._published_hardlink_is_exact(
+                            temporary, name, identity, raw
+                        )
+                    ):
+                        temporary_exists = self.exists(temporary)
+                        break
+                    raise DuplicateInvocation(
+                        "immutable transaction artifact exists: OUTCOME.json"
+                    ) from exc
+                except OSError as exc:
+                    if not _is_estale(exc):
+                        raise
+                    uncertain_commit = True
+                    try:
+                        self._refresh_directory_handles()
+                    except OSError as refresh_exc:
+                        if not _is_estale(refresh_exc):
+                            raise
+                    if self._replacement_is_exact(
+                        temporary, name, identity, raw, 0o400
+                    ):
+                        temporary_exists = False
+                        break
+                    if self._published_hardlink_is_exact(
+                        temporary, name, identity, raw
+                    ):
+                        temporary_exists = True
+                        break
+                    if self.exists(name):
+                        raise DuplicateInvocation(
+                            "immutable transaction artifact exists: OUTCOME.json"
+                        )
+                    if not self.exists(temporary):
+                        raise TransactionError(
+                            "ambiguous terminal outcome publication after ESTALE"
+                        )
+                    if attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                        raise
+                    _estale_backoff(attempt)
+            else:
+                raise AssertionError("unreachable terminal publication retry state")
+            if temporary_exists:
+                self._unlink_exact(temporary, identity)
+                temporary_exists = False
             # This is a durability barrier, not a namespace/content mutation.
-            os.fsync(self.root_fd)
+            self._retry_estale(lambda: os.fsync(self.root_fd))
         except FileExistsError as exc:
             raise DuplicateInvocation(
                 "immutable transaction artifact exists: OUTCOME.json"
@@ -1635,13 +2242,47 @@ class TransactionDirectory:
             # replay the preserved terminal outcome.
             raise
         finally:
-            if temporary_exists:
+            if temporary_exists and identity is not None:
                 try:
-                    os.unlink(temporary, dir_fd=self.root_fd)
-                    os.fsync(self.root_fd)
+                    self._unlink_exact(temporary, identity)
+                    self._retry_estale(lambda: os.fsync(self.root_fd))
                 except FileNotFoundError:
                     pass
         return _sha256_bytes(raw)
+
+    def _replacement_is_exact(
+        self,
+        temporary: str,
+        name: str,
+        identity: tuple[int, int],
+        raw: bytes,
+        mode: int,
+    ) -> bool:
+        """Prove an ESTALE-ambiguous rename/replace committed exactly once."""
+        try:
+            target = self._retry_estale(
+                lambda: os.stat(
+                    name,
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            temporary_exists = self.exists(temporary)
+        except FileNotFoundError:
+            temporary_exists = False
+        if (
+            temporary_exists
+            or not stat.S_ISREG(target.st_mode)
+            or target.st_uid != os.geteuid()
+            or stat.S_IMODE(target.st_mode) != mode
+            or (target.st_dev, target.st_ino) != identity
+            or target.st_size != len(raw)
+        ):
+            return False
+        return self.read_bytes(name) == raw
 
     def replace_heartbeat(self, name: str, payload: Mapping[str, Any]) -> None:
         self.assert_identity()
@@ -1650,31 +2291,54 @@ class TransactionDirectory:
             pass
         raw = _canonical_json_bytes(payload)
         temporary = f".tmp.{name}.{os.getpid()}.{uuid.uuid4().hex}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(temporary, flags, 0o600, dir_fd=self.root_fd)
+        temporary_exists = True
+        identity: tuple[int, int] | None = None
         try:
-            view = memoryview(raw)
-            while view:
-                written = os.write(fd, view)
-                view = view[written:]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        try:
-            os.replace(
+            identity = self._write_exclusive_temporary(
                 temporary,
-                name,
-                src_dir_fd=self.root_fd,
-                dst_dir_fd=self.root_fd,
+                raw,
+                final_mode=0o600,
             )
-            os.fsync(self.root_fd)
+            for attempt in range(ESTALE_RETRY_ATTEMPTS):
+                try:
+                    os.replace(
+                        temporary,
+                        name,
+                        src_dir_fd=self.root_fd,
+                        dst_dir_fd=self.root_fd,
+                    )
+                    temporary_exists = False
+                    break
+                except OSError as exc:
+                    if not _is_estale(exc):
+                        raise
+                    try:
+                        self._refresh_directory_handles()
+                    except OSError as refresh_exc:
+                        if not _is_estale(refresh_exc):
+                            raise
+                    if self._replacement_is_exact(
+                        temporary,
+                        name,
+                        identity,
+                        raw,
+                        0o600,
+                    ):
+                        temporary_exists = False
+                        break
+                    if not self.exists(temporary):
+                        raise TransactionError(
+                            f"ambiguous heartbeat replacement after ESTALE: {name}"
+                        )
+                    if attempt + 1 == ESTALE_RETRY_ATTEMPTS:
+                        raise
+                    _estale_backoff(attempt)
+            else:
+                raise AssertionError("unreachable heartbeat replace retry state")
+            self._retry_estale(lambda: os.fsync(self.root_fd))
         finally:
-            try:
-                os.unlink(temporary, dir_fd=self.root_fd)
-            except FileNotFoundError:
-                pass
+            if temporary_exists and identity is not None:
+                self._unlink_exact(temporary, identity)
 
     def close(self) -> None:
         if self.root_fd >= 0:

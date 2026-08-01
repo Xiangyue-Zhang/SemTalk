@@ -185,7 +185,435 @@ class RenameNoReplaceCompatibilityTests(unittest.TestCase):
                 TRANSACTION._CPU_TEST_MODE = previous_test_mode
                 transaction.close()
 
+
+class TransactionDirectoryEstaleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="semtalk-estale-")
+        self.parent = Path(self.temporary.name).resolve()
+        self.root = self.parent / "transaction"
+        self.transaction = TRANSACTION.TransactionDirectory(
+            self.root,
+            self.parent,
+            self.root.name,
+            0,
+        )
+        self.transaction.create_or_wait(time.monotonic() + 1.0)
+
+    def tearDown(self) -> None:
+        self.transaction.close()
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _payload(status: str = "STARTED") -> dict[str, object]:
+        return {
+            "schema": "estale-test-v1",
+            "status": status,
+            "rank": 1,
+        }
+
+    def test_open_existing_reopens_root_if_initial_fstat_is_estale(self) -> None:
+        second = TRANSACTION.TransactionDirectory(
+            self.root,
+            self.parent,
+            self.root.name,
+            1,
+        )
+        real_fstat = TRANSACTION.os.fstat
+        injected = False
+
+        def stale_first_root_fstat(fd: int) -> os.stat_result:
+            nonlocal injected
+            result = real_fstat(fd)
+            if not injected and fd not in second.namespace_fds:
+                injected = True
+                raise OSError(errno.ESTALE, "injected stale root handle")
+            return result
+
+        try:
+            with mock.patch.object(
+                TRANSACTION.os,
+                "fstat",
+                side_effect=stale_first_root_fstat,
+            ):
+                second.open_existing()
+            self.assertTrue(injected)
+            second.assert_identity()
+        finally:
+            second.close()
+
+    def test_immutable_publish_recovers_estale_pwrite_without_duplication(
+        self,
+    ) -> None:
+        real_pwrite = TRANSACTION.os.pwrite
+        calls = 0
+
+        def stale_first_pwrite(fd: int, data: bytes, offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.ESTALE, "injected stale write handle")
+            return real_pwrite(fd, data, offset)
+
+        payload = self._payload()
+        with mock.patch.object(
+            TRANSACTION.os,
+            "pwrite",
+            side_effect=stale_first_pwrite,
+        ):
+            digest = self.transaction.publish_immutable(
+                "STARTED.rank1.json",
+                payload,
+            )
+        observed, observed_digest = self.transaction.read_json(
+            "STARTED.rank1.json"
+        )
+        self.assertEqual(observed, payload)
+        self.assertEqual(observed_digest, digest)
+        self.assertGreaterEqual(calls, 2)
+
+    def test_persistent_pwrite_estale_exhausts_bound_and_cleans_temporary(
+        self,
+    ) -> None:
+        calls = 0
+
+        def persistent_estale(_fd: int, _data: bytes, _offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            raise OSError(errno.ESTALE, "injected persistent stale write")
+
+        with (
+            mock.patch.object(
+                TRANSACTION.os,
+                "pwrite",
+                side_effect=persistent_estale,
+            ),
+            mock.patch.object(TRANSACTION, "_estale_backoff"),
+        ):
+            with self.assertRaises(OSError) as raised:
+                self.transaction.publish_immutable(
+                    "STARTED.rank1.json",
+                    self._payload(),
+                )
+        self.assertEqual(raised.exception.errno, errno.ESTALE)
+        self.assertEqual(calls, TRANSACTION.ESTALE_RETRY_ATTEMPTS)
+        self.assertFalse((self.root / "STARTED.rank1.json").exists())
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_non_estale_pwrite_error_is_not_retried(self) -> None:
+        calls = 0
+
+        def fail_eio(_fd: int, _data: bytes, _offset: int) -> int:
+            nonlocal calls
+            calls += 1
+            raise OSError(errno.EIO, "injected non-retryable write failure")
+
+        with mock.patch.object(
+            TRANSACTION.os,
+            "pwrite",
+            side_effect=fail_eio,
+        ):
+            with self.assertRaises(OSError) as raised:
+                self.transaction.publish_immutable(
+                    "STARTED.rank1.json",
+                    self._payload(),
+                )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(calls, 1)
+        self.assertFalse((self.root / "STARTED.rank1.json").exists())
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_immutable_publish_reconciles_fchmod_committed_then_estale(
+        self,
+    ) -> None:
+        real_fchmod = TRANSACTION.os.fchmod
+        injected = False
+
+        def commit_then_estale(fd: int, mode: int) -> None:
+            nonlocal injected
+            real_fchmod(fd, mode)
+            if not injected and mode == 0o400:
+                injected = True
+                raise OSError(errno.ESTALE, "injected ambiguous chmod commit")
+
+        payload = self._payload()
+        with mock.patch.object(
+            TRANSACTION.os,
+            "fchmod",
+            side_effect=commit_then_estale,
+        ):
+            digest = self.transaction.publish_immutable(
+                "STARTED.rank1.json",
+                payload,
+            )
+        observed, observed_digest = self.transaction.read_json(
+            "STARTED.rank1.json"
+        )
+        self.assertTrue(injected)
+        self.assertEqual(observed, payload)
+        self.assertEqual(observed_digest, digest)
+
+    def test_immutable_publish_reconciles_link_committed_then_estale(self) -> None:
+        real_link = TRANSACTION.os.link
+        injected = False
+
+        def commit_then_estale(*args: object, **kwargs: object) -> None:
+            nonlocal injected
+            real_link(*args, **kwargs)
+            if not injected:
+                injected = True
+                raise OSError(errno.ESTALE, "injected ambiguous link commit")
+
+        payload = self._payload()
+        with mock.patch.object(
+            TRANSACTION.os,
+            "link",
+            side_effect=commit_then_estale,
+        ):
+            digest = self.transaction.publish_immutable(
+                "STARTED.rank1.json",
+                payload,
+            )
+        observed, observed_digest = self.transaction.read_json(
+            "STARTED.rank1.json"
+        )
+        self.assertTrue(injected)
+        self.assertEqual(observed, payload)
+        self.assertEqual(observed_digest, digest)
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_ambiguous_link_never_adopts_same_bytes_from_different_inode(
+        self,
+    ) -> None:
+        payload = self._payload()
+        raw = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        real_link = TRANSACTION.os.link
+
+        def publish_foreign_inode_then_estale(
+            source: str,
+            target: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+            follow_symlinks: bool,
+        ) -> None:
+            if target != "STARTED.rank1.json":
+                real_link(
+                    source,
+                    target,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                    follow_symlinks=follow_symlinks,
+                )
+                return
+            fd = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(fd, raw)
+                os.fsync(fd)
+                os.fchmod(fd, 0o400)
+            finally:
+                os.close(fd)
+            raise OSError(errno.ESTALE, "injected foreign ambiguous publication")
+
+        with mock.patch.object(
+            TRANSACTION.os,
+            "link",
+            side_effect=publish_foreign_inode_then_estale,
+        ):
+            with self.assertRaises(TRANSACTION.DuplicateInvocation):
+                self.transaction.publish_immutable(
+                    "STARTED.rank1.json",
+                    payload,
+                )
+        self.assertEqual((self.root / "STARTED.rank1.json").read_bytes(), raw)
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in self.root.iterdir()
+            )
+        )
+
+    def test_postcommit_directory_fsync_error_preserves_immutable_target(
+        self,
+    ) -> None:
+        real_fsync = TRANSACTION.os.fsync
+        injected = False
+
+        def fail_postcommit_root_fsync(fd: int) -> None:
+            nonlocal injected
+            if (
+                not injected
+                and fd == self.transaction.root_fd
+                and (self.root / "STARTED.rank1.json").exists()
+            ):
+                injected = True
+                raise OSError(errno.EIO, "injected postcommit directory fsync failure")
+            real_fsync(fd)
+
+        with mock.patch.object(
+            TRANSACTION.os,
+            "fsync",
+            side_effect=fail_postcommit_root_fsync,
+        ):
+            with self.assertRaises(OSError) as raised:
+                self.transaction.publish_immutable(
+                    "STARTED.rank1.json",
+                    self._payload(),
+                )
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertTrue(injected)
+        observed, _ = self.transaction.read_json("STARTED.rank1.json")
+        self.assertEqual(observed, self._payload())
+
+    def test_exact_cleanup_rejects_replaced_temporary_inode(self) -> None:
+        name = ".tmp.STARTED.rank1.json.fixed"
+        original = self.root / name
+        original.write_bytes(b"original")
+        original_info = original.stat()
+        original.unlink()
+        original.write_bytes(b"replacement")
+        with self.assertRaisesRegex(
+            TRANSACTION.TransactionError,
+            "temporary identity changed",
+        ):
+            self.transaction._unlink_exact(
+                name,
+                (original_info.st_dev, original_info.st_ino),
+            )
+        self.assertEqual(original.read_bytes(), b"replacement")
+
+    def test_fresh_publish_never_adopts_an_existing_exact_receipt(self) -> None:
+        payload = self._payload()
+        self.transaction.publish_immutable("STARTED.rank1.json", payload)
+        with self.assertRaises(TRANSACTION.DuplicateInvocation):
+            self.transaction.publish_immutable("STARTED.rank1.json", payload)
+
+    def test_postcommit_estale_never_rolls_back_visible_immutable_target(
+        self,
+    ) -> None:
+        real_unlink = TRANSACTION.os.unlink
+
+        def stale_private_cleanup(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            if os.fspath(path).startswith(".tmp.STARTED.rank1.json."):
+                raise OSError(errno.ESTALE, "injected stale private cleanup")
+            real_unlink(path, dir_fd=dir_fd)
+
+        payload = self._payload()
+        with mock.patch.object(
+            TRANSACTION.os,
+            "unlink",
+            side_effect=stale_private_cleanup,
+        ):
+            with self.assertRaises(OSError) as raised:
+                self.transaction.publish_immutable(
+                    "STARTED.rank1.json",
+                    payload,
+                )
+        self.assertEqual(raised.exception.errno, errno.ESTALE)
+        observed, _ = self.transaction.read_json("STARTED.rank1.json")
+        self.assertEqual(observed, payload)
+
+    def test_immutable_read_reopens_after_estale(self) -> None:
+        payload = self._payload("ARMED")
+        self.transaction.publish_immutable("ARMED.rank1.json", payload)
+        real_read = TRANSACTION.os.read
+        calls = 0
+
+        def stale_first_read(fd: int, size: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.ESTALE, "injected stale receipt read")
+            return real_read(fd, size)
+
+        with mock.patch.object(
+            TRANSACTION.os,
+            "read",
+            side_effect=stale_first_read,
+        ):
+            observed, _ = self.transaction.read_json("ARMED.rank1.json")
+        self.assertEqual(observed, payload)
+        self.assertGreaterEqual(calls, 2)
+
+    def test_heartbeat_replace_reconciles_committed_then_estale(self) -> None:
+        payload = self._payload("RUNNING")
+        real_replace = TRANSACTION.os.replace
+        injected = False
+
+        def commit_then_estale(*args: object, **kwargs: object) -> None:
+            nonlocal injected
+            real_replace(*args, **kwargs)
+            if not injected:
+                injected = True
+                raise OSError(errno.ESTALE, "injected ambiguous replace commit")
+
+        with mock.patch.object(
+            TRANSACTION.os,
+            "replace",
+            side_effect=commit_then_estale,
+        ):
+            self.transaction.replace_heartbeat("HEARTBEAT.rank1.json", payload)
+        observed, _ = self.transaction.read_json("HEARTBEAT.rank1.json")
+        self.assertTrue(injected)
+        self.assertEqual(observed, payload)
+
+    def test_terminal_rename_reconciles_committed_then_estale(self) -> None:
+        payload = self._payload("SUCCEEDED")
+
+        def commit_then_estale(
+            source_dir_fd: int,
+            source: str,
+            target_dir_fd: int,
+            target: str,
+            *,
+            expected_source_identity: tuple[int, int] | None = None,
+        ) -> None:
+            self.assertIsNotNone(expected_source_identity)
+            os.rename(
+                source,
+                target,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=target_dir_fd,
+            )
+            raise OSError(errno.ESTALE, "injected ambiguous rename commit")
+
+        with mock.patch.object(
+            TRANSACTION,
+            "_rename_noreplace",
+            side_effect=commit_then_estale,
+        ):
+            digest = self.transaction.publish_terminal_outcome(payload)
+        observed, observed_digest = self.transaction.read_json("OUTCOME.json")
+        self.assertEqual(observed, payload)
+        self.assertEqual(observed_digest, digest)
+
 HARNESS = r"""
+import errno
 import json
 import os
 import sys
@@ -308,6 +736,34 @@ if os.environ.get("SEMTALK_TEST_REPLAY_RANK"):
             self.sequence = 1
     module.Coordinator._heartbeat = replaying_heartbeat
 
+estale_started_rank = os.environ.get("SEMTALK_TEST_ESTALE_STARTED_LINK_RANK")
+estale_started_mode = os.environ.get("SEMTALK_TEST_ESTALE_STARTED_LINK_MODE")
+if estale_started_rank is not None:
+    target_name = f"STARTED.rank{int(estale_started_rank)}.json"
+    original_link = module.os.link
+    injected = False
+    def injected_started_link(source, target, *args, **kwargs):
+        global injected
+        if os.fspath(target) != target_name:
+            return original_link(source, target, *args, **kwargs)
+        if estale_started_mode == "commit_then_estale" and not injected:
+            original_link(source, target, *args, **kwargs)
+            injected = True
+            marker = os.environ.get("SEMTALK_TEST_ESTALE_INJECTION_MARKER")
+            if marker:
+                with open(marker, "x", encoding="utf-8") as handle:
+                    handle.write("commit_then_estale\n")
+            raise OSError(errno.ESTALE, "injected STARTED link commit then ESTALE")
+        if estale_started_mode == "persistent_precommit":
+            injected = True
+            marker = os.environ.get("SEMTALK_TEST_ESTALE_INJECTION_MARKER")
+            if marker and not os.path.exists(marker):
+                with open(marker, "x", encoding="utf-8") as handle:
+                    handle.write("persistent_precommit\n")
+            raise OSError(errno.ESTALE, "injected persistent STARTED link ESTALE")
+        return original_link(source, target, *args, **kwargs)
+    module.os.link = injected_started_link
+
 raise SystemExit(module.main(sys.argv[1:]))
 """
 
@@ -325,6 +781,25 @@ rank = os.environ["SEMTALK_W16_NODE_RANK"]
 entry = configuration[rank]
 marker_root = Path(configuration["marker_root"])
 marker_root.mkdir(parents=True, exist_ok=True)
+if entry.get("record_invocation_once"):
+    invocation_log = marker_root / f"invocation-log.rank{rank}"
+    log_descriptor = os.open(
+        invocation_log,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    try:
+        os.write(log_descriptor, b"1\n")
+        os.fsync(log_descriptor)
+    finally:
+        os.close(log_descriptor)
+    invocation = marker_root / f"invocation.rank{rank}"
+    descriptor = os.open(invocation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"1\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 (marker_root / f"started.rank{rank}").write_text(str(os.getpid()))
 if entry.get("record_runtime"):
     python_target_fd_leaks = []
@@ -437,6 +912,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
         read_authority: bool = False,
         expected_authority: str = "",
         record_runtime: bool = False,
+        record_invocation_once: bool = False,
     ) -> dict[str, object]:
         return {
             "marker_root": str(self.root / "markers"),
@@ -449,6 +925,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "read_authority": read_authority,
                 "expected_authority": expected_authority,
                 "record_runtime": record_runtime,
+                "record_invocation_once": record_invocation_once,
             },
             "1": {
                 "seconds": seconds1,
@@ -459,6 +936,7 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
                 "read_authority": read_authority,
                 "expected_authority": expected_authority,
                 "record_runtime": record_runtime,
+                "record_invocation_once": record_invocation_once,
             },
         }
 
@@ -828,6 +1306,120 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self.assertIn("restored_guards_by_gpu", final["outer_guarded_runner"]["guard_evidence"])
         replay = self._replay(transaction_root)
         self.assertEqual(replay["status"], "REPLAYED_SUCCEEDED")
+
+    def test_started_link_commit_then_estale_is_one_successful_protocol_run(
+        self,
+    ) -> None:
+        transaction_root = self.root / "started_link_commit_then_estale"
+        configuration = self._configuration(record_invocation_once=True)
+        injection_marker = self.root / "rank1-started-link-injected"
+        node1 = self._start(
+            self._command(1, transaction_root, configuration),
+            extra_environment={
+                "SEMTALK_TEST_ESTALE_STARTED_LINK_RANK": "1",
+                "SEMTALK_TEST_ESTALE_STARTED_LINK_MODE": "commit_then_estale",
+                "SEMTALK_TEST_ESTALE_INJECTION_MARKER": str(injection_marker),
+            },
+        )
+        node0 = self._start(self._command(0, transaction_root, configuration))
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
+
+        self.assertEqual(injection_marker.read_text(), "commit_then_estale\n")
+        decision_paths = list(transaction_root.glob("DECISION*.json"))
+        self.assertEqual([path.name for path in decision_paths], ["DECISION.json"])
+        decision = json.loads(decision_paths[0].read_text())
+        self.assertEqual(decision["status"], "GO")
+        bootstrap = json.loads((transaction_root / "TRANSACTION.json").read_text())
+        self.assertEqual(bootstrap["portable"]["max_restarts"], 0)
+
+        started_path = transaction_root / "STARTED.rank1.json"
+        started_raw = started_path.read_bytes()
+        started = json.loads(started_raw)
+        self.assertEqual(started["status"], "STARTED")
+        self.assertEqual(started["rank"], 1)
+        self.assertEqual(
+            started_raw,
+            (json.dumps(started, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+        )
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in transaction_root.iterdir()
+            )
+        )
+        for rank in (0, 1):
+            self.assertEqual(
+                (self.root / "markers" / f"invocation.rank{rank}").read_text(),
+                "1\n",
+            )
+            self.assertEqual(
+                (self.root / "markers" / f"invocation-log.rank{rank}").read_text(),
+                "1\n",
+            )
+            result = json.loads(
+                (transaction_root / f"WORKLOAD_RESULT.rank{rank}.json").read_text()
+            )
+            self.assertEqual(
+                (result["status"], result["workload_returncode"]),
+                ("COMPLETED", 0),
+            )
+
+        finalized = self._finalize(transaction_root)
+        self.assertEqual(finalized["status"], "FINALIZED_SUCCEEDED")
+        self.assertEqual(
+            json.loads((transaction_root / "OUTCOME.json").read_text())["status"],
+            "SUCCEEDED",
+        )
+
+    def test_persistent_started_link_estale_aborts_without_false_success(
+        self,
+    ) -> None:
+        transaction_root = self.root / "persistent_started_link_estale"
+        configuration = self._configuration(
+            seconds0=0.2,
+            seconds1=0.2,
+            record_invocation_once=True,
+        )
+        injection_marker = self.root / "rank1-started-link-persistent"
+        node1 = self._start(
+            self._command(1, transaction_root, configuration),
+            extra_environment={
+                "SEMTALK_TEST_ESTALE_STARTED_LINK_RANK": "1",
+                "SEMTALK_TEST_ESTALE_STARTED_LINK_MODE": "persistent_precommit",
+                "SEMTALK_TEST_ESTALE_INJECTION_MARKER": str(injection_marker),
+            },
+        )
+        node0 = self._start(self._command(0, transaction_root, configuration))
+        self.assertNotEqual(self._wait_process(node1), 0)
+        self.assertNotEqual(self._wait_process(node0), 0)
+
+        self.assertEqual(injection_marker.read_text(), "persistent_precommit\n")
+        self.assertEqual(
+            json.loads((transaction_root / "DECISION.json").read_text())["status"],
+            "GO",
+        )
+        self.assertFalse((transaction_root / "STARTED.rank1.json").exists())
+        self.assertFalse((transaction_root / "HANDOFF.rank0.json").exists())
+        self.assertFalse((transaction_root / "HANDOFF.rank1.json").exists())
+        self.assertFalse(
+            any(
+                path.name.startswith(".tmp.STARTED.rank1.json.")
+                for path in transaction_root.iterdir()
+            )
+        )
+        for rank in (0, 1):
+            self.assertEqual(
+                (self.root / "markers" / f"invocation.rank{rank}").read_text(),
+                "1\n",
+            )
+            self.assertEqual(
+                (self.root / "markers" / f"invocation-log.rank{rank}").read_text(),
+                "1\n",
+            )
+        outcome = json.loads((transaction_root / "OUTCOME.json").read_text())
+        self.assertEqual(outcome["status"], "FAILED")
+        self.assertNotEqual(outcome["status"], "SUCCEEDED")
 
     def test_terminal_final_is_portable_across_mount_identity_views(self) -> None:
         transaction_root = self.root / "portable_terminal_receipt"
