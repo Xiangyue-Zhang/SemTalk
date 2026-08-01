@@ -61,22 +61,23 @@ class V14FormalContractTest(unittest.TestCase):
         self.pipeline_source = {
             "origin": contract.ORIGIN,
             "source_root": "/pinned/validation/source",
-            "commit": contract.VALIDATION_SOURCE_COMMIT,
-            "tree": contract.VALIDATION_SOURCE_TREE,
+            "commit": contract.PIPELINE_EVIDENCE_SOURCE_COMMIT,
+            "tree": contract.PIPELINE_EVIDENCE_SOURCE_TREE,
             "clean": True,
             "detached": True,
             "local_branches_at_commit": [],
         }
         self.validation_authority = {
             "origin": contract.ORIGIN,
-            "commit": contract.VALIDATION_SOURCE_COMMIT,
-            "tree": contract.VALIDATION_SOURCE_TREE,
+            "commit": contract.RUNTIME_VALIDATION_SOURCE_COMMIT,
+            "tree": contract.RUNTIME_VALIDATION_SOURCE_TREE,
             "clean": True,
             "detached": True,
             "local_branches_at_commit": [],
             "selector_sha256": "a" * 64,
             "training_contract_sha256": "b" * 64,
             "validation_contract_sha256": "c" * 64,
+            "diffsheg_adapter_sha256": "d" * 64,
         }
         self.validated = []
         results = []
@@ -215,6 +216,7 @@ class V14FormalContractTest(unittest.TestCase):
         v14_selector.OFFICIAL_SELECTOR_SHA256 = "a" * 64
         v14_selector.OFFICIAL_TRAIN_CONTRACT_SHA256 = "b" * 64
         v14_selector.OFFICIAL_VALIDATION_CONTRACT_SHA256 = "c" * 64
+        v14_selector.OFFICIAL_DIFFSHEG_ADAPTER_SHA256 = "d" * 64
         frozen_by_mode = {
             mode: {
                 "source": {

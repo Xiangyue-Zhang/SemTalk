@@ -43,7 +43,7 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.temporary = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temporary.name).resolve(strict=True)
-        cls.official_repository = cls.root / "official-4066f20"
+        cls.official_repository = cls.root / "official-runtime-70a70f4"
         subprocess.run(
             [
                 "git",
@@ -64,7 +64,7 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                 "checkout",
                 "--quiet",
                 "--detach",
-                selection.VALIDATION_SOURCE_COMMIT,
+                selection.RUNTIME_VALIDATION_SOURCE_COMMIT,
             ],
             check=True,
         )
@@ -304,8 +304,8 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                 "_validation_source_authority",
                 return_value={
                     "origin": selection.SOURCE_ORIGIN,
-                    "commit": selection.VALIDATION_SOURCE_COMMIT,
-                    "tree": selection.VALIDATION_SOURCE_TREE,
+                    "commit": selection.RUNTIME_VALIDATION_SOURCE_COMMIT,
+                    "tree": selection.RUNTIME_VALIDATION_SOURCE_TREE,
                     "clean": True,
                     "detached": True,
                     "local_branches_at_commit": [],
@@ -315,6 +315,9 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                     ),
                     "validation_contract_sha256": (
                         selection.OFFICIAL_VALIDATION_CONTRACT_SHA256
+                    ),
+                    "diffsheg_adapter_sha256": (
+                        selection.OFFICIAL_DIFFSHEG_ADAPTER_SHA256
                     ),
                 },
             )
@@ -347,8 +350,8 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                 return_value={
                     "origin": selection.SOURCE_ORIGIN,
                     "source_root": "/verified/validation/4066f20",
-                    "commit": selection.VALIDATION_SOURCE_COMMIT,
-                    "tree": selection.VALIDATION_SOURCE_TREE,
+                    "commit": selection.PIPELINE_EVIDENCE_SOURCE_COMMIT,
+                    "tree": selection.PIPELINE_EVIDENCE_SOURCE_TREE,
                     "clean": True,
                     "detached": True,
                     "local_branches_at_commit": [],
@@ -431,7 +434,7 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["validation_source_authority"]["commit"],
-            selection.VALIDATION_SOURCE_COMMIT,
+            selection.RUNTIME_VALIDATION_SOURCE_COMMIT,
         )
         self.assertNotEqual(
             payload["training_source_authority"]["commit"],
@@ -485,19 +488,26 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
             selection.OFFICIAL_VALIDATION_CONTRACT_SHA256,
         )
         self.assertEqual(
+            _sha(
+                self.official_repository
+                / "scripts/show_base/select_base_official_adapt.py"
+            ),
+            selection.OFFICIAL_DIFFSHEG_ADAPTER_SHA256,
+        )
+        self.assertEqual(
             subprocess.run(
                 [
                     "git",
                     "-C",
                     str(REPOSITORY),
                     "rev-parse",
-                    f"{selection.VALIDATION_SOURCE_COMMIT}^{{tree}}",
+            f"{selection.RUNTIME_VALIDATION_SOURCE_COMMIT}^{{tree}}",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip(),
-            selection.VALIDATION_SOURCE_TREE,
+            selection.RUNTIME_VALIDATION_SOURCE_TREE,
         )
 
     def test_protocol_path_is_cli_bound_and_linux_portable(self) -> None:
@@ -836,7 +846,7 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
                     "origin": selection.SOURCE_ORIGIN,
                     "source_root": "/verified/validation/4066f20",
                     "commit": commit,
-                    "tree": selection.VALIDATION_SOURCE_TREE,
+                    "tree": selection.PIPELINE_EVIDENCE_SOURCE_TREE,
                     "clean": True,
                     "detached": True,
                     "local_branches_at_commit": [],
@@ -860,13 +870,14 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
             }
 
         good = {"pipeline_receipt": receipt(
-            selection.VALIDATION_SOURCE_COMMIT, "pipeline-4066f20.json"
+            selection.PIPELINE_EVIDENCE_SOURCE_COMMIT,
+            "pipeline-4066f20.json",
         )}
         authority = selection._validation_pipeline_authority(
             good, selection.MODE_P1
         )
         self.assertEqual(
-            authority["commit"], selection.VALIDATION_SOURCE_COMMIT
+            authority["commit"], selection.PIPELINE_EVIDENCE_SOURCE_COMMIT
         )
         bad = {"pipeline_receipt": receipt(
             selection.TRAINING_SOURCE_COMMIT, "pipeline-5b84075.json"

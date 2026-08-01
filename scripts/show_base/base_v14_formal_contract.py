@@ -33,8 +33,10 @@ class V14ContractError(RuntimeError):
 ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 TRAINING_SOURCE_COMMIT = "5b84075bb5bc9577a891a1f5ff72e93c39bab2e8"
 TRAINING_SOURCE_TREE = "05372163157d24cc8a72c073ac172b7c1859bba0"
-VALIDATION_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
-VALIDATION_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
+RUNTIME_VALIDATION_SOURCE_COMMIT = "70a70f452bdf743e317b583a7770980f0ce744c3"
+RUNTIME_VALIDATION_SOURCE_TREE = "bdf7680f56f9f53c92e7ab0bf6c6a84ef4f83d69"
+PIPELINE_EVIDENCE_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
+PIPELINE_EVIDENCE_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
 SELECTION_PROTOCOL_SHA256 = (
     "ad556b191f580b21e589a0f4800ccd6bce38acff6183d1194223fe592ef0bc69"
 )
@@ -209,8 +211,9 @@ def validate_schedule_payload(payload: Mapping[str, Any]) -> None:
         or binding.get("training_semantics_source_commit")
         != TRAINING_SOURCE_COMMIT
         or binding.get("training_semantics_source_tree") != TRAINING_SOURCE_TREE
-        or binding.get("validation_source_commit") != VALIDATION_SOURCE_COMMIT
-        or binding.get("validation_source_tree") != VALIDATION_SOURCE_TREE
+        or binding.get("validation_source_commit")
+        != PIPELINE_EVIDENCE_SOURCE_COMMIT
+        or binding.get("validation_source_tree") != PIPELINE_EVIDENCE_SOURCE_TREE
         or binding.get("selection_protocol_sha256") != SELECTION_PROTOCOL_SHA256
         or binding.get("candidate_modes") != list(MODES)
         or binding.get("candidate_epochs") != list(CANDIDATE_EPOCHS)
@@ -567,7 +570,7 @@ def current_project_authority(project_root: Path) -> dict[str, Any]:
         root,
         "merge-base",
         "--is-ancestor",
-        VALIDATION_SOURCE_COMMIT,
+        RUNTIME_VALIDATION_SOURCE_COMMIT,
         commit,
         check=False,
     )
@@ -723,8 +726,8 @@ def validate_control_plane(
     common_authority = audit.get("common_authority")
     expected_validation_authority = {
         "origin": ORIGIN,
-        "commit": VALIDATION_SOURCE_COMMIT,
-        "tree": VALIDATION_SOURCE_TREE,
+        "commit": RUNTIME_VALIDATION_SOURCE_COMMIT,
+        "tree": RUNTIME_VALIDATION_SOURCE_TREE,
         "clean": True,
         "detached": True,
         "local_branches_at_commit": [],
@@ -734,6 +737,9 @@ def validate_control_plane(
         ),
         "validation_contract_sha256": (
             v14_selector.OFFICIAL_VALIDATION_CONTRACT_SHA256
+        ),
+        "diffsheg_adapter_sha256": (
+            v14_selector.OFFICIAL_DIFFSHEG_ADAPTER_SHA256
         ),
     }
     if (
@@ -854,7 +860,11 @@ def validate_control_plane(
         gate_source.get("commit") != project["commit"]
         or gate_source.get("tree") != project["tree"]
         or project["commit"]
-        in {TRAINING_SOURCE_COMMIT, VALIDATION_SOURCE_COMMIT}
+        in {
+            TRAINING_SOURCE_COMMIT,
+            RUNTIME_VALIDATION_SOURCE_COMMIT,
+            PIPELINE_EVIDENCE_SOURCE_COMMIT,
+        }
         or gate_run_id == formal_run_id
         or gate_port == formal_master_port
         or gate_run_id
@@ -891,8 +901,12 @@ def validate_control_plane(
             "tree": TRAINING_SOURCE_TREE,
         },
         "validation_source": {
-            "commit": VALIDATION_SOURCE_COMMIT,
-            "tree": VALIDATION_SOURCE_TREE,
+            "commit": RUNTIME_VALIDATION_SOURCE_COMMIT,
+            "tree": RUNTIME_VALIDATION_SOURCE_TREE,
+        },
+        "validation_pipeline_evidence_source": {
+            "commit": PIPELINE_EVIDENCE_SOURCE_COMMIT,
+            "tree": PIPELINE_EVIDENCE_SOURCE_TREE,
         },
         "formal_control_plane_source": project,
         "native_nine_mode_is_not_v14_authority": True,

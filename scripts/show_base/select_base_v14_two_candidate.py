@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Select the SemTalk SHOW V14 winner from exactly two validated reports.
 
-This is a CPU-only, fail-closed adapter around the 4066f20 official
-``validate_quality_report`` evidence replay.  The short-quality training
-artifacts remain bound to the earlier, frozen 5b84075 source.  Keeping those
-two authorities explicit prevents an evaluator-only source update from being
-misrepresented as a training-source change.  A legacy nine-mode decision may
+This is a CPU-only, fail-closed adapter around the corrected 70a70f4 official
+``validate_quality_report`` runtime replay.  The already-produced validation
+reports remain bound to their frozen 4066f20 evidence pipeline, while the
+short-quality training artifacts remain bound to the earlier 5b84075 source.
+Keeping those three authorities explicit prevents an evaluator-only source
+update from being misrepresented as a training-source change or an old report
+from being relabelled as a new inference.  A legacy nine-mode decision may
 be replayed as independent audit evidence when it exists.  Its absence is
 recorded explicitly (and may itself be evidenced by the nine probes plus the
 failed W1 short-quality receipt), but neither audit state can decide or block
@@ -43,16 +45,21 @@ PROTOCOL_SHA256 = (
 SOURCE_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 TRAINING_SOURCE_COMMIT = "5b84075bb5bc9577a891a1f5ff72e93c39bab2e8"
 TRAINING_SOURCE_TREE = "05372163157d24cc8a72c073ac172b7c1859bba0"
-VALIDATION_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
-VALIDATION_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
+RUNTIME_VALIDATION_SOURCE_COMMIT = "70a70f452bdf743e317b583a7770980f0ce744c3"
+RUNTIME_VALIDATION_SOURCE_TREE = "bdf7680f56f9f53c92e7ab0bf6c6a84ef4f83d69"
+PIPELINE_EVIDENCE_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
+PIPELINE_EVIDENCE_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
 OFFICIAL_SELECTOR_SHA256 = (
     "2510956db237d5f622517e9828ee4704e75b98cd47ddbc8ce888b56f37f70769"
 )
 OFFICIAL_TRAIN_CONTRACT_SHA256 = (
-    "b5e84633126c4027d93ae32a67f6c3ccdcc71f14a75e2821bcae7aae99e22441"
+    "29fdd5d3e9bdfc61904f649b71d4dae1766b42a4a6a5a40b2bbd37a4c6b33173"
 )
 OFFICIAL_VALIDATION_CONTRACT_SHA256 = (
-    "3983eb7adf2f8cbfcf738fca8cc1cf8f3b34acab274bb5dfd2e23964550f8daa"
+    "0168e7f9ab2b9a122656ed98c36dc36777f577816ef08b0186ffc892813d2c70"
+)
+OFFICIAL_DIFFSHEG_ADAPTER_SHA256 = (
+    "1857460c188096fcd4b24a9f8f5a0b0390a80eacd20744a46098195ac0f39ddf"
 )
 TOPOLOGY_GATE_SHA256 = (
     "1ee9ae31e2ca735265972022c26a82ba2789f7538a128631168af4e86f7808c4"
@@ -361,8 +368,10 @@ def _module_file(module: Any, label: str) -> Path:
 def load_official_modules(root: Path) -> tuple[ModuleType, ModuleType]:
     project = Path(root).resolve(strict=True)
     if (
-        _git(project, "rev-parse", "HEAD") != VALIDATION_SOURCE_COMMIT
-        or _git(project, "rev-parse", "HEAD^{tree}") != VALIDATION_SOURCE_TREE
+        _git(project, "rev-parse", "HEAD")
+        != RUNTIME_VALIDATION_SOURCE_COMMIT
+        or _git(project, "rev-parse", "HEAD^{tree}")
+        != RUNTIME_VALIDATION_SOURCE_TREE
         or _git(project, "remote", "get-url", "origin") != SOURCE_ORIGIN
         or _git(project, "status", "--porcelain=v1", "--untracked-files=all")
         != ""
@@ -378,6 +387,7 @@ def load_official_modules(root: Path) -> tuple[ModuleType, ModuleType]:
     selector_path = project / "scripts/show_base/select_base_training_topology.py"
     train_path = project / "scripts/show_base/train_base_official_adapt_long.py"
     validation_path = project / "scripts/show_base/base_long_val_contract.py"
+    diffsheg_path = project / "scripts/show_base/select_base_official_adapt.py"
     topology_gate = project / "configs/show_base/semtalk_base_topology_gate_spec_20260731.json"
     quality_gate = project / "configs/show_base/semtalk_base_topology_quality_gate_spec_v4_20260801.json"
     _verified_code_file(
@@ -391,6 +401,11 @@ def load_official_modules(root: Path) -> tuple[ModuleType, ModuleType]:
         OFFICIAL_VALIDATION_CONTRACT_SHA256,
         "official validation contract",
     )
+    _verified_code_file(
+        diffsheg_path,
+        OFFICIAL_DIFFSHEG_ADAPTER_SHA256,
+        "official DiffSHEG adapter",
+    )
     _verified_json_file(
         topology_gate, TOPOLOGY_GATE_SHA256, "topology gate specification"
     )
@@ -400,6 +415,7 @@ def load_official_modules(root: Path) -> tuple[ModuleType, ModuleType]:
     expected_imports = {
         "scripts.show_base.train_base_official_adapt_long": train_path,
         "scripts.show_base.base_long_val_contract": validation_path,
+        "scripts.show_base.select_base_official_adapt": diffsheg_path,
     }
     for name, expected_path in expected_imports.items():
         existing = sys.modules.get(name)
@@ -421,6 +437,11 @@ def load_official_modules(root: Path) -> tuple[ModuleType, ModuleType]:
         != train_path
         or _module_file(module.formal_validation, "imported formal validation")
         != validation_path
+        or _module_file(
+            module.formal_validation.diffsheg,
+            "imported official DiffSHEG adapter",
+        )
+        != diffsheg_path
     ):
         raise SelectionError("official selector imported from the wrong path")
     return module, contract
@@ -437,14 +458,15 @@ def _validation_source_authority(root: Path) -> dict[str, Any]:
     load_official_modules(project)
     return {
         "origin": SOURCE_ORIGIN,
-        "commit": VALIDATION_SOURCE_COMMIT,
-        "tree": VALIDATION_SOURCE_TREE,
+        "commit": RUNTIME_VALIDATION_SOURCE_COMMIT,
+        "tree": RUNTIME_VALIDATION_SOURCE_TREE,
         "clean": True,
         "detached": True,
         "local_branches_at_commit": [],
         "selector_sha256": OFFICIAL_SELECTOR_SHA256,
         "training_contract_sha256": OFFICIAL_TRAIN_CONTRACT_SHA256,
         "validation_contract_sha256": OFFICIAL_VALIDATION_CONTRACT_SHA256,
+        "diffsheg_adapter_sha256": OFFICIAL_DIFFSHEG_ADAPTER_SHA256,
     }
 
 
@@ -529,8 +551,8 @@ def _validation_pipeline_authority(
         or not isinstance(source, dict)
         or set(source) != expected_keys
         or source.get("origin") != SOURCE_ORIGIN
-        or source.get("commit") != VALIDATION_SOURCE_COMMIT
-        or source.get("tree") != VALIDATION_SOURCE_TREE
+        or source.get("commit") != PIPELINE_EVIDENCE_SOURCE_COMMIT
+        or source.get("tree") != PIPELINE_EVIDENCE_SOURCE_TREE
         or source.get("clean") is not True
         or source.get("detached") is not True
         or source.get("local_branches_at_commit") != []
@@ -538,7 +560,8 @@ def _validation_pipeline_authority(
         or ".." in source_root.parts
     ):
         raise SelectionError(
-            f"{mode} validation pipeline is not the pinned 4066f20 val-only source"
+            f"{mode} validation pipeline is not the pinned 4066f20 val-only "
+            "evidence source"
         )
     return copy.deepcopy(source)
 
