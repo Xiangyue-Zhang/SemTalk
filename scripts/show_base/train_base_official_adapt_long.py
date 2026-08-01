@@ -4629,11 +4629,18 @@ def validate_throughput_gate(
         args.expected_throughput_gate_sha256,
         "Base throughput gate",
     )
+    gate_frozen_receipt = _load_throughput_gate_frozen_receipt(
+        path,
+        report,
+    )
     trajectory_mode = frozen_receipt["long_contract"][
         "trajectory_anchor"
     ]["mode"]
-    frozen_compatibility_sha256 = _frozen_gate_compatibility_sha256(
-        frozen_receipt
+    gate_frozen_compatibility_sha256 = (
+        _frozen_gate_compatibility_sha256(gate_frozen_receipt)
+    )
+    cross_run_compatibility_sha256 = (
+        _frozen_gate_cross_run_compatibility_sha256(frozen_receipt)
     )
     if (
         report.get("format") != GATE_FORMAT
@@ -4651,11 +4658,19 @@ def validate_throughput_gate(
         )
         is None
         or report.get("frozen_gate_compatibility_sha256")
-        != frozen_compatibility_sha256
+        != gate_frozen_compatibility_sha256
         or report.get("topology_independent_input_sha256")
         != _topology_independent_gate_semantic_sha256(frozen_receipt)
+        or report.get("topology_independent_input_sha256")
+        != _topology_independent_gate_semantic_sha256(
+            gate_frozen_receipt
+        )
         or report.get("topology_receipt_sha256")
-        != frozen_receipt["topology"]["receipt_sha256"]
+        != gate_frozen_receipt["topology"]["receipt_sha256"]
+        or _frozen_gate_cross_run_compatibility_sha256(
+            gate_frozen_receipt
+        )
+        != cross_run_compatibility_sha256
         or report.get("node_count") != NODE_COUNT
         or report.get("local_world_size") != LOCAL_WORLD_SIZE
         or report.get("world_size") != WORLD_SIZE
@@ -4760,7 +4775,7 @@ def validate_throughput_gate(
             "frozen_receipt_sha256"
         ],
         "frozen_gate_compatibility_sha256": (
-            frozen_compatibility_sha256
+            gate_frozen_compatibility_sha256
         ),
     }
 
@@ -6223,6 +6238,162 @@ def _frozen_gate_compatibility_sha256(
         for key, value in frozen_receipt.items()
         if key not in required
     }
+    return canonical_json_sha256(payload)
+
+
+def _load_throughput_gate_frozen_receipt(
+    report_path: Path,
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load the immutable frozen inputs that produced a throughput report.
+
+    ``frozen_receipt_sha256`` is the semantic self-hash stored inside
+    ``frozen_inputs.json`` rather than the hash of its pretty-printed bytes.
+    Read and parse the sibling artifact through one no-follow descriptor,
+    then verify that self-hash against the gate report.  This preserves the
+    original probe's complete execution-instance binding while allowing a
+    later training run to use its own run ID and rendezvous port.
+    """
+
+    claimed_receipt_sha256 = _require_sha256(
+        report.get("frozen_receipt_sha256"),
+        "throughput gate frozen receipt SHA-256",
+    )
+    frozen_path = report_path.parent / "frozen_inputs.json"
+    resolved, payload_bytes, identity = _read_regular_file_bytes(
+        frozen_path,
+        "Base throughput gate frozen inputs",
+    )
+    payload = _strict_json_bytes(payload_bytes, str(resolved))
+    unsigned = dict(payload)
+    observed_receipt_sha256 = unsigned.pop("receipt_sha256", None)
+    if (
+        identity["size"] != len(payload_bytes)
+        or payload.get("format")
+        != "semtalk_show_base_official_adapt_frozen_inputs_v1"
+        or payload.get("run_purpose") != RUN_PURPOSE_THROUGHPUT
+        or payload.get("target_epochs") != []
+        or observed_receipt_sha256 != claimed_receipt_sha256
+        or canonical_json_sha256(unsigned) != claimed_receipt_sha256
+    ):
+        raise AdaptationContractError(
+            "throughput gate frozen inputs are not the exact self-hashed probe authority"
+        )
+    return payload
+
+
+def _frozen_gate_cross_run_compatibility_sha256(
+    frozen_receipt: Mapping[str, Any],
+) -> str:
+    """Project frozen inputs onto semantics shared by distinct executions.
+
+    A throughput probe and the training run that consumes it must have
+    different formal run IDs and rendezvous ports.  Those values, plus the
+    topology self-hash derived from them, identify an execution instance;
+    they do not change the model, data, objective, batching, host/rank layout,
+    precision, or optimizer trajectory.  Remove only those run-local fields
+    while retaining every result-affecting and structural field.
+    """
+
+    required = {
+        "run_purpose",
+        "target_epochs",
+        "receipt_sha256",
+        "protocol",
+        "topology",
+    }
+    if not isinstance(frozen_receipt, Mapping) or not required.issubset(
+        frozen_receipt
+    ):
+        raise AdaptationContractError(
+            "frozen Base receipt lacks cross-run gate semantics"
+        )
+    try:
+        payload = json.loads(
+            json.dumps(
+                frozen_receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise AdaptationContractError(
+            "frozen Base receipt is not strict JSON"
+        ) from error
+    claimed_frozen_sha256 = _require_sha256(
+        payload.get("receipt_sha256"),
+        "frozen Base receipt self-hash",
+    )
+    unsigned_frozen = dict(payload)
+    unsigned_frozen.pop("receipt_sha256")
+    if canonical_json_sha256(unsigned_frozen) != claimed_frozen_sha256:
+        raise AdaptationContractError(
+            "frozen Base receipt self-hash is invalid"
+        )
+    for key in ("run_purpose", "target_epochs", "receipt_sha256"):
+        payload.pop(key)
+
+    protocol = payload.get("protocol")
+    topology = payload.get("topology")
+    if not isinstance(protocol, dict) or not isinstance(topology, dict):
+        raise AdaptationContractError(
+            "frozen Base receipt topology semantics are malformed"
+        )
+    distributed = protocol.get("distributed_topology")
+    if not isinstance(distributed, dict):
+        raise AdaptationContractError(
+            "frozen Base receipt distributed topology is malformed"
+        )
+    ranks = topology.get("ranks")
+    if not isinstance(ranks, list) or any(
+        not isinstance(rank, dict) for rank in ranks
+    ):
+        raise AdaptationContractError(
+            "frozen Base receipt rank topology is malformed"
+        )
+    formal_run_id = distributed.get("formal_run_id")
+    master_port = distributed.get("master_port")
+    master_addr = distributed.get("master_addr")
+    if (
+        not isinstance(formal_run_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,128}", formal_run_id) is None
+        or isinstance(master_port, bool)
+        or not isinstance(master_port, int)
+        or not 1024 <= master_port <= 65535
+        or not isinstance(master_addr, str)
+        or not master_addr
+        or topology.get("formal_run_id") != formal_run_id
+        or topology.get("master_port") != master_port
+        or topology.get("master_addr") != master_addr
+        or any(
+            rank.get("formal_run_id") != formal_run_id
+            or rank.get("master_port") != master_port
+            or rank.get("master_addr") != master_addr
+            for rank in ranks
+        )
+    ):
+        raise AdaptationContractError(
+            "frozen Base receipt rendezvous identity is inconsistent"
+        )
+    claimed_topology_sha256 = _require_sha256(
+        topology.get("receipt_sha256"),
+        "frozen Base topology self-hash",
+    )
+    unsigned_topology = dict(topology)
+    unsigned_topology.pop("receipt_sha256")
+    if canonical_json_sha256(unsigned_topology) != claimed_topology_sha256:
+        raise AdaptationContractError(
+            "frozen Base topology self-hash is invalid"
+        )
+    for key in ("formal_run_id", "master_port"):
+        distributed.pop(key)
+        topology.pop(key)
+    topology.pop("receipt_sha256")
+    for rank in ranks:
+        rank.pop("formal_run_id")
+        rank.pop("master_port")
     return canonical_json_sha256(payload)
 
 

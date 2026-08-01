@@ -778,6 +778,10 @@ def validate_candidate_ready_receipts(
                     f"{label} throughput gate",
                 )
             )
+            gate_frozen = contract._load_throughput_gate_frozen_receipt(
+                full_probe_path,
+                full_probe,
+            )
             normalized_trajectory = _fresh_trajectory_probe(
                 mode,
                 throughput["trajectory_probe"],
@@ -812,11 +816,21 @@ def validate_candidate_ready_receipts(
             or full_probe.get("frozen_gate_compatibility_sha256")
             != throughput["frozen_gate_compatibility_sha256"]
             or throughput["frozen_gate_compatibility_sha256"]
-            != contract._frozen_gate_compatibility_sha256(frozen)
+            != contract._frozen_gate_compatibility_sha256(gate_frozen)
             or full_probe.get("topology_receipt_sha256")
-            != frozen.get("topology", {}).get("receipt_sha256")
+            != gate_frozen.get("topology", {}).get("receipt_sha256")
+            or contract._frozen_gate_cross_run_compatibility_sha256(
+                gate_frozen
+            )
+            != contract._frozen_gate_cross_run_compatibility_sha256(
+                frozen
+            )
             or full_probe.get("topology_independent_input_sha256")
             != contract._topology_independent_gate_semantic_sha256(frozen)
+            or full_probe.get("topology_independent_input_sha256")
+            != contract._topology_independent_gate_semantic_sha256(
+                gate_frozen
+            )
             or full_probe.get("updates_per_epoch") != expected_updates
             or full_probe.get("trajectory_mode")
             != contract.FRESH_TRAJECTORY_MODE

@@ -254,7 +254,11 @@ def _frozen_gate_fixture(
     run_purpose: str,
     target_epochs: list[int],
 ) -> dict[str, object]:
-    return {
+    del receipt_sha256
+    del topology_receipt_sha256
+    formal_run_id = "fixture-throughput-run"
+    master_port = 27101
+    payload: dict[str, object] = {
         "format": "semtalk_show_base_official_adapt_frozen_inputs_v1",
         "run_purpose": run_purpose,
         "target_epochs": target_epochs,
@@ -285,14 +289,51 @@ def _frozen_gate_fixture(
             "target_dataset": "SHOW",
             "target_speaker_scope": "All",
             "vq_models_in_training_graph": False,
+            "distributed_topology": {
+                "formal_run_id": formal_run_id,
+                "master_addr": "master.example",
+                "master_port": master_port,
+            },
         },
         "long_contract": {
             "schedule": {"sha256": "5" * 64},
             "trajectory_anchor": {"mode": trajectory_mode},
         },
-        "topology": {"receipt_sha256": topology_receipt_sha256},
-        "receipt_sha256": receipt_sha256,
+        "topology": {
+            "formal_run_id": formal_run_id,
+            "master_addr": "master.example",
+            "master_port": master_port,
+            "world_size": ADAPT.WORLD_SIZE,
+            "ranks": [
+                {
+                    "rank": rank,
+                    "formal_run_id": formal_run_id,
+                    "master_addr": "master.example",
+                    "master_port": master_port,
+                }
+                for rank in range(ADAPT.WORLD_SIZE)
+            ],
+        },
     }
+    payload["topology"]["receipt_sha256"] = (
+        ADAPT.canonical_json_sha256(payload["topology"])
+    )
+    payload["receipt_sha256"] = ADAPT.canonical_json_sha256(payload)
+    return payload
+
+
+def _reseal_frozen_fixture(value: dict[str, object]) -> dict[str, object]:
+    result = json.loads(json.dumps(value))
+    topology = dict(result["topology"])
+    topology.pop("receipt_sha256", None)
+    result["topology"] = topology
+    result["topology"]["receipt_sha256"] = (
+        ADAPT.canonical_json_sha256(topology)
+    )
+    unsigned = dict(result)
+    unsigned.pop("receipt_sha256", None)
+    result["receipt_sha256"] = ADAPT.canonical_json_sha256(unsigned)
+    return result
 
 
 def _topology_selection_inputs(
@@ -3492,16 +3533,38 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
                 target_epochs=[],
             )
-            training_frozen = {
-                **gate_frozen,
-                "receipt_sha256": "b" * 64,
-                "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(
-                    ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
-                ),
-            }
+            training_frozen = json.loads(json.dumps(gate_frozen))
+            training_frozen["run_purpose"] = (
+                ADAPT.RUN_PURPOSE_SHORT_QUALITY
+            )
+            training_frozen["target_epochs"] = list(
+                ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
+            )
+            training_frozen["protocol"]["distributed_topology"][
+                "formal_run_id"
+            ] = "fixture-quality-run"
+            training_frozen["protocol"]["distributed_topology"][
+                "master_port"
+            ] = 27201
+            training_frozen["topology"]["formal_run_id"] = (
+                "fixture-quality-run"
+            )
+            training_frozen["topology"]["master_port"] = 27201
+            for rank in training_frozen["topology"]["ranks"]:
+                rank["formal_run_id"] = "fixture-quality-run"
+                rank["master_port"] = 27201
+            unsigned_topology = dict(training_frozen["topology"])
+            unsigned_topology.pop("receipt_sha256")
+            training_frozen["topology"]["receipt_sha256"] = (
+                ADAPT.canonical_json_sha256(unsigned_topology)
+            )
+            unsigned_training = dict(training_frozen)
+            unsigned_training.pop("receipt_sha256")
+            training_frozen["receipt_sha256"] = (
+                ADAPT.canonical_json_sha256(unsigned_training)
+            )
             report = _gate_report(
-                frozen_sha256="a" * 64,
+                frozen_sha256=gate_frozen["receipt_sha256"],
                 frozen_compatibility_sha256=(
                     ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
                 ),
@@ -3510,11 +3573,17 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                         gate_frozen
                     )
                 ),
-                topology_receipt_sha256="t" * 64,
+                topology_receipt_sha256=gate_frozen["topology"][
+                    "receipt_sha256"
+                ],
                 trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
                 trajectory_probe=None,
             )
             path = root / "gate.json"
+            (root / "frozen_inputs.json").write_text(
+                json.dumps(gate_frozen, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             path.write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -3537,18 +3606,26 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
             changed_receipts = []
             changed = json.loads(json.dumps(training_frozen))
             changed["source"]["commit"] = "9" * 40
-            changed_receipts.append(changed)
+            changed_receipts.append(_reseal_frozen_fixture(changed))
             changed = json.loads(json.dumps(training_frozen))
             changed["dataset"]["data_mdb_sha256"] = "9" * 64
-            changed_receipts.append(changed)
+            changed_receipts.append(_reseal_frozen_fixture(changed))
             changed = json.loads(json.dumps(training_frozen))
             changed["dataset"]["selected_prerequisite_sha256"]["face"] = (
                 "0" * 64
             )
-            changed_receipts.append(changed)
+            changed_receipts.append(_reseal_frozen_fixture(changed))
             changed = json.loads(json.dumps(training_frozen))
             changed["topology"]["receipt_sha256"] = "9" * 64
+            unsigned_changed = dict(changed)
+            unsigned_changed.pop("receipt_sha256")
+            changed["receipt_sha256"] = ADAPT.canonical_json_sha256(
+                unsigned_changed
+            )
             changed_receipts.append(changed)
+            changed = json.loads(json.dumps(training_frozen))
+            changed["topology"]["master_addr"] = "other.example"
+            changed_receipts.append(_reseal_frozen_fixture(changed))
             for changed in changed_receipts:
                 with self.assertRaises(ADAPT.AdaptationContractError):
                     ADAPT.validate_throughput_gate(
@@ -3580,16 +3657,16 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 run_purpose=ADAPT.RUN_PURPOSE_THROUGHPUT,
                 target_epochs=[],
             )
-            training_frozen = {
-                **gate_frozen,
-                "receipt_sha256": "b" * 64,
-                "run_purpose": ADAPT.RUN_PURPOSE_SHORT_QUALITY,
-                "target_epochs": list(
-                    ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
-                ),
-            }
+            training_frozen = json.loads(json.dumps(gate_frozen))
+            training_frozen["run_purpose"] = (
+                ADAPT.RUN_PURPOSE_SHORT_QUALITY
+            )
+            training_frozen["target_epochs"] = list(
+                ADAPT.short_quality_epochs(ADAPT.W8_GLOBAL512_MODE)
+            )
+            training_frozen = _reseal_frozen_fixture(training_frozen)
             report = _gate_report(
-                frozen_sha256="a" * 64,
+                frozen_sha256=gate_frozen["receipt_sha256"],
                 frozen_compatibility_sha256=(
                     ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
                 ),
@@ -3598,7 +3675,9 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                         gate_frozen
                     )
                 ),
-                topology_receipt_sha256="t" * 64,
+                topology_receipt_sha256=gate_frozen["topology"][
+                    "receipt_sha256"
+                ],
                 trajectory_mode=ADAPT.LEGACY_TRAJECTORY_MODE,
                 trajectory_probe=None,
             )
@@ -3611,6 +3690,10 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 }
             )
             path = root / "forged-eta-gate.json"
+            (root / "frozen_inputs.json").write_text(
+                json.dumps(gate_frozen, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             path.write_text(
                 json.dumps(report, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -3706,7 +3789,7 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                 target_epochs=[],
             )
             report = _gate_report(
-                frozen_sha256="c" * 64,
+                frozen_sha256=gate_frozen["receipt_sha256"],
                 frozen_compatibility_sha256=(
                     ADAPT._frozen_gate_compatibility_sha256(gate_frozen)
                 ),
@@ -3715,11 +3798,17 @@ class OfficialBaseAdaptReceiptContracts(unittest.TestCase):
                         gate_frozen
                     )
                 ),
-                topology_receipt_sha256="u" * 64,
+                topology_receipt_sha256=gate_frozen["topology"][
+                    "receipt_sha256"
+                ],
                 trajectory_mode=ADAPT.FRESH_TRAJECTORY_MODE,
                 trajectory_probe=probe,
             )
             path = Path(temporary) / "fresh-gate.json"
+            (Path(temporary) / "frozen_inputs.json").write_text(
+                json.dumps(gate_frozen, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             path.write_text(
                 json.dumps(report, sort_keys=True) + "\n",
                 encoding="utf-8",

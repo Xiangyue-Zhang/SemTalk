@@ -508,6 +508,14 @@ class TrainerWatcherCompatibilityContracts(unittest.TestCase):
         primary_source_roots = set(
             diffsheg.DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES
         )
+        self.assertIn(
+            "scripts/show_base/semtalk_base_inference_core.py",
+            primary_source_roots,
+        )
+        self.assertNotIn(
+            "scripts/show_base/run_base_inference.py",
+            primary_source_roots,
+        )
         self.assertFalse(primary_source_roots & compatibility_roots)
         self.assertEqual(
             primary_source_roots,
@@ -708,6 +716,90 @@ class TrainerWatcherCompatibilityContracts(unittest.TestCase):
         self.assertEqual(before["files"], after["files"])
         self.assertEqual(set(before["files"]), primary_source_roots)
         self.assertFalse(set(before["files"]) & compatibility_roots)
+
+    def test_fresh_diffsheg_pipeline_pins_the_neutral_inference_core(
+        self,
+    ) -> None:
+        from scripts.show_base import select_base_official_adapt as diffsheg
+
+        entrypoint_relative = "scripts/show_base/run_base_val_inference.py"
+        helper_relative = (
+            "scripts/show_base/semtalk_base_inference_core.py"
+        )
+        entrypoint = {
+            "path": f"/source/{entrypoint_relative}",
+            "sha256": "1" * 64,
+            "bytes": 1,
+            "git_mode": "100644",
+            "git_blob_sha1": "1" * 40,
+        }
+        helper = {
+            "path": f"/source/{helper_relative}",
+            "sha256": "2" * 64,
+            "bytes": 2,
+            "git_mode": "100644",
+            "git_blob_sha1": "2" * 40,
+        }
+        source = {
+            "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+            "source_root": "/source",
+            "commit": "3" * 40,
+            "tree": "4" * 40,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+            "files": {
+                entrypoint_relative: entrypoint,
+                helper_relative: helper,
+            },
+        }
+        selected = {}
+        for stage, character in zip(
+            ("face", "hands", "upper", "lower", "global"),
+            "56789",
+        ):
+            selected[stage] = {
+                "candidate_checkpoint": {
+                    "path": f"/selected/{stage}.bin",
+                    "sha256": character * 64,
+                    "bytes": 10,
+                },
+                "epoch": 1,
+                "optimizer_updates": 2,
+                "updates_per_epoch": 2,
+                "candidate_audit_sha256": "a" * 64,
+                "selection_metric": {"name": "validation"},
+                "measurement_receipt": {"path": f"/{stage}.json"},
+            }
+        bridge = {
+            "selection": {"receipt_payload_sha256": "b" * 64},
+            "selected": selected,
+        }
+        with (
+            mock.patch.object(
+                diffsheg._selected_prerequisites,
+                "load_selected_prerequisites",
+                return_value=bridge,
+            ),
+            mock.patch.object(
+                diffsheg,
+                "_safe_file_snapshot",
+                return_value=(Path("/selection.json"), b"{}"),
+            ),
+            mock.patch.object(
+                diffsheg,
+                "build_fresh_pipeline_source_receipt",
+                return_value=source,
+            ),
+        ):
+            pipeline = diffsheg.build_fresh_pipeline_payload(
+                source_root=Path("/source"),
+                prerequisite_selection=Path("/selection.json"),
+                expected_prerequisite_selection_sha256="c" * 64,
+            )
+        self.assertEqual(pipeline["inference_entrypoint"], entrypoint)
+        self.assertEqual(pipeline["inference_helper"], helper)
+        self.assertNotEqual(pipeline["inference_helper"], entrypoint)
 
     def test_watcher_ready_schema_matches_trainer_literal(self) -> None:
         tree = ast.parse(

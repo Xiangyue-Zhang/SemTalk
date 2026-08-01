@@ -80,6 +80,81 @@ def _write_contract_receipt(
     return _artifact(path), payload
 
 
+def _fixture_topology_bindings(
+    mode: str,
+    *,
+    formal_run_id: str,
+    master_port: int,
+) -> tuple[dict[str, object], dict[str, object]]:
+    specification = contract.TOPOLOGY_SPECS[mode]
+    node_count = int(specification["node_count"])
+    local_world_size = int(specification["local_world_size"])
+    world_size = int(specification["world_size"])
+    nodes: list[dict[str, object]] = []
+    ranks: list[dict[str, object]] = []
+    for node_rank in range(node_count):
+        rank_range = list(
+            range(
+                node_rank * local_world_size,
+                (node_rank + 1) * local_world_size,
+            )
+        )
+        nodes.append(
+            {
+                "node_rank": node_rank,
+                "host_slot": node_rank,
+                "hostname": f"fixture-host-{node_rank}",
+                "rank_range": rank_range,
+            }
+        )
+        for local_rank, rank in enumerate(rank_range):
+            ranks.append(
+                {
+                    "rank": rank,
+                    "local_rank": local_rank,
+                    "node_rank": node_rank,
+                    "host_slot": node_rank,
+                    "hostname": f"fixture-host-{node_rank}",
+                    "master_addr": "fixture-master.example",
+                    "master_port": master_port,
+                    "formal_run_id": formal_run_id,
+                }
+            )
+    distributed: dict[str, object] = {
+        "mode": mode,
+        "classification": specification["classification"],
+        "backend": "nccl",
+        "node_count": node_count,
+        "local_world_size": local_world_size,
+        "world_size": world_size,
+        "nodes": nodes,
+        "master_addr": "fixture-master.example",
+        "master_port": master_port,
+        "formal_run_id": formal_run_id,
+    }
+    topology: dict[str, object] = {
+        "format": "semtalk_show_base_topology_receipt_v1",
+        "topology_mode": mode,
+        "classification": specification["classification"],
+        "backend": "nccl",
+        "node_count": node_count,
+        "local_world_size": local_world_size,
+        "world_size": world_size,
+        "global_batch_size": int(specification["global_batch_size"]),
+        "local_batch_size": int(specification["local_batch_size"]),
+        "updates_per_epoch": int(specification["updates_per_epoch"]),
+        "unique_samples_per_epoch": int(
+            specification["unique_samples_per_epoch"]
+        ),
+        "master_addr": "fixture-master.example",
+        "master_port": master_port,
+        "formal_run_id": formal_run_id,
+        "ranks": ranks,
+    }
+    topology["receipt_sha256"] = contract.canonical_json_sha256(topology)
+    return distributed, topology
+
+
 def _trajectory_probe(mode: str) -> dict[str, object]:
     specification = contract.TOPOLOGY_SPECS[mode]
     world_size = int(specification["world_size"])
@@ -272,6 +347,8 @@ class QualityFixture:
         self.lineages: dict[int, dict[str, object]] = {}
         self.reports: dict[int, dict[str, object]] = {}
         self.short_status_by_mode: dict[str, dict[str, object]] = {}
+        self.training_frozen_by_mode: dict[str, dict[str, object]] = {}
+        self.gate_frozen_by_mode: dict[str, dict[str, object]] = {}
         val_artifact = selector._formal_artifact_projection(self.val_inputs)
         pipeline_artifact = selector._formal_artifact_projection(self.pipeline)
         for epoch in selector.CANDIDATE_QUALITY_EPOCHS:
@@ -411,22 +488,82 @@ class QualityFixture:
             "short_quality_candidate_receipts",
         ):
             (run_root / directory).mkdir(exist_ok=True)
-        frozen_body = {
-            key: value
-            for key, value in self.frozen_payload.items()
-            if key != "receipt_sha256"
-        }
+        specification = contract.TOPOLOGY_SPECS[mode]
+        training_run_id = f"fixture-{mode}-quality"
+        gate_run_id = f"fixture-{mode}-throughput"
+        training_distributed, training_topology = (
+            _fixture_topology_bindings(
+                mode,
+                formal_run_id=training_run_id,
+                master_port=27201,
+            )
+        )
+        gate_distributed, gate_topology = _fixture_topology_bindings(
+            mode,
+            formal_run_id=gate_run_id,
+            master_port=27101,
+        )
+        frozen_body = json.loads(json.dumps(self.frozen_payload))
+        frozen_body.pop("receipt_sha256")
         frozen_body["target_epochs"] = list(quality_epochs)
+        frozen_body["dataset"]["selected_prerequisite_sha256"] = {
+            "face": "1" * 64,
+            "hands": "2" * 64,
+            "upper": "3" * 64,
+            "lower": "4" * 64,
+            "global": "5" * 64,
+        }
+        frozen_body["protocol"].update(
+            {
+                "node_count": int(specification["node_count"]),
+                "local_world_size": int(
+                    specification["local_world_size"]
+                ),
+                "world_size": int(specification["world_size"]),
+                "local_batch_size": int(
+                    specification["local_batch_size"]
+                ),
+                "global_batch_size": int(
+                    specification["global_batch_size"]
+                ),
+                "distributed_topology": training_distributed,
+                "optimizer": {
+                    "name": "Adam",
+                    "learning_rate": float(
+                        specification["learning_rate"]
+                    ),
+                },
+                "precision": specification["precision"],
+            }
+        )
+        frozen_body["topology"] = training_topology
         frozen, frozen_payload = _write_contract_receipt(
             run_root / "frozen_inputs.json", frozen_body
         )
+        gate_frozen_body = json.loads(json.dumps(frozen_body))
+        gate_frozen_body["run_purpose"] = (
+            contract.RUN_PURPOSE_THROUGHPUT
+        )
+        gate_frozen_body["target_epochs"] = []
+        gate_frozen_body["protocol"]["distributed_topology"] = (
+            gate_distributed
+        )
+        gate_frozen_body["topology"] = gate_topology
+        gate_root = self.root / f"{mode}-throughput"
+        gate_root.mkdir(exist_ok=True)
+        _gate_frozen, gate_frozen_payload = _write_contract_receipt(
+            gate_root / "frozen_inputs.json", gate_frozen_body
+        )
+        self.training_frozen_by_mode[mode] = frozen_payload
+        self.gate_frozen_by_mode[mode] = gate_frozen_payload
         semantic_sha = contract._topology_independent_gate_semantic_sha256(
-            frozen_payload
+            gate_frozen_payload
         )
         frozen_compatibility_sha = (
-            contract._frozen_gate_compatibility_sha256(frozen_payload)
+            contract._frozen_gate_compatibility_sha256(
+                gate_frozen_payload
+            )
         )
-        specification = contract.TOPOLOGY_SPECS[mode]
         updates_per_epoch = int(specification["updates_per_epoch"])
         world_size = int(specification["world_size"])
         probe_epoch_updates = list(
@@ -446,11 +583,15 @@ class QualityFixture:
             "topology_classification": specification["classification"],
             "topology_gate_spec_sha256": self.topology_sha,
             "topology_independent_input_sha256": semantic_sha,
-            "frozen_receipt_sha256": frozen_payload["receipt_sha256"],
+            "frozen_receipt_sha256": gate_frozen_payload[
+                "receipt_sha256"
+            ],
             "frozen_gate_compatibility_sha256": (
                 frozen_compatibility_sha
             ),
-            "topology_receipt_sha256": "7" * 64,
+            "topology_receipt_sha256": gate_frozen_payload["topology"][
+                "receipt_sha256"
+            ],
             "node_count": specification["node_count"],
             "local_world_size": specification["local_world_size"],
             "world_size": world_size,
@@ -533,7 +674,7 @@ class QualityFixture:
             },
         }
         full_probe, full_probe_payload = _write_contract_receipt(
-            self.root / f"{mode}-throughput.json",
+            gate_root / "throughput_gate.json",
             full_probe_body,
         )
 
@@ -555,7 +696,7 @@ class QualityFixture:
             ],
             "trajectory_mode": contract.FRESH_TRAJECTORY_MODE,
             "trajectory_probe": trajectory_probe,
-            "gate_frozen_receipt_sha256": frozen_payload[
+            "gate_frozen_receipt_sha256": gate_frozen_payload[
                 "receipt_sha256"
             ],
             "frozen_gate_compatibility_sha256": (
@@ -933,6 +1074,118 @@ class QualityFixture:
 
 
 class ProduceBaseTopologyShortQualityTests(unittest.TestCase):
+    def test_selector_allows_only_run_id_and_port_to_change_from_probe(
+        self,
+    ) -> None:
+        mode = contract.W8_GLOBAL2048_MODE
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = QualityFixture(Path(raw).resolve())
+            ready = fixture.candidate_ready_receipts(mode)
+            quality_epochs = selector.quality_epochs_for_mode(mode)
+            artifacts, _semantic_sha, _checkpoints = (
+                selector.validate_candidate_ready_receipts(
+                    mode,
+                    [ready[epoch] for epoch in quality_epochs],
+                    topology_gate_spec_sha256=fixture.topology_sha,
+                    quality_gate_spec_sha256=fixture.quality_sha,
+                )
+            )
+            self.assertEqual(len(artifacts), len(quality_epochs))
+
+            training = fixture.training_frozen_by_mode[mode]
+            gate = fixture.gate_frozen_by_mode[mode]
+            self.assertNotEqual(
+                training["protocol"]["distributed_topology"][
+                    "formal_run_id"
+                ],
+                gate["protocol"]["distributed_topology"][
+                    "formal_run_id"
+                ],
+            )
+            self.assertNotEqual(
+                training["protocol"]["distributed_topology"][
+                    "master_port"
+                ],
+                gate["protocol"]["distributed_topology"][
+                    "master_port"
+                ],
+            )
+            gate_semantic = (
+                contract._frozen_gate_cross_run_compatibility_sha256(gate)
+            )
+            self.assertEqual(
+                gate_semantic,
+                contract._frozen_gate_cross_run_compatibility_sha256(
+                    training
+                ),
+            )
+            drifts: list[tuple[str, dict[str, object]]] = []
+            changed = json.loads(json.dumps(training))
+            changed["source"]["commit"] = "f" * 40
+            drifts.append(("source", changed))
+            changed = json.loads(json.dumps(training))
+            changed["dataset"]["data_mdb_sha256"] = "f" * 64
+            drifts.append(("dataset", changed))
+            changed = json.loads(json.dumps(training))
+            changed["dataset"]["selected_prerequisite_sha256"][
+                "face"
+            ] = "f" * 64
+            drifts.append(("VQ lineage", changed))
+            changed = json.loads(json.dumps(training))
+            changed["protocol"]["local_batch_size"] += 1
+            drifts.append(("local batch", changed))
+            changed = json.loads(json.dumps(training))
+            changed["protocol"]["world_size"] += 1
+            drifts.append(("world size", changed))
+            changed = json.loads(json.dumps(training))
+            changed["protocol"]["distributed_topology"]["nodes"][0][
+                "hostname"
+            ] = "other-host"
+            drifts.append(("host", changed))
+            changed = json.loads(json.dumps(training))
+            changed["topology"]["ranks"][0]["rank"] = 99
+            drifts.append(("rank", changed))
+            changed = json.loads(json.dumps(training))
+            changed["protocol"]["precision"] = "fp32"
+            drifts.append(("precision", changed))
+            changed = json.loads(json.dumps(training))
+            changed["protocol"]["optimizer"]["learning_rate"] = 6e-5
+            drifts.append(("learning rate", changed))
+
+            for label, drifted in drifts:
+                unsigned_topology = dict(drifted["topology"])
+                unsigned_topology.pop("receipt_sha256")
+                drifted["topology"]["receipt_sha256"] = (
+                    contract.canonical_json_sha256(unsigned_topology)
+                )
+                unsigned_frozen = dict(drifted)
+                unsigned_frozen.pop("receipt_sha256")
+                drifted["receipt_sha256"] = (
+                    contract.canonical_json_sha256(unsigned_frozen)
+                )
+                self.assertNotEqual(
+                    gate_semantic,
+                    contract._frozen_gate_cross_run_compatibility_sha256(
+                        drifted
+                    ),
+                    label,
+                )
+                with mock.patch.object(
+                    contract,
+                    "_load_throughput_gate_frozen_receipt",
+                    return_value=drifted,
+                ):
+                    with self.assertRaises(
+                        selector.TopologySelectionError,
+                        msg=label,
+                    ):
+                        selector.validate_candidate_ready_receipts(
+                            mode,
+                            [ready[epoch] for epoch in quality_epochs],
+                            topology_gate_spec_sha256=fixture.topology_sha,
+                            quality_gate_spec_sha256=fixture.quality_sha,
+                        )
+
     def patches(self, fixture: QualityFixture):
         return (
             mock.patch.object(

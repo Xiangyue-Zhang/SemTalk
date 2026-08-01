@@ -128,7 +128,7 @@ INFERENCE_HELPERS = (
 DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES = (
     "scripts/show_base/__init__.py",
     "scripts/show_base/run_base_val_inference.py",
-    "scripts/show_base/run_base_inference.py",
+    "scripts/show_base/semtalk_base_inference_core.py",
     "scripts/show_base/evaluate_diffsheg_val_fgd.py",
     "scripts/show_base/base_long_val_contract.py",
     "scripts/show_base/select_base_official_adapt.py",
@@ -2020,7 +2020,7 @@ def build_fresh_pipeline_payload(
             "scripts/show_base/run_base_val_inference.py"
         ],
         "inference_helper": files[
-            "scripts/show_base/run_base_inference.py"
+            "scripts/show_base/semtalk_base_inference_core.py"
         ],
         "generator_module": "models.semtalk.semtalk_base",
         "prerequisite_consumption": FRESH_PREREQUISITE_CONSUMPTION,
@@ -2108,7 +2108,9 @@ def validate_fresh_pipeline(
             "scripts/show_base/run_base_val_inference.py"
         ]
         or pipeline["inference_helper"]
-        != live_source["files"]["scripts/show_base/run_base_inference.py"]
+        != live_source["files"][
+            "scripts/show_base/semtalk_base_inference_core.py"
+        ]
     ):
         raise SelectionContractError(
             "fresh Base validation pipeline mixed source checkouts"

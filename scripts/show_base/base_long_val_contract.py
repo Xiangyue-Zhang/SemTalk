@@ -20,6 +20,14 @@ from scripts.show_base import select_base_official_adapt as diffsheg
 OFFICIAL_BASE_SHA256 = (
     "52999373a2c6bb6252c1153317116bb226d115c0a81d61362029ed3cc1d89603"
 )
+FORMAL_HOST_BY_SLOT = {
+    0: (
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-master-0"
+    ),
+    1: (
+        "iannnzhang-aws-28data2-m2d-iannnzhang-28data-2x8-worker-0"
+    ),
+}
 TOPOLOGY_SPECS = {
     "official_w1_b64_reference": {
         "classification": "exact_official_runtime_topology_reference",
@@ -341,6 +349,11 @@ def _validate_frozen(
         else None
     )
     topology = TOPOLOGY_SPECS.get(topology_mode)
+    topology_nodes = (
+        distributed_topology.get("nodes")
+        if isinstance(distributed_topology, dict)
+        else None
+    )
     expected_optimizer = (
         {
             "name": "Adam",
@@ -374,6 +387,8 @@ def _validate_frozen(
         or protocol.get("global_batch_size") != topology["global_batch_size"]
         or protocol.get("precision") != topology["precision"]
         or protocol.get("optimizer") != expected_optimizer
+        or not isinstance(topology_nodes, list)
+        or len(topology_nodes) != topology["node_count"]
         or not isinstance(topology_receipt, dict)
         or topology_receipt.get("topology_mode") != topology_mode
         or topology_receipt.get("classification")
@@ -420,6 +435,43 @@ def _validate_frozen(
             "long Base frozen inputs do not bind selected SHOW prerequisites "
             "and the official All-Speakers Base warm start"
         )
+    observed_topology_host_slots: set[int] = set()
+    observed_topology_hostnames: set[str] = set()
+    for expected_rank, node in enumerate(topology_nodes):
+        expected_rank_range = list(
+            range(
+                expected_rank * topology["local_world_size"],
+                (expected_rank + 1) * topology["local_world_size"],
+            )
+        )
+        if not isinstance(node, dict) or set(node) != {
+            "node_rank",
+            "host_slot",
+            "hostname",
+            "rank_range",
+        }:
+            raise LongCandidateContractError(
+                "long Base frozen topology node schema changed"
+            )
+        host_slot = node["host_slot"]
+        hostname = node["hostname"]
+        if (
+            type(node["node_rank"]) is not int
+            or node["node_rank"] != expected_rank
+            or type(host_slot) is not int
+            or host_slot not in FORMAL_HOST_BY_SLOT
+            or host_slot in observed_topology_host_slots
+            or hostname != FORMAL_HOST_BY_SLOT[host_slot]
+            or hostname in observed_topology_hostnames
+            or not isinstance(node["rank_range"], list)
+            or any(type(rank) is not int for rank in node["rank_range"])
+            or node["rank_range"] != expected_rank_range
+        ):
+            raise LongCandidateContractError(
+                "long Base frozen topology node/host mapping changed"
+            )
+        observed_topology_host_slots.add(host_slot)
+        observed_topology_hostnames.add(hostname)
     for stage, digest in dataset["selected_prerequisite_sha256"].items():
         require_sha256(digest, f"selected {stage} checkpoint SHA-256")
     selection = dataset.get("prerequisite_selection")
@@ -484,10 +536,12 @@ def _validate_frozen(
         raise LongCandidateContractError(
             "long Base frozen dataset provenance is incomplete"
         )
+    observed_host_slots: set[int] = set()
     observed_hostnames: set[str] = set()
     for expected_rank, node in enumerate(node_bindings):
         if not isinstance(node, dict) or set(node) != {
             "node_rank",
+            "host_slot",
             "hostname",
             "binding",
         }:
@@ -496,11 +550,18 @@ def _validate_frozen(
             )
         binding = node["binding"]
         files = binding.get("files") if isinstance(binding, dict) else None
+        host_slot = node["host_slot"]
         hostname = node["hostname"]
+        topology_node = topology_nodes[expected_rank]
         if (
-            node["node_rank"] != expected_rank
-            or not isinstance(hostname, str)
-            or not hostname
+            type(node["node_rank"]) is not int
+            or node["node_rank"] != expected_rank
+            or type(host_slot) is not int
+            or host_slot not in FORMAL_HOST_BY_SLOT
+            or host_slot in observed_host_slots
+            or hostname != FORMAL_HOST_BY_SLOT[host_slot]
+            or host_slot != topology_node["host_slot"]
+            or hostname != topology_node["hostname"]
             or hostname in observed_hostnames
             or not isinstance(binding, dict)
             or set(binding) != {"format", "directory_identity", "files"}
@@ -518,6 +579,7 @@ def _validate_frozen(
             raise LongCandidateContractError(
                 "long Base frozen dataset node binding changed"
             )
+        observed_host_slots.add(host_slot)
         observed_hostnames.add(hostname)
         for filename, expected_sha in (
             ("data.mdb", dataset["data_mdb_sha256"]),

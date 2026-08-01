@@ -35,6 +35,135 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _write_probe_frozen_inputs(path: Path, mode: str) -> dict[str, object]:
+    specification = contract.TOPOLOGY_SPECS[mode]
+    node_count = int(specification["node_count"])
+    local_world_size = int(specification["local_world_size"])
+    world_size = int(specification["world_size"])
+    formal_run_id = f"fixture-{mode}-throughput"
+    master_port = 27101
+    nodes: list[dict[str, object]] = []
+    ranks: list[dict[str, object]] = []
+    for node_rank in range(node_count):
+        rank_range = list(
+            range(
+                node_rank * local_world_size,
+                (node_rank + 1) * local_world_size,
+            )
+        )
+        nodes.append(
+            {
+                "node_rank": node_rank,
+                "host_slot": node_rank,
+                "hostname": f"fixture-host-{node_rank}",
+                "rank_range": rank_range,
+            }
+        )
+        for local_rank, rank in enumerate(rank_range):
+            ranks.append(
+                {
+                    "rank": rank,
+                    "local_rank": local_rank,
+                    "node_rank": node_rank,
+                    "host_slot": node_rank,
+                    "hostname": f"fixture-host-{node_rank}",
+                    "master_addr": "fixture-master.example",
+                    "master_port": master_port,
+                    "formal_run_id": formal_run_id,
+                }
+            )
+    distributed_topology: dict[str, object] = {
+        "mode": mode,
+        "classification": specification["classification"],
+        "backend": "nccl",
+        "node_count": node_count,
+        "local_world_size": local_world_size,
+        "world_size": world_size,
+        "nodes": nodes,
+        "master_addr": "fixture-master.example",
+        "master_port": master_port,
+        "formal_run_id": formal_run_id,
+    }
+    topology: dict[str, object] = {
+        "format": "semtalk_show_base_topology_receipt_v1",
+        "topology_mode": mode,
+        "classification": specification["classification"],
+        "backend": "nccl",
+        "node_count": node_count,
+        "local_world_size": local_world_size,
+        "world_size": world_size,
+        "global_batch_size": int(specification["global_batch_size"]),
+        "local_batch_size": int(specification["local_batch_size"]),
+        "updates_per_epoch": int(specification["updates_per_epoch"]),
+        "unique_samples_per_epoch": int(
+            specification["unique_samples_per_epoch"]
+        ),
+        "master_addr": "fixture-master.example",
+        "master_port": master_port,
+        "formal_run_id": formal_run_id,
+        "ranks": ranks,
+    }
+    topology["receipt_sha256"] = contract.canonical_json_sha256(topology)
+    payload: dict[str, object] = {
+        "format": "semtalk_show_base_official_adapt_frozen_inputs_v1",
+        "run_purpose": contract.RUN_PURPOSE_THROUGHPUT,
+        "target_epochs": [],
+        "source": {
+            "origin": contract.EXPECTED_ORIGIN,
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean": True,
+            "entrypoint_sha256": "3" * 64,
+        },
+        "official_base": {"sha256": "4" * 64},
+        "speaker_initialization": {"rows": [0, 1, 2, 3]},
+        "dataset": {
+            "data_mdb_sha256": "5" * 64,
+            "selected_prerequisite_sha256": {
+                "face": "1" * 64,
+                "hands": "2" * 64,
+                "upper": "3" * 64,
+                "lower": "4" * 64,
+                "global": "5" * 64,
+            },
+        },
+        "protocol": {
+            "format": contract.PROTOCOL_FORMAT,
+            "node_count": node_count,
+            "local_world_size": local_world_size,
+            "world_size": world_size,
+            "local_batch_size": int(specification["local_batch_size"]),
+            "global_batch_size": int(specification["global_batch_size"]),
+            "distributed_topology": distributed_topology,
+            "optimizer": {
+                "name": "Adam",
+                "learning_rate": float(specification["learning_rate"]),
+            },
+            "precision": specification["precision"],
+            "forward_contract": {"fixture": True},
+            "loss": {"fixture": True},
+            "target_dataset": "SHOW",
+            "target_speaker_scope": "All",
+            "vq_models_in_training_graph": False,
+        },
+        "long_contract": {
+            "format": "semtalk_show_base_long_contract_receipts_v1",
+            "schedule": {"sha256": "a" * 64},
+            "trajectory_anchor": {
+                "mode": contract.FRESH_TRAJECTORY_MODE,
+                "sha256": "b" * 64,
+            },
+        },
+        "topology": topology,
+    }
+    payload["receipt_sha256"] = contract.canonical_json_sha256(payload)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _write_probe(
     path: Path,
     mode: str,
@@ -42,6 +171,13 @@ def _write_probe(
     *,
     p99_seconds: float | None = None,
 ) -> Path:
+    gate_root = path.parent / f"{path.stem}-gate"
+    gate_root.mkdir()
+    path = gate_root / "throughput_gate.json"
+    frozen = _write_probe_frozen_inputs(
+        gate_root / "frozen_inputs.json",
+        mode,
+    )
     specification = contract.TOPOLOGY_SPECS[mode]
     world_size = int(specification["world_size"])
     global_batch_size = int(specification["global_batch_size"])
@@ -77,10 +213,16 @@ def _write_probe(
         "topology_mode": mode,
         "topology_classification": specification["classification"],
         "topology_gate_spec_sha256": _sha(TOPOLOGY_SPEC),
-        "topology_independent_input_sha256": "a" * 64,
-        "frozen_receipt_sha256": "b" * 64,
-        "frozen_gate_compatibility_sha256": "c" * 64,
-        "topology_receipt_sha256": "d" * 64,
+        "topology_independent_input_sha256": (
+            contract._topology_independent_gate_semantic_sha256(frozen)
+        ),
+        "frozen_receipt_sha256": frozen["receipt_sha256"],
+        "frozen_gate_compatibility_sha256": (
+            contract._frozen_gate_compatibility_sha256(frozen)
+        ),
+        "topology_receipt_sha256": frozen["topology"][
+            "receipt_sha256"
+        ],
         "node_count": specification["node_count"],
         "local_world_size": specification["local_world_size"],
         "world_size": world_size,
@@ -219,7 +361,9 @@ class ProduceOverBudgetQualitySkipTests(unittest.TestCase):
             )
             self.assertEqual(
                 validated["source_binding"]["frozen_receipt_sha256"],
-                "b" * 64,
+                json.loads(probe.read_text(encoding="utf-8"))[
+                    "frozen_receipt_sha256"
+                ],
             )
             with self.assertRaisesRegex(
                 FileExistsError,

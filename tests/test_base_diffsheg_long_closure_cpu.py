@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 from pathlib import Path
 import tempfile
@@ -40,11 +41,28 @@ def _frozen_for_topology(
         "ctime_ns": 5,
     }
     node_bindings = []
+    topology_nodes = []
     for node_rank in range(topology["node_count"]):
+        host_slot = node_rank
+        hostname = contract.FORMAL_HOST_BY_SLOT[host_slot]
+        topology_nodes.append(
+            {
+                "node_rank": node_rank,
+                "host_slot": host_slot,
+                "hostname": hostname,
+                "rank_range": list(
+                    range(
+                        node_rank * topology["local_world_size"],
+                        (node_rank + 1) * topology["local_world_size"],
+                    )
+                ),
+            }
+        )
         node_bindings.append(
             {
                 "node_rank": node_rank,
-                "hostname": f"show-base-node-{node_rank}",
+                "host_slot": host_slot,
+                "hostname": hostname,
                 "binding": {
                     "format": "semtalk_show_base_lmdb_inode_binding_v1",
                     "directory_identity": dict(identity),
@@ -92,7 +110,10 @@ def _frozen_for_topology(
         "local_batch_size": topology["local_batch_size"],
         "global_batch_size": topology["global_batch_size"],
         "precision": topology["precision"],
-        "distributed_topology": {"mode": mode},
+        "distributed_topology": {
+            "mode": mode,
+            "nodes": topology_nodes,
+        },
         "optimizer": {
             "name": "Adam",
             "learning_rate": optimizer_learning_rate,
@@ -148,7 +169,102 @@ def _frozen_for_topology(
     return frozen
 
 
+def _reseal_frozen(frozen: dict[str, object]) -> dict[str, object]:
+    frozen = copy.deepcopy(frozen)
+    frozen.pop("receipt_sha256", None)
+    frozen["receipt_sha256"] = contract.canonical_json_sha256(frozen)
+    return frozen
+
+
 class BaseDiffSHEGLongClosureTests(unittest.TestCase):
+    def test_frozen_node_bindings_require_exact_host_slot_authority(self) -> None:
+        mode = "validation_gated_w16_l64_g1024_empirical_acceleration"
+        accepted = _frozen_for_topology(mode)
+        _claimed, _selected, _topology, dataset = contract._validate_frozen(
+            accepted
+        )
+        self.assertEqual(
+            [
+                (row["node_rank"], row["host_slot"], row["hostname"])
+                for row in dataset["node_lmdb_inode_bindings"]
+            ],
+            [
+                (0, 0, contract.FORMAL_HOST_BY_SLOT[0]),
+                (1, 1, contract.FORMAL_HOST_BY_SLOT[1]),
+            ],
+        )
+
+        mutations = {}
+
+        missing = copy.deepcopy(accepted)
+        del missing["dataset"]["node_lmdb_inode_bindings"][0]["host_slot"]
+        mutations["missing host_slot"] = missing
+
+        wrong = copy.deepcopy(accepted)
+        wrong["dataset"]["node_lmdb_inode_bindings"][0]["host_slot"] = 9
+        mutations["wrong host_slot"] = wrong
+
+        duplicate = copy.deepcopy(accepted)
+        duplicate["dataset"]["node_lmdb_inode_bindings"][1]["host_slot"] = 0
+        duplicate["dataset"]["node_lmdb_inode_bindings"][1]["hostname"] = (
+            contract.FORMAL_HOST_BY_SLOT[0]
+        )
+        mutations["duplicate host_slot"] = duplicate
+
+        swapped = copy.deepcopy(accepted)
+        bindings = swapped["dataset"]["node_lmdb_inode_bindings"]
+        bindings[0]["host_slot"], bindings[1]["host_slot"] = (
+            bindings[1]["host_slot"],
+            bindings[0]["host_slot"],
+        )
+        bindings[0]["hostname"], bindings[1]["hostname"] = (
+            bindings[1]["hostname"],
+            bindings[0]["hostname"],
+        )
+        mutations["swapped binding hosts"] = swapped
+
+        wrong_hostname = copy.deepcopy(accepted)
+        wrong_hostname["dataset"]["node_lmdb_inode_bindings"][0][
+            "hostname"
+        ] = contract.FORMAL_HOST_BY_SLOT[1]
+        mutations["wrong hostname"] = wrong_hostname
+
+        topology_swapped = copy.deepcopy(accepted)
+        nodes = topology_swapped["protocol"]["distributed_topology"]["nodes"]
+        nodes[0]["host_slot"], nodes[1]["host_slot"] = (
+            nodes[1]["host_slot"],
+            nodes[0]["host_slot"],
+        )
+        nodes[0]["hostname"], nodes[1]["hostname"] = (
+            nodes[1]["hostname"],
+            nodes[0]["hostname"],
+        )
+        mutations["swapped topology hosts"] = topology_swapped
+
+        bool_topology_rank = copy.deepcopy(accepted)
+        bool_topology_rank["protocol"]["distributed_topology"]["nodes"][0][
+            "node_rank"
+        ] = False
+        mutations["boolean topology node rank"] = bool_topology_rank
+
+        bool_binding_rank = copy.deepcopy(accepted)
+        bool_binding_rank["dataset"]["node_lmdb_inode_bindings"][0][
+            "node_rank"
+        ] = False
+        mutations["boolean dataset node rank"] = bool_binding_rank
+
+        bool_rank_range = copy.deepcopy(accepted)
+        bool_rank_range["protocol"]["distributed_topology"]["nodes"][0][
+            "rank_range"
+        ][0] = False
+        mutations["boolean topology rank range"] = bool_rank_range
+
+        for label, forged in mutations.items():
+            with self.subTest(label=label), self.assertRaises(
+                contract.LongCandidateContractError
+            ):
+                contract._validate_frozen(_reseal_frozen(forged))
+
     def test_frozen_topology_binds_the_exact_adam_learning_rate(self) -> None:
         modes = (
             "validation_gated_w16_l64_g1024_empirical_acceleration",
