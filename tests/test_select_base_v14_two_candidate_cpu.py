@@ -390,21 +390,21 @@ class V14TwoCandidateSelectorTests(unittest.TestCase):
         self.assertEqual(artifact["sha256"], selection.PROTOCOL_SHA256)
         self.assertEqual(
             _sha(
-                REPOSITORY
+                self.official_repository
                 / "scripts/show_base/select_base_training_topology.py"
             ),
             selection.OFFICIAL_SELECTOR_SHA256,
         )
         self.assertEqual(
             _sha(
-                REPOSITORY
+                self.official_repository
                 / "scripts/show_base/train_base_official_adapt_long.py"
             ),
             selection.OFFICIAL_TRAIN_CONTRACT_SHA256,
         )
         self.assertEqual(
             _sha(
-                REPOSITORY
+                self.official_repository
                 / "scripts/show_base/base_long_val_contract.py"
             ),
             selection.OFFICIAL_VALIDATION_CONTRACT_SHA256,
