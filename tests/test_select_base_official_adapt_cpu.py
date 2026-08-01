@@ -621,9 +621,11 @@ class SelectionFixture:
                         ),
                         "sha256": specification["sha256"],
                         "input_dim": specification["input_dim"],
-                        "latent_dim": 300,
-                        "state_container": "model_state",
-                        "load_mode": "encoder_only",
+                        "latent_dim": specification["latent_dim"],
+                        "state_container": specification[
+                            "state_container"
+                        ],
+                        "load_mode": specification["load_mode"],
                         "feature_count": self.coverage["window_count"],
                     }
                     for name, specification in pins[
@@ -1479,6 +1481,22 @@ class BaseValSelectorReceiptContracts(unittest.TestCase):
                     report,
                     expected_coverage=fixture.coverage,
                 )
+            for field, value in (
+                ("state_container", "model_state"),
+                ("load_mode", "encoder_only"),
+                ("latent_dim", 299),
+            ):
+                report = fixture.report(1)
+                report["provenance"]["autoencoders"]["fgd"][field] = value
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(
+                        SELECTOR.SelectionContractError,
+                        "fgd autoencoder",
+                    ):
+                        SELECTOR.validate_diffsheg_report(
+                            report,
+                            expected_coverage=fixture.coverage,
+                        )
             report = fixture.report(1)
             report["provenance"]["autoencoders"]["fmd"] = {
                 "path": "/assets/gesture_expression.pth.tar",

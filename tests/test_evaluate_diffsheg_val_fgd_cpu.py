@@ -90,8 +90,8 @@ class FakePASPAEvaluator:
             "path": str(checkpoint),
             "sha256": EVALUATOR.DIFFSHEG_GESTURE_AE_SHA256,
             "input_dim": 129,
-            "state_container": "model_state",
-            "load_mode": "encoder_only",
+            "state_container": "state_dict",
+            "load_mode": "full_half_embedding_net",
         }
 
     def extract_features(self, **kwargs: object) -> tuple[np.ndarray, np.ndarray]:
@@ -214,6 +214,14 @@ class EvaluateDiffSHEGValFGDCPUTest(unittest.TestCase):
         self.assertEqual(
             EVALUATOR.DIFFSHEG_GESTURE_AE_SHA256,
             pins["autoencoders"]["fgd"]["sha256"],
+        )
+        self.assertEqual(
+            pins["autoencoders"]["fgd"]["state_container"],
+            "state_dict",
+        )
+        self.assertEqual(
+            pins["autoencoders"]["fgd"]["load_mode"],
+            "full_half_embedding_net",
         )
         self.assertEqual(selector.VAL_METRIC_KEYS, ("fgd",))
 

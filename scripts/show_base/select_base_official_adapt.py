@@ -188,6 +188,9 @@ DIFFSHEG_PINNED_RECEIPT: dict[str, Any] = {
                 "5eaf9b882a5ccd5f6eb4385aaadf3d28f3ee4382360ecb13c12f4904b3c3216e"
             ),
             "input_dim": 129,
+            "latent_dim": 300,
+            "state_container": "state_dict",
+            "load_mode": "full_half_embedding_net",
         },
     },
     "window_length": DIFFSHEG_WINDOW,
@@ -2905,9 +2908,10 @@ def validate_diffsheg_report(
         if (
             observed.get("sha256") != specification["sha256"]
             or observed.get("input_dim") != specification["input_dim"]
-            or observed.get("latent_dim") != 300
-            or observed.get("state_container") != "model_state"
-            or observed.get("load_mode") != "encoder_only"
+            or observed.get("latent_dim") != specification["latent_dim"]
+            or observed.get("state_container")
+            != specification["state_container"]
+            or observed.get("load_mode") != specification["load_mode"]
             or observed.get("feature_count") != window_count
             or Path(str(observed.get("path", ""))).name
             != specification["filename"]
