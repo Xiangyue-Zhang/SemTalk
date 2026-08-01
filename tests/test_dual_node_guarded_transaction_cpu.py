@@ -239,6 +239,48 @@ def fake_source(args):
 module._runner_evidence = fake_runner
 module._source_evidence = fake_source
 
+identity_offset = int(os.environ.get("SEMTALK_TEST_ARTIFACT_IDENTITY_OFFSET", "0"))
+artifact_tamper = os.environ.get("SEMTALK_TEST_ARTIFACT_PORTABLE_TAMPER")
+if identity_offset or artifact_tamper:
+    original_snapshot = module._external_artifact_snapshot
+    def adjusted_snapshot(raw_path, label, *, json_payload):
+        artifact, payload = original_snapshot(
+            raw_path,
+            label,
+            json_payload=json_payload,
+        )
+        artifact = dict(artifact)
+        artifact["st_dev"] += identity_offset
+        artifact["st_ino"] += identity_offset * 1009
+        if artifact_tamper and label == "rank 0 guarded-runner status":
+            if artifact_tamper == "path":
+                artifact["path"] += ".tampered"
+            elif artifact_tamper == "sha256":
+                artifact["sha256"] = "0" * 64
+            elif artifact_tamper == "bytes":
+                artifact["bytes"] += 1
+            elif artifact_tamper == "status_rejected":
+                payload = dict(payload)
+                payload["restore_error"] = "injected portable status tamper"
+            elif artifact_tamper == "status_payload":
+                payload = dict(payload)
+                payload["portable_test_note"] = "injected accepted status tamper"
+            elif artifact_tamper == "guard":
+                pass
+            else:
+                raise AssertionError("unknown artifact tamper")
+        return artifact, payload
+    module._external_artifact_snapshot = adjusted_snapshot
+
+if artifact_tamper == "guard":
+    original_validate_runner = module._validate_recorded_runner
+    def adjusted_validate_runner(runner, prepared, status):
+        guard = original_validate_runner(runner, prepared, status)
+        guard = dict(guard)
+        guard["gpu_reservation"] += ".tampered"
+        return guard
+    module._validate_recorded_runner = adjusted_validate_runner
+
 if os.environ.get("SEMTALK_TEST_FINAL_PUBLISH_FAIL"):
     original_publish = module.TransactionDirectory.publish_immutable
     def failing_publish(self, name, payload):
@@ -786,6 +828,127 @@ class DualNodeGuardedTransactionTest(unittest.TestCase):
             self.assertIn("restored_guards_by_gpu", final["outer_guarded_runner"]["guard_evidence"])
         replay = self._replay(transaction_root)
         self.assertEqual(replay["status"], "REPLAYED_SUCCEEDED")
+
+    def test_terminal_final_is_portable_across_mount_identity_views(self) -> None:
+        transaction_root = self.root / "portable_terminal_receipt"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
+        finalized = self._finalize(transaction_root)
+        self.assertEqual(finalized["status"], "FINALIZED_SUCCEEDED")
+
+        def local_identity_keys(value: object) -> set[str]:
+            if isinstance(value, dict):
+                result = set(value) & {"st_dev", "st_ino"}
+                for item in value.values():
+                    result |= local_identity_keys(item)
+                return result
+            if isinstance(value, list):
+                result: set[str] = set()
+                for item in value:
+                    result |= local_identity_keys(item)
+                return result
+            return set()
+
+        for rank in (0, 1):
+            final = json.loads(
+                (transaction_root / f"FINAL.rank{rank}.json").read_text()
+            )
+            outer = final["outer_guarded_runner"]
+            self.assertEqual(
+                outer["artifact_binding_format"],
+                TRANSACTION.OUTER_ARTIFACT_BINDING_FORMAT,
+            )
+            self.assertEqual(
+                set(outer["status_artifact"]),
+                {"path", "sha256", "bytes"},
+            )
+            self.assertEqual(
+                set(outer["log_artifact"]),
+                {"path", "sha256", "bytes"},
+            )
+            self.assertEqual(local_identity_keys(final), set())
+
+        outcome_sha = hashlib.sha256(
+            (transaction_root / "OUTCOME.json").read_bytes()
+        ).hexdigest()
+        shifted_environment = os.environ.copy()
+        shifted_environment["SEMTALK_TEST_ARTIFACT_IDENTITY_OFFSET"] = "1048576"
+        replay = subprocess.run(
+            self._control_command(
+                "replay",
+                transaction_root,
+                outcome_sha256=outcome_sha,
+            ),
+            cwd=REPOSITORY,
+            env=shifted_environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(
+            json.loads(replay.stdout)["status"],
+            "REPLAYED_SUCCEEDED",
+        )
+
+        wrong_pin = subprocess.run(
+            self._control_command(
+                "replay",
+                transaction_root,
+                outcome_sha256="0" * 64,
+            ),
+            cwd=REPOSITORY,
+            env=shifted_environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertNotEqual(wrong_pin.returncode, 0)
+        self.assertIn("OUTCOME SHA differs", wrong_pin.stderr)
+
+    def test_portable_terminal_replay_rejects_semantic_artifact_tamper(
+        self,
+    ) -> None:
+        transaction_root = self.root / "portable_terminal_tamper"
+        node0, node1 = self._run_pair(transaction_root)
+        self.assertEqual(self._wait_process(node0), 0, node0.stderr.read())
+        self.assertEqual(self._wait_process(node1), 0, node1.stderr.read())
+        self._finalize(transaction_root)
+        outcome_sha = hashlib.sha256(
+            (transaction_root / "OUTCOME.json").read_bytes()
+        ).hexdigest()
+        for field in (
+            "path",
+            "sha256",
+            "bytes",
+            "status_rejected",
+            "status_payload",
+            "guard",
+        ):
+            with self.subTest(field=field):
+                environment = os.environ.copy()
+                environment["SEMTALK_TEST_ARTIFACT_PORTABLE_TAMPER"] = field
+                replay = subprocess.run(
+                    self._control_command(
+                        "replay",
+                        transaction_root,
+                        outcome_sha256=outcome_sha,
+                    ),
+                    cwd=REPOSITORY,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertNotEqual(replay.returncode, 0)
+                if field == "status_rejected":
+                    self.assertIn(
+                        "outer guarded-runner finish/restore evidence mismatch",
+                        replay.stderr,
+                    )
+                else:
+                    self.assertIn("FINAL receipt mismatch", replay.stderr)
 
     def test_actual_argv_must_equal_common_digest_before_spawn(self) -> None:
         transaction_root = self.root / "argv_mismatch"

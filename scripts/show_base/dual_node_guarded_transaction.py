@@ -59,6 +59,9 @@ PINNED_INPUT_FD_BASE = 200
 WORKLOAD_INPUT_SCHEMA = {
     "fresh_test_authority": "--fresh-test-authority",
 }
+OUTER_ARTIFACT_BINDING_FORMAT = (
+    "semtalk.dual_node_guarded_transaction.outer_artifact_binding.v1"
+)
 
 # CPU tests import this module and replace the process-evidence provider.  The
 # installed CLI never exposes a switch that weakens Linux runner ancestry or
@@ -3966,6 +3969,83 @@ def _outer_evidence(
     }
 
 
+def _portable_outer_evidence(
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project verified local artifact snapshots into one portable receipt.
+
+    ``st_dev`` and ``st_ino`` are deliberately retained until after the
+    caller's same-node alias check.  They are mount-local identity evidence,
+    however, and AWS EFS can expose a different ``st_dev`` (and other network
+    filesystems can expose a different inode view) for the same immutable
+    file on another client.  Consequently neither value may enter FINAL or
+    the OUTCOME hash which binds FINAL.
+    """
+
+    if set(evidence) != {
+        "runner",
+        "status_artifact",
+        "log_artifact",
+        "guard_evidence",
+    }:
+        raise TransactionError("outer guarded-runner evidence schema changed")
+    projected_artifacts: dict[str, dict[str, Any]] = {}
+    for name in ("status_artifact", "log_artifact"):
+        artifact = evidence.get(name)
+        if (
+            not isinstance(artifact, Mapping)
+            or set(artifact) != {
+                "path",
+                "sha256",
+                "bytes",
+                "st_dev",
+                "st_ino",
+            }
+            or not isinstance(artifact.get("path"), str)
+            or not Path(artifact["path"]).is_absolute()
+            or HEX64_RE.fullmatch(str(artifact.get("sha256"))) is None
+            or not _exact_int(artifact.get("bytes"), minimum=0)
+            or not _exact_int(artifact.get("st_dev"), minimum=0)
+            or not _exact_int(artifact.get("st_ino"), minimum=0)
+        ):
+            raise TransactionError(
+                f"invalid local outer artifact snapshot: {name}"
+            )
+        projected_artifacts[name] = {
+            "path": artifact["path"],
+            "sha256": artifact["sha256"],
+            "bytes": artifact["bytes"],
+        }
+    runner = evidence.get("runner")
+    guard = evidence.get("guard_evidence")
+    if not isinstance(runner, Mapping) or not isinstance(guard, Mapping):
+        raise TransactionError("outer guarded-runner evidence changed")
+    result = {
+        "artifact_binding_format": OUTER_ARTIFACT_BINDING_FORMAT,
+        "runner": dict(runner),
+        "status_artifact": projected_artifacts["status_artifact"],
+        "log_artifact": projected_artifacts["log_artifact"],
+        "guard_evidence": dict(guard),
+    }
+
+    def contains_local_identity(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(
+                key in {"st_dev", "st_ino"}
+                or contains_local_identity(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(contains_local_identity(item) for item in value)
+        return False
+
+    if contains_local_identity(result):
+        raise TransactionError(
+            "portable outer evidence contains local filesystem identity"
+        )
+    return result
+
+
 def _collect_outer_evidence(
     chain: Mapping[str, Any],
 ) -> dict[int, dict[str, Any]]:
@@ -3995,7 +4075,10 @@ def _collect_outer_evidence(
     ]
     if len(set(identities)) != 4:
         raise TransactionError("runner status/log artifacts alias one inode")
-    return evidence
+    return {
+        rank: _portable_outer_evidence(evidence[rank])
+        for rank in EXPECTED_RANKS
+    }
 
 
 def _terminal_final_payload(
