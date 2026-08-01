@@ -29,6 +29,8 @@ EPOCHS: Tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 EXPECTED_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
 EXPECTED_SOURCE_COMMIT = "70a70f452bdf743e317b583a7770980f0ce744c3"
 EXPECTED_SOURCE_TREE = "bdf7680f56f9f53c92e7ab0bf6c6a84ef4f83d69"
+EXPECTED_EVIDENCE_SOURCE_COMMIT = "4066f2096e1675f9c19d725894007ff25f3e9b4b"
+EXPECTED_EVIDENCE_SOURCE_TREE = "0b66e3aa1fb23732e76e51492737c4ab1f4db2d0"
 PRODUCER_RELATIVE = "scripts/show_base/produce_base_topology_short_quality.py"
 PRODUCER_SHA256 = "1d7fbd600d6ac0657896688eed0acd47600cacffe1632a655c4f9409eb604dac"
 ADAPTER_RELATIVE = "scripts/show_base/base_short_quality_val_adapter.py"
@@ -526,8 +528,16 @@ def verify_runtime(runtime: Path = EXPECTED_PYTHON_RUNTIME) -> Dict[str, Any]:
     }
 
 
-def verify_source(source_root: Path) -> Dict[str, Any]:
-    root = _canonical_existing(source_root, "official source root", directory=True)
+def verify_source(
+    source_root: Path,
+    *,
+    expected_commit: str = EXPECTED_SOURCE_COMMIT,
+    expected_tree: str = EXPECTED_SOURCE_TREE,
+    label: str = "runtime validation source",
+) -> Dict[str, Any]:
+    expected_commit = _require_git_oid(expected_commit, f"{label} commit")
+    expected_tree = _require_git_oid(expected_tree, f"{label} tree")
+    root = _canonical_existing(source_root, label, directory=True)
     remotes = [line for line in _git(root, "remote").splitlines() if line]
     origin = _git(root, "remote", "get-url", "origin")
     push_origin = _git(root, "remote", "get-url", "--push", "origin")
@@ -549,14 +559,15 @@ def verify_source(source_root: Path) -> Dict[str, Any]:
         remotes != ["origin"]
         or origin != EXPECTED_ORIGIN
         or push_origin != EXPECTED_ORIGIN
-        or commit != EXPECTED_SOURCE_COMMIT
-        or tree != EXPECTED_SOURCE_TREE
+        or commit != expected_commit
+        or tree != expected_tree
         or status_text
         or branch != "HEAD"
         or heads
     ):
         raise SealError(
-            "source must be the exact clean detached branchless official 4066 tree"
+            f"{label} must be the exact clean detached branchless official "
+            f"{expected_commit} tree"
         )
     producer = root / PRODUCER_RELATIVE
     producer_payload, _producer_inode = _safe_read(producer, "official producer")
@@ -570,7 +581,7 @@ def verify_source(source_root: Path) -> Dict[str, Any]:
         or committed.returncode != 0
         or committed.stdout != producer_payload
     ):
-        raise SealError("official producer bytes differ from pinned 4066 commit")
+        raise SealError(f"official producer bytes differ from pinned {label}")
     adapter = root / ADAPTER_RELATIVE
     adapter_payload, _adapter_inode = _safe_read(adapter, "official val adapter")
     return {
@@ -988,6 +999,7 @@ def _global_claim_value(
         "campaign_root": str(campaign_root),
         "binding_sha256": _sha256_bytes(_canonical_json_bytes(binding)),
         "source": binding["source"],
+        "evidence_source": binding["evidence_source"],
         "runtime": binding["runtime"],
         "sealer": binding["sealer"],
         "preflight": binding["preflight"],
@@ -1043,6 +1055,7 @@ def _existing_campaign_action(
     runtime: Mapping[str, Any],
     sealer: Mapping[str, Any],
     source: Mapping[str, Any],
+    evidence_source: Mapping[str, Any],
     preflight_artifact: Mapping[str, Any],
     input_closure: Mapping[str, Any],
     global_claim: Mapping[str, Any],
@@ -1079,6 +1092,7 @@ def _existing_campaign_action(
                 or completion.get("campaign_claim") != expected_claim
                 or completion.get("global_claim") != global_claim
                 or completion.get("source") != source
+                or completion.get("evidence_source") != evidence_source
                 or completion.get("runtime") != runtime
                 or completion.get("sealer") != sealer
                 or completion.get("producer") != source["producer"]
@@ -1304,6 +1318,12 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
     )
     runtime = verify_runtime()
     source = verify_source(args.source_root)
+    evidence_source = verify_source(
+        args.evidence_source_root,
+        expected_commit=EXPECTED_EVIDENCE_SOURCE_COMMIT,
+        expected_tree=EXPECTED_EVIDENCE_SOURCE_TREE,
+        label="validation evidence source",
+    )
     preflight_artifact, preflight = _strict_pinned_json(
         args.preflight,
         "short-quality preflight",
@@ -1311,13 +1331,14 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
         args.expected_preflight_bytes,
         args.expected_preflight_payload_sha256,
     )
-    _require_source_binding(preflight, source)
-    replay_preflight(runtime, source, preflight_artifact)
+    _require_source_binding(preflight, evidence_source)
+    replay_preflight(runtime, evidence_source, preflight_artifact)
     input_closure, common_command = build_input_closure(
         preflight, args.validation_root
     )
     binding = {
         "source": source,
+        "evidence_source": evidence_source,
         "runtime": runtime,
         "sealer": sealer,
         "preflight": preflight_artifact,
@@ -1344,6 +1365,7 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
             runtime,
             sealer,
             source,
+            evidence_source,
             preflight_artifact,
             input_closure,
             global_claim,
@@ -1406,6 +1428,18 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
                 raise SealError("outputs changed across official fresh replay")
             if verify_source(args.source_root) != source:
                 raise SealError("official source changed across producer execution")
+            if (
+                verify_source(
+                    args.evidence_source_root,
+                    expected_commit=EXPECTED_EVIDENCE_SOURCE_COMMIT,
+                    expected_tree=EXPECTED_EVIDENCE_SOURCE_TREE,
+                    label="validation evidence source",
+                )
+                != evidence_source
+            ):
+                raise SealError(
+                    "validation evidence source changed across producer execution"
+                )
             if verify_runtime() != runtime:
                 raise SealError("formal Python runtime changed across producer execution")
             if (
@@ -1438,6 +1472,7 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
                 },
                 "global_claim": global_claim,
                 "source": source,
+                "evidence_source": evidence_source,
                 "runtime": runtime,
                 "sealer": sealer,
                 "producer": source["producer"],
@@ -1476,6 +1511,7 @@ def seal(args: argparse.Namespace) -> Dict[str, Any]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--evidence-source-root", type=Path, required=True)
     parser.add_argument("--expected-sealer-commit", required=True)
     parser.add_argument("--expected-sealer-blob-oid", required=True)
     parser.add_argument("--expected-sealer-file-sha256", required=True)

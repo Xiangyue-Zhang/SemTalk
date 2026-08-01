@@ -66,6 +66,20 @@ def fixture_contracts(root: Path):
             "bytes": 456,
         },
     }
+    evidence_source = copy.deepcopy(source)
+    evidence_source.update(
+        {
+            "source_root": "/official/evidence-source",
+            "commit": sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT,
+            "tree": sealmod.EXPECTED_EVIDENCE_SOURCE_TREE,
+        }
+    )
+    evidence_source["producer"]["path"] = (
+        "/official/evidence-source/" + sealmod.PRODUCER_RELATIVE
+    )
+    evidence_source["val_adapter"]["path"] = (
+        "/official/evidence-source/" + sealmod.ADAPTER_RELATIVE
+    )
     preflight_artifact = {
         "path": str(root / "preflight.json"),
         "sha256": "3" * 64,
@@ -73,8 +87,8 @@ def fixture_contracts(root: Path):
         "receipt_payload_sha256": "4" * 64,
     }
     preflight = {
-        "adapter_source": dict(source),
-        "pipeline_source": dict(source),
+        "adapter_source": dict(evidence_source),
+        "pipeline_source": dict(evidence_source),
     }
     closure = {
         "topology_mode": "fixture-mode",
@@ -86,6 +100,7 @@ def fixture_contracts(root: Path):
     }
     arguments = argparse.Namespace(
         source_root=Path("/official/source"),
+        evidence_source_root=Path("/official/evidence-source"),
         expected_sealer_commit="a" * 40,
         expected_sealer_blob_oid="b" * 40,
         expected_sealer_file_sha256="c" * 64,
@@ -96,7 +111,15 @@ def fixture_contracts(root: Path):
         validation_root=root / "validation",
         campaign_root=root / "campaign",
     )
-    return runtime, source, preflight_artifact, preflight, closure, arguments
+    return (
+        runtime,
+        source,
+        evidence_source,
+        preflight_artifact,
+        preflight,
+        closure,
+        arguments,
+    )
 
 
 def make_integrated_sealer_repository(root: Path) -> tuple[Path, str, str, str]:
@@ -267,7 +290,7 @@ class HardenedSealTests(unittest.TestCase):
         cls.official_temporary = tempfile.TemporaryDirectory()
         cls.official_repository = (
             Path(cls.official_temporary.name).resolve(strict=True)
-            / "official-4066f20"
+            / "official-runtime-validation"
         )
         subprocess.run(
             [
@@ -330,18 +353,97 @@ class HardenedSealTests(unittest.TestCase):
                 ],
                 check=True,
             )
+        cls.evidence_repository = (
+            Path(cls.official_temporary.name).resolve(strict=True)
+            / "official-validation-evidence"
+        )
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-checkout",
+                str(REPOSITORY),
+                str(cls.evidence_repository),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cls.evidence_repository),
+                "checkout",
+                "--quiet",
+                "--detach",
+                sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cls.evidence_repository),
+                "remote",
+                "set-url",
+                "origin",
+                sealmod.EXPECTED_ORIGIN,
+            ],
+            check=True,
+        )
+        evidence_branches = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cls.evidence_repository),
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        for reference in evidence_branches:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(cls.evidence_repository),
+                    "update-ref",
+                    "-d",
+                    reference,
+                ],
+                check=True,
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.official_temporary.cleanup()
 
     def common_patches(self, root: Path):
-        runtime, source, preflight_artifact, preflight, closure, args = (
+        (
+            runtime,
+            source,
+            evidence_source,
+            preflight_artifact,
+            preflight,
+            closure,
+            args,
+        ) = (
             fixture_contracts(root)
         )
+
+        def verified_source(_path, **kwargs):
+            if kwargs.get("expected_commit") == sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT:
+                return evidence_source
+            return source
+
         patches = (
             mock.patch.object(sealmod, "verify_runtime", return_value=runtime),
-            mock.patch.object(sealmod, "verify_source", return_value=source),
+            mock.patch.object(sealmod, "verify_source", side_effect=verified_source),
             mock.patch.object(
                 sealmod,
                 "_strict_pinned_json",
@@ -398,6 +500,25 @@ class HardenedSealTests(unittest.TestCase):
         self.assertEqual(
             source["producer"]["sha256"], sealmod.PRODUCER_SHA256
         )
+        evidence = sealmod.verify_source(
+            self.evidence_repository,
+            expected_commit=sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT,
+            expected_tree=sealmod.EXPECTED_EVIDENCE_SOURCE_TREE,
+            label="validation evidence source",
+        )
+        self.assertEqual(
+            evidence["commit"], sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT
+        )
+        self.assertEqual(evidence["tree"], sealmod.EXPECTED_EVIDENCE_SOURCE_TREE)
+
+    def test_runtime_and_evidence_sources_cannot_be_relabelled(self):
+        with self.assertRaisesRegex(sealmod.SealError, "validation evidence source"):
+            sealmod.verify_source(
+                self.official_repository,
+                expected_commit=sealmod.EXPECTED_EVIDENCE_SOURCE_COMMIT,
+                expected_tree=sealmod.EXPECTED_EVIDENCE_SOURCE_TREE,
+                label="validation evidence source",
+            )
 
     def test_integrated_hash_pinned_sealer_is_accepted_and_fully_recorded(self):
         with tempfile.TemporaryDirectory() as raw:
