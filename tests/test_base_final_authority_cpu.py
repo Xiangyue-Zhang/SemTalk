@@ -450,6 +450,7 @@ class AuthorityFixture:
             "candidates": candidate_rows,
         }
         self.winner_selection = root / "winner.json"
+        self.selection_handoff = root / "selection-handoff.json"
         self.prerequisite_selection = root / "prerequisite-selection.json"
         self.continuation = root / "continuation.json"
         self.continuation_waves: list[dict[str, object]] = []
@@ -566,6 +567,24 @@ class AuthorityFixture:
         write_json(
             self.winner_selection,
             self.winner_selection_payload,
+        )
+        selection_handoff_unsigned = {
+            "format": "semtalk_show_base_v14_live_selection_handoff_v1",
+            "status": "complete",
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": True,
+            "test_evaluations_observed": 0,
+        }
+        self.selection_handoff_payload = {
+            **selection_handoff_unsigned,
+            "receipt_payload_sha256": AUTH.canonical_json_sha256(
+                selection_handoff_unsigned
+            ),
+        }
+        write_json(
+            self.selection_handoff,
+            self.selection_handoff_payload,
         )
         self.continuation_payload = {
             "format": "semtalk_show_prerequisite_continuation_decision_v2",
@@ -694,6 +713,7 @@ class AuthorityFixture:
             "base_long_candidate_artifacts": (
                 self.base_long_candidate_artifacts
             ),
+            "selection_handoff": artifact(self.selection_handoff),
             "winner_selection": artifact(self.winner_selection),
             "continuation_decision": artifact(self.continuation),
             "continuation_waves": self.continuation_waves,
@@ -709,6 +729,39 @@ class AuthorityFixture:
     def fresh_control_validators(self):
         published = mock.Mock(
             return_value=dict(self.published_validation)
+        )
+        handoff = mock.Mock(
+            return_value={
+                "artifact": {
+                    **artifact(self.selection_handoff),
+                    "receipt_payload_sha256": (
+                        self.selection_handoff_payload[
+                            "receipt_payload_sha256"
+                        ]
+                    ),
+                },
+                "canonical_payload_sha256": AUTH.canonical_json_sha256(
+                    self.selection_handoff_payload
+                ),
+                "outer_selection": {},
+                "reconciliation_receipt": {},
+                "reconciled_measurements": [
+                    {"sha256": f"{epoch:064x}"}
+                    for epoch in LONG.EXPECTED_CANDIDATE_EPOCHS
+                ],
+                "candidate_bundle": {},
+                "formal_selection_output": {
+                    **artifact(self.winner_selection),
+                    "receipt_payload_sha256": (
+                        self.winner_selection_payload[
+                            "receipt_payload_sha256"
+                        ]
+                    ),
+                },
+                "selected": copy.deepcopy(
+                    self.winner_selection_payload["selected"]
+                ),
+            }
         )
         with (
             mock.patch.object(
@@ -736,6 +789,11 @@ class AuthorityFixture:
                 "_replay_long_diffsheg_test_winner_claim",
                 side_effect=published,
             ),
+            mock.patch.object(
+                AUTH,
+                "_replay_live_selection_handoff",
+                side_effect=handoff,
+            ),
         ):
             yield (
                 continuation,
@@ -747,6 +805,113 @@ class AuthorityFixture:
 
 
 class BaseFinalAuthorityTest(unittest.TestCase):
+    def test_live_selection_handoff_is_fresh_and_output_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            winner_unsigned = {
+                "format": LONG.SELECTION_FORMAT,
+                "status": "selected",
+                "selected": {"epoch": 80, "fgd": 0.125},
+            }
+            winner_payload = {
+                **winner_unsigned,
+                "receipt_payload_sha256": AUTH.canonical_json_sha256(
+                    winner_unsigned
+                ),
+            }
+            winner_path = root / "formal-selection.json"
+            write_json(winner_path, winner_payload)
+            pinned_winner = {
+                **artifact(winner_path),
+                "receipt_payload_sha256": winner_payload[
+                    "receipt_payload_sha256"
+                ],
+            }
+            handoff_unsigned = {
+                "format": "semtalk_show_base_v14_live_selection_handoff_v1",
+                "formal_selection_output": pinned_winner,
+                "selected": winner_payload["selected"],
+            }
+            handoff_payload = {
+                **handoff_unsigned,
+                "receipt_payload_sha256": AUTH.canonical_json_sha256(
+                    handoff_unsigned
+                ),
+            }
+            handoff_path = root / "selection-handoff.json"
+            write_json(handoff_path, handoff_payload)
+            pinned_handoff = {
+                **artifact(handoff_path),
+                "receipt_payload_sha256": handoff_payload[
+                    "receipt_payload_sha256"
+                ],
+            }
+            candidates = {}
+            for role in ("manifest", "status", "frozen_inputs"):
+                path = root / f"{role}.json"
+                write_json(path, {"role": role})
+                candidates[role] = artifact(path)
+            replayed = {
+                "handoff": pinned_handoff,
+                "winner_selection": pinned_winner,
+                "formal_selection": winner_payload,
+                "outer_selection": {"sha256": "1" * 64},
+                "reconciliation_receipt": {"sha256": "2" * 64},
+                "reconciled_measurements": [
+                    {"sha256": f"{epoch:064x}"}
+                    for epoch in LONG.EXPECTED_CANDIDATE_EPOCHS
+                ],
+                "candidate_bundle": {"canonical_bundle_sha256": "3" * 64},
+                "selected": winner_payload["selected"],
+            }
+            validator = mock.Mock(return_value=replayed)
+            module = mock.Mock(
+                HANDOFF_FORMAT=(
+                    "semtalk_show_base_v14_live_selection_handoff_v1"
+                ),
+                validate_handoff=validator,
+            )
+            with mock.patch.object(
+                AUTH, "_control_module", return_value=module
+            ):
+                observed = AUTH._replay_live_selection_handoff(
+                    artifact(handoff_path),
+                    artifact(winner_path),
+                    candidate_artifacts=candidates,
+                )
+            self.assertEqual(observed["artifact"], pinned_handoff)
+            self.assertEqual(
+                observed["formal_selection_output"], pinned_winner
+            )
+            validator.assert_called_once_with(
+                handoff_artifact=pinned_handoff,
+                winner_selection=pinned_winner,
+                candidate_artifacts=candidates,
+            )
+
+            copied = root / "manual-selection-copy.json"
+            write_json(copied, winner_payload)
+            copied_pin = {
+                **artifact(copied),
+                "receipt_payload_sha256": winner_payload[
+                    "receipt_payload_sha256"
+                ],
+            }
+            forged = {**replayed, "winner_selection": copied_pin}
+            module.validate_handoff = mock.Mock(return_value=forged)
+            with (
+                mock.patch.object(AUTH, "_control_module", return_value=module),
+                self.assertRaisesRegex(
+                    AUTH.BaseFinalAuthorityError,
+                    "not exactly the freshly replayed handoff output",
+                ),
+            ):
+                AUTH._replay_live_selection_handoff(
+                    artifact(handoff_path),
+                    artifact(copied),
+                    candidate_artifacts=candidates,
+                )
+
     def test_base_long_bundle_uses_fresh_twenty_two_candidate_validator(
         self,
     ) -> None:

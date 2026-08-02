@@ -26,6 +26,7 @@ def _write_inputs(path: Path, *, test_evaluations: int = 1) -> dict[str, object]
         "canonical_root_receipt": {},
         "audio_authorities": [],
         "base_long_candidate_artifacts": {},
+        "selection_handoff": {},
         "winner_selection": {},
         "continuation_decision": {},
         "continuation_waves": [],
@@ -60,6 +61,22 @@ class BaseFinalAuthorityCliTests(unittest.TestCase):
                 authority._load_authority_inputs(
                     path,
                     expected_file_sha256="0" * 64,
+                )
+            manual = dict(expected)
+            manual.pop("selection_handoff")
+            manual.pop("receipt_payload_sha256")
+            manual["receipt_payload_sha256"] = (
+                authority.canonical_json_sha256(manual)
+            )
+            path.write_bytes(authority.canonical_json_bytes(manual))
+            with self.assertRaisesRegex(
+                authority.BaseFinalAuthorityError, "schema mismatch"
+            ):
+                authority._load_authority_inputs(
+                    path,
+                    expected_file_sha256=hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest(),
                 )
             _write_inputs(path, test_evaluations=2)
             with self.assertRaisesRegex(

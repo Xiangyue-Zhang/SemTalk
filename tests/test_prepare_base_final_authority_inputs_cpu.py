@@ -86,6 +86,7 @@ class PrepareBaseFinalAuthorityInputsCpuTests(unittest.TestCase):
             base_long_manifest=create("base-long-manifest.json"),
             base_long_status=create("base-long-status.json"),
             base_long_frozen_inputs=create("base-long-frozen.json"),
+            selection_handoff=create("selection-handoff.json"),
             winner_selection=create("winner.json"),
             continuation_decision=create("stop.json"),
             winner_validation_metric_closure=create("diffsheg-val.json"),
@@ -102,6 +103,10 @@ class PrepareBaseFinalAuthorityInputsCpuTests(unittest.TestCase):
             value = producer.build_inputs(args)
             self.assertEqual(value["format"], authority.INPUTS_FORMAT)
             self.assertEqual(value["continuation_waves"], [])
+            self.assertEqual(
+                value["selection_handoff"]["path"],
+                str(args.selection_handoff),
+            )
             self.assertEqual(
                 [item["shard_id"] for item in value["audio_authorities"]],
                 list(range(authority.NUM_SHARDS)),

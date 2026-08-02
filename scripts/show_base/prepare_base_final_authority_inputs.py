@@ -203,6 +203,10 @@ def build_inputs(args: argparse.Namespace) -> dict[str, Any]:
                 args.base_long_frozen_inputs, "Base-long frozen inputs"
             ),
         },
+        "selection_handoff": _regular_artifact(
+            args.selection_handoff,
+            "live-v2 to official-v1 selection handoff",
+        ),
         "winner_selection": _regular_artifact(
             args.winner_selection, "validation winner selection"
         ),
@@ -240,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-long-manifest", type=Path, required=True)
     parser.add_argument("--base-long-status", type=Path, required=True)
     parser.add_argument("--base-long-frozen-inputs", type=Path, required=True)
+    parser.add_argument("--selection-handoff", type=Path, required=True)
     parser.add_argument("--winner-selection", type=Path, required=True)
     parser.add_argument("--continuation-decision", type=Path, required=True)
     parser.add_argument(

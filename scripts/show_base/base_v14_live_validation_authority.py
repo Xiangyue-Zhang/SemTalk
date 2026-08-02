@@ -54,6 +54,12 @@ PRODUCER_TRAINER_SHA256 = (
 PRODUCER_V14_CONTRACT_SHA256 = (
     "3526ca896f23e7849545e3f81553dd242dc1ca3049eabdeeb89fc38357616323"
 )
+PRODUCER_TOPOLOGY_SELECTOR_SHA256 = (
+    "2510956db237d5f622517e9828ee4704e75b98cd47ddbc8ce888b56f37f70769"
+)
+PRODUCER_V14_SELECTOR_SHA256 = (
+    "3e9437cb5b502e3d847fee606b2a32dec129cb70abef8ee438ec4e110eab9358"
+)
 TRAINING_SEMANTICS_SOURCE_COMMIT = (
     "5b84075bb5bc9577a891a1f5ff72e93c39bab2e8"
 )
@@ -64,12 +70,15 @@ TRAINING_SEMANTICS_TRAINER_SHA256 = (
     "65cb565ceaf70f5c744b5c85db50e41d728f507d12cac28b06a5cc3756b65dba"
 )
 # The unchanged top-level numerical objective/data/checkpoint definitions in
-# 5b84075 and 8f1fa7b have this canonical name->AST hash projection.  The exact
+# 5b84075 and 8f1fa7b have this canonical name->portable-AST hash projection.
+# The projection deliberately omits only an empty ``type_params`` field, which
+# Python 3.12 adds to FunctionDef/ClassDef nodes but Python 3.9 does not expose.
+# Non-empty type parameters are rejected instead of being erased.  The exact
 # changed-name set below is limited to V14 control-plane, schedule, and
 # throughput-gate plumbing; the entire runtime producer file is independently
 # byte pinned above.
 TRAINING_SEMANTICS_UNCHANGED_DEFS_SHA256 = (
-    "ca62d6297e80c2e71bb2c6a92305b44fe746e161fa17f8fddf22ea10ef223bab"
+    "fa66194419d2d830ebf728a31098ac4d98da0c0ed7f0c79c2ef1b2faaad824c6"
 )
 TRAINING_SEMANTICS_ALLOWED_CHANGED_DEFS = frozenset(
     {
@@ -357,6 +366,7 @@ THROUGHPUT_REFERENCE_KEYS = frozenset(
         "trajectory_probe",
         "gate_frozen_receipt_sha256",
         "frozen_gate_compatibility_sha256",
+        "topology_selection",
     }
 )
 FINAL_STATUS_KEYS = frozenset(
@@ -530,6 +540,44 @@ def canonical_existing_directory(value: Any, label: str) -> Path:
             f"{label} must be a canonical non-symlink directory: {path}"
         )
     return path
+
+
+def bind_exact_scripts_namespace(source_root: Path, label: str) -> None:
+    """Bind a namespace-package ``scripts`` to one verified checkout only.
+
+    SemTalk intentionally has no ``scripts/__init__.py``.  A normal import can
+    therefore merge it with an unrelated top-level ``scripts`` package from
+    site-packages.  Install an explicit one-path namespace before executing a
+    pinned entrypoint, and reject any namespace that was already bound to a
+    different closure.
+    """
+
+    scripts_root = canonical_existing_directory(
+        source_root / "scripts", f"{label} scripts namespace"
+    )
+    existing = sys.modules.get("scripts")
+    if existing is not None:
+        module_file = getattr(existing, "__file__", None)
+        module_paths = list(getattr(existing, "__path__", []) or [])
+        if module_file is not None or module_paths != [str(scripts_root)]:
+            raise LiveValidationContractError(
+                f"preloaded scripts namespace is not exactly {label}-bound"
+            )
+        return
+    namespace = ModuleType("scripts")
+    namespace.__file__ = None
+    namespace.__package__ = "scripts"
+    namespace.__path__ = [str(scripts_root)]
+    specification = importlib.util.spec_from_loader(
+        "scripts", loader=None, is_package=True
+    )
+    if specification is None:
+        raise LiveValidationContractError(
+            f"cannot construct {label} scripts namespace"
+        )
+    specification.submodule_search_locations = [str(scripts_root)]
+    namespace.__spec__ = specification
+    sys.modules["scripts"] = namespace
 
 
 def _identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -750,6 +798,33 @@ def _top_level_definition_hashes(
             f"cannot parse {label} for the training-semantics proof"
         ) from error
     definitions: dict[str, str] = {}
+
+    def portable(value: Any) -> Any:
+        if isinstance(value, ast.AST):
+            fields = []
+            for field, child in ast.iter_fields(value):
+                if field == "type_params":
+                    if child != []:
+                        raise LiveValidationContractError(
+                            f"{label} uses unsupported non-empty type parameters"
+                        )
+                    continue
+                fields.append([field, portable(child)])
+            return {"node": value.__class__.__name__, "fields": fields}
+        if isinstance(value, list):
+            return [portable(child) for child in value]
+        if value is Ellipsis:
+            return {"ellipsis": True}
+        if isinstance(value, bytes):
+            return {"bytes_hex": value.hex()}
+        if isinstance(value, (str, int, float, complex, bool, type(None))):
+            if isinstance(value, complex):
+                return {"complex": repr(value)}
+            return value
+        raise LiveValidationContractError(
+            f"{label} has an unsupported AST scalar: {type(value).__name__}"
+        )
+
     for node in module.body:
         if not isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -759,7 +834,7 @@ def _top_level_definition_hashes(
             raise LiveValidationContractError(
                 f"duplicate top-level definition in {label}: {node.name}"
             )
-        normalized = ast.dump(node, include_attributes=False).encode("utf-8")
+        normalized = canonical_json_bytes(portable(node))
         definitions[node.name] = hashlib.sha256(normalized).hexdigest()
     if not definitions:
         raise LiveValidationContractError(
@@ -1012,6 +1087,14 @@ class ValidationHooks:
             self.producer_source_root
             / "scripts/show_base/base_v14_formal_contract.py"
         )
+        self.topology_selector_path = (
+            self.producer_source_root
+            / "scripts/show_base/select_base_training_topology.py"
+        )
+        self.v14_selector_path = (
+            self.producer_source_root
+            / "scripts/show_base/select_base_v14_two_candidate.py"
+        )
         self.validation_evidence_contract_path = (
             self.validation_evidence_source_root
             / "scripts/show_base/base_long_val_contract.py"
@@ -1031,6 +1114,12 @@ class ValidationHooks:
         _, trainer_sha, _ = safe_regular_hash(self.trainer_path, "trainer entrypoint")
         _, producer_contract_sha, _ = safe_regular_hash(
             self.producer_contract_path, "producer V14 contract entrypoint"
+        )
+        _, topology_selector_sha, _ = safe_regular_hash(
+            self.topology_selector_path, "producer topology selector entrypoint"
+        )
+        _, v14_selector_sha, _ = safe_regular_hash(
+            self.v14_selector_path, "producer V14 selector entrypoint"
         )
         _, evidence_contract_sha, _ = safe_regular_hash(
             self.validation_evidence_contract_path,
@@ -1086,6 +1175,14 @@ class ValidationHooks:
             raise LiveValidationContractError(
                 "producer V14 contract entrypoint SHA-256 changed"
             )
+        if topology_selector_sha != PRODUCER_TOPOLOGY_SELECTOR_SHA256:
+            raise LiveValidationContractError(
+                "producer topology selector entrypoint SHA-256 changed"
+            )
+        if v14_selector_sha != PRODUCER_V14_SELECTOR_SHA256:
+            raise LiveValidationContractError(
+                "producer V14 selector entrypoint SHA-256 changed"
+            )
         if (
             evidence_contract_sha != VALIDATION_EVIDENCE_CONTRACT_SHA256
             or evidence_contract_sha != expected_evidence_contract_sha
@@ -1122,6 +1219,9 @@ class ValidationHooks:
         self.runtime_validation_selector_sha256 = runtime_selector_sha
         self.require_exact_v14_schedule_bytes = True
         self.trainer: ModuleType | None = None
+        self.v14_contract: ModuleType | None = None
+        self.topology_selector: ModuleType | None = None
+        self.v14_selector: ModuleType | None = None
         self.topology_specs: dict[str, Any] | None = None
 
     def _path_within_producer_source(self, path: Path) -> bool:
@@ -1152,14 +1252,47 @@ class ValidationHooks:
                     f"project namespace escaped verified source root: {name}"
                 )
 
+    def _bind_scripts_namespace(self) -> None:
+        """Bind the repository's namespace package without site-path bleed.
+
+        ``scripts`` intentionally has no ``__init__.py``.  On Python 3.12 the
+        environment also contains a top-level ``scripts`` namespace in
+        site-packages, so normal namespace discovery merges the verified
+        repository directory with that unrelated path.  Install an explicit
+        one-path namespace after rejecting every preloaded project module and
+        before importing the pinned trainer.  This preserves normal submodule
+        imports while making the executable search closure exact.
+        """
+
+        bind_exact_scripts_namespace(self.producer_source_root, "producer")
+
     def _load_verified_modules(self) -> None:
         if self.trainer is not None:
             return
         # Reject a preloaded project namespace before executing either pinned
         # entrypoint.  Git cleanliness has already been proved by the caller.
         self._verify_project_module_closure()
+        self._bind_scripts_namespace()
         self.trainer = self._load_module(
             self.trainer_path, f"_live_val_trainer_{self.trainer_sha256}"
+        )
+        contract = getattr(self.trainer, "v14_contract", None)
+        if (
+            not isinstance(contract, ModuleType)
+            or Path(str(getattr(contract, "__file__", ""))).resolve(strict=True)
+            != self.producer_contract_path
+        ):
+            raise LiveValidationContractError(
+                "producer trainer did not import the pinned V14 contract"
+            )
+        self.v14_contract = contract
+        self.topology_selector = self._load_module(
+            self.topology_selector_path,
+            f"_live_val_topology_selector_{PRODUCER_TOPOLOGY_SELECTOR_SHA256}",
+        )
+        self.v14_selector = self._load_module(
+            self.v14_selector_path,
+            f"_live_val_v14_selector_{PRODUCER_V14_SELECTOR_SHA256}",
         )
         self._verify_project_module_closure()
         self.topology_specs = dict(self.trainer.TOPOLOGY_SPECS)
@@ -1402,14 +1535,24 @@ class ValidationHooks:
     ) -> dict[str, Any]:
         protocol = frozen["protocol"]
         topology_gate_spec = protocol.get("topology_gate_spec")
-        if not isinstance(topology_gate_spec, dict):
+        topology_selection = reference.get("topology_selection")
+        distributed = protocol.get("distributed_topology")
+        schedule = protocol.get("schedule")
+        if (
+            not isinstance(topology_gate_spec, dict)
+            or not isinstance(topology_selection, dict)
+            or not isinstance(distributed, dict)
+            or not isinstance(schedule, dict)
+        ):
             raise LiveValidationContractError("topology gate specification is absent")
+        base_reference = dict(reference)
+        del base_reference["topology_selection"]
         args = SimpleNamespace(
             topology_mode=topology_mode,
             topology_gate_spec=topology_gate_spec.get("path"),
             expected_topology_gate_spec_sha256=topology_gate_spec.get("sha256"),
-            throughput_gate_report=reference.get("path"),
-            expected_throughput_gate_sha256=reference.get("sha256"),
+            throughput_gate_report=base_reference.get("path"),
+            expected_throughput_gate_sha256=base_reference.get("sha256"),
             precision=protocol.get("precision"),
             learning_rate=protocol.get("optimizer", {}).get("learning_rate"),
         )
@@ -1419,15 +1562,52 @@ class ValidationHooks:
             normalized = self.trainer.validate_throughput_gate(
                 args, frozen_receipt=frozen
             )
+            selection_protocol = topology_selection.get("selection_protocol")
+            selection_audit = topology_selection.get("selection_audit")
+            fresh_gate = topology_selection.get("fresh_throughput_gate")
+            if (
+                not isinstance(selection_protocol, dict)
+                or not isinstance(selection_audit, dict)
+                or not isinstance(fresh_gate, dict)
+                or fresh_gate.get("path") != normalized.get("path")
+                or fresh_gate.get("sha256") != normalized.get("sha256")
+            ):
+                raise LiveValidationContractError(
+                    "formal topology selection does not bind the replayed gate"
+                )
+            replayed_selection = self.v14_contract.validate_control_plane(
+                project_root=self.producer_source_root,
+                schedule_path=Path(str(schedule.get("path"))),
+                expected_schedule_sha256=schedule.get("sha256"),
+                protocol_path=Path(str(selection_protocol.get("path"))),
+                expected_protocol_sha256=selection_protocol.get("sha256"),
+                audit_path=Path(str(selection_audit.get("path"))),
+                expected_audit_sha256=selection_audit.get("sha256"),
+                throughput_gate_path=Path(str(normalized.get("path"))),
+                expected_throughput_gate_sha256=normalized.get("sha256"),
+                topology_mode=topology_mode,
+                formal_run_id=distributed.get("formal_run_id"),
+                formal_master_port=distributed.get("master_port"),
+                selector=self.topology_selector,
+                v14_selector=self.v14_selector,
+                training_contract=self.trainer,
+                topology_specs=self.topology_specs,
+            )
         except Exception as error:
             raise LiveValidationContractError(
-                "existing producer throughput/trajectory contract rejected the candidate"
+                "existing producer throughput/topology contract rejected the candidate"
             ) from error
-        if gate_spec != topology_gate_spec or normalized != dict(reference):
+        combined = {**dict(normalized), "topology_selection": replayed_selection}
+        if (
+            gate_spec != topology_gate_spec
+            or normalized != base_reference
+            or replayed_selection != topology_selection
+            or combined != dict(reference)
+        ):
             raise LiveValidationContractError(
                 "manifest throughput closure differs from producer replay"
             )
-        return dict(normalized)
+        return combined
 
     def validate_trajectory_probe(
         self, probe: Any, topology_mode: str
@@ -1682,15 +1862,43 @@ class ValidationHooks:
         frozen: Mapping[str, Any],
         validation_evidence_source: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        frozen_selection = frozen["dataset"]["prerequisite_selection"]
+        if not isinstance(frozen_selection, dict) or set(frozen_selection) != {
+            "path",
+            "sha256",
+            "receipt_payload_sha256",
+        }:
+            raise LiveValidationContractError(
+                "frozen prerequisite selection schema changed"
+            )
+        selection_path, selection_sha, selection_bytes = safe_regular_hash(
+            frozen_selection["path"], "frozen prerequisite selection"
+        )
+        if (
+            str(selection_path) != frozen_selection["path"]
+            or selection_sha != frozen_selection["sha256"]
+        ):
+            raise LiveValidationContractError(
+                "frozen prerequisite selection identity changed"
+            )
+        # The producer's frozen dataset receipt intentionally stores the
+        # selection path/SHA/payload hash, while the validation-pipeline
+        # contract also records the verified file byte count.  Derive that
+        # fourth field from the same safely opened, SHA-pinned file instead of
+        # weakening either exact schema.
+        expected_prerequisite_selection = {
+            **dict(frozen_selection),
+            "bytes": selection_bytes,
+        }
         try:
             result = self._run_validation_helper(
                 "validate_pipeline",
                 {
                     "path": str(path),
                     "expected_sha256": expected_sha256,
-                    "expected_prerequisite_selection": frozen["dataset"][
-                        "prerequisite_selection"
-                    ],
+                    "expected_prerequisite_selection": (
+                        expected_prerequisite_selection
+                    ),
                     "expected_source": dict(validation_evidence_source),
                 },
             )
@@ -3431,6 +3639,7 @@ def _run_internal_validation_helper(argv: Sequence[str]) -> int:
     root_text = str(root)
     sys.path = [entry for entry in sys.path if entry != root_text]
     sys.path.insert(0, root_text)
+    bind_exact_scripts_namespace(root, "runtime validation")
     specification = importlib.util.spec_from_file_location(
         f"_isolated_validation_contract_{contract_sha}", contract_path
     )

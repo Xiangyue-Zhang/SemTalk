@@ -22,8 +22,8 @@ import types
 from typing import Any, Mapping, Sequence
 
 
-FORMAT = "semtalk_show_base_final_test_authority_v2"
-INPUTS_FORMAT = "semtalk_show_base_final_authority_inputs_v2"
+FORMAT = "semtalk_show_base_final_test_authority_v3"
+INPUTS_FORMAT = "semtalk_show_base_final_authority_inputs_v3"
 PAYLOAD_HASH_ALGORITHM = "canonical_json_utf8_sorted_compact_newline_v1"
 BASE_SELECTION_METRIC = "validation.diffsheg.metrics.fgd"
 BASE_SELECTION_PROTOCOL = "diffsheg_show_validation_fgd_v1"
@@ -162,6 +162,16 @@ EVALUATOR_ASSET_KEYS = {
     "talkshow_asset",
 }
 BASE_LONG_ARTIFACT_ROLES = ("manifest", "status", "frozen_inputs")
+SELECTION_HANDOFF_PROOF_KEYS = {
+    "artifact",
+    "canonical_payload_sha256",
+    "outer_selection",
+    "reconciliation_receipt",
+    "reconciled_measurements",
+    "candidate_bundle",
+    "formal_selection_output",
+    "selected",
+}
 BASE_LONG_BUNDLE_KEYS = {
     "artifacts",
     "manifest",
@@ -251,6 +261,13 @@ _CONTROL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "select_base_official_adapt",
         "base_long_val_contract",
         "select_base_official_adapt_long",
+    ),
+    "base_live_val_consumer_bridge": (),
+    "adapt_base_v14_live_selection_for_final": (
+        "select_base_official_adapt",
+        "base_long_val_contract",
+        "select_base_official_adapt_long",
+        "base_live_val_consumer_bridge",
     ),
 }
 
@@ -1817,10 +1834,91 @@ def _replay_long_diffsheg_test_winner_claim(
     return validated
 
 
+def _replay_live_selection_handoff(
+    handoff_binding: Mapping[str, Any],
+    winner_binding: Mapping[str, Any],
+    *,
+    candidate_artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freshly replay the live-v2 -> official-v1 selection handoff."""
+
+    handoff, handoff_payload = _json_artifact(
+        handoff_binding,
+        "live selection handoff",
+    )
+    winner, winner_payload = _json_artifact(
+        winner_binding,
+        "winner selection",
+    )
+    pinned_handoff = {
+        **handoff,
+        "receipt_payload_sha256": _sha256(
+            handoff_payload.get("receipt_payload_sha256"),
+            "live selection handoff payload SHA",
+        ),
+    }
+    pinned_winner = {
+        **winner,
+        "receipt_payload_sha256": _sha256(
+            winner_payload.get("receipt_payload_sha256"),
+            "winner selection payload SHA",
+        ),
+    }
+    module = _control_module("adapt_base_v14_live_selection_for_final")
+    validator = getattr(module, "validate_handoff", None)
+    expected_format = getattr(module, "HANDOFF_FORMAT", None)
+    if not callable(validator) or type(expected_format) is not str:
+        raise BaseFinalAuthorityError(
+            "live selection handoff validator ABI mismatch"
+        )
+    if handoff_payload.get("format") != expected_format:
+        raise BaseFinalAuthorityError(
+            "final Base authority requires the live-v2 formal-selection "
+            "handoff receipt"
+        )
+    try:
+        replayed = validator(
+            handoff_artifact=pinned_handoff,
+            winner_selection=pinned_winner,
+            candidate_artifacts=candidate_artifacts,
+        )
+    except Exception as exc:
+        raise BaseFinalAuthorityError(
+            f"live selection handoff fresh replay failed: {exc}"
+        ) from exc
+    if (
+        type(replayed) is not dict
+        or replayed.get("handoff") != pinned_handoff
+        or replayed.get("winner_selection") != pinned_winner
+        or replayed.get("formal_selection") != winner_payload
+        or handoff_payload.get("formal_selection_output") != pinned_winner
+        or handoff_payload.get("selected") != winner_payload.get("selected")
+    ):
+        raise BaseFinalAuthorityError(
+            "winner selection is not exactly the freshly replayed handoff "
+            "output"
+        )
+    return {
+        "artifact": pinned_handoff,
+        "canonical_payload_sha256": canonical_json_sha256(handoff_payload),
+        "outer_selection": dict(replayed["outer_selection"]),
+        "reconciliation_receipt": dict(
+            replayed["reconciliation_receipt"]
+        ),
+        "reconciled_measurements": [
+            dict(item) for item in replayed["reconciled_measurements"]
+        ],
+        "candidate_bundle": dict(replayed["candidate_bundle"]),
+        "formal_selection_output": dict(pinned_winner),
+        "selected": dict(replayed["selected"]),
+    }
+
+
 def _control_authority(
     *,
     expected_output_root: Path,
     base_long_candidate_bundle: Mapping[str, Any],
+    selection_handoff: Mapping[str, Any],
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
@@ -1991,6 +2089,11 @@ def _control_authority(
         "continuation decision",
     )
 
+    replayed_handoff = _replay_live_selection_handoff(
+        selection_handoff,
+        winner_selection,
+        candidate_artifacts=base_long_candidate_bundle["artifacts"],
+    )
     selection, selection_payload = _json_artifact(
         winner_selection,
         "winner selection",
@@ -2096,6 +2199,7 @@ def _control_authority(
                 "DiffSHEG winner does not bind the selected Base/report"
             )
         for label, payload in (
+            ("selection handoff", replayed_handoff),
             ("winner selection", selection_payload),
             ("continuation decision", replayed_continuation),
             ("continuation waves", replayed_waves),
@@ -2105,6 +2209,7 @@ def _control_authority(
         ):
             _reject_forbidden(payload, label)
         return {
+            "selection_handoff": replayed_handoff,
             "winner_selection": {
                 **pinned_winner_selection,
                 "canonical_payload_sha256": canonical_json_sha256(
@@ -2202,6 +2307,7 @@ def _authority_inputs(
     canonical_root_receipt: Mapping[str, Any],
     audio_authorities: Sequence[Mapping[str, Any]],
     base_long_candidate_artifacts: Mapping[str, Mapping[str, Any]],
+    selection_handoff: Mapping[str, Any],
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
@@ -2241,6 +2347,7 @@ def _authority_inputs(
     control = _control_authority(
         expected_output_root=output_root,
         base_long_candidate_bundle=base_long_candidate_bundle,
+        selection_handoff=selection_handoff,
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
@@ -2306,6 +2413,7 @@ def _build_test_authority(
     canonical_root_receipt: Mapping[str, Any],
     audio_authorities: Sequence[Mapping[str, Any]],
     base_long_candidate_artifacts: Mapping[str, Mapping[str, Any]],
+    selection_handoff: Mapping[str, Any],
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
@@ -2323,6 +2431,7 @@ def _build_test_authority(
         canonical_root_receipt=canonical_root_receipt,
         audio_authorities=audio_authorities,
         base_long_candidate_artifacts=base_long_candidate_artifacts,
+        selection_handoff=selection_handoff,
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
@@ -2351,6 +2460,7 @@ def build_test_authority(
     canonical_root_receipt: Mapping[str, Any],
     audio_authorities: Sequence[Mapping[str, Any]],
     base_long_candidate_artifacts: Mapping[str, Mapping[str, Any]],
+    selection_handoff: Mapping[str, Any],
     winner_selection: Mapping[str, Any],
     continuation_decision: Mapping[str, Any],
     continuation_waves: Sequence[Mapping[str, Any]],
@@ -2369,6 +2479,7 @@ def build_test_authority(
         canonical_root_receipt=canonical_root_receipt,
         audio_authorities=audio_authorities,
         base_long_candidate_artifacts=base_long_candidate_artifacts,
+        selection_handoff=selection_handoff,
         winner_selection=winner_selection,
         continuation_decision=continuation_decision,
         continuation_waves=continuation_waves,
@@ -2388,6 +2499,7 @@ def _replay_authority(value: Any) -> dict[str, Any]:
         "expected_output_root",
         "canonical",
         "audio",
+        "selection_handoff",
         "winner_selection",
         "continuation_decision",
         "continuation_waves",
@@ -2464,6 +2576,19 @@ def _replay_authority(value: Any) -> dict[str, Any]:
         raise BaseFinalAuthorityError(
             "test authority continuation wave inventory mismatch"
         )
+    handoff_proof = value["selection_handoff"]
+    if (
+        type(handoff_proof) is not dict
+        or set(handoff_proof) != SELECTION_HANDOFF_PROOF_KEYS
+        or type(handoff_proof.get("artifact")) is not dict
+        or set(handoff_proof["artifact"])
+        != ARTIFACT_KEYS | {"receipt_payload_sha256"}
+        or type(handoff_proof.get("reconciled_measurements")) is not list
+        or len(handoff_proof["reconciled_measurements"]) != 22
+    ):
+        raise BaseFinalAuthorityError(
+            "test authority live-selection handoff proof schema mismatch"
+        )
     rebuilt = _build_test_authority(
         expected_output_root=value["expected_output_root"],
         canonical_manifest=canonical["manifest"],
@@ -2482,6 +2607,10 @@ def _replay_authority(value: Any) -> dict[str, Any]:
         base_long_candidate_artifacts=value[
             "base_long_candidate_bundle"
         ]["artifacts"],
+        selection_handoff={
+            key: value["selection_handoff"]["artifact"][key]
+            for key in ARTIFACT_KEYS
+        },
         winner_selection={
             key: value["winner_selection"][key]
             for key in ARTIFACT_KEYS
@@ -2619,6 +2748,7 @@ def _load_authority_inputs(
         "canonical_root_receipt",
         "audio_authorities",
         "base_long_candidate_artifacts",
+        "selection_handoff",
         "winner_selection",
         "continuation_decision",
         "continuation_waves",
@@ -2696,6 +2826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_long_candidate_artifacts=inputs[
             "base_long_candidate_artifacts"
         ],
+        selection_handoff=inputs["selection_handoff"],
         winner_selection=inputs["winner_selection"],
         continuation_decision=inputs["continuation_decision"],
         continuation_waves=inputs["continuation_waves"],

@@ -499,7 +499,7 @@ def _base_final_authority_module() -> Any:
     module = _fresh_local_control_module("base_final_authority.py")
     if (
         getattr(module, "FORMAT", None)
-        != "semtalk_show_base_final_test_authority_v2"
+        != "semtalk_show_base_final_test_authority_v3"
         or not callable(getattr(module, "validate_test_authority", None))
     ):
         raise MetricAdapterContractError(

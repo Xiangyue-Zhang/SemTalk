@@ -1998,14 +1998,14 @@ class OfflineAdapterTest(unittest.TestCase):
             ):
                 METRICS._consume_combined_talkshow_suite_start(**kwargs)
 
-    def test_same_path_cached_final_authority_is_ignored(self) -> None:
+    def test_same_path_cached_legacy_final_authority_is_ignored(self) -> None:
         expected = (
             Path(METRICS.__file__).resolve().parent
             / "base_final_authority.py"
         )
         fake = types.SimpleNamespace(
             __file__=str(expected),
-            FORMAT="semtalk_show_base_final_test_authority_v1",
+            FORMAT="semtalk_show_base_final_test_authority_v2",
             validate_test_authority=lambda *_args, **_kwargs: {
                 "poisoned": True
             },
@@ -2018,8 +2018,26 @@ class OfflineAdapterTest(unittest.TestCase):
         self.assertIsNot(observed, fake)
         self.assertEqual(
             observed.FORMAT,
-            "semtalk_show_base_final_test_authority_v2",
+            "semtalk_show_base_final_test_authority_v3",
         )
+
+    def test_legacy_v2_final_authority_abi_is_rejected(self) -> None:
+        legacy = types.SimpleNamespace(
+            FORMAT="semtalk_show_base_final_test_authority_v2",
+            validate_test_authority=lambda *_args, **_kwargs: {},
+        )
+        with (
+            mock.patch.object(
+                METRICS,
+                "_fresh_local_control_module",
+                return_value=legacy,
+            ),
+            self.assertRaisesRegex(
+                METRICS.MetricAdapterContractError,
+                "base_final_authority API/schema mismatch",
+            ),
+        ):
+            METRICS._base_final_authority_module()
 
     def test_same_path_cached_talkshow_contract_is_ignored(self) -> None:
         expected = (

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -591,8 +594,32 @@ class Fixture:
 
     def throughput(self):
         probe = self.probe()
+        gate_path = str(self.root / "throughput.json")
+        topology_selection = {
+            "format": "semtalk_show_base_v14_formal_control_plane_receipt_v1",
+            "status": "pass",
+            "selected_mode": self.mode,
+            "schedule": {
+                "path": str(self.schedule_path),
+                "sha256": self.schedule_sha,
+            },
+            "selection_protocol": {
+                "path": str(self.root / "selection-protocol.json"),
+                "sha256": "3" * 64,
+            },
+            "selection_audit": {
+                "path": str(self.root / "selection-audit.json"),
+                "sha256": "4" * 64,
+            },
+            "fresh_throughput_gate": {
+                "path": gate_path,
+                "sha256": "0" * 64,
+                "formal_run_id_distinct": True,
+                "formal_master_port_distinct": True,
+            },
+        }
         return {
-            "path": str(self.root / "throughput.json"),
+            "path": gate_path,
             "sha256": "0" * 64,
             "topology_mode": self.mode,
             "samples_per_second": 1000.0,
@@ -605,6 +632,7 @@ class Fixture:
             "trajectory_probe": probe,
             "gate_frozen_receipt_sha256": "1" * 64,
             "frozen_gate_compatibility_sha256": "2" * 64,
+            "topology_selection": topology_selection,
         }
 
     def publish_candidate(self, epoch: int):
@@ -868,9 +896,15 @@ class LiveValidationAdapterTests(unittest.TestCase):
         return Fixture(Path(temporary.name).resolve(), mode)
 
     def test_default_hooks_do_not_execute_before_source_validation(self):
-        validation_root = Path(
+        validation_fixture = Path(
             "/private/tmp/semtalk_final_integration_20260801"
-        ).resolve(strict=True)
+        )
+        runtime_fixture = Path(
+            "/private/tmp/semtalk_diffsheg_provenance_fix_20260802"
+        )
+        if not validation_fixture.is_dir() or not runtime_fixture.is_dir():
+            self.skipTest("local pinned validation fixtures are absent")
+        validation_root = validation_fixture.resolve(strict=True)
         producer_root = REPOSITORY.resolve(strict=True)
         with mock.patch.object(
             ADAPTER.ValidationHooks, "_load_verified_modules"
@@ -890,9 +924,7 @@ class LiveValidationAdapterTests(unittest.TestCase):
                 expected_validation_evidence_selector_sha256=(
                     ADAPTER.VALIDATION_EVIDENCE_SELECTOR_SHA256
                 ),
-                runtime_validation_source_root=Path(
-                    "/private/tmp/semtalk_diffsheg_provenance_fix_20260802"
-                ).resolve(strict=True),
+                runtime_validation_source_root=runtime_fixture.resolve(strict=True),
                 expected_runtime_validation_contract_sha256=(
                     ADAPTER.RUNTIME_VALIDATION_CONTRACT_SHA256
                 ),
@@ -917,6 +949,12 @@ class LiveValidationAdapterTests(unittest.TestCase):
             ),
             "scripts/show_base/base_v14_formal_contract.py": (
                 ADAPTER.PRODUCER_V14_CONTRACT_SHA256
+            ),
+            "scripts/show_base/select_base_training_topology.py": (
+                ADAPTER.PRODUCER_TOPOLOGY_SELECTOR_SHA256
+            ),
+            "scripts/show_base/select_base_v14_two_candidate.py": (
+                ADAPTER.PRODUCER_V14_SELECTOR_SHA256
             ),
             "configs/show_base/semtalk_base_v14_formal_schedule_20260802.json": (
                 ADAPTER.V14_SCHEDULE_SHA256
@@ -1033,6 +1071,89 @@ class LiveValidationAdapterTests(unittest.TestCase):
                     ADAPTER.LiveValidationContractError
                 ):
                     hooks.validate_training_source(attacked)
+
+    def test_throughput_replays_embedded_v14_control_plane(self):
+        fixture = self.fixture()
+        reference = fixture.throughput()
+        base_reference = copy.deepcopy(reference)
+        topology_selection = base_reference.pop("topology_selection")
+        hooks = object.__new__(ADAPTER.ValidationHooks)
+        hooks.producer_source_root = REPOSITORY.resolve(strict=True)
+        hooks.topology_specs = copy.deepcopy(ADAPTER.SUPPORTED_TOPOLOGIES)
+        hooks.topology_selector = object()
+        hooks.v14_selector = object()
+        hooks.trainer = mock.Mock()
+        hooks.trainer.validate_topology_gate_spec.return_value = copy.deepcopy(
+            fixture.frozen["protocol"]["topology_gate_spec"]
+        )
+        hooks.trainer.validate_throughput_gate.return_value = copy.deepcopy(
+            base_reference
+        )
+        hooks.v14_contract = mock.Mock()
+        hooks.v14_contract.validate_control_plane.return_value = copy.deepcopy(
+            topology_selection
+        )
+
+        accepted = hooks.validate_throughput(
+            reference=reference,
+            frozen=fixture.frozen,
+            topology_mode=fixture.mode,
+        )
+        self.assertEqual(accepted, reference)
+        replay = hooks.v14_contract.validate_control_plane.call_args.kwargs
+        distributed = fixture.frozen["protocol"]["distributed_topology"]
+        self.assertEqual(replay["formal_run_id"], distributed["formal_run_id"])
+        self.assertEqual(
+            replay["formal_master_port"], distributed["master_port"]
+        )
+        self.assertEqual(
+            replay["throughput_gate_path"], Path(base_reference["path"])
+        )
+        self.assertIs(replay["training_contract"], hooks.trainer)
+
+        hooks.v14_contract.validate_control_plane.return_value = {
+            **copy.deepcopy(topology_selection),
+            "selected_mode": ADAPTER.W8G2048_MODE,
+        }
+        with self.assertRaisesRegex(
+            ADAPTER.LiveValidationContractError,
+            "manifest throughput closure differs",
+        ):
+            hooks.validate_throughput(
+                reference=reference,
+                frozen=fixture.frozen,
+                topology_mode=fixture.mode,
+            )
+
+    def test_throughput_rejects_unbound_topology_gate(self):
+        fixture = self.fixture()
+        reference = fixture.throughput()
+        reference["topology_selection"]["fresh_throughput_gate"][
+            "sha256"
+        ] = "f" * 64
+        base_reference = copy.deepcopy(reference)
+        base_reference.pop("topology_selection")
+        hooks = object.__new__(ADAPTER.ValidationHooks)
+        hooks.producer_source_root = REPOSITORY.resolve(strict=True)
+        hooks.topology_specs = copy.deepcopy(ADAPTER.SUPPORTED_TOPOLOGIES)
+        hooks.topology_selector = object()
+        hooks.v14_selector = object()
+        hooks.trainer = mock.Mock()
+        hooks.trainer.validate_topology_gate_spec.return_value = copy.deepcopy(
+            fixture.frozen["protocol"]["topology_gate_spec"]
+        )
+        hooks.trainer.validate_throughput_gate.return_value = base_reference
+        hooks.v14_contract = mock.Mock()
+        with self.assertRaisesRegex(
+            ADAPTER.LiveValidationContractError,
+            "throughput/topology contract rejected",
+        ):
+            hooks.validate_throughput(
+                reference=reference,
+                frozen=fixture.frozen,
+                topology_mode=fixture.mode,
+            )
+        hooks.v14_contract.validate_control_plane.assert_not_called()
 
     def test_authorize_both_supported_topologies(self):
         for mode in (ADAPTER.W8G1024_MODE, ADAPTER.W8G2048_MODE):
@@ -1378,6 +1499,209 @@ class LiveValidationAdapterTests(unittest.TestCase):
             proof["unchanged_definitions_sha256"],
             ADAPTER.TRAINING_SEMANTICS_UNCHANGED_DEFS_SHA256,
         )
+
+    def test_ast_definition_hashes_ignore_only_empty_python312_type_params(self):
+        source = b"def f(value=...):\n    return value\n\nclass C:\n    pass\n"
+        baseline = ADAPTER._top_level_definition_hashes(
+            source, label="pre-3.12 fixture"
+        )
+        classes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        missing = [cls for cls in classes if "type_params" not in cls._fields]
+        original_fields = {cls: cls._fields for cls in missing}
+        try:
+            for cls in missing:
+                cls._fields = (*cls._fields, "type_params")
+            simulated_tree = ast.parse(source.decode("utf-8"))
+            for node in ast.walk(simulated_tree):
+                if isinstance(node, classes):
+                    node.type_params = []
+            with mock.patch.object(
+                ADAPTER.ast, "parse", return_value=simulated_tree
+            ):
+                simulated_312 = ADAPTER._top_level_definition_hashes(
+                    source, label="3.12 fixture"
+                )
+            self.assertEqual(simulated_312, baseline)
+            malicious_tree = copy.deepcopy(simulated_tree)
+            function = next(
+                node
+                for node in ast.walk(malicious_tree)
+                if isinstance(node, ast.FunctionDef)
+            )
+            function.type_params = [ast.Name(id="T", ctx=ast.Load())]
+            with mock.patch.object(
+                ADAPTER.ast, "parse", return_value=malicious_tree
+            ):
+                with self.assertRaisesRegex(
+                    ADAPTER.LiveValidationContractError,
+                    "unsupported non-empty type parameters",
+                ):
+                    ADAPTER._top_level_definition_hashes(
+                        source, label="type-parameter attack"
+                    )
+        finally:
+            for cls in missing:
+                cls._fields = original_fields[cls]
+
+    def test_scripts_namespace_is_bound_to_only_the_verified_producer(self):
+        with tempfile.TemporaryDirectory(prefix="producer-namespace-") as root:
+            producer = Path(root).resolve()
+            (producer / "scripts").mkdir()
+            hooks = object.__new__(ADAPTER.ValidationHooks)
+            hooks.producer_source_root = producer
+            saved_modules = {
+                name: sys.modules.pop(name)
+                for name in tuple(sys.modules)
+                if name == "scripts" or name.startswith("scripts.")
+            }
+            try:
+                hooks._bind_scripts_namespace()
+                namespace = sys.modules["scripts"]
+                self.assertIsNone(namespace.__file__)
+                self.assertEqual(
+                    list(namespace.__path__), [str(producer / "scripts")]
+                )
+                self.assertEqual(
+                    list(namespace.__spec__.submodule_search_locations),
+                    [str(producer / "scripts")],
+                )
+                namespace.__path__.append("/outside/site-packages/scripts")
+                with self.assertRaisesRegex(
+                    ADAPTER.LiveValidationContractError,
+                    "project namespace escaped verified source root",
+                ):
+                    hooks._verify_project_module_closure()
+            finally:
+                for name in tuple(sys.modules):
+                    if name == "scripts" or name.startswith("scripts."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved_modules)
+
+    def test_internal_validation_helper_binds_runtime_namespace_before_import(self):
+        with tempfile.TemporaryDirectory(prefix="runtime-validation-") as root_text:
+            root = Path(root_text).resolve()
+            (root / "scripts" / "show_base").mkdir(parents=True)
+            contract = root / "scripts" / "show_base" / "base_long_val_contract.py"
+            selector = root / "scripts" / "show_base" / "select_base_official_adapt.py"
+            contract.write_bytes(b"contract fixture\n")
+            selector.write_bytes(b"selector fixture\n")
+            request = ADAPTER.canonical_json_bytes(
+                {
+                    "operation": "validate_val_inputs",
+                    "payload": {"path": "/unused", "expected_sha256": "a" * 64},
+                }
+            )
+
+            def pinned_hash(path, label):
+                del label
+                resolved = Path(path).resolve(strict=True)
+                if resolved == contract:
+                    return resolved, ADAPTER.RUNTIME_VALIDATION_CONTRACT_SHA256, 1
+                if resolved == selector:
+                    return resolved, ADAPTER.RUNTIME_VALIDATION_SELECTOR_SHA256, 1
+                raise AssertionError(f"unexpected path: {resolved}")
+
+            project_names = [
+                name
+                for name in tuple(sys.modules)
+                if name in {"scripts", "models", "dataloaders"}
+                or name.startswith(("scripts.", "models.", "dataloaders."))
+            ]
+            saved_modules = {name: sys.modules.pop(name) for name in project_names}
+            try:
+                with (
+                    mock.patch.object(
+                        ADAPTER.ValidationHooks, "_git_checkout_authority"
+                    ),
+                    mock.patch.object(
+                        ADAPTER, "safe_regular_hash", side_effect=pinned_hash
+                    ),
+                    mock.patch.object(
+                        ADAPTER,
+                        "bind_exact_scripts_namespace",
+                    ) as bind_namespace,
+                    mock.patch.object(
+                        ADAPTER.importlib.util,
+                        "spec_from_file_location",
+                        side_effect=RuntimeError("stop after namespace bind"),
+                    ),
+                    mock.patch.object(
+                        ADAPTER.sys,
+                        "stdin",
+                        SimpleNamespace(buffer=io.BytesIO(request)),
+                    ),
+                    mock.patch.object(ADAPTER.sys, "path", list(sys.path)),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stop after namespace bind"
+                    ):
+                        ADAPTER._run_internal_validation_helper(
+                            [
+                                "--runtime-validation-source-root",
+                                str(root),
+                                "--expected-runtime-validation-contract-sha256",
+                                ADAPTER.RUNTIME_VALIDATION_CONTRACT_SHA256,
+                                "--expected-runtime-validation-selector-sha256",
+                                ADAPTER.RUNTIME_VALIDATION_SELECTOR_SHA256,
+                            ]
+                        )
+                    bind_namespace.assert_called_once_with(
+                        root, "runtime validation"
+                    )
+            finally:
+                for name in tuple(sys.modules):
+                    if name in {"scripts", "models", "dataloaders"} or name.startswith(
+                        ("scripts.", "models.", "dataloaders.")
+                    ):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved_modules)
+
+    def test_pipeline_helper_receives_sha_verified_selection_byte_bridge(self):
+        with tempfile.TemporaryDirectory(prefix="selection-bridge-") as root_text:
+            selection = Path(root_text).resolve() / "selection.json"
+            selection.write_bytes(b"{\"selection\":true}\n")
+            selection_sha = hashlib.sha256(selection.read_bytes()).hexdigest()
+            selected = {
+                stage: hashlib.sha256(stage.encode()).hexdigest()
+                for stage in ("face", "hands", "upper", "lower", "global")
+            }
+            frozen = {
+                "dataset": {
+                    "prerequisite_selection": {
+                        "path": str(selection),
+                        "sha256": selection_sha,
+                        "receipt_payload_sha256": "b" * 64,
+                    },
+                    "selected_prerequisite_sha256": selected,
+                }
+            }
+            pipeline = {
+                "fixed_checkpoints": {
+                    stage: {"sha256": digest}
+                    for stage, digest in selected.items()
+                }
+            }
+            hooks = object.__new__(ADAPTER.ValidationHooks)
+            hooks._run_validation_helper = mock.Mock(
+                return_value={"receipt": {"sha256": "c" * 64}, "pipeline": pipeline}
+            )
+            receipt, observed = hooks.validate_pipeline(
+                Path("/verified/pipeline.json"),
+                "d" * 64,
+                frozen=frozen,
+                validation_evidence_source={"commit": "e" * 40},
+            )
+            self.assertEqual(receipt, {"sha256": "c" * 64})
+            self.assertEqual(observed, pipeline)
+            operation, payload = hooks._run_validation_helper.call_args.args
+            self.assertEqual(operation, "validate_pipeline")
+            self.assertEqual(
+                payload["expected_prerequisite_selection"],
+                {
+                    **frozen["dataset"]["prerequisite_selection"],
+                    "bytes": selection.stat().st_size,
+                },
+            )
 
     def test_real_runtime_validation_successor_proof(self):
         root = Path(
