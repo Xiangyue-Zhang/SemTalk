@@ -850,7 +850,9 @@ def _runner_workload(job: Mapping[str, Any], campaign: Mapping[str, Any]) -> Lis
 def _runner_argv_v2(job: Mapping[str, Any], campaign: Mapping[str, Any]) -> List[str]:
     return [
         campaign["_formal_python"]["argv0"], campaign["_guarded_runner"]["path"],
-        "--gpus", "0,1,2,3,4,5,6,7", "--status", job["runner_status_path"],
+        "--gpus", "0,1,2,3,4,5,6,7",
+        "--cwd", campaign["_control_source"]["root"],
+        "--status", job["runner_status_path"],
         "--log", job["runner_log_path"], "--", *_runner_workload(job, campaign),
     ]
 

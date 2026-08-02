@@ -195,8 +195,16 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(bridge_reconcile[2], control["bridge"]["path"])
         self.assertEqual(bridge_replay[4], control["bridge"]["path"])
         argv = sup._runner_argv_v2(job, campaign)
+        self.assertEqual(argv.count("--cwd"), 1)
+        self.assertEqual(argv[argv.index("--cwd") + 1], control["root"])
+        self.assertLess(argv.index("--cwd"), argv.index("--"))
         self.assertEqual(argv[argv.index("--") + 1:argv.index("--") + 3], ["/bin/bash", self.fx.launcher["path"]])
         self.assertEqual(sup._validate_runner_argv_v2(argv, job, campaign), argv)
+        missing_cwd = list(argv)
+        cwd_index = missing_cwd.index("--cwd")
+        del missing_cwd[cwd_index:cwd_index + 2]
+        with self.assertRaisesRegex(sup.SupervisorError, "exact tracked"):
+            sup._validate_runner_argv_v2(missing_cwd, job, campaign)
         changed = list(argv)
         changed[changed.index("--") + 1] = self.fx.formal["argv0"]
         with self.assertRaisesRegex(sup.SupervisorError, "exact tracked"):
