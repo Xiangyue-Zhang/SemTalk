@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import argparse
 import copy
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -77,6 +78,13 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             old_path = list(sys.path)
             try:
                 sys.path[:] = [str(launch), str(site), *old_path]
+                vanilla = importlib.import_module("scripts")
+                self.assertEqual(
+                    list(vanilla.__path__)[:2],
+                    [str(launch / "scripts"), str(site / "scripts")],
+                )
+                self.assertGreaterEqual(len(vanilla.__path__), 2)
+                sys.modules.pop("scripts")
                 BRIDGE._bind_exact_scripts_namespace(runtime)
                 namespace = sys.modules["scripts"]
                 self.assertEqual(
@@ -87,6 +95,155 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                 sys.path[:] = old_path
                 for name in tuple(sys.modules):
                     if name == "scripts" or name.startswith("scripts."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved)
+
+    def test_loader_binds_scripts_before_its_first_runtime_import(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-loader-order-", dir="/private/tmp"
+        ) as raw:
+            runtime = Path(raw).resolve()
+            scripts_root = runtime / "scripts"
+            scripts_root.mkdir()
+            prefixes = ("scripts", "models", "dataloaders", "utils")
+            project_names = [
+                name
+                for name in tuple(sys.modules)
+                if any(
+                    name == prefix or name.startswith(prefix + ".")
+                    for prefix in prefixes
+                )
+            ]
+            saved = {name: sys.modules.pop(name) for name in project_names}
+            old_path = list(sys.path)
+            observed = []
+
+            def stop_after_binding(name: str):
+                namespace = sys.modules["scripts"]
+                observed.append(name)
+                self.assertEqual(namespace.__path__, [str(scripts_root)])
+                self.assertEqual(
+                    namespace.__spec__.submodule_search_locations,
+                    [str(scripts_root)],
+                )
+                raise RuntimeError("stop after exact namespace binding")
+
+            try:
+                with mock.patch.object(
+                    BRIDGE.importlib,
+                    "import_module",
+                    side_effect=stop_after_binding,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "stop after exact namespace binding"
+                    ):
+                        BRIDGE._load_validation_modules(runtime)
+                self.assertEqual(
+                    observed,
+                    ["scripts.show_base.base_long_val_contract"],
+                )
+                self.assertNotEqual(sys.path[0], str(runtime))
+            finally:
+                sys.path[:] = old_path
+                for name in tuple(sys.modules):
+                    if any(
+                        name == prefix or name.startswith(prefix + ".")
+                        for prefix in prefixes
+                    ):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved)
+
+    def test_successful_loader_keeps_runtime_root_for_lazy_model_imports(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-loader-lazy-", dir="/private/tmp"
+        ) as raw:
+            runtime = Path(raw).resolve()
+            show_base = runtime / "scripts" / "show_base"
+            show_base.mkdir(parents=True)
+            models = runtime / "models"
+            models.mkdir()
+            (models / "__init__.py").write_text("", encoding="utf-8")
+            (models / "lazy_probe.py").write_text(
+                "SOURCE = 'runtime'\n", encoding="utf-8"
+            )
+            module_names = {
+                "contract": "scripts.show_base.base_long_val_contract",
+                "engine": "scripts.show_base.run_base_val_inference",
+                "producer": "scripts.show_base.produce_base_val_measurement",
+                "selector": "scripts.show_base.select_base_official_adapt_long",
+                "legacy": "scripts.show_base.select_base_official_adapt",
+            }
+            fake_modules = {}
+            for key, name in module_names.items():
+                path = show_base / (name.rsplit(".", 1)[-1] + ".py")
+                path.write_text("", encoding="utf-8")
+                module = ModuleType(name)
+                module.__file__ = str(path)
+                fake_modules[key] = module
+            fake_modules["legacy"].DIFFSHEG_PINNED_RECEIPT = {
+                "autoencoders": {
+                    "fgd": copy.deepcopy(
+                        BRIDGE.EXPECTED_DIFFSHEG_FGD_PROVENANCE
+                    )
+                }
+            }
+            by_name = {
+                name: fake_modules[key] for key, name in module_names.items()
+            }
+            prefixes = ("scripts", "models", "dataloaders", "utils")
+            project_names = [
+                name
+                for name in tuple(sys.modules)
+                if any(
+                    name == prefix or name.startswith(prefix + ".")
+                    for prefix in prefixes
+                )
+            ]
+            saved = {name: sys.modules.pop(name) for name in project_names}
+            old_path = list(sys.path)
+
+            def import_runtime(name: str):
+                module = by_name[name]
+                sys.modules[name] = module
+                return module
+
+            def pinned_file(path: Path, _label: str):
+                digest = (
+                    BRIDGE.RUNTIME_VALIDATION_CONTRACT_SHA256
+                    if path.name == "base_long_val_contract.py"
+                    else BRIDGE.RUNTIME_VALIDATION_SELECTOR_SHA256
+                )
+                return path, b"", digest
+
+            try:
+                with (
+                    mock.patch.object(
+                        BRIDGE.importlib,
+                        "import_module",
+                        side_effect=import_runtime,
+                    ),
+                    mock.patch.object(BRIDGE, "_validate_runtime_source"),
+                    mock.patch.object(
+                        BRIDGE, "_safe_file", side_effect=pinned_file
+                    ),
+                ):
+                    loaded = BRIDGE._load_validation_modules(runtime)
+                self.assertEqual(set(loaded), set(module_names))
+                self.assertEqual(sys.path[0], str(runtime))
+                lazy = importlib.import_module("models.lazy_probe")
+                self.assertEqual(lazy.SOURCE, "runtime")
+                self.assertEqual(
+                    Path(lazy.__file__).resolve(strict=True),
+                    models / "lazy_probe.py",
+                )
+                BRIDGE._project_modules_are_from(runtime)
+            finally:
+                sys.path[:] = old_path
+                for name in tuple(sys.modules):
+                    if any(
+                        name == prefix or name.startswith(prefix + ".")
+                        for prefix in prefixes
+                    ):
                         sys.modules.pop(name, None)
                 sys.modules.update(saved)
 

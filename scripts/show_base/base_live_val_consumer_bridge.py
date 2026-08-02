@@ -748,7 +748,9 @@ def _bind_exact_scripts_namespace(source_root: Path) -> None:
 
 def _load_validation_modules(source_root: Path) -> dict[str, ModuleType]:
     _project_modules_are_from(source_root)
-    sys.path.insert(0, str(source_root))
+    root_text = str(source_root)
+    sys.path = [entry for entry in sys.path if entry != root_text]
+    sys.path.insert(0, root_text)
     try:
         _bind_exact_scripts_namespace(source_root)
         modules = {
@@ -801,10 +803,15 @@ def _load_validation_modules(source_root: Path) -> dict[str, ModuleType]:
             raise LiveConsumerError(
                 "runtime validation lacks exact official DiffSHEG provenance"
             )
+        if not sys.path or sys.path[0] != root_text:
+            raise LiveConsumerError(
+                "runtime validation source lost import-path precedence"
+            )
         return modules
-    finally:
-        if sys.path and sys.path[0] == str(source_root):
+    except BaseException:
+        if sys.path and sys.path[0] == root_text:
             sys.path.pop(0)
+        raise
 
 
 def _validate_work_authority(
