@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
@@ -12,6 +13,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+
+from scripts.show_base import base_live_val_consumer_bridge as bridge
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/show_base/supervise_base_v14_live_validation.py"
@@ -142,6 +145,90 @@ class ContractTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.fx.close()
+
+    def test_recovery_request_uses_bridge_payload_hash_abi(self) -> None:
+        artifact = {
+            "path": "/tmp/恢复验证/artifact.json",
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        payload = {
+            "format": sup.RECOVERY_REQUEST_FORMAT,
+            "status": "ready_for_single_recovery",
+            "candidate_epoch": 1,
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": False,
+            "failed_campaign": artifact,
+            "failed_job_claim": artifact,
+            "failed_active_claim": artifact,
+            "failed_authorization": artifact,
+            "failed_work_authority": artifact,
+            "failed_consumer_claim": artifact,
+            "failed_runner_status": artifact,
+            "failed_runner_log": artifact,
+            "failed_run_root": "/tmp/恢复验证/failed-run",
+            "failed_run_inventory": {
+                "semantic_outputs": [],
+                "marker": "导入来源错误",
+            },
+            "failed_process_proof": {
+                "wrapper_proc_state": "absent",
+                "child_proc_state": "absent",
+            },
+            "guard_proof": {"stdout": "PASS 恢复验证\n"},
+            "new_campaign": artifact,
+            "new_control_source": {"root": "/tmp/恢复验证/control"},
+            "new_work_authority": artifact,
+            "new_run_root": "/tmp/恢复验证/new-run",
+            "created_unix": 1.0,
+        }
+        self.assertEqual(
+            set(payload) | {"receipt_payload_sha256"},
+            sup.RECOVERY_REQUEST_KEYS,
+        )
+        value = sup._add_bridge_self_hash(payload, "receipt_payload_sha256")
+        self.assertEqual(
+            value["receipt_payload_sha256"], bridge._payload_sha(value)
+        )
+        self.assertNotEqual(
+            value["receipt_payload_sha256"],
+            bridge._supervisor_payload_sha(
+                value, "receipt_payload_sha256"
+            ),
+        )
+        with self.assertRaisesRegex(
+            sup.SupervisorError, "bridge self-hash field already present"
+        ):
+            sup._add_bridge_self_hash(value, "receipt_payload_sha256")
+
+        tree = ast.parse(Path(sup.__file__).read_text(encoding="utf-8"))
+        request_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_recovery_request_value"
+        )
+        bridge_hash_calls = [
+            node
+            for node in ast.walk(request_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_add_bridge_self_hash"
+        ]
+        self.assertEqual(len(bridge_hash_calls), 1)
+        call = bridge_hash_calls[0]
+        self.assertGreaterEqual(len(call.args), 2)
+        self.assertIsInstance(call.args[1], ast.Constant)
+        self.assertEqual(call.args[1].value, "receipt_payload_sha256")
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_add_self_hash"
+                for node in ast.walk(request_function)
+            )
+        )
 
     def test_exact_candidate_queue(self) -> None:
         self.assertEqual(sup.CANDIDATE_EPOCHS, (1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80, 100, 120, 140, 160, 180, 200, 240, 280, 320, 360, 400))

@@ -468,6 +468,29 @@ def _payload_sha(value: Mapping[str, Any], key: str = "receipt_payload_sha256") 
     return hashlib.sha256(_canonical_json(body)).hexdigest()
 
 
+def _supervisor_payload_sha(value: Mapping[str, Any], key: str) -> str:
+    """Reproduce the V14 supervisor's distinct self-hash ABI exactly."""
+
+    body = dict(value)
+    body.pop(key, None)
+    try:
+        encoded = (
+            json.dumps(
+                body,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise LiveConsumerError(
+            "value is not strict supervisor canonical JSON"
+        ) from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _with_payload_sha(value: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(value)
     result["receipt_payload_sha256"] = _payload_sha(result)
@@ -697,12 +720,18 @@ def _self_hashed_document(
     keys: frozenset[str],
     payload_key: str,
     label: str,
+    supervisor_payload_abi: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     artifact, raw = _core_artifact(artifact_value, label)
     value = _strict_json_bytes(raw, label)
     _exact_keys(value, keys, label)
     claimed = _sha(value.get(payload_key), f"{label} payload SHA")
-    if _payload_sha(value, payload_key) != claimed:
+    observed = (
+        _supervisor_payload_sha(value, payload_key)
+        if supervisor_payload_abi
+        else _payload_sha(value, payload_key)
+    )
+    if observed != claimed:
         raise LiveConsumerError(f"{label} payload SHA mismatch")
     return artifact, value
 
@@ -1869,6 +1898,7 @@ def _campaign_document(
         keys=FAILED_CAMPAIGN_KEYS,
         payload_key="campaign_payload_sha256",
         label=label,
+        supervisor_payload_abi=True,
     )
     if (
         value["format"]
@@ -2119,6 +2149,7 @@ def _validate_recovery_request(
         keys=FAILED_JOB_CLAIM_KEYS,
         payload_key="claim_payload_sha256",
         label="failed job claim",
+        supervisor_payload_abi=True,
     )
     _require_failed_incident_artifact(failed_job_artifact, "job_claim")
     failed_state = _canonical_path(
@@ -2149,6 +2180,7 @@ def _validate_recovery_request(
         keys=FAILED_ACTIVE_CLAIM_KEYS,
         payload_key="claim_payload_sha256",
         label="failed active claim",
+        supervisor_payload_abi=True,
     )
     _require_failed_incident_artifact(failed_active_artifact, "active_claim")
     if (
@@ -2168,6 +2200,7 @@ def _validate_recovery_request(
         keys=FAILED_AUTHORIZATION_KEYS,
         payload_key="receipt_payload_sha256",
         label="failed authorization",
+        supervisor_payload_abi=True,
     )
     _require_failed_incident_artifact(
         failed_authorization_artifact, "authorization"

@@ -495,6 +495,17 @@ def _bridge_payload_sha(value: Mapping[str, Any]) -> str:
     return _sha256(raw)
 
 
+def _add_bridge_self_hash(
+    payload: Mapping[str, Any], field: str,
+) -> Dict[str, Any]:
+    """Publish a document using the bridge's no-newline payload ABI."""
+
+    result = dict(payload)
+    require(field not in result, "bridge self-hash field already present")
+    result[field] = _bridge_payload_sha(result)
+    return result
+
+
 def _plain_artifact(value: Any, label: str, *, executable: bool = False) -> Dict[str, Any]:
     artifact = _artifact(value, label)
     if executable:
@@ -1885,7 +1896,7 @@ def _recovery_request_value(
         "failed incident changed during recovery admission",
     )
     process_proof = _failed_process_proof(status_2, clock())
-    request_value = _add_self_hash({
+    request_value = _add_bridge_self_hash({
         "format": RECOVERY_REQUEST_FORMAT,
         "status": "ready_for_single_recovery",
         "split": "val", "test_visible": False,

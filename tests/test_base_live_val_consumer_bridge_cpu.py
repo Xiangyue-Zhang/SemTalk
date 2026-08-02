@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import argparse
+import ast
 import copy
 import hashlib
 import importlib
@@ -15,6 +16,7 @@ import unittest
 from unittest import mock
 
 from scripts.show_base import base_live_val_consumer_bridge as BRIDGE
+from scripts.show_base import supervise_base_v14_live_validation as SUPERVISOR
 
 
 class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
@@ -907,6 +909,115 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                         {"path": "/pinned", "sha256": digest, "bytes": size + 1},
                         role,
                     )
+
+    def test_supervisor_self_hash_abi_cross_module_with_non_ascii(self) -> None:
+        unsigned = {
+            "format": "supervisor-abi-probe",
+            "candidate_epoch": 1,
+            "note": "恢复验证",
+            "nested": {"accent": "é", "exact": True},
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="live-supervisor-abi-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            for payload_key in (
+                "campaign_payload_sha256",
+                "claim_payload_sha256",
+                "receipt_payload_sha256",
+            ):
+                with self.subTest(payload_key=payload_key):
+                    value = SUPERVISOR._add_self_hash(unsigned, payload_key)
+                    self.assertEqual(
+                        value[payload_key],
+                        BRIDGE._supervisor_payload_sha(value, payload_key),
+                    )
+                    self.assertNotEqual(
+                        value[payload_key],
+                        BRIDGE._payload_sha(value, payload_key),
+                    )
+                    payload = SUPERVISOR.canonical_json_bytes(value)
+                    path = root / (payload_key + ".json")
+                    path.write_bytes(payload)
+                    artifact = {
+                        "path": str(path),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "bytes": len(payload),
+                    }
+                    observed_artifact, observed_value = (
+                        BRIDGE._self_hashed_document(
+                            artifact,
+                            keys=frozenset(value),
+                            payload_key=payload_key,
+                            label="supervisor ABI probe",
+                            supervisor_payload_abi=True,
+                        )
+                    )
+                    self.assertEqual(observed_artifact, artifact)
+                    self.assertEqual(observed_value, value)
+                    with self.assertRaisesRegex(
+                        BRIDGE.LiveConsumerError, "payload SHA mismatch"
+                    ):
+                        BRIDGE._self_hashed_document(
+                            artifact,
+                            keys=frozenset(value),
+                            payload_key=payload_key,
+                            label="bridge-native ABI negative probe",
+                        )
+
+        native = BRIDGE._with_payload_sha(unsigned)
+        self.assertEqual(
+            native["receipt_payload_sha256"], BRIDGE._payload_sha(native)
+        )
+        self.assertNotEqual(
+            native["receipt_payload_sha256"],
+            BRIDGE._supervisor_payload_sha(
+                native, "receipt_payload_sha256"
+            ),
+        )
+
+    def test_recovery_supervisor_abi_is_bound_at_every_production_callsite(
+        self,
+    ) -> None:
+        tree = ast.parse(Path(BRIDGE.__file__).read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        expected_counts = {
+            "_campaign_document": 1,
+            "_validate_recovery_request": 3,
+        }
+        observed = {}
+        for function_name, expected_count in expected_counts.items():
+            function = functions[function_name]
+            calls = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_self_hashed_document"
+            ]
+            observed[function_name] = len(calls)
+            self.assertEqual(len(calls), expected_count)
+            for call in calls:
+                keywords = {item.arg: item.value for item in call.keywords}
+                self.assertIn("supervisor_payload_abi", keywords)
+                value = keywords["supervisor_payload_abi"]
+                self.assertIsInstance(value, ast.Constant)
+                self.assertIs(value.value, True)
+        self.assertEqual(observed, expected_counts)
+
+        every_production_call = [
+            node
+            for function in functions.values()
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_self_hashed_document"
+        ]
+        self.assertEqual(len(every_production_call), 4)
 
     def test_direct_recovery_request_rejects_rehashed_fake_incident(self) -> None:
         with tempfile.TemporaryDirectory(
