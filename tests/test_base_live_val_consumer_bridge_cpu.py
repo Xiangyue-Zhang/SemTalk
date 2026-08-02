@@ -1073,6 +1073,73 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                         new_run_must_exist=False,
                     )
 
+    def test_recovery_work_authority_replay_allows_only_publication_metadata(self) -> None:
+        failed_value = BRIDGE._with_payload_sha({
+            "format": BRIDGE.WORK_FORMAT,
+            "candidate_epoch": 1,
+            "execution_contract": {"expected_shards": 8},
+            "published_unix": 1.0,
+        })
+        new_value = BRIDGE._with_payload_sha({
+            **{
+                key: copy.deepcopy(value)
+                for key, value in failed_value.items()
+                if key not in {"published_unix", "receipt_payload_sha256"}
+            },
+            "published_unix": 2.0,
+        })
+        failed_artifact = {
+            "path": "/failed/work.json",
+            "sha256": "a" * 64,
+            "bytes": 101,
+            "receipt_payload_sha256": failed_value["receipt_payload_sha256"],
+        }
+        new_artifact = {
+            "path": "/new/work.json",
+            "sha256": "b" * 64,
+            "bytes": 99,
+            "receipt_payload_sha256": new_value["receipt_payload_sha256"],
+        }
+        request = {
+            "failed_work_authority": BRIDGE._artifact_core(failed_artifact),
+            "new_work_authority": BRIDGE._artifact_core(new_artifact),
+        }
+
+        BRIDGE._validate_recovery_work_authority_replay(
+            request,
+            failed_artifact,
+            failed_value,
+            new_artifact,
+            new_value,
+        )
+
+        tampered = copy.deepcopy(new_value)
+        tampered["candidate_epoch"] = 2
+        tampered["receipt_payload_sha256"] = BRIDGE._payload_sha(tampered)
+        with self.assertRaisesRegex(
+            BRIDGE.LiveConsumerError, "does not semantically replay"
+        ):
+            BRIDGE._validate_recovery_work_authority_replay(
+                request,
+                failed_artifact,
+                failed_value,
+                new_artifact,
+                tampered,
+            )
+
+        mismatched_request = copy.deepcopy(request)
+        mismatched_request["new_work_authority"]["sha256"] = "c" * 64
+        with self.assertRaisesRegex(
+            BRIDGE.LiveConsumerError, "does not semantically replay"
+        ):
+            BRIDGE._validate_recovery_work_authority_replay(
+                mismatched_request,
+                failed_artifact,
+                failed_value,
+                new_artifact,
+                new_value,
+            )
+
     def test_failed_process_proof_is_exact_pid_only_and_read_only(self) -> None:
         status = {
             "wrapper_pid": 900_000_001,

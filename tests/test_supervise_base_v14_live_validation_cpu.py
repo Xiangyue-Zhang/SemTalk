@@ -508,15 +508,54 @@ class ContractTests(unittest.TestCase):
             self.fx.train / "live_val_consumer_claims/epoch-0001.json",
             {"occupied": True},
         )
-        authority_raw = sup.canonical_json_bytes({"candidate_epoch": 1})
+        preview_raw = sup.canonical_json_bytes({
+            "candidate_epoch": 1,
+            "published_unix": 1.0,
+            "receipt_payload_sha256": "a" * 64,
+        })
         authority_preview = {
+            "path": job["authority_path"],
+            "sha256": hashlib.sha256(preview_raw).hexdigest(),
+            "bytes": len(preview_raw),
+        }
+        authority_raw = sup.canonical_json_bytes({
+            "candidate_epoch": 1,
+            "published_unix": 2.0,
+            "receipt_payload_sha256": "b" * 64,
+        })
+        actual_authority = {
             "path": job["authority_path"],
             "sha256": hashlib.sha256(authority_raw).hexdigest(),
             "bytes": len(authority_raw),
         }
         request_value = {
-            "admission": "passed", "new_work_authority": authority_preview,
+            "format": sup.RECOVERY_REQUEST_FORMAT,
+            "status": "ready_for_single_recovery",
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": False,
+            "candidate_epoch": 1,
+            "failed_campaign": {"path": "/failed/campaign", "sha256": "1" * 64, "bytes": 1},
+            "failed_job_claim": {"path": "/failed/job", "sha256": "2" * 64, "bytes": 2},
+            "failed_active_claim": {"path": "/failed/active", "sha256": "3" * 64, "bytes": 3},
+            "failed_authorization": {"path": "/failed/auth", "sha256": "4" * 64, "bytes": 4},
+            "failed_work_authority": {"path": "/failed/work", "sha256": "5" * 64, "bytes": 5},
+            "failed_consumer_claim": {"path": "/failed/consumer", "sha256": "6" * 64, "bytes": 6},
+            "failed_runner_status": {"path": "/failed/status", "sha256": "7" * 64, "bytes": 7},
+            "failed_runner_log": {"path": "/failed/log", "sha256": "8" * 64, "bytes": 8},
+            "failed_run_root": "/failed/run",
+            "failed_run_inventory": {},
+            "failed_process_proof": {},
+            "guard_proof": {},
+            "new_campaign": {"path": "/new/campaign", "sha256": "9" * 64, "bytes": 9},
+            "new_control_source": {},
+            "new_work_authority": authority_preview,
+            "new_run_root": job["run_root"],
+            "created_unix": 1.0,
         }
+        request_value = sup._add_bridge_self_hash(
+            request_value, "receipt_payload_sha256"
+        )
         recovery_authority_value = {"recovery": "authority"}
         recovery_authority_raw = sup.canonical_json_bytes(
             recovery_authority_value
@@ -537,11 +576,20 @@ class ContractTests(unittest.TestCase):
                 events.append("authorize")
                 Path(job["authority_path"]).write_bytes(authority_raw)
                 stdout = (
-                    json.dumps(authority_preview, sort_keys=True) + "\n"
+                    json.dumps(actual_authority, sort_keys=True) + "\n"
                 ).encode()
                 return 0, stdout, b""
             if "inspect-recovery" in argv:
                 events.append("inspect")
+                request_path = Path(argv[argv.index("--request") + 1])
+                rebound_request = json.loads(request_path.read_text())
+                self.assertEqual(
+                    rebound_request["new_work_authority"], actual_authority
+                )
+                self.assertEqual(
+                    rebound_request["receipt_payload_sha256"],
+                    sup._bridge_payload_sha(rebound_request),
+                )
                 value = {
                     "status": "ready",
                     "recovery_authority": recovery_authority_preview,
@@ -681,8 +729,14 @@ class ContractTests(unittest.TestCase):
             "bytes": len(authority_raw),
         }
         request_value = {
-            "admission": "passed", "new_work_authority": authority_preview,
+            key: None
+            for key in sup.RECOVERY_REQUEST_KEYS
+            if key != "receipt_payload_sha256"
         }
+        request_value["new_work_authority"] = authority_preview
+        request_value = sup._add_bridge_self_hash(
+            request_value, "receipt_payload_sha256"
+        )
         events = []
 
         def capture(argv):

@@ -2038,6 +2038,36 @@ def _validate_failed_process_proof(
     return dict(proof)
 
 
+def _validate_recovery_work_authority_replay(
+    request: Mapping[str, Any],
+    failed_work_artifact: Mapping[str, Any],
+    failed_work: Mapping[str, Any],
+    new_work_artifact: Mapping[str, Any],
+    new_work: Mapping[str, Any],
+) -> None:
+    """Bind distinct publications to one exact work-authority semantics."""
+
+    failed_work_semantics = dict(failed_work)
+    new_work_semantics = dict(new_work)
+    for projection in (failed_work_semantics, new_work_semantics):
+        projection.pop("published_unix", None)
+        projection.pop("receipt_payload_sha256", None)
+    if (
+        not _strict_equal(
+            _artifact_core(failed_work_artifact),
+            request["failed_work_authority"],
+        )
+        or not _strict_equal(
+            _artifact_core(new_work_artifact),
+            request["new_work_authority"],
+        )
+        or not _strict_equal(failed_work_semantics, new_work_semantics)
+    ):
+        raise LiveConsumerError(
+            "new work authority does not semantically replay failed work"
+        )
+
+
 def _validate_recovery_request(
     request_path: Path,
     expected_sha: str,
@@ -2096,21 +2126,13 @@ def _validate_recovery_request(
         request["new_work_authority"]["sha256"],
         load_modules=False,
     )
-    failed_work_semantics = dict(failed_work)
-    new_work_semantics = dict(new_work)
-    for projection in (failed_work_semantics, new_work_semantics):
-        projection.pop("published_unix", None)
-        projection.pop("receipt_payload_sha256", None)
-    if (
-        not _strict_equal(_artifact_core(failed_work_artifact), request["failed_work_authority"])
-        or not _strict_equal(_artifact_core(new_work_artifact), request["new_work_authority"])
-        or not _strict_equal(failed_work_semantics, new_work_semantics)
-        or failed_work_artifact["sha256"] != new_work_artifact["sha256"]
-        or failed_work_artifact["bytes"] != new_work_artifact["bytes"]
-    ):
-        raise LiveConsumerError(
-            "new work authority does not semantically replay failed work"
-        )
+    _validate_recovery_work_authority_replay(
+        request,
+        failed_work_artifact,
+        failed_work,
+        new_work_artifact,
+        new_work,
+    )
     _require_failed_incident_artifact(
         _artifact_core(failed_work_artifact), "work_authority"
     )

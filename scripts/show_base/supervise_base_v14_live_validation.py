@@ -1931,6 +1931,53 @@ def _recovery_request_value(
     return request_value, new_authority
 
 
+def _bind_actual_recovery_work_authority(
+    request_value: Mapping[str, Any],
+    preview_authority: Mapping[str, Any],
+    actual_authority: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Replace the read-only path preview with the newly published artifact.
+
+    A work authority intentionally records its publication time, so a fresh
+    authority cannot be byte-identical to the failed incident's authority.
+    The bridge performs the authoritative semantic-replay comparison before
+    reserving the global recovery slot.  Here we permit only the artifact
+    SHA/size to change at the already-pinned new path and then recompute the
+    request's bridge-ABI self hash.
+    """
+
+    require(
+        isinstance(request_value, dict)
+        and set(request_value) == RECOVERY_REQUEST_KEYS
+        and request_value.get("receipt_payload_sha256")
+        == _bridge_payload_sha(request_value)
+        and strict_json_equal(
+            request_value.get("new_work_authority"), preview_authority
+        ),
+        "recovery request work-authority preview changed before publication",
+    )
+    require(
+        set(preview_authority) == ARTIFACT_KEYS
+        and set(actual_authority) == ARTIFACT_KEYS
+        and preview_authority["path"] == actual_authority["path"],
+        "new work authority publication path changed",
+    )
+    body = dict(request_value)
+    body.pop("receipt_payload_sha256", None)
+    body["new_work_authority"] = dict(actual_authority)
+    rebound = _add_bridge_self_hash(body, "receipt_payload_sha256")
+    require(
+        set(rebound) == set(request_value)
+        and all(
+            strict_json_equal(rebound[key], request_value[key])
+            for key in request_value
+            if key not in {"new_work_authority", "receipt_payload_sha256"}
+        ),
+        "recovery request changed beyond the published work authority",
+    )
+    return rebound
+
+
 def _campaign_claim_v2(campaign: Mapping[str, Any], clock: Callable[[], float]) -> Dict[str, Any]:
     path = Path(campaign["campaign_claim_path"])
     if not os.path.lexists(path):
@@ -2429,8 +2476,8 @@ def recover_e1(
         head["authority_path"], "recovery queue-head work authority"
     )
     require(
-        strict_json_equal(authority, authority_preview),
-        "new work authority is not byte-identical to the read-only recovery preview",
+        authority["path"] == authority_preview["path"],
+        "new work authority publication path changed",
     )
     adapter_stdout_sha = _adapter_stdout_artifact(
         authorize_stdout, authority, "recovery authority adapter authorize"
@@ -2444,6 +2491,9 @@ def recover_e1(
             _candidate_receipt_artifact(head), candidate_receipt
         ),
         "candidate-ready receipt changed during recovery authorization",
+    )
+    request_value = _bind_actual_recovery_work_authority(
+        request_value, authority_preview, authority
     )
     dynamic = dict(head)
     dynamic.update({
