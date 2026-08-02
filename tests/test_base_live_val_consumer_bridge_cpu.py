@@ -18,6 +18,145 @@ from scripts.show_base import base_live_val_consumer_bridge as BRIDGE
 
 
 class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
+    @staticmethod
+    def _git_blob_sha1(payload: bytes) -> str:
+        header = f"blob {len(payload)}\0".encode("ascii")
+        return hashlib.sha1(header + payload).hexdigest()
+
+    @classmethod
+    def _runtime_projection_fixture(cls, root: Path):
+        evidence_root = root / "evidence"
+        runtime_root = root / "runtime"
+        repository = Path(BRIDGE.__file__).resolve().parents[2]
+        evidence_files = {}
+        runtime_files = {}
+        for relative in BRIDGE.RUNTIME_EXECUTION_SOURCE_FILES:
+            evidence_payload = subprocess.run(
+                [
+                    "git", "-C", str(repository), "show",
+                    f"{BRIDGE.VALIDATION_EVIDENCE_SOURCE_COMMIT}:{relative}",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            runtime_payload = subprocess.run(
+                [
+                    "git", "-C", str(repository), "show",
+                    f"{BRIDGE.RUNTIME_VALIDATION_SOURCE_COMMIT}:{relative}",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            if relative in BRIDGE.RUNTIME_EXECUTION_CHANGED_FILES:
+                expected_pair = BRIDGE.RUNTIME_EXECUTION_CHANGED_SHA256[relative]
+                if (
+                    hashlib.sha256(evidence_payload).hexdigest(),
+                    hashlib.sha256(runtime_payload).hexdigest(),
+                ) != expected_pair:
+                    raise AssertionError(f"changed proof pair drifted: {relative}")
+            elif evidence_payload != runtime_payload:
+                raise AssertionError(f"unchanged fixture bytes drifted: {relative}")
+            evidence_path = evidence_root / relative
+            runtime_path = runtime_root / relative
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_bytes(evidence_payload)
+            runtime_path.write_bytes(runtime_payload)
+            evidence_files[relative] = {
+                "path": str(evidence_path),
+                "sha256": hashlib.sha256(evidence_payload).hexdigest(),
+                "bytes": len(evidence_payload),
+                "git_mode": "100644",
+                "git_blob_sha1": cls._git_blob_sha1(evidence_payload),
+            }
+            runtime_files[relative] = {
+                "path": str(runtime_path),
+                "sha256": hashlib.sha256(runtime_payload).hexdigest(),
+                "bytes": len(runtime_payload),
+                "git_mode": "100644",
+                "git_blob_sha1": cls._git_blob_sha1(runtime_payload),
+            }
+
+        evidence_source = {
+            "origin": BRIDGE.EXPECTED_ORIGIN,
+            "source_root": str(evidence_root),
+            "commit": BRIDGE.VALIDATION_EVIDENCE_SOURCE_COMMIT,
+            "tree": BRIDGE.VALIDATION_EVIDENCE_SOURCE_TREE,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+        }
+        runtime_source = {
+            "origin": BRIDGE.EXPECTED_ORIGIN,
+            "source_root": str(runtime_root),
+            "commit": BRIDGE.RUNTIME_VALIDATION_SOURCE_COMMIT,
+            "tree": BRIDGE.RUNTIME_VALIDATION_SOURCE_TREE,
+            "clean": True,
+            "detached": True,
+            "local_branches_at_commit": [],
+        }
+        evidence_pipeline = {
+            "format": "projection-fixture",
+            "source": evidence_source,
+            "source_closure": evidence_files,
+            "inference_entrypoint": evidence_files[
+                "scripts/show_base/run_base_val_inference.py"
+            ],
+            "inference_helper": evidence_files[
+                "scripts/show_base/semtalk_base_inference_core.py"
+            ],
+        }
+        evidence_pipeline["receipt_payload_sha256"] = BRIDGE._payload_sha(
+            evidence_pipeline
+        )
+        pipeline_reference = {
+            "path": str(root / "pipeline.json"),
+            "sha256": "a" * 64,
+            "receipt_payload_sha256": evidence_pipeline[
+                "receipt_payload_sha256"
+            ],
+        }
+        runtime_receipt = {**runtime_source, "files": runtime_files}
+        authority = {
+            "validation_evidence_source": evidence_source,
+            "runtime_validation_source": runtime_source,
+            "runtime_validation_proof": (
+                BRIDGE._expected_runtime_validation_proof()
+            ),
+            "pipeline_receipt": pipeline_reference,
+        }
+        contract = SimpleNamespace(
+            validate_pipeline=lambda *_args, **_kwargs: (
+                pipeline_reference,
+                evidence_pipeline,
+            )
+        )
+
+        def modules_for(receipt):
+            def build(observed_root: Path):
+                if observed_root != runtime_root:
+                    raise AssertionError("runtime builder received another root")
+                return copy.deepcopy(receipt)
+
+            return {
+                "contract": contract,
+                "legacy": SimpleNamespace(
+                    DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES=(
+                        BRIDGE.RUNTIME_EXECUTION_SOURCE_FILES
+                    ),
+                    build_fresh_pipeline_source_receipt=build,
+                ),
+            }
+
+        return {
+            "evidence_root": evidence_root,
+            "runtime_root": runtime_root,
+            "evidence_pipeline": evidence_pipeline,
+            "runtime_receipt": runtime_receipt,
+            "authority": authority,
+            "modules_for": modules_for,
+        }
+
     def test_scripts_namespace_is_single_root_and_rejects_preload(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="live-scripts-namespace-", dir="/private/tmp"
@@ -25,10 +164,14 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             root = Path(raw).resolve()
             scripts_root = root / "scripts"
             scripts_root.mkdir()
+            prefixes = ("scripts", "models", "dataloaders", "utils")
             project_names = [
                 name
                 for name in tuple(sys.modules)
-                if name == "scripts" or name.startswith("scripts.")
+                if any(
+                    name == prefix or name.startswith(prefix + ".")
+                    for prefix in prefixes
+                )
             ]
             saved = {name: sys.modules.pop(name) for name in project_names}
             try:
@@ -55,7 +198,10 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                     BRIDGE._bind_exact_scripts_namespace(root)
             finally:
                 for name in tuple(sys.modules):
-                    if name == "scripts" or name.startswith("scripts."):
+                    if any(
+                        name == prefix or name.startswith(prefix + ".")
+                        for prefix in prefixes
+                    ):
                         sys.modules.pop(name, None)
                 sys.modules.update(saved)
 
@@ -69,10 +215,14 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             site = root / "site"
             for source in (runtime, launch, site):
                 (source / "scripts").mkdir(parents=True)
+            prefixes = ("scripts", "models", "dataloaders", "utils")
             project_names = [
                 name
                 for name in tuple(sys.modules)
-                if name == "scripts" or name.startswith("scripts.")
+                if any(
+                    name == prefix or name.startswith(prefix + ".")
+                    for prefix in prefixes
+                )
             ]
             saved = {name: sys.modules.pop(name) for name in project_names}
             old_path = list(sys.path)
@@ -94,7 +244,10 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             finally:
                 sys.path[:] = old_path
                 for name in tuple(sys.modules):
-                    if name == "scripts" or name.startswith("scripts."):
+                    if any(
+                        name == prefix or name.startswith(prefix + ".")
+                        for prefix in prefixes
+                    ):
                         sys.modules.pop(name, None)
                 sys.modules.update(saved)
 
@@ -246,6 +399,241 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                     ):
                         sys.modules.pop(name, None)
                 sys.modules.update(saved)
+
+    def test_full_runtime_projection_is_exact_and_keeps_evidence_immutable(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-runtime-projection-", dir="/private/tmp"
+        ) as raw:
+            fixture = self._runtime_projection_fixture(Path(raw).resolve())
+            before = copy.deepcopy(fixture["evidence_pipeline"])
+            with mock.patch.object(
+                BRIDGE,
+                "_validate_runtime_validation_roles",
+                return_value=(
+                    fixture["evidence_root"], fixture["runtime_root"]
+                ),
+            ):
+                evidence, runtime, runtime_root = (
+                    BRIDGE._runtime_execution_pipeline(
+                        fixture["authority"],
+                        fixture["modules_for"](fixture["runtime_receipt"]),
+                    )
+                )
+            self.assertIs(evidence, fixture["evidence_pipeline"])
+            self.assertEqual(evidence, before)
+            self.assertEqual(fixture["evidence_pipeline"], before)
+            self.assertEqual(runtime_root, fixture["runtime_root"])
+            self.assertEqual(
+                tuple(runtime["source_closure"]),
+                BRIDGE.RUNTIME_EXECUTION_SOURCE_FILES,
+            )
+            self.assertEqual(len(runtime["source_closure"]), 29)
+            self.assertEqual(
+                runtime["source"], fixture["authority"]["runtime_validation_source"]
+            )
+            for relative in BRIDGE.RUNTIME_EXECUTION_SOURCE_FILES:
+                self.assertEqual(
+                    Path(runtime["source_closure"][relative]["path"]),
+                    fixture["runtime_root"] / relative,
+                )
+            self.assertEqual(
+                runtime["inference_entrypoint"],
+                runtime["source_closure"][
+                    "scripts/show_base/run_base_val_inference.py"
+                ],
+            )
+            self.assertEqual(
+                runtime["inference_helper"],
+                runtime["source_closure"][
+                    "scripts/show_base/semtalk_base_inference_core.py"
+                ],
+            )
+            self.assertEqual(
+                runtime["receipt_payload_sha256"], BRIDGE._payload_sha(runtime)
+            )
+
+    def test_runtime_projection_rejects_closure_tamper_before_engine_use(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-runtime-tamper-", dir="/private/tmp"
+        ) as raw:
+            fixture = self._runtime_projection_fixture(Path(raw).resolve())
+            unchanged = next(
+                relative
+                for relative in BRIDGE.RUNTIME_EXECUTION_SOURCE_FILES
+                if relative not in BRIDGE.RUNTIME_EXECUTION_CHANGED_FILES
+            )
+            tampered_receipts = []
+
+            missing = copy.deepcopy(fixture["runtime_receipt"])
+            missing["files"].pop(unchanged)
+            tampered_receipts.append(missing)
+
+            extra = copy.deepcopy(fixture["runtime_receipt"])
+            extra["files"]["models/extra.py"] = copy.deepcopy(
+                extra["files"][unchanged]
+            )
+            tampered_receipts.append(extra)
+
+            escaped = copy.deepcopy(fixture["runtime_receipt"])
+            escaped["files"][unchanged]["path"] = str(
+                fixture["runtime_root"].parent / "escaped.py"
+            )
+            tampered_receipts.append(escaped)
+
+            third_delta = copy.deepcopy(fixture["runtime_receipt"])
+            third_delta["files"][unchanged]["sha256"] = "f" * 64
+            third_delta["files"][unchanged]["git_blob_sha1"] = "e" * 40
+            third_delta["files"][unchanged]["bytes"] += 1
+            tampered_receipts.append(third_delta)
+
+            changed_pair = copy.deepcopy(fixture["runtime_receipt"])
+            changed_relative = next(iter(BRIDGE.RUNTIME_EXECUTION_CHANGED_FILES))
+            changed_pair["files"][changed_relative]["sha256"] = "f" * 64
+            tampered_receipts.append(changed_pair)
+
+            with mock.patch.object(
+                BRIDGE,
+                "_validate_runtime_validation_roles",
+                return_value=(
+                    fixture["evidence_root"], fixture["runtime_root"]
+                ),
+            ):
+                for index, receipt in enumerate(tampered_receipts):
+                    with self.subTest(index=index):
+                        with self.assertRaises(BRIDGE.LiveConsumerError):
+                            BRIDGE._runtime_execution_pipeline(
+                                fixture["authority"],
+                                fixture["modules_for"](receipt),
+                            )
+
+    def test_engine_projection_fixes_same_bytes_different_root_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-runtime-adapter-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            relative = "models/semtalk.py"
+            evidence_file = root / "evidence" / relative
+            runtime_file = root / "runtime" / relative
+            evidence_file.parent.mkdir(parents=True)
+            runtime_file.parent.mkdir(parents=True)
+            payload = b"SOURCE = 'same tracked bytes'\n"
+            evidence_file.write_bytes(payload)
+            runtime_file.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            evidence_pipeline = {
+                "source_closure": {
+                    relative: {
+                        "path": str(evidence_file),
+                        "sha256": digest,
+                        "bytes": len(payload),
+                    }
+                }
+            }
+            runtime_pipeline = copy.deepcopy(evidence_pipeline)
+            runtime_pipeline["source_closure"][relative]["path"] = str(
+                runtime_file
+            )
+            evidence_before = copy.deepcopy(evidence_pipeline)
+            runtime_before = copy.deepcopy(runtime_pipeline)
+            runtime_module = ModuleType("models.semtalk")
+            runtime_module.__file__ = str(runtime_file)
+            observed = []
+
+            def original_helper(pipeline):
+                entry = pipeline["source_closure"][relative]
+                module_path = Path(runtime_module.__file__).resolve(strict=True)
+                snapshot = module_path.read_bytes()
+                if hashlib.sha256(snapshot).hexdigest() != entry["sha256"]:
+                    raise RuntimeError("byte mismatch")
+                if module_path != Path(entry["path"]):
+                    raise RuntimeError("was imported from another checkout")
+                observed.append(("helper", entry["path"]))
+                pipeline["consumer_mutation"] = True
+                return runtime_module
+
+            def original_joint(helper, pipeline):
+                del helper
+                self.assertNotIn("consumer_mutation", pipeline)
+                observed.append(
+                    ("joint", pipeline["source_closure"][relative]["path"])
+                )
+                return {}, {}
+
+            def original_models(
+                helper, *, epoch, preflight, pipeline, device
+            ):
+                del helper, epoch, preflight, device
+                self.assertNotIn("consumer_mutation", pipeline)
+                observed.append(
+                    ("models", pipeline["source_closure"][relative]["path"])
+                )
+                return {}, {}
+
+            engine = ModuleType("runtime_engine")
+            engine._preflight_artifact = lambda *_args: ("old", "preflight")
+            engine._load_pinned_helper = original_helper
+            engine._pinned_joint_mask_arrays = original_joint
+            engine._load_models = original_models
+            originals = {
+                name: getattr(engine, name)
+                for name in (
+                    "_preflight_artifact",
+                    "_load_pinned_helper",
+                    "_pinned_joint_mask_arrays",
+                    "_load_models",
+                )
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "another checkout"):
+                original_helper(copy.deepcopy(evidence_pipeline))
+
+            with BRIDGE._engine_adapter(
+                engine,
+                evidence_pipeline=evidence_pipeline,
+                runtime_pipeline=runtime_pipeline,
+            ):
+                helper = engine._load_pinned_helper(
+                    copy.deepcopy(evidence_pipeline)
+                )
+                engine._pinned_joint_mask_arrays(
+                    helper, copy.deepcopy(evidence_pipeline)
+                )
+                engine._load_models(
+                    helper,
+                    epoch=1,
+                    preflight={},
+                    pipeline=copy.deepcopy(evidence_pipeline),
+                    device="cpu",
+                )
+                tampered = copy.deepcopy(evidence_pipeline)
+                tampered["source_closure"][relative]["path"] = str(runtime_file)
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "immutable evidence"
+                ):
+                    engine._load_pinned_helper(tampered)
+
+            self.assertEqual(evidence_pipeline, evidence_before)
+            self.assertEqual(runtime_pipeline, runtime_before)
+            self.assertEqual(
+                observed,
+                [
+                    ("helper", str(runtime_file)),
+                    ("joint", str(runtime_file)),
+                    ("models", str(runtime_file)),
+                ],
+            )
+            for name, original in originals.items():
+                self.assertIs(getattr(engine, name), original)
+
+            with self.assertRaisesRegex(RuntimeError, "engine failure"):
+                with BRIDGE._engine_adapter(
+                    engine,
+                    evidence_pipeline=evidence_pipeline,
+                    runtime_pipeline=runtime_pipeline,
+                ):
+                    raise RuntimeError("engine failure")
+            for name, original in originals.items():
+                self.assertIs(getattr(engine, name), original)
 
     def test_strict_json_rejects_duplicate_and_nonfinite_tokens(self) -> None:
         with self.assertRaisesRegex(BRIDGE.LiveConsumerError, "duplicate JSON"):

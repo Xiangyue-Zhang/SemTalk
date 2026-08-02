@@ -22,6 +22,7 @@ keeps these roles separate; the bridge itself contains no model implementation.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import hashlib
 import importlib
@@ -88,6 +89,53 @@ CANDIDATE_EPOCHS = (
     1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80,
     100, 120, 140, 160, 180, 200, 240, 280, 320, 360, 400,
 )
+RUNTIME_EXECUTION_SOURCE_FILES = (
+    "scripts/show_base/__init__.py",
+    "scripts/show_base/run_base_val_inference.py",
+    "scripts/show_base/semtalk_base_inference_core.py",
+    "scripts/show_base/evaluate_diffsheg_val_fgd.py",
+    "scripts/show_base/base_long_val_contract.py",
+    "scripts/show_base/select_base_official_adapt.py",
+    "scripts/show_base/build_base_features.py",
+    "scripts/show_base/selected_prerequisites.py",
+    "scripts/show_base/prerequisite_val_contract.py",
+    "scripts/show_base/merge_prerequisite_val_shards.py",
+    "scripts/show_base/gate_task_space_on_show_v2.py",
+    "scripts/show_base/gate_released_all_speakers_on_show.py",
+    "utils/show_base_joints.py",
+    "utils/rotation_conversions.py",
+    "utils/__init__.py",
+    "dataloaders/__init__.py",
+    "dataloaders/data_tools.py",
+    "models/__init__.py",
+    "models/semtalk.py",
+    "models/motion_encoder.py",
+    "models/motion_representation.py",
+    "models/rvq.py",
+    "models/encdec.py",
+    "models/residual_vq.py",
+    "models/quantizer.py",
+    "models/resnet.py",
+    "models/utils/__init__.py",
+    "models/utils/layer.py",
+    "models/utils/skeleton.py",
+)
+RUNTIME_EXECUTION_CHANGED_FILES = frozenset(
+    {
+        "scripts/show_base/base_long_val_contract.py",
+        "scripts/show_base/select_base_official_adapt.py",
+    }
+)
+RUNTIME_EXECUTION_CHANGED_SHA256 = {
+    "scripts/show_base/base_long_val_contract.py": (
+        VALIDATION_EVIDENCE_CONTRACT_SHA256,
+        RUNTIME_VALIDATION_CONTRACT_SHA256,
+    ),
+    "scripts/show_base/select_base_official_adapt.py": (
+        VALIDATION_EVIDENCE_SELECTOR_SHA256,
+        RUNTIME_VALIDATION_SELECTOR_SHA256,
+    ),
+}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_OID_RE = re.compile(r"[0-9a-f]{40}")
 FORBIDDEN_SOURCE_RE = re.compile(
@@ -136,6 +184,10 @@ SOURCE_KEYS = frozenset(
         "origin", "source_root", "commit", "tree", "clean", "detached",
         "local_branches_at_commit",
     }
+)
+SOURCE_RECEIPT_KEYS = SOURCE_KEYS | frozenset({"files"})
+SOURCE_FILE_KEYS = frozenset(
+    {"path", "sha256", "bytes", "git_mode", "git_blob_sha1"}
 )
 COVERAGE_KEYS = frozenset(
     {
@@ -663,6 +715,205 @@ def _validate_runtime_validation_roles(authority: Mapping[str, Any]) -> tuple[Pa
             "runtime validation no longer descends from evidence source"
         )
     return evidence_root, runtime_root
+
+
+def _runtime_execution_pipeline(
+    authority: Mapping[str, Any],
+    modules: Mapping[str, ModuleType],
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    """Project validated evidence paths onto the pinned runtime checkout.
+
+    The immutable pipeline receipt is intentionally authored by, and
+    revalidated against, the 4066 evidence source.  Runtime imports are
+    intentionally bound to its 70a provenance-fix successor.  Passing the
+    evidence receipt's absolute paths to the 70a engine therefore creates a
+    false mixed-checkout failure even when an unchanged tracked file has the
+    same bytes.  Build a non-persisted execution view only after replaying the
+    complete tracked source closure in both roots.
+    """
+
+    evidence_root, runtime_root = _validate_runtime_validation_roles(authority)
+    contract = modules.get("contract")
+    legacy = modules.get("legacy")
+    validate_pipeline = getattr(contract, "validate_pipeline", None)
+    build_runtime_source = getattr(
+        legacy, "build_fresh_pipeline_source_receipt", None
+    )
+    runtime_source_files = getattr(
+        legacy, "DIFFSHEG_PRIMARY_PIPELINE_SOURCE_FILES", None
+    )
+    if (
+        not callable(validate_pipeline)
+        or not callable(build_runtime_source)
+        or tuple(runtime_source_files or ()) != RUNTIME_EXECUTION_SOURCE_FILES
+    ):
+        raise LiveConsumerError(
+            "runtime validation source-closure implementation changed"
+        )
+
+    pipeline_reference = authority["pipeline_receipt"]
+    try:
+        pipeline_artifact, evidence_pipeline = validate_pipeline(
+            Path(pipeline_reference["path"]),
+            pipeline_reference["sha256"],
+            expected_source=authority["validation_evidence_source"],
+        )
+    except Exception as error:
+        raise LiveConsumerError(
+            "cannot replay the immutable evidence validation pipeline"
+        ) from error
+    if (
+        not isinstance(evidence_pipeline, dict)
+        or not _strict_equal(pipeline_artifact, pipeline_reference)
+        or not _strict_equal(
+            evidence_pipeline.get("source"),
+            authority["validation_evidence_source"],
+        )
+    ):
+        raise LiveConsumerError(
+            "immutable evidence validation pipeline changed during replay"
+        )
+    evidence_snapshot = copy.deepcopy(evidence_pipeline)
+    evidence_source = _exact_keys(
+        evidence_pipeline.get("source"),
+        SOURCE_KEYS,
+        "evidence pipeline source",
+    )
+    evidence_files = evidence_pipeline.get("source_closure")
+    if (
+        not isinstance(evidence_files, dict)
+        or set(evidence_files) != set(RUNTIME_EXECUTION_SOURCE_FILES)
+    ):
+        raise LiveConsumerError(
+            "evidence pipeline source closure is not the exact pinned 29 files"
+        )
+    if evidence_source["source_root"] != str(evidence_root):
+        raise LiveConsumerError("evidence pipeline source root changed")
+
+    try:
+        runtime_source_receipt = build_runtime_source(runtime_root)
+    except Exception as error:
+        raise LiveConsumerError(
+            "cannot build the pinned runtime source closure"
+        ) from error
+    runtime_source_receipt = _exact_keys(
+        runtime_source_receipt,
+        SOURCE_RECEIPT_KEYS,
+        "runtime execution source receipt",
+    )
+    runtime_source = {
+        key: runtime_source_receipt[key] for key in SOURCE_KEYS
+    }
+    if not _strict_equal(runtime_source, authority["runtime_validation_source"]):
+        raise LiveConsumerError(
+            "runtime execution source differs from its clean pinned authority"
+        )
+    runtime_files = runtime_source_receipt["files"]
+    if (
+        not isinstance(runtime_files, dict)
+        or set(runtime_files) != set(RUNTIME_EXECUTION_SOURCE_FILES)
+    ):
+        raise LiveConsumerError(
+            "runtime execution source closure is not the exact pinned 29 files"
+        )
+
+    metadata_differences: set[str] = set()
+    for relative in RUNTIME_EXECUTION_SOURCE_FILES:
+        evidence_entry = _exact_keys(
+            evidence_files[relative],
+            SOURCE_FILE_KEYS,
+            f"evidence source closure {relative}",
+        )
+        runtime_entry = _exact_keys(
+            runtime_files[relative],
+            SOURCE_FILE_KEYS,
+            f"runtime source closure {relative}",
+        )
+        if (
+            Path(str(evidence_entry["path"])) != evidence_root / relative
+            or Path(str(runtime_entry["path"])) != runtime_root / relative
+        ):
+            raise LiveConsumerError(
+                f"source closure path projection escaped its checkout: {relative}"
+            )
+        for label, entry in (
+            ("evidence", evidence_entry),
+            ("runtime", runtime_entry),
+        ):
+            _sha(entry["sha256"], f"{label} source closure {relative} SHA")
+            _integer(
+                entry["bytes"],
+                f"{label} source closure {relative} bytes",
+                minimum=0,
+            )
+            if entry["git_mode"] not in {"100644", "100755"}:
+                raise LiveConsumerError(
+                    f"{label} source closure {relative} Git mode changed"
+                )
+            _oid(
+                entry["git_blob_sha1"],
+                f"{label} source closure {relative} Git blob",
+            )
+        evidence_metadata = {
+            key: evidence_entry[key] for key in SOURCE_FILE_KEYS if key != "path"
+        }
+        runtime_metadata = {
+            key: runtime_entry[key] for key in SOURCE_FILE_KEYS if key != "path"
+        }
+        if not _strict_equal(evidence_metadata, runtime_metadata):
+            metadata_differences.add(relative)
+        if relative in RUNTIME_EXECUTION_CHANGED_FILES:
+            expected_evidence_sha, expected_runtime_sha = (
+                RUNTIME_EXECUTION_CHANGED_SHA256[relative]
+            )
+            if (
+                evidence_entry["sha256"] != expected_evidence_sha
+                or runtime_entry["sha256"] != expected_runtime_sha
+                or evidence_entry["git_mode"] != runtime_entry["git_mode"]
+            ):
+                raise LiveConsumerError(
+                    f"pinned runtime successor projection changed: {relative}"
+                )
+        elif not _strict_equal(evidence_metadata, runtime_metadata):
+            raise LiveConsumerError(
+                f"unchanged source differs across validation roots: {relative}"
+            )
+    if metadata_differences != set(RUNTIME_EXECUTION_CHANGED_FILES):
+        raise LiveConsumerError(
+            "runtime successor must differ at exactly the two pinned proof files"
+        )
+
+    helper_relative = "scripts/show_base/semtalk_base_inference_core.py"
+    engine_relative = "scripts/show_base/run_base_val_inference.py"
+    if (
+        not _strict_equal(
+            evidence_pipeline.get("inference_helper"),
+            evidence_files[helper_relative],
+        )
+        or not _strict_equal(
+            evidence_pipeline.get("inference_entrypoint"),
+            evidence_files[engine_relative],
+        )
+    ):
+        raise LiveConsumerError(
+            "evidence pipeline entrypoints differ from its source closure"
+        )
+
+    runtime_pipeline = copy.deepcopy(evidence_pipeline)
+    runtime_pipeline["source"] = copy.deepcopy(runtime_source)
+    runtime_pipeline["source_closure"] = copy.deepcopy(runtime_files)
+    runtime_pipeline["inference_helper"] = copy.deepcopy(
+        runtime_files[helper_relative]
+    )
+    runtime_pipeline["inference_entrypoint"] = copy.deepcopy(
+        runtime_files[engine_relative]
+    )
+    runtime_pipeline["receipt_payload_sha256"] = _payload_sha(runtime_pipeline)
+    if not _strict_equal(evidence_pipeline, evidence_snapshot):
+        raise LiveConsumerError(
+            "runtime execution projection mutated immutable evidence"
+        )
+    return evidence_pipeline, runtime_pipeline, runtime_root
 
 
 def _validate_execution_contract(value: Any, epoch: int) -> dict[str, Any]:
@@ -1333,13 +1584,70 @@ def _preflight_artifact(path: Path, expected_sha: str) -> tuple[dict[str, Any], 
 
 
 @contextmanager
-def _engine_adapter(engine: ModuleType) -> Iterable[None]:
-    previous = engine._preflight_artifact
-    engine._preflight_artifact = _preflight_artifact
+def _engine_adapter(
+    engine: ModuleType,
+    *,
+    evidence_pipeline: Mapping[str, Any],
+    runtime_pipeline: Mapping[str, Any],
+) -> Iterable[None]:
+    names = (
+        "_preflight_artifact",
+        "_load_pinned_helper",
+        "_pinned_joint_mask_arrays",
+        "_load_models",
+    )
+    previous = {name: getattr(engine, name, None) for name in names}
+    if any(not callable(previous[name]) for name in names):
+        raise LiveConsumerError("runtime validation engine adapter ABI changed")
+    evidence_snapshot = copy.deepcopy(evidence_pipeline)
+
+    def execution_view(pipeline: Mapping[str, Any]) -> dict[str, Any]:
+        if (
+            not _strict_equal(pipeline, evidence_pipeline)
+            or not _strict_equal(evidence_pipeline, evidence_snapshot)
+        ):
+            raise LiveConsumerError(
+                "engine pipeline differs from validated immutable evidence"
+            )
+        return copy.deepcopy(runtime_pipeline)
+
+    def load_pinned_helper(pipeline: Mapping[str, Any]) -> ModuleType:
+        return previous["_load_pinned_helper"](execution_view(pipeline))
+
+    def pinned_joint_mask_arrays(
+        helper: ModuleType,
+        pipeline: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return previous["_pinned_joint_mask_arrays"](
+            helper,
+            execution_view(pipeline),
+        )
+
+    def load_models(
+        helper: ModuleType,
+        *,
+        epoch: int,
+        preflight: Mapping[str, Any],
+        pipeline: Mapping[str, Any],
+        device: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return previous["_load_models"](
+            helper,
+            epoch=epoch,
+            preflight=preflight,
+            pipeline=execution_view(pipeline),
+            device=device,
+        )
+
     try:
+        engine._preflight_artifact = _preflight_artifact
+        engine._load_pinned_helper = load_pinned_helper
+        engine._pinned_joint_mask_arrays = pinned_joint_mask_arrays
+        engine._load_models = load_models
         yield
     finally:
-        engine._preflight_artifact = previous
+        for name in names:
+            setattr(engine, name, previous[name])
 
 
 def _engine_command(args: argparse.Namespace, command: str) -> dict[str, Any]:
@@ -1350,15 +1658,25 @@ def _engine_command(args: argparse.Namespace, command: str) -> dict[str, Any]:
     if args.epoch != epoch or args.num_shards != 8:
         raise LiveConsumerError("engine command differs from one-candidate eight-shard work")
     authority = preflight["work_authority"]
-    _authority_artifact, _authority, modules = _validate_work_authority(
+    _authority_artifact, validated_authority, modules = _validate_work_authority(
         Path(authority["path"]), authority["sha256"]
     )
     assert modules is not None
+    evidence_pipeline, runtime_pipeline, runtime_root = (
+        _runtime_execution_pipeline(validated_authority, modules)
+    )
     engine = modules["engine"]
-    with _engine_adapter(engine):
+    with _engine_adapter(
+        engine,
+        evidence_pipeline=evidence_pipeline,
+        runtime_pipeline=runtime_pipeline,
+    ):
         if command == "shard":
-            return engine.run_shard(args)
-        return engine.finalize(args)
+            result = engine.run_shard(args)
+        else:
+            result = engine.finalize(args)
+    _project_modules_are_from(runtime_root)
+    return result
 
 
 def _measurement_value(
