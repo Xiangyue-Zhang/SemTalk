@@ -82,6 +82,18 @@ WORK_FORMAT = "semtalk_show_base_live_val_candidate_work_authority_v2"
 RECONCILIATION_FORMAT = "semtalk_show_base_live_val_reconciliation_v2"
 PREFLIGHT_FORMAT = "semtalk_show_base_live_val_execution_preflight_v2"
 CLAIM_FORMAT = "semtalk_show_base_live_val_consumer_claim_v2"
+RECOVERY_REQUEST_FORMAT = (
+    "semtalk_show_base_v14_failed_consumer_recovery_request_v1"
+)
+RECOVERY_CLAIM_FORMAT = (
+    "semtalk_show_base_live_val_consumer_recovery_claim_v1"
+)
+RECOVERY_AUTHORITY_FORMAT = (
+    "semtalk_show_base_live_val_consumer_recovery_authority_v1"
+)
+FAILED_RUN_INVENTORY_FORMAT = (
+    "semtalk_show_base_failed_consumer_run_inventory_v1"
+)
 MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v2"
 SELECTION_FORMAT = "semtalk_show_base_live_val_22way_selection_v2"
 
@@ -220,6 +232,202 @@ CLAIM_KEYS = frozenset(
         "candidate_epoch", "expected_shards", "work_authority", "run_root",
         "receipt_payload_sha256",
     }
+)
+ARTIFACT_CORE_KEYS = frozenset({"path", "sha256", "bytes"})
+RECOVERY_REQUEST_KEYS = frozenset(
+    {
+        "format", "status", "split", "test_visible", "selection_eligible",
+        "candidate_epoch", "failed_campaign", "failed_job_claim",
+        "failed_active_claim", "failed_authorization", "failed_work_authority",
+        "failed_consumer_claim", "failed_runner_status", "failed_runner_log",
+        "failed_run_root", "failed_run_inventory", "guard_proof",
+        "failed_process_proof",
+        "new_campaign", "new_control_source", "new_work_authority",
+        "new_run_root", "created_unix", "receipt_payload_sha256",
+    }
+)
+RECOVERY_CLAIM_KEYS = frozenset(
+    {
+        "format", "status", "split", "test_visible", "selection_eligible",
+        "candidate_epoch", "expected_shards", "recovery_request",
+        "failed_consumer_claim", "failed_runner_status", "new_campaign",
+        "new_control_source", "new_work_authority", "new_run_root",
+        "recovery_authority", "receipt_payload_sha256",
+    }
+)
+RECOVERY_AUTHORITY_KEYS = frozenset(
+    {
+        "format", "status", "split", "test_visible", "selection_eligible",
+        "candidate_epoch", "expected_shards", "recovery_request",
+        "recovery_claim_path", "failed_consumer_claim", "failed_runner_status",
+        "new_campaign", "new_control_source", "new_work_authority",
+        "new_run_root", "receipt_payload_sha256",
+    }
+)
+FAILED_RUN_INVENTORY_KEYS = frozenset(
+    {
+        "format", "root", "directories", "files", "shard_log_sha256",
+        "shard_failure_marker", "semantic_outputs",
+    }
+)
+FAILED_RUN_FILE_KEYS = frozenset({"relative_path", "sha256", "bytes"})
+GUARD_PROOF_KEYS = frozenset(
+    {"verifier", "argv", "stdout", "restored_guards", "verified_unix"}
+)
+FAILED_PROCESS_PROOF_KEYS = frozenset(
+    {
+        "wrapper_pid", "child_pid", "wrapper_proc_state",
+        "child_proc_state", "runner_command", "checked_unix",
+    }
+)
+FAILED_CAMPAIGN_KEYS = frozenset(
+    {
+        "format", "status", "split", "test_visible",
+        "test_measurements_authorized", "candidate_epochs", "state_root",
+        "campaign_claim_path", "summary_path", "control_source",
+        "runtime_validation_source", "authority_adapter_config",
+        "final_manifest_path", "final_status_path", "paspa_root",
+        "diffsheg_root", "seed", "diffsheg_batch_size", "formal_python",
+        "formal_python_runtime_contract", "guarded_runner", "guard_verifier",
+        "reconciliation_path", "reconcile_selection_root", "jobs",
+        "campaign_payload_sha256",
+    }
+)
+CAMPAIGN_JOB_KEYS = frozenset(
+    {
+        "epoch", "candidate_receipt_path", "authority_path",
+        "authorization_path", "run_root", "measurement_path",
+        "completion_path", "runner_status_path", "runner_log_path",
+    }
+)
+FAILED_JOB_CLAIM_KEYS = frozenset(
+    {
+        "format", "status", "candidate_epoch", "campaign",
+        "candidate_receipt", "authority_path", "run_root",
+        "measurement_path", "authorize_argv_sha256", "created_unix",
+        "claim_payload_sha256",
+    }
+)
+FAILED_ACTIVE_CLAIM_KEYS = frozenset(
+    {
+        "format", "status", "operation", "campaign", "created_unix",
+        "claim_payload_sha256",
+    }
+)
+FAILED_AUTHORIZATION_KEYS = frozenset(
+    {
+        "format", "status", "candidate_epoch", "campaign",
+        "candidate_receipt", "work_authority", "adapter", "adapter_argv",
+        "adapter_stdout_sha256", "runner_argv", "completed_unix",
+        "receipt_payload_sha256",
+    }
+)
+FAILED_RUNNER_STATUS_KEYS = frozenset(
+    {
+        "updated_at", "state", "wrapper_pid", "child_pid", "return_code",
+        "received_signal", "error", "cleanup_error", "restored_guards",
+        "restore_error", "command",
+    }
+)
+CONTROL_SOURCE_KEYS = frozenset(
+    {"root", "origin", "commit", "tree", "supervisor", "launcher", "bridge", "authority_adapter"}
+)
+FORMAL_EPOCH_ONE = 1
+FAILED_RUN_DIRECTORIES = (
+    ".", "candidates", "candidates/e1", "candidates/e1/shards", "logs",
+)
+FAILED_RUN_FILES = (
+    "diffsheg-evaluator-bundle.json",
+    "logs/e1-shard0.log", "logs/e1-shard1.log",
+    "logs/e1-shard2.log", "logs/e1-shard3.log",
+    "logs/e1-shard4.log", "logs/e1-shard5.log",
+    "logs/e1-shard6.log", "logs/e1-shard7.log",
+    "logs/evaluator-preflight.log", "logs/work-inspect.json",
+    "logs/work-preflight.log", "work-preflight.json",
+)
+FAILED_RUN_FILE_PINS = {
+    "diffsheg-evaluator-bundle.json": (
+        "de641ffb88c5393c5df7327f21b704588f18ece21bb1b0c4cabe4556c7550bd6",
+        1347,
+    ),
+    "logs/e1-shard0.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard1.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard2.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard3.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard4.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard5.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard6.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard7.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/evaluator-preflight.log": (
+        "71ca30c56e0e8db4d7de2b59e419e24d7f0bdd9589f24b60e9bd27b8a7ef814c",
+        1402,
+    ),
+    "logs/work-inspect.json": (
+        "dc27d291061f4157ba73704e8323a55472b3484a0a60c123d13204565293734f",
+        433,
+    ),
+    "logs/work-preflight.log": (
+        "12d1b367af40a8135348230c04b2ec2d40f76950fd391c7b0d226bff185db875",
+        818,
+    ),
+    "work-preflight.json": (
+        "5c42928d3af37cce915ada37bd98b90b4da28e82869d6f383f4fa5621ca9c6c0",
+        6294,
+    ),
+}
+FAILED_SHARD_LOGS = tuple(f"logs/e1-shard{index}.log" for index in range(8))
+FAILED_SHARD_FAILURE_MARKER = (
+    "ValInferenceContractError: scripts.show_base.build_base_features was "
+    "imported from another checkout"
+)
+FAILED_RUNNER_LOG = b"eight-shard live validation failed for e1\n"
+FAILED_CONTROL_COMMIT = "58407ed3207fdd76dbf9a6e480de8af579bdb747"
+FAILED_CONTROL_TREE = "b71f20161677fc68b4f9220a71d25e40632b17a0"
+MINIMUM_RECOVERY_CONTROL_COMMIT = "8532272130e14098fdef3f54c7733d4ba6033f4c"
+REJECTED_RECOVERY_CONTROL_COMMIT = "7d9967c9c5124d6f1ba041c2cb315dee88554a76"
+REJECTED_RECOVERY_CONTROL_TREE = "a965cf1ccff214bd8922692603b33832b7357543"
+FAILED_WRAPPER_PID = 261736
+FAILED_CHILD_PID = 261737
+FAILED_INCIDENT_ARTIFACTS = {
+    "campaign": ("9f299db9dc874826808142bfec4a69e403102a90293a42e2aa6c9ad52e3fab0a", 33838),
+    "job_claim": ("195994203d9f762b29c612c00aa1f185a9b407b1cfca687baa0fbc535d4c3b9b", 1231),
+    "active_claim": ("0f4349f368b532334f6540252d2d7609d0f5ca13d7ed1d5307a74a5432f25f4a", 456),
+    "authorization": ("c122131f1198a431e927fc45e6ea529c21fc6dbf49e0cdfe0f3ca166e3647207", 5193),
+    "work_authority": ("31c2930acf1bc608687351132b0ce135ddddc7d8d75655857ca9334fb51142d2", 23578),
+    "runner_status": ("b0c3f8a9a7ffd203621ac6d5bbcc29fdc2ff008ce9c6a2825b934139cee6fd2d", 1517),
+    "runner_log": ("dd2a04e4989df737ca48fd55c3df02c027d0e5c9a2e3b2540d3908c864628ad8", 42),
+    "candidate_receipt": ("16b2fe66a7f8ec0c38c7ab326b540a6a14043c74cd85fe013e7ca6cf10b24d8a", 2396),
+    "consumer_claim": ("b8449bf107ca4c97a543676e8883ad4218231524241e3ff685fbcc1cbff940b3", 720),
+}
+GUARD_PASS_RE = re.compile(
+    r"^PASS GPU0=PID([1-9][0-9]*) GPU1=PID([1-9][0-9]*) "
+    r"GPU2=PID([1-9][0-9]*) GPU3=PID([1-9][0-9]*) "
+    r"GPU4=PID([1-9][0-9]*) GPU5=PID([1-9][0-9]*) "
+    r"GPU6=PID([1-9][0-9]*) GPU7=PID([1-9][0-9]*)\n$"
 )
 
 MANIFEST_FORMAT = "semtalk_show_base_official_adapt_long_manifest_v1"
@@ -460,6 +668,132 @@ def _artifact_core(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _core_artifact(
+    value: Any,
+    label: str,
+    *,
+    executable: bool = False,
+) -> tuple[dict[str, Any], bytes]:
+    """Read one exact path/SHA/byte artifact without extending its ABI."""
+
+    item = _exact_keys(value, ARTIFACT_CORE_KEYS, label)
+    path, payload, digest = _safe_file(
+        item["path"],
+        label,
+        expected_sha=_sha(item["sha256"], f"{label} SHA"),
+        expected_bytes=_integer(item["bytes"], f"{label} bytes", minimum=1),
+    )
+    if executable and path.stat().st_mode & 0o111 == 0:
+        raise LiveConsumerError(f"{label} is not executable")
+    artifact = {"path": str(path), "sha256": digest, "bytes": len(payload)}
+    if not _strict_equal(artifact, item):
+        raise LiveConsumerError(f"{label} artifact changed")
+    return artifact, payload
+
+
+def _self_hashed_document(
+    artifact_value: Any,
+    *,
+    keys: frozenset[str],
+    payload_key: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    artifact, raw = _core_artifact(artifact_value, label)
+    value = _strict_json_bytes(raw, label)
+    _exact_keys(value, keys, label)
+    claimed = _sha(value.get(payload_key), f"{label} payload SHA")
+    if _payload_sha(value, payload_key) != claimed:
+        raise LiveConsumerError(f"{label} payload SHA mismatch")
+    return artifact, value
+
+
+def _relative_inventory(root: Path) -> dict[str, Any]:
+    """Recompute the one accepted failed-e1 tree without following links."""
+
+    canonical_root = _canonical_path(root, "failed run root")
+    if not canonical_root.is_dir():
+        raise LiveConsumerError("failed run root must be a directory")
+    directories = ["."]
+    files: list[dict[str, Any]] = []
+    stack = [canonical_root]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda row: row.name)
+        except OSError as error:
+            raise LiveConsumerError("cannot inventory failed run root") from error
+        for entry in entries:
+            entry_path = Path(entry.path)
+            try:
+                relative = entry_path.relative_to(canonical_root).as_posix()
+            except ValueError as error:  # pragma: no cover - scandir invariant
+                raise LiveConsumerError("failed run entry escaped root") from error
+            observed = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(observed.st_mode):
+                raise LiveConsumerError("failed run inventory contains a symlink")
+            if stat.S_ISDIR(observed.st_mode):
+                directories.append(relative)
+                stack.append(entry_path)
+            elif stat.S_ISREG(observed.st_mode):
+                if observed.st_nlink != 1:
+                    raise LiveConsumerError(
+                        "failed run inventory contains a multi-link file"
+                    )
+                _path, payload, digest = _safe_file(
+                    entry_path, f"failed run file {relative}"
+                )
+                files.append(
+                    {
+                        "relative_path": relative,
+                        "sha256": digest,
+                        "bytes": len(payload),
+                    }
+                )
+            else:
+                raise LiveConsumerError(
+                    "failed run inventory contains a special entry"
+                )
+    directories.sort()
+    files.sort(key=lambda row: row["relative_path"])
+    if tuple(directories) != tuple(sorted(FAILED_RUN_DIRECTORIES)):
+        raise LiveConsumerError("failed run directory inventory changed")
+    if tuple(row["relative_path"] for row in files) != tuple(
+        sorted(FAILED_RUN_FILES)
+    ):
+        raise LiveConsumerError(
+            "failed run contains a semantic or unknown output"
+        )
+    observed_pins = {
+        row["relative_path"]: (row["sha256"], row["bytes"])
+        for row in files
+    }
+    if observed_pins != FAILED_RUN_FILE_PINS:
+        raise LiveConsumerError("failed run artifact SHA/byte pins changed")
+    file_by_path = {row["relative_path"]: row for row in files}
+    shard_shas = {file_by_path[path]["sha256"] for path in FAILED_SHARD_LOGS}
+    if len(shard_shas) != 1:
+        raise LiveConsumerError("failed shard logs are not byte-identical")
+    for relative in FAILED_SHARD_LOGS:
+        _path, payload, _digest = _safe_file(
+            canonical_root / relative, f"failed shard log {relative}"
+        )
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeError as error:
+            raise LiveConsumerError("failed shard log is not UTF-8") from error
+        if text.count(FAILED_SHARD_FAILURE_MARKER) != 1:
+            raise LiveConsumerError("failed shard log error marker changed")
+    return {
+        "format": FAILED_RUN_INVENTORY_FORMAT,
+        "root": str(canonical_root),
+        "directories": directories,
+        "files": files,
+        "shard_log_sha256": next(iter(shard_shas)),
+        "shard_failure_marker": FAILED_SHARD_FAILURE_MARKER,
+        "semantic_outputs": [],
+    }
+
+
 def _artifact(
     value: Any,
     keys: frozenset[str],
@@ -622,6 +956,72 @@ def _validate_source(
             f"{role} must be the exact clean detached branchless SemTalk source"
         )
     return root
+
+
+def _validate_recovery_control_source(value: Any) -> dict[str, Any]:
+    """Audit the new clean detached control checkout and this exact bridge."""
+
+    source = _exact_keys(value, CONTROL_SOURCE_KEYS, "new control source")
+    root = _canonical_path(source["root"], "new control source root")
+    if not root.is_dir():
+        raise LiveConsumerError("new control source root is not a directory")
+    commit = _oid(source["commit"], "new control source commit")
+    tree = _oid(source["tree"], "new control source tree")
+    if source["origin"] != EXPECTED_ORIGIN:
+        raise LiveConsumerError("new control source origin changed")
+    ancestry_rc, _ancestry_output = _git(
+        root,
+        "merge-base",
+        "--is-ancestor",
+        MINIMUM_RECOVERY_CONTROL_COMMIT,
+        commit,
+        allow_failure=True,
+    )
+    if (
+        (
+            commit == REJECTED_RECOVERY_CONTROL_COMMIT
+            and tree == REJECTED_RECOVERY_CONTROL_TREE
+        )
+        or ancestry_rc != 0
+        or _git(root, "remote")[1].splitlines() != ["origin"]
+        or _git(root, "remote", "get-url", "origin")[1] != EXPECTED_ORIGIN
+        or _git(root, "remote", "get-url", "--push", "origin")[1]
+        != EXPECTED_ORIGIN
+        or _git(root, "rev-parse", "HEAD")[1] != commit
+        or _git(root, "rev-parse", "HEAD^{tree}")[1] != tree
+        or _git(root, "status", "--porcelain=v1", "--untracked-files=all")[1]
+        or _git(root, "symbolic-ref", "-q", "HEAD", allow_failure=True)[0] == 0
+        or _git(root, "for-each-ref", "--format=%(refname)", "refs/heads")[1]
+    ):
+        raise LiveConsumerError(
+            "new control source must be exact clean detached branchless SemTalk"
+        )
+    expected_relatives = {
+        "supervisor": "scripts/show_base/supervise_base_v14_live_validation.py",
+        "launcher": "scripts/show_base/run_base_live_val_8shard.sh",
+        "bridge": "scripts/show_base/base_live_val_consumer_bridge.py",
+        "authority_adapter": "scripts/show_base/base_v14_live_validation_authority.py",
+    }
+    validated = dict(source)
+    for role, relative in expected_relatives.items():
+        artifact, payload = _core_artifact(source[role], f"new control {role}")
+        expected_path = root / relative
+        if Path(artifact["path"]) != expected_path:
+            raise LiveConsumerError(f"new control {role} path changed")
+        tracked = _git(root, "ls-files", "--error-unmatch", relative)[1]
+        committed = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{relative}"],
+            capture_output=True,
+            check=False,
+        )
+        if tracked != relative or committed.returncode != 0 or committed.stdout != payload:
+            raise LiveConsumerError(f"new control {role} is not exact tracked content")
+        validated[role] = artifact
+    if Path(validated["bridge"]["path"]).resolve(strict=True) != Path(
+        __file__
+    ).resolve(strict=True):
+        raise LiveConsumerError("recovery must run through the new pinned bridge")
+    return validated
 
 
 def _validate_evidence_source(value: Any) -> Path:
@@ -1333,13 +1733,13 @@ def _validate_work_authority(
     return authority_artifact, authority, modules
 
 
-def _claim_path(
+def _training_root_for_candidate(
     *,
     producer_ready_receipt: Mapping[str, Any],
     candidate_checkpoint: Mapping[str, Any],
     epoch: int,
 ) -> Path:
-    """Return the one claim slot for the producer candidate itself.
+    """Return the immutable training root anchoring one producer candidate.
 
     The work-authority file path is not part of its signed JSON body.  A
     byte-identical copy may therefore live at another path.  Deriving the
@@ -1385,28 +1785,798 @@ def _claim_path(
         raise LiveConsumerError(
             "producer ready receipt is outside its fixed candidate inventory"
         )
-    claim_dir = training_root / "live_val_consumer_claims"
+    return training_root
+
+
+def _claim_slot(
+    training_root: Path,
+    *,
+    directory_name: str,
+    epoch: int,
+    create_directory: bool,
+) -> Path:
+    claim_dir = training_root / directory_name
     created = False
     if os.path.lexists(claim_dir):
-        resolved = _canonical_path(claim_dir, "consumer claim directory")
+        resolved = _canonical_path(claim_dir, f"{directory_name} directory")
         if not resolved.is_dir():
-            raise LiveConsumerError("consumer claim path is not a directory")
-    else:
+            raise LiveConsumerError(f"{directory_name} path is not a directory")
+    elif create_directory:
         try:
             claim_dir.mkdir(mode=0o755)
             created = True
         except FileExistsError:
             pass
-        resolved = _canonical_path(claim_dir, "consumer claim directory")
+        resolved = _canonical_path(claim_dir, f"{directory_name} directory")
         if not resolved.is_dir():
-            raise LiveConsumerError("consumer claim directory race was unsafe")
+            raise LiveConsumerError(f"{directory_name} directory race was unsafe")
+    else:
+        resolved = claim_dir
     if created:
         parent_fd = os.open(claim_dir.parent, os.O_RDONLY)
         try:
             os.fsync(parent_fd)
         finally:
             os.close(parent_fd)
-    return resolved / expected_name
+    return resolved / f"epoch-{epoch:04d}.json"
+
+
+def _claim_path(
+    *,
+    producer_ready_receipt: Mapping[str, Any],
+    candidate_checkpoint: Mapping[str, Any],
+    epoch: int,
+) -> Path:
+    """Return/create the original one-shot consumer claim slot."""
+
+    training_root = _training_root_for_candidate(
+        producer_ready_receipt=producer_ready_receipt,
+        candidate_checkpoint=candidate_checkpoint,
+        epoch=epoch,
+    )
+    return _claim_slot(
+        training_root,
+        directory_name="live_val_consumer_claims",
+        epoch=epoch,
+        create_directory=True,
+    )
+
+
+def _recovery_claim_path(
+    authority: Mapping[str, Any], *, create_directory: bool
+) -> Path:
+    epoch = _integer(
+        authority.get("candidate_epoch"), "recovery candidate epoch", minimum=1
+    )
+    training_root = _training_root_for_candidate(
+        producer_ready_receipt=authority["producer_ready_receipt"],
+        candidate_checkpoint=authority["candidate_checkpoint"],
+        epoch=epoch,
+    )
+    return _claim_slot(
+        training_root,
+        directory_name="live_val_consumer_recovery_claims",
+        epoch=epoch,
+        create_directory=create_directory,
+    )
+
+
+def _campaign_document(
+    artifact_value: Any, label: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    artifact, value = _self_hashed_document(
+        artifact_value,
+        keys=FAILED_CAMPAIGN_KEYS,
+        payload_key="campaign_payload_sha256",
+        label=label,
+    )
+    if (
+        value["format"]
+        != "semtalk_show_base_v14_live_validation_campaign_v3"
+        or value["status"] != "frozen_before_execution"
+        or value["split"] != "val"
+        or value["test_visible"] is not False
+        or type(value["test_measurements_authorized"]) is not int
+        or value["test_measurements_authorized"] != 0
+        or value["candidate_epochs"] != list(CANDIDATE_EPOCHS)
+    ):
+        raise LiveConsumerError(f"{label} is not the frozen val-only campaign")
+    state_root = _canonical_path(value["state_root"], f"{label} state root")
+    if not state_root.is_dir():
+        raise LiveConsumerError(f"{label} state root is not a directory")
+    if Path(artifact["path"]) != state_root / "campaign.json":
+        raise LiveConsumerError(f"{label} path is outside its state root")
+    jobs = value["jobs"]
+    if not isinstance(jobs, list) or len(jobs) != len(CANDIDATE_EPOCHS):
+        raise LiveConsumerError(f"{label} jobs changed")
+    for epoch, job_value in zip(CANDIDATE_EPOCHS, jobs):
+        job = _exact_keys(job_value, CAMPAIGN_JOB_KEYS, f"{label} e{epoch} job")
+        if type(job["epoch"]) is not int or job["epoch"] != epoch:
+            raise LiveConsumerError(f"{label} job order changed")
+    return artifact, value
+
+
+def _campaign_job(campaign: Mapping[str, Any], epoch: int) -> dict[str, Any]:
+    index = CANDIDATE_EPOCHS.index(epoch)
+    return dict(campaign["jobs"][index])
+
+
+def _argv_option(argv: Any, option: str, label: str) -> str:
+    if (
+        not isinstance(argv, list)
+        or not all(isinstance(token, str) and token and "\0" not in token for token in argv)
+        or argv.count(option) != 1
+    ):
+        raise LiveConsumerError(f"{label} changed")
+    index = argv.index(option)
+    if index + 1 >= len(argv):
+        raise LiveConsumerError(f"{label} is missing a value")
+    return argv[index + 1]
+
+
+def _artifact_reference(
+    artifact: Mapping[str, Any], value: Mapping[str, Any]
+) -> dict[str, Any]:
+    result = dict(artifact)
+    result["receipt_payload_sha256"] = value["receipt_payload_sha256"]
+    return result
+
+
+def _require_failed_incident_artifact(
+    artifact: Mapping[str, Any], role: str
+) -> None:
+    expected_sha, expected_bytes = FAILED_INCIDENT_ARTIFACTS[role]
+    if (
+        artifact.get("sha256") != expected_sha
+        or type(artifact.get("bytes")) is not int
+        or artifact["bytes"] != expected_bytes
+    ):
+        raise LiveConsumerError(f"failed incident {role} is not the pinned artifact")
+
+
+def _validate_guard_proof(
+    value: Any,
+    *,
+    failed_campaign: Mapping[str, Any],
+    failed_status: Mapping[str, Any],
+) -> dict[str, Any]:
+    proof = _exact_keys(value, GUARD_PROOF_KEYS, "guard proof")
+    verifier, _verifier_payload = _core_artifact(
+        proof["verifier"], "guard verifier"
+    )
+    if not _strict_equal(verifier, failed_campaign["guard_verifier"]):
+        raise LiveConsumerError("guard proof verifier differs from failed campaign")
+    restored = proof["restored_guards"]
+    expected_keys = {str(index) for index in range(8)}
+    if (
+        not isinstance(restored, dict)
+        or set(restored) != expected_keys
+        or any(
+            type(restored[str(index)]) is not int
+            or restored[str(index)] <= 1
+            for index in range(8)
+        )
+        or len(set(restored.values())) != 8
+        or not _strict_equal(restored, failed_status["restored_guards"])
+    ):
+        raise LiveConsumerError("guard proof PID set changed")
+    formal = failed_campaign["formal_python"]
+    if not isinstance(formal, dict) or not isinstance(formal.get("argv0"), str):
+        raise LiveConsumerError("failed campaign formal Python changed")
+    expected_argv = [
+        formal["argv0"], verifier["path"],
+        *[str(restored[str(index)]) for index in range(8)],
+    ]
+    if proof["argv"] != expected_argv:
+        raise LiveConsumerError("guard proof argv changed")
+    match = GUARD_PASS_RE.fullmatch(proof["stdout"])
+    if (
+        match is None
+        or {str(index): int(match.group(index + 1)) for index in range(8)}
+        != restored
+    ):
+        raise LiveConsumerError("guard proof stdout changed")
+    _finite(proof["verified_unix"], "guard proof time", positive=True)
+    result = dict(proof)
+    result["verifier"] = verifier
+    return result
+
+
+def _validate_failed_process_proof(
+    value: Any, failed_status: Mapping[str, Any]
+) -> dict[str, Any]:
+    proof = _exact_keys(
+        value, FAILED_PROCESS_PROOF_KEYS, "failed process proof"
+    )
+    wrapper_pid = _integer(
+        proof["wrapper_pid"], "failed wrapper PID", minimum=2
+    )
+    child_pid = _integer(proof["child_pid"], "failed child PID", minimum=2)
+    if (
+        wrapper_pid != failed_status["wrapper_pid"]
+        or child_pid != failed_status["child_pid"]
+        or wrapper_pid == child_pid
+        or proof["wrapper_proc_state"] != "absent"
+        or proof["child_proc_state"] != "absent"
+        or not _strict_equal(proof["runner_command"], failed_status["command"])
+    ):
+        raise LiveConsumerError("failed process proof changed")
+    _finite(proof["checked_unix"], "failed process proof time", positive=True)
+    for pid in (wrapper_pid, child_pid):
+        if os.path.lexists(Path("/proc") / str(pid)):
+            raise LiveConsumerError(f"failed process PID {pid} is no longer absent")
+    return dict(proof)
+
+
+def _validate_recovery_request(
+    request_path: Path,
+    expected_sha: str,
+    *,
+    new_run_must_exist: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], Path, Path]:
+    request_artifact, request = _json_file(
+        request_path, expected_sha, "consumer recovery request"
+    )
+    _exact_keys(request, RECOVERY_REQUEST_KEYS, "consumer recovery request")
+    if (
+        request["format"] != RECOVERY_REQUEST_FORMAT
+        or request["status"] != "ready_for_single_recovery"
+        or request["split"] != "val"
+        or request["test_visible"] is not False
+        or request["selection_eligible"] is not False
+        or type(request["candidate_epoch"]) is not int
+        or request["candidate_epoch"] != FORMAL_EPOCH_ONE
+        or _payload_sha(request) != request["receipt_payload_sha256"]
+    ):
+        raise LiveConsumerError("consumer recovery request state changed")
+    _finite(request["created_unix"], "consumer recovery request time", positive=True)
+    request_artifact["receipt_payload_sha256"] = request[
+        "receipt_payload_sha256"
+    ]
+
+    failed_campaign_artifact, failed_campaign = _campaign_document(
+        request["failed_campaign"], "failed campaign"
+    )
+    _require_failed_incident_artifact(failed_campaign_artifact, "campaign")
+    failed_control = _exact_keys(
+        failed_campaign["control_source"],
+        CONTROL_SOURCE_KEYS,
+        "failed campaign control source",
+    )
+    if (
+        failed_control["commit"] != FAILED_CONTROL_COMMIT
+        or failed_control["tree"] != FAILED_CONTROL_TREE
+    ):
+        raise LiveConsumerError("failed campaign is not the pinned 58407ed incident")
+    new_campaign_artifact, new_campaign = _campaign_document(
+        request["new_campaign"], "new campaign"
+    )
+    if failed_campaign_artifact == new_campaign_artifact:
+        raise LiveConsumerError("failed and new campaigns are not distinct")
+    failed_job = _campaign_job(failed_campaign, FORMAL_EPOCH_ONE)
+    new_job = _campaign_job(new_campaign, FORMAL_EPOCH_ONE)
+
+    failed_work_artifact, failed_work, _ = _validate_work_authority(
+        Path(request["failed_work_authority"]["path"]),
+        request["failed_work_authority"]["sha256"],
+        load_modules=False,
+    )
+    new_work_artifact, new_work, _ = _validate_work_authority(
+        Path(request["new_work_authority"]["path"]),
+        request["new_work_authority"]["sha256"],
+        load_modules=False,
+    )
+    failed_work_semantics = dict(failed_work)
+    new_work_semantics = dict(new_work)
+    for projection in (failed_work_semantics, new_work_semantics):
+        projection.pop("published_unix", None)
+        projection.pop("receipt_payload_sha256", None)
+    if (
+        not _strict_equal(_artifact_core(failed_work_artifact), request["failed_work_authority"])
+        or not _strict_equal(_artifact_core(new_work_artifact), request["new_work_authority"])
+        or not _strict_equal(failed_work_semantics, new_work_semantics)
+        or failed_work_artifact["sha256"] != new_work_artifact["sha256"]
+        or failed_work_artifact["bytes"] != new_work_artifact["bytes"]
+    ):
+        raise LiveConsumerError(
+            "new work authority does not semantically replay failed work"
+        )
+    _require_failed_incident_artifact(
+        _artifact_core(failed_work_artifact), "work_authority"
+    )
+    _require_failed_incident_artifact(
+        _artifact_core(failed_work["producer_ready_receipt"]),
+        "candidate_receipt",
+    )
+    epoch = failed_work["candidate_epoch"]
+    if epoch != FORMAL_EPOCH_ONE:
+        raise LiveConsumerError("only the failed formal e1 is recoverable")
+
+    failed_run_root = _canonical_path(
+        request["failed_run_root"], "failed run root"
+    )
+    new_run_root = _canonical_path(
+        request["new_run_root"], "new run root", must_exist=False
+    )
+    if new_run_must_exist:
+        new_run_root = _canonical_path(new_run_root, "new run root")
+        if not new_run_root.is_dir():
+            raise LiveConsumerError("new recovery run root is not a directory")
+    elif os.path.lexists(new_run_root):
+        raise LiveConsumerError("new recovery run root is not new")
+    if failed_run_root == new_run_root:
+        raise LiveConsumerError("recovery cannot reuse the failed run root")
+    if (
+        failed_job["authority_path"] != failed_work_artifact["path"]
+        or failed_job["run_root"] != str(failed_run_root)
+        or new_job["authority_path"] != new_work_artifact["path"]
+        or new_job["run_root"] != str(new_run_root)
+    ):
+        raise LiveConsumerError("campaign job paths differ from recovery request")
+
+    failed_job_artifact, failed_job_claim = _self_hashed_document(
+        request["failed_job_claim"],
+        keys=FAILED_JOB_CLAIM_KEYS,
+        payload_key="claim_payload_sha256",
+        label="failed job claim",
+    )
+    _require_failed_incident_artifact(failed_job_artifact, "job_claim")
+    failed_state = _canonical_path(
+        failed_campaign["state_root"], "failed campaign state root"
+    )
+    if (
+        Path(failed_job_artifact["path"])
+        != failed_state / "job_claims" / "epoch-0001.json"
+        or failed_job_claim["format"]
+        != "semtalk_show_base_v14_live_validation_job_claim_v2"
+        or failed_job_claim["status"] != "claimed"
+        or failed_job_claim["candidate_epoch"] != FORMAL_EPOCH_ONE
+        or not _strict_equal(failed_job_claim["campaign"], failed_campaign_artifact)
+        or failed_job_claim["authority_path"] != failed_work_artifact["path"]
+        or failed_job_claim["run_root"] != str(failed_run_root)
+        or failed_job_claim["measurement_path"] != failed_job["measurement_path"]
+        or not _strict_equal(
+            failed_job_claim["candidate_receipt"],
+            _artifact_core(failed_work["producer_ready_receipt"]),
+        )
+    ):
+        raise LiveConsumerError("failed job claim binding changed")
+    _sha(failed_job_claim["authorize_argv_sha256"], "failed authorize argv SHA")
+    _finite(failed_job_claim["created_unix"], "failed job claim time", positive=True)
+
+    failed_active_artifact, failed_active = _self_hashed_document(
+        request["failed_active_claim"],
+        keys=FAILED_ACTIVE_CLAIM_KEYS,
+        payload_key="claim_payload_sha256",
+        label="failed active claim",
+    )
+    _require_failed_incident_artifact(failed_active_artifact, "active_claim")
+    if (
+        Path(failed_active_artifact["path"])
+        != failed_state / "active_invocation.claim.json"
+        or failed_active["format"]
+        != "semtalk_show_base_v14_live_validation_active_claim_v1"
+        or failed_active["status"] != "active"
+        or failed_active["operation"] != "run-next"
+        or not _strict_equal(failed_active["campaign"], failed_campaign_artifact)
+    ):
+        raise LiveConsumerError("failed active claim binding changed")
+    _finite(failed_active["created_unix"], "failed active claim time", positive=True)
+
+    failed_authorization_artifact, failed_authorization = _self_hashed_document(
+        request["failed_authorization"],
+        keys=FAILED_AUTHORIZATION_KEYS,
+        payload_key="receipt_payload_sha256",
+        label="failed authorization",
+    )
+    _require_failed_incident_artifact(
+        failed_authorization_artifact, "authorization"
+    )
+    if (
+        Path(failed_authorization_artifact["path"])
+        != Path(failed_job["authorization_path"])
+        or failed_authorization["format"]
+        != "semtalk_show_base_v14_live_authorization_v1"
+        or failed_authorization["status"] != "complete"
+        or failed_authorization["candidate_epoch"] != FORMAL_EPOCH_ONE
+        or not _strict_equal(
+            failed_authorization["campaign"], failed_campaign_artifact
+        )
+        or not _strict_equal(
+            failed_authorization["candidate_receipt"],
+            _artifact_core(failed_work["producer_ready_receipt"]),
+        )
+        or not _strict_equal(
+            failed_authorization["work_authority"],
+            _artifact_core(failed_work_artifact),
+        )
+    ):
+        raise LiveConsumerError("failed authorization binding changed")
+    _sha(
+        failed_authorization["adapter_stdout_sha256"],
+        "failed adapter stdout SHA",
+    )
+    _finite(
+        failed_authorization["completed_unix"],
+        "failed authorization time",
+        positive=True,
+    )
+
+    failed_status_artifact, failed_status_raw = _core_artifact(
+        request["failed_runner_status"], "failed runner status"
+    )
+    _require_failed_incident_artifact(failed_status_artifact, "runner_status")
+    failed_status = _strict_json_bytes(failed_status_raw, "failed runner status")
+    _exact_keys(failed_status, FAILED_RUNNER_STATUS_KEYS, "failed runner status")
+    restored = failed_status["restored_guards"]
+    if (
+        Path(failed_status_artifact["path"]) != Path(failed_job["runner_status_path"])
+        or failed_status["state"] != "failed"
+        or type(failed_status["return_code"]) is not int
+        or failed_status["return_code"] != 1
+        or any(
+            failed_status[key] is not None
+            for key in ("received_signal", "error", "cleanup_error", "restore_error")
+        )
+        or failed_status["wrapper_pid"] != FAILED_WRAPPER_PID
+        or failed_status["child_pid"] != FAILED_CHILD_PID
+        or not isinstance(restored, dict)
+    ):
+        raise LiveConsumerError("failed runner was not the exact clean rc1 exit")
+    runner_argv = failed_authorization["runner_argv"]
+    if not isinstance(runner_argv, list) or runner_argv.count("--") != 1:
+        raise LiveConsumerError("failed guarded runner argv changed")
+    separator = runner_argv.index("--")
+    if (
+        failed_status["command"] != runner_argv[separator + 1 :]
+        or _argv_option(runner_argv, "--status", "failed runner status option")
+        != failed_status_artifact["path"]
+        or _argv_option(runner_argv, "--log", "failed runner log option")
+        != failed_job["runner_log_path"]
+        or _argv_option(
+            failed_status["command"], "--work-authority", "failed work option"
+        )
+        != failed_work_artifact["path"]
+        or _argv_option(failed_status["command"], "--run-root", "failed run option")
+        != str(failed_run_root)
+    ):
+        raise LiveConsumerError("failed runner command binding changed")
+
+    failed_log_artifact, failed_log = _core_artifact(
+        request["failed_runner_log"], "failed runner log"
+    )
+    _require_failed_incident_artifact(failed_log_artifact, "runner_log")
+    if (
+        Path(failed_log_artifact["path"]) != Path(failed_job["runner_log_path"])
+        or failed_log != FAILED_RUNNER_LOG
+    ):
+        raise LiveConsumerError("failed runner log changed")
+
+    failed_claim_artifact, failed_claim = _json_file(
+        Path(request["failed_consumer_claim"]["path"]),
+        request["failed_consumer_claim"]["sha256"],
+        "failed global consumer claim",
+    )
+    _exact_keys(failed_claim, CLAIM_KEYS, "failed global consumer claim")
+    failed_claim_artifact["receipt_payload_sha256"] = failed_claim[
+        "receipt_payload_sha256"
+    ]
+    _require_failed_incident_artifact(
+        _artifact_core(failed_claim_artifact), "consumer_claim"
+    )
+    failed_training_root = _training_root_for_candidate(
+        producer_ready_receipt=failed_work["producer_ready_receipt"],
+        candidate_checkpoint=failed_work["candidate_checkpoint"],
+        epoch=FORMAL_EPOCH_ONE,
+    )
+    expected_failed_claim_path = _claim_slot(
+        failed_training_root,
+        directory_name="live_val_consumer_claims",
+        epoch=FORMAL_EPOCH_ONE,
+        create_directory=False,
+    )
+    if (
+        not _strict_equal(
+            _artifact_core(failed_claim_artifact),
+            request["failed_consumer_claim"],
+        )
+        or Path(failed_claim_artifact["path"]) != expected_failed_claim_path
+        or failed_claim["format"] != CLAIM_FORMAT
+        or failed_claim["status"] != "claimed"
+        or failed_claim["split"] != "val"
+        or failed_claim["test_visible"] is not False
+        or failed_claim["selection_eligible"] is not False
+        or failed_claim["candidate_epoch"] != FORMAL_EPOCH_ONE
+        or failed_claim["expected_shards"] != 8
+        or not _strict_equal(
+            failed_claim["work_authority"], failed_work_artifact
+        )
+        or failed_claim["run_root"] != str(failed_run_root)
+    ):
+        raise LiveConsumerError("failed global consumer claim changed")
+
+    inventory = _exact_keys(
+        request["failed_run_inventory"],
+        FAILED_RUN_INVENTORY_KEYS,
+        "failed run inventory",
+    )
+    for index, file_value in enumerate(inventory["files"]):
+        _exact_keys(file_value, FAILED_RUN_FILE_KEYS, f"failed run file {index}")
+    if not _strict_equal(inventory, _relative_inventory(failed_run_root)):
+        raise LiveConsumerError("failed run inventory changed")
+    _validate_guard_proof(
+        request["guard_proof"],
+        failed_campaign=failed_campaign,
+        failed_status=failed_status,
+    )
+    _validate_failed_process_proof(request["failed_process_proof"], failed_status)
+
+    new_control = _validate_recovery_control_source(request["new_control_source"])
+    if not _strict_equal(new_control, new_campaign["control_source"]):
+        raise LiveConsumerError("new campaign/control source binding changed")
+    new_state = _canonical_path(new_campaign["state_root"], "new campaign state root")
+    recovery_authority_path = new_state / "recovery-authority.epoch-0001.json"
+    recovery_claim_path = _recovery_claim_path(
+        new_work, create_directory=False
+    )
+    return (
+        request_artifact,
+        request,
+        {
+            "failed_campaign": failed_campaign_artifact,
+            "failed_consumer_claim": failed_claim_artifact,
+            "failed_runner_status": failed_status_artifact,
+            "new_campaign": new_campaign_artifact,
+            "new_control_source": new_control,
+            "new_work_authority": new_work_artifact,
+            "new_work_authority_value": new_work,
+            "new_run_root": str(new_run_root),
+        },
+        recovery_claim_path,
+        recovery_authority_path,
+    )
+
+
+def _recovery_documents(
+    *,
+    request_artifact: Mapping[str, Any],
+    request: Mapping[str, Any],
+    bindings: Mapping[str, Any],
+    recovery_claim_path: Path,
+    recovery_authority_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    request_reference = _artifact_reference(request_artifact, request)
+    authority_body = _with_payload_sha(
+        {
+            "format": RECOVERY_AUTHORITY_FORMAT,
+            "status": "authorized",
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": False,
+            "candidate_epoch": FORMAL_EPOCH_ONE,
+            "expected_shards": 8,
+            "recovery_request": request_reference,
+            "recovery_claim_path": str(recovery_claim_path),
+            "failed_consumer_claim": _artifact_core(
+                bindings["failed_consumer_claim"]
+            ),
+            "failed_runner_status": dict(bindings["failed_runner_status"]),
+            "new_campaign": dict(bindings["new_campaign"]),
+            "new_control_source": copy.deepcopy(bindings["new_control_source"]),
+            "new_work_authority": _artifact_core(
+                bindings["new_work_authority"]
+            ),
+            "new_run_root": bindings["new_run_root"],
+        }
+    )
+    authority_encoded = _canonical_json(authority_body, newline=True)
+    authority_preview = {
+        "path": str(recovery_authority_path),
+        "sha256": hashlib.sha256(authority_encoded).hexdigest(),
+        "bytes": len(authority_encoded),
+    }
+    claim_body = _with_payload_sha(
+        {
+            "format": RECOVERY_CLAIM_FORMAT,
+            "status": "claimed",
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": False,
+            "candidate_epoch": FORMAL_EPOCH_ONE,
+            "expected_shards": 8,
+            "recovery_request": request_reference,
+            "failed_consumer_claim": _artifact_core(
+                bindings["failed_consumer_claim"]
+            ),
+            "failed_runner_status": dict(bindings["failed_runner_status"]),
+            "new_campaign": dict(bindings["new_campaign"]),
+            "new_control_source": copy.deepcopy(bindings["new_control_source"]),
+            "new_work_authority": _artifact_core(
+                bindings["new_work_authority"]
+            ),
+            "new_run_root": bindings["new_run_root"],
+            "recovery_authority": authority_preview,
+        }
+    )
+    return authority_body, claim_body, authority_preview
+
+
+def _recovery_preview(
+    args: argparse.Namespace,
+) -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], Path
+]:
+    (
+        request_artifact,
+        request,
+        bindings,
+        recovery_claim_path,
+        recovery_authority_path,
+    ) = _validate_recovery_request(
+        args.request,
+        args.expected_request_sha256,
+        new_run_must_exist=False,
+    )
+    output = _canonical_path(
+        args.output_authority, "recovery authority output", must_exist=False
+    )
+    if output != recovery_authority_path:
+        raise LiveConsumerError(
+            "recovery authority output is not the deterministic new-state slot"
+        )
+    parent = _canonical_path(output.parent, "recovery authority output parent")
+    if not parent.is_dir():
+        raise LiveConsumerError("recovery authority output parent is absent")
+    authority_body, claim_body, authority_preview = _recovery_documents(
+        request_artifact=request_artifact,
+        request=request,
+        bindings=bindings,
+        recovery_claim_path=recovery_claim_path,
+        recovery_authority_path=recovery_authority_path,
+    )
+    if os.path.lexists(recovery_claim_path) or os.path.lexists(output):
+        raise DuplicateConsumptionError("consumer recovery is already reserved")
+    return (
+        authority_body,
+        claim_body,
+        authority_preview,
+        bindings,
+        recovery_claim_path,
+    )
+
+
+def inspect_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    _authority, _claim, preview, _bindings, claim_path = _recovery_preview(args)
+    return {
+        "status": "ready",
+        "recovery_authority": preview,
+        "recovery_claim_path": str(claim_path),
+    }
+
+
+def _write_strict_new(
+    path: Path, value: Mapping[str, Any], label: str
+) -> dict[str, Any]:
+    if os.path.lexists(path):
+        raise DuplicateConsumptionError(f"{label} already exists: {path}")
+    artifact, created = _write_new_or_identical(path, value)
+    if not created:
+        raise DuplicateConsumptionError(f"{label} was not create-new: {path}")
+    return artifact
+
+
+def reserve_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    authority_body, claim_body, preview, bindings, claim_path = (
+        _recovery_preview(args)
+    )
+    created_claim_path = _recovery_claim_path(
+        bindings["new_work_authority_value"],
+        create_directory=True,
+    )
+    if created_claim_path != claim_path:
+        raise LiveConsumerError("recovery claim slot changed during reservation")
+    claim_artifact = _write_strict_new(
+        claim_path, claim_body, "consumer recovery claim"
+    )
+    # The claim is intentionally durable before the authority.  If authority
+    # publication fails, the one recovery allowance remains consumed.
+    authority_artifact = _write_strict_new(
+        Path(preview["path"]), authority_body, "consumer recovery authority"
+    )
+    if not _strict_equal(authority_artifact, preview):
+        raise LiveConsumerError("published recovery authority differs from preview")
+    return {
+        "status": "reserved",
+        "recovery_authority": authority_artifact,
+        "recovery_claim": claim_artifact,
+    }
+
+
+def _validate_recovery_binding(
+    *,
+    recovery_authority_path: Path,
+    expected_recovery_authority_sha: str,
+    recovery_claim_path: Path,
+    expected_recovery_claim_sha: str,
+    work_authority_artifact: Mapping[str, Any],
+    run_root: Path,
+) -> dict[str, Any]:
+    authority_artifact, authority = _json_file(
+        recovery_authority_path,
+        expected_recovery_authority_sha,
+        "consumer recovery authority",
+    )
+    _exact_keys(authority, RECOVERY_AUTHORITY_KEYS, "consumer recovery authority")
+    claim_artifact, claim = _json_file(
+        recovery_claim_path,
+        expected_recovery_claim_sha,
+        "consumer recovery claim",
+    )
+    _exact_keys(claim, RECOVERY_CLAIM_KEYS, "consumer recovery claim")
+    authority_artifact["receipt_payload_sha256"] = authority[
+        "receipt_payload_sha256"
+    ]
+    claim_artifact["receipt_payload_sha256"] = claim["receipt_payload_sha256"]
+    if (
+        authority["format"] != RECOVERY_AUTHORITY_FORMAT
+        or authority["status"] != "authorized"
+        or claim["format"] != RECOVERY_CLAIM_FORMAT
+        or claim["status"] != "claimed"
+        or any(
+            document["split"] != "val"
+            or document["test_visible"] is not False
+            or document["selection_eligible"] is not False
+            or document["candidate_epoch"] != FORMAL_EPOCH_ONE
+            or document["expected_shards"] != 8
+            or _payload_sha(document) != document["receipt_payload_sha256"]
+            for document in (authority, claim)
+        )
+    ):
+        raise LiveConsumerError("consumer recovery authority/claim state changed")
+    request_value = authority["recovery_request"]
+    _exact_keys(
+        request_value,
+        frozenset({"path", "sha256", "bytes", "receipt_payload_sha256"}),
+        "recovery request reference",
+    )
+    (
+        request_artifact,
+        request,
+        bindings,
+        expected_claim_path,
+        expected_authority_path,
+    ) = _validate_recovery_request(
+        Path(request_value["path"]),
+        request_value["sha256"],
+        new_run_must_exist=True,
+    )
+    if (
+        not _strict_equal(_artifact_reference(request_artifact, request), request_value)
+        or Path(authority_artifact["path"]) != expected_authority_path
+        or Path(claim_artifact["path"]) != expected_claim_path
+        or run_root != Path(bindings["new_run_root"])
+        or not _strict_equal(
+            _artifact_core(work_authority_artifact),
+            _artifact_core(bindings["new_work_authority"]),
+        )
+    ):
+        raise LiveConsumerError("consumer recovery execution binding changed")
+    expected_authority, expected_claim, authority_preview = _recovery_documents(
+        request_artifact=request_artifact,
+        request=request,
+        bindings=bindings,
+        recovery_claim_path=expected_claim_path,
+        recovery_authority_path=expected_authority_path,
+    )
+    if (
+        not _strict_equal(authority, expected_authority)
+        or not _strict_equal(claim, expected_claim)
+        or not _strict_equal(_artifact_core(authority_artifact), authority_preview)
+        or not _strict_equal(claim["recovery_authority"], authority_preview)
+        or authority["recovery_claim_path"] != claim_artifact["path"]
+    ):
+        raise LiveConsumerError("consumer recovery replay changed")
+    return claim_artifact
 
 
 def _preflight_body(
@@ -1470,26 +2640,50 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         args.work_authority, args.expected_work_authority_sha256
     )
     epoch = authority["candidate_epoch"]
-    claim_body = _with_payload_sha(
-        {
-            "format": CLAIM_FORMAT,
-            "status": "claimed",
-            "split": "val",
-            "test_visible": False,
-            "selection_eligible": False,
-            "candidate_epoch": epoch,
-            "expected_shards": 8,
-            "work_authority": authority_artifact,
-            "run_root": str(run_root),
-        }
+    recovery_values = (
+        getattr(args, "recovery_authority", None),
+        getattr(args, "expected_recovery_authority_sha256", None),
+        getattr(args, "recovery_claim", None),
+        getattr(args, "expected_recovery_claim_sha256", None),
     )
-    claim_path = _claim_path(
-        producer_ready_receipt=authority["producer_ready_receipt"],
-        candidate_checkpoint=authority["candidate_checkpoint"],
-        epoch=epoch,
-    )
-    claim_artifact, _created = _write_new_or_identical(claim_path, claim_body)
-    claim_artifact["receipt_payload_sha256"] = claim_body["receipt_payload_sha256"]
+    if any(value is not None for value in recovery_values) and not all(
+        value is not None for value in recovery_values
+    ):
+        raise LiveConsumerError(
+            "prepare recovery arguments must be supplied all-or-none"
+        )
+    if all(value is not None for value in recovery_values):
+        claim_artifact = _validate_recovery_binding(
+            recovery_authority_path=Path(recovery_values[0]),
+            expected_recovery_authority_sha=str(recovery_values[1]),
+            recovery_claim_path=Path(recovery_values[2]),
+            expected_recovery_claim_sha=str(recovery_values[3]),
+            work_authority_artifact=authority_artifact,
+            run_root=run_root,
+        )
+    else:
+        claim_body = _with_payload_sha(
+            {
+                "format": CLAIM_FORMAT,
+                "status": "claimed",
+                "split": "val",
+                "test_visible": False,
+                "selection_eligible": False,
+                "candidate_epoch": epoch,
+                "expected_shards": 8,
+                "work_authority": authority_artifact,
+                "run_root": str(run_root),
+            }
+        )
+        claim_path = _claim_path(
+            producer_ready_receipt=authority["producer_ready_receipt"],
+            candidate_checkpoint=authority["candidate_checkpoint"],
+            epoch=epoch,
+        )
+        claim_artifact, _created = _write_new_or_identical(claim_path, claim_body)
+        claim_artifact["receipt_payload_sha256"] = claim_body[
+            "receipt_payload_sha256"
+        ]
     preflight = _with_payload_sha(
         _preflight_body(
             authority_artifact=authority_artifact,
@@ -1554,22 +2748,53 @@ def _preflight_artifact(path: Path, expected_sha: str) -> tuple[dict[str, Any], 
     claim_artifact, claim = _json_file(
         Path(claim_value["path"]), claim_value["sha256"], "consumer claim"
     )
-    _exact_keys(claim, CLAIM_KEYS, "consumer claim")
     claim_artifact["receipt_payload_sha256"] = claim["receipt_payload_sha256"]
-    if (
-        claim.get("format") != CLAIM_FORMAT
-        or claim.get("status") != "claimed"
-        or claim.get("split") != "val"
-        or claim.get("test_visible") is not False
-        or claim.get("selection_eligible") is not False
-        or _integer(claim.get("candidate_epoch"), "claim candidate epoch", minimum=1)
-        != epochs[0]
-        or _integer(claim.get("expected_shards"), "claim expected shards", minimum=1)
-        != 8
-        or not _strict_equal(claim.get("work_authority"), authority_artifact)
-        or not _strict_equal(claim_artifact, claim_value)
-    ):
-        raise LiveConsumerError("consumer claim changed")
+    if claim.get("format") == CLAIM_FORMAT:
+        _exact_keys(claim, CLAIM_KEYS, "consumer claim")
+        if (
+            claim.get("status") != "claimed"
+            or claim.get("split") != "val"
+            or claim.get("test_visible") is not False
+            or claim.get("selection_eligible") is not False
+            or _integer(
+                claim.get("candidate_epoch"),
+                "claim candidate epoch",
+                minimum=1,
+            )
+            != epochs[0]
+            or _integer(
+                claim.get("expected_shards"),
+                "claim expected shards",
+                minimum=1,
+            )
+            != 8
+            or not _strict_equal(claim.get("work_authority"), authority_artifact)
+            or not _strict_equal(claim_artifact, claim_value)
+        ):
+            raise LiveConsumerError("consumer claim changed")
+    elif claim.get("format") == RECOVERY_CLAIM_FORMAT:
+        _exact_keys(claim, RECOVERY_CLAIM_KEYS, "consumer recovery claim")
+        recovery_authority = _exact_keys(
+            claim["recovery_authority"],
+            ARTIFACT_CORE_KEYS,
+            "consumer recovery authority reference",
+        )
+        replayed_claim = _validate_recovery_binding(
+            recovery_authority_path=Path(recovery_authority["path"]),
+            expected_recovery_authority_sha=recovery_authority["sha256"],
+            recovery_claim_path=Path(claim_artifact["path"]),
+            expected_recovery_claim_sha=claim_artifact["sha256"],
+            work_authority_artifact=authority_artifact,
+            run_root=Path(claim["new_run_root"]),
+        )
+        if (
+            epochs[0] != FORMAL_EPOCH_ONE
+            or not _strict_equal(replayed_claim, claim_artifact)
+            or not _strict_equal(claim_artifact, claim_value)
+        ):
+            raise LiveConsumerError("consumer recovery claim changed")
+    else:
+        raise LiveConsumerError("consumer claim format changed")
     expected = _with_payload_sha(
         _preflight_body(
             authority_artifact=authority_artifact,
@@ -2219,6 +3444,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--expected-work-authority-sha256", required=True)
     prepare_parser.add_argument("--run-root", type=Path, required=True)
     prepare_parser.add_argument("--output", type=Path, required=True)
+    prepare_parser.add_argument("--recovery-authority", type=Path)
+    prepare_parser.add_argument("--expected-recovery-authority-sha256")
+    prepare_parser.add_argument("--recovery-claim", type=Path)
+    prepare_parser.add_argument("--expected-recovery-claim-sha256")
+
+    for command in ("inspect-recovery", "reserve-recovery"):
+        recovery_parser = commands.add_parser(command, allow_abbrev=False)
+        recovery_parser.add_argument("--request", type=Path, required=True)
+        recovery_parser.add_argument("--expected-request-sha256", required=True)
+        recovery_parser.add_argument(
+            "--output-authority", type=Path, required=True
+        )
 
     inspect_parser = commands.add_parser("inspect", allow_abbrev=False)
     inspect_parser.add_argument("--preflight", type=Path, required=True)
@@ -2260,6 +3497,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "prepare":
             result = prepare(args)
+        elif args.command == "inspect-recovery":
+            result = inspect_recovery(args)
+        elif args.command == "reserve-recovery":
+            result = reserve_recovery(args)
         elif args.command == "inspect":
             artifact, payload = _preflight_artifact(
                 args.preflight, args.expected_preflight_sha256

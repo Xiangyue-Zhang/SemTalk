@@ -42,6 +42,25 @@ def bridge_hash(value: dict) -> str:
     return sup._bridge_payload_sha(value)
 
 
+def write_failed_run_fixture(root: Path) -> dict:
+    for relative in ("candidates/e1/shards", "logs"):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+    fixture_pins = {}
+    for relative in (
+        "diffsheg-evaluator-bundle.json", "work-preflight.json",
+        "logs/evaluator-preflight.log", "logs/work-inspect.json",
+        "logs/work-preflight.log",
+    ):
+        artifact = write_bytes(root / relative, (relative + "\n").encode())
+        fixture_pins[relative] = (artifact["sha256"], artifact["bytes"])
+    shard_raw = ("prefix\n" + sup.FAILED_SHARD_MARKER + "\nsuffix\n").encode()
+    for shard in range(8):
+        relative = "logs/e1-shard%d.log" % shard
+        artifact = write_bytes(root / relative, shard_raw)
+        fixture_pins[relative] = (artifact["sha256"], artifact["bytes"])
+    return fixture_pins
+
+
 class Fixture:
     def __init__(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="v14-live-v3-")
@@ -209,6 +228,23 @@ class ContractTests(unittest.TestCase):
         changed[changed.index("--") + 1] = self.fx.formal["argv0"]
         with self.assertRaisesRegex(sup.SupervisorError, "exact tracked"):
             sup._validate_runner_argv_v2(changed, job, campaign)
+        recovery = {
+            label: write_json(self.fx.root / ("recovery-%s.json" % label), {label: True})
+            for label in ("request", "authority", "claim")
+        }
+        recovered_job = {**job, "consumer_recovery": recovery}
+        recovered_workload = sup._runner_workload(recovered_job, campaign)
+        self.assertEqual(
+            recovered_workload[-8:],
+            [
+                "--recovery-authority", recovery["authority"]["path"],
+                "--expected-recovery-authority-sha256",
+                recovery["authority"]["sha256"],
+                "--recovery-claim", recovery["claim"]["path"],
+                "--expected-recovery-claim-sha256",
+                recovery["claim"]["sha256"],
+            ],
+        )
 
     def test_build_campaign_succeeds_with_zero_candidate_receipts(self) -> None:
         build_root = self.fx.root / "build"
@@ -314,6 +350,333 @@ class ContractTests(unittest.TestCase):
             sup.run_next(campaign, capture=lambda _argv: self.fail("adapter was retried"), clock=lambda: 2.0)
         self.assertEqual(len(calls), 1)
 
+    def test_plain_run_next_refuses_occupied_global_e1_claim_before_private_claim(self) -> None:
+        campaign = self.fx.campaign()
+        write_json(Path(self.fx.jobs[0]["candidate_receipt_path"]), {"epoch": 1})
+        original = self.fx.train / "live_val_consumer_claims/epoch-0001.json"
+        write_json(original, {"occupied": True})
+        with self.assertRaisesRegex(sup.SupervisorError, "recover-e1"):
+            sup.run_next(
+                campaign,
+                capture=lambda _argv: self.fail("plain run-next executed work"),
+                clock=lambda: 1.0,
+            )
+        self.assertFalse((self.fx.state / "job_claims/epoch-0001.json").exists())
+        self.assertFalse((self.fx.state / "active_invocation.claim.json").exists())
+        self.assertFalse(Path(self.fx.jobs[0]["authority_path"]).exists())
+
+    def test_recovery_read_only_admission_failure_leaves_zero_new_state(self) -> None:
+        campaign = self.fx.campaign()
+        write_json(Path(self.fx.jobs[0]["candidate_receipt_path"]), {"epoch": 1})
+        write_json(
+            self.fx.train / "live_val_consumer_claims/epoch-0001.json",
+            {"occupied": True},
+        )
+        before_state = sorted(
+            path.relative_to(self.fx.state).as_posix()
+            for path in self.fx.state.rglob("*")
+        )
+        failed_root = self.fx.root / "failed-run-admission"
+        fixture_pins = write_failed_run_fixture(failed_root)
+        write_bytes(failed_root / "work-preflight.json", b"tampered\n")
+
+        def reject_tampered_inventory(*_args, **_kwargs):
+            sup._failed_run_inventory(failed_root)
+            self.fail("tampered non-shard preflight unexpectedly passed")
+
+        with mock.patch.object(sup, "FAILED_RUN_FILE_PINS", fixture_pins), \
+             mock.patch.object(sup, "_load_failed_campaign", return_value={}), \
+             mock.patch.object(sup, "_revalidate_control"), \
+             mock.patch.object(sup, "_runtime_contract_check"), \
+             mock.patch.object(
+                 sup, "_recovery_request_value",
+                 side_effect=reject_tampered_inventory,
+             ):
+            with self.assertRaisesRegex(sup.SupervisorError, "SHA/byte pins"):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("runner was invoked"),
+                    capture=lambda _argv: self.fail("unexpected capture"),
+                    clock=lambda: 1.0,
+                )
+        after_state = sorted(
+            path.relative_to(self.fx.state).as_posix()
+            for path in self.fx.state.rglob("*")
+        )
+        self.assertEqual(after_state, before_state)
+        self.assertFalse(Path(campaign["campaign_claim_path"]).exists())
+        self.assertFalse((self.fx.state / "active_invocation.claim.json").exists())
+        self.assertFalse((self.fx.state / "job_claims/epoch-0001.json").exists())
+        self.assertFalse(Path(self.fx.jobs[0]["authority_path"]).exists())
+        self.assertFalse(
+            (self.fx.train / "live_val_consumer_recovery_claims").exists()
+        )
+
+    def test_recovery_reserves_once_before_runner_and_failure_is_terminal(self) -> None:
+        campaign = self.fx.campaign()
+        job = self.fx.jobs[0]
+        write_json(Path(job["candidate_receipt_path"]), {"epoch": 1})
+        write_json(
+            self.fx.train / "live_val_consumer_claims/epoch-0001.json",
+            {"occupied": True},
+        )
+        authority_raw = sup.canonical_json_bytes({"candidate_epoch": 1})
+        authority_preview = {
+            "path": job["authority_path"],
+            "sha256": hashlib.sha256(authority_raw).hexdigest(),
+            "bytes": len(authority_raw),
+        }
+        request_value = {
+            "admission": "passed", "new_work_authority": authority_preview,
+        }
+        recovery_authority_value = {"recovery": "authority"}
+        recovery_authority_raw = sup.canonical_json_bytes(
+            recovery_authority_value
+        )
+        recovery_authority_preview = {
+            "path": str(self.fx.state / "recovery-authority.epoch-0001.json"),
+            "sha256": hashlib.sha256(recovery_authority_raw).hexdigest(),
+            "bytes": len(recovery_authority_raw),
+        }
+        recovery_claim_path = (
+            self.fx.train
+            / "live_val_consumer_recovery_claims/epoch-0001.json"
+        )
+        events = []
+
+        def capture(argv):
+            if "authorize" in argv:
+                events.append("authorize")
+                Path(job["authority_path"]).write_bytes(authority_raw)
+                stdout = (
+                    json.dumps(authority_preview, sort_keys=True) + "\n"
+                ).encode()
+                return 0, stdout, b""
+            if "inspect-recovery" in argv:
+                events.append("inspect")
+                value = {
+                    "status": "ready",
+                    "recovery_authority": recovery_authority_preview,
+                    "recovery_claim_path": str(recovery_claim_path),
+                }
+                return 0, (json.dumps(value, sort_keys=True) + "\n").encode(), b""
+            if "reserve-recovery" in argv:
+                events.append("reserve")
+                recovery_authority = write_json(
+                    Path(recovery_authority_preview["path"]),
+                    recovery_authority_value,
+                )
+                recovery_claim = write_json(
+                    recovery_claim_path, {"recovery": "claim"}
+                )
+                value = {
+                    "status": "reserved",
+                    "recovery_authority": recovery_authority,
+                    "recovery_claim": recovery_claim,
+                }
+                return 0, (json.dumps(value, sort_keys=True) + "\n").encode(), b""
+            self.fail("unexpected captured command: %r" % (argv,))
+
+        def runner(_argv):
+            events.append("runner")
+            return 1
+
+        patches = (
+            mock.patch.object(sup, "_load_failed_campaign", return_value={}),
+            mock.patch.object(sup, "_revalidate_control"),
+            mock.patch.object(sup, "_runtime_contract_check"),
+            mock.patch.object(
+                sup, "_recovery_request_value",
+                return_value=(request_value, authority_preview),
+            ),
+            mock.patch.object(sup, "_work_authority_runtime_binding"),
+            mock.patch.object(sup, "_work_authority_candidate_binding"),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            with self.assertRaisesRegex(sup.SupervisorError, "runner returned nonzero"):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=runner, capture=capture, clock=lambda: 1.0,
+                )
+        self.assertEqual(events, ["authorize", "inspect", "reserve", "runner"])
+        self.assertTrue(recovery_claim_path.exists())
+        self.assertTrue(Path(recovery_authority_preview["path"]).exists())
+        self.assertTrue((self.fx.state / "job_claims/epoch-0001.json").exists())
+        self.assertTrue((self.fx.state / "active_invocation.claim.json").exists())
+        events.clear()
+        with mock.patch.object(sup, "_load_failed_campaign", return_value={}):
+            with self.assertRaisesRegex(sup.SupervisorError, "claim exists without completion"):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("recovery runner was retried"),
+                    capture=lambda _argv: self.fail("recovery command was retried"),
+                    clock=lambda: 2.0,
+                )
+        self.assertEqual(events, [])
+
+    def test_recovery_authorize_failure_is_private_terminal_without_global_slot(self) -> None:
+        campaign = self.fx.campaign()
+        job = self.fx.jobs[0]
+        write_json(Path(job["candidate_receipt_path"]), {"epoch": 1})
+        original_claim = write_json(
+            self.fx.train / "live_val_consumer_claims/epoch-0001.json",
+            {"occupied": True},
+        )
+        original_raw = Path(original_claim["path"]).read_bytes()
+        authority_raw = sup.canonical_json_bytes({"candidate_epoch": 1})
+        authority_preview = {
+            "path": job["authority_path"],
+            "sha256": hashlib.sha256(authority_raw).hexdigest(),
+            "bytes": len(authority_raw),
+        }
+        calls = []
+
+        def capture(argv):
+            calls.append(list(argv))
+            self.assertIn("authorize", argv)
+            return 9, b"", b"authorize failed"
+
+        with mock.patch.object(sup, "_load_failed_campaign", return_value={}), \
+             mock.patch.object(sup, "_revalidate_control"), \
+             mock.patch.object(sup, "_runtime_contract_check"), \
+             mock.patch.object(
+                 sup, "_recovery_request_value",
+                 return_value=(
+                     {"new_work_authority": authority_preview},
+                     authority_preview,
+                 ),
+             ):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "authorize failed"
+            ):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("runner was invoked"),
+                    capture=capture, clock=lambda: 1.0,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(Path(campaign["campaign_claim_path"]).exists())
+        self.assertTrue((self.fx.state / "active_invocation.claim.json").exists())
+        self.assertTrue((self.fx.state / "job_claims/epoch-0001.json").exists())
+        self.assertFalse(
+            (self.fx.train / "live_val_consumer_recovery_claims").exists()
+        )
+        self.assertEqual(Path(original_claim["path"]).read_bytes(), original_raw)
+        with mock.patch.object(sup, "_load_failed_campaign", return_value={}):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "claim exists without completion"
+            ):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("runner was retried"),
+                    capture=lambda _argv: self.fail("capture was retried"),
+                    clock=lambda: 2.0,
+                )
+
+    def test_recovery_inspect_failure_is_private_terminal_without_global_slot(self) -> None:
+        campaign = self.fx.campaign()
+        job = self.fx.jobs[0]
+        write_json(Path(job["candidate_receipt_path"]), {"epoch": 1})
+        original_claim = write_json(
+            self.fx.train / "live_val_consumer_claims/epoch-0001.json",
+            {"occupied": True},
+        )
+        original_raw = Path(original_claim["path"]).read_bytes()
+        authority_raw = sup.canonical_json_bytes({"candidate_epoch": 1})
+        authority_preview = {
+            "path": job["authority_path"],
+            "sha256": hashlib.sha256(authority_raw).hexdigest(),
+            "bytes": len(authority_raw),
+        }
+        request_value = {
+            "admission": "passed", "new_work_authority": authority_preview,
+        }
+        events = []
+
+        def capture(argv):
+            if "authorize" in argv:
+                events.append("authorize")
+                Path(job["authority_path"]).write_bytes(authority_raw)
+                stdout = (
+                    json.dumps(authority_preview, sort_keys=True) + "\n"
+                ).encode()
+                return 0, stdout, b""
+            if "inspect-recovery" in argv:
+                events.append("inspect")
+                return 7, b"", b"inspect failed"
+            self.fail("unexpected captured command: %r" % (argv,))
+
+        patches = (
+            mock.patch.object(sup, "_load_failed_campaign", return_value={}),
+            mock.patch.object(sup, "_revalidate_control"),
+            mock.patch.object(sup, "_runtime_contract_check"),
+            mock.patch.object(
+                sup, "_recovery_request_value",
+                return_value=(request_value, authority_preview),
+            ),
+            mock.patch.object(sup, "_work_authority_runtime_binding"),
+            mock.patch.object(sup, "_work_authority_candidate_binding"),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            with self.assertRaisesRegex(sup.SupervisorError, "inspect-recovery"):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("runner was invoked"),
+                    capture=capture, clock=lambda: 1.0,
+                )
+        self.assertEqual(events, ["authorize", "inspect"])
+        self.assertTrue(Path(campaign["campaign_claim_path"]).exists())
+        self.assertTrue((self.fx.state / "active_invocation.claim.json").exists())
+        self.assertTrue((self.fx.state / "job_claims/epoch-0001.json").exists())
+        self.assertTrue((self.fx.state / "recovery-request.epoch-0001.json").exists())
+        self.assertFalse(
+            (self.fx.train / "live_val_consumer_recovery_claims").exists()
+        )
+        self.assertFalse(
+            (self.fx.state / "recovery-authority.epoch-0001.json").exists()
+        )
+        self.assertEqual(Path(original_claim["path"]).read_bytes(), original_raw)
+        events.clear()
+        with mock.patch.object(sup, "_load_failed_campaign", return_value={}):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "claim exists without completion"
+            ):
+                sup.recover_e1(
+                    campaign, "/failed-campaign.json",
+                    sup.FAILED_CAMPAIGN_SHA256, sup.FAILED_CAMPAIGN_BYTES,
+                    runner=lambda _argv: self.fail("runner was retried"),
+                    capture=lambda _argv: self.fail("capture was retried"),
+                    clock=lambda: 2.0,
+                )
+        self.assertEqual(events, [])
+
+    def test_unrelated_7d_incident_is_not_an_admissible_failed_campaign(self) -> None:
+        raw = sup.canonical_json_bytes({
+            "control_source": {"supervisor": {"path": "/old/supervisor.py"}},
+            "formal_python": {"argv0": "/old/venv/bin/python"},
+        })
+        failed_7d = {"_control_source": {
+            "commit": "7d9967c9c5124d6f1ba041c2cb315dee88554a76",
+            "tree": "a965cf1ccff214bd8922692603b33832b7357543",
+        }}
+        with mock.patch.object(
+            sup, "safe_regular_bytes",
+            return_value=(Path("/old/campaign.json"), raw,
+                          sup.FAILED_CAMPAIGN_SHA256,
+                          sup.FAILED_CAMPAIGN_BYTES),
+        ), mock.patch.object(sup, "load_campaign", return_value=failed_7d):
+            with self.assertRaisesRegex(sup.SupervisorError, "pinned 58407ed"):
+                sup._load_failed_campaign(
+                    "/old/campaign.json", sup.FAILED_CAMPAIGN_SHA256,
+                    sup.FAILED_CAMPAIGN_BYTES,
+                )
+
     def test_e400_final_absent_waits_without_reconcile_claim(self) -> None:
         campaign = self.fx.campaign()
         result = sup._finalize_v2(campaign, [({}, {}) for _ in sup.CANDIDATE_EPOCHS], lambda _argv: 0, lambda _argv: (0, b"", b""), lambda: 1.0)
@@ -342,6 +705,50 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(sup.SupervisorError, "trailing-NUL"):
             sup._verify_runner_log(job)
 
+    def test_completion_binds_recovery_claim_and_normal_completion_is_explicit_null(self) -> None:
+        campaign = self.fx.campaign()
+        base_job = {
+            **self.fx.jobs[0],
+            "candidate_receipt": {"path": "/candidate", "sha256": "1" * 64, "bytes": 1},
+            "work_authority": {"path": "/authority", "sha256": "2" * 64, "bytes": 1},
+            "authorization": {"path": "/authorization", "sha256": "3" * 64, "bytes": 1},
+        }
+        status_artifact = {"path": "/status", "sha256": "4" * 64, "bytes": 1}
+        log_artifact = {"path": "/log", "sha256": "5" * 64, "bytes": 1}
+        measurement = {"path": "/measurement", "sha256": "6" * 64,
+                       "bytes": 1, "receipt_payload_sha256": "7" * 64}
+        guards = {str(i): 100 + i for i in range(8)}
+        normal = sup._completion_body(
+            campaign, base_job, status_artifact, {}, log_artifact,
+            measurement, {"metrics": {"fgd": 0.25}}, ["bridge"],
+            ["verify"], "PASS\n", guards, 1.0,
+        )
+        self.assertIsNone(normal["consumer_recovery"])
+        recovery = {
+            label: write_json(self.fx.root / ("bound-%s.json" % label), {label: 1})
+            for label in ("request", "authority", "claim")
+        }
+        recovered_job = {**base_job, "consumer_recovery": recovery}
+        recovered_value = {
+            "metrics": {"fgd": 0.25},
+            "consumer_claim": {**recovery["claim"], "receipt_payload_sha256": "8" * 64},
+        }
+        completion = sup._completion_body(
+            campaign, recovered_job, status_artifact, {}, log_artifact,
+            measurement, recovered_value, ["bridge"], ["verify"],
+            "PASS\n", guards, 1.0,
+        )
+        self.assertEqual(completion["consumer_recovery"], recovery)
+        recovered_value["consumer_claim"] = {
+            **recovered_value["consumer_claim"], "sha256": "9" * 64,
+        }
+        with self.assertRaisesRegex(sup.SupervisorError, "reserved recovery claim"):
+            sup._completion_body(
+                campaign, recovered_job, status_artifact, {}, log_artifact,
+                measurement, recovered_value, ["bridge"], ["verify"],
+                "PASS\n", guards, 1.0,
+            )
+
     def test_guard_verifier_exact_line_and_pid_order(self) -> None:
         campaign = {"_formal_python": self.fx.formal, "_guard_verifier": self.fx.verifier}
         status = {"restored_guards": {str(i): 300 + i for i in range(8)}}
@@ -351,6 +758,72 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(observed, status["restored_guards"])
         with self.assertRaisesRegex(sup.SupervisorError, "differ"):
             sup._guard_verify(campaign, status, lambda _argv: (0, ("PASS " + " ".join("GPU%d=PID%d" % (i, 301 if i == 0 else 300 + i) for i in range(8)) + "\n").encode(), b""))
+
+    def test_failed_process_proof_checks_only_the_two_pinned_proc_paths(self) -> None:
+        status = {
+            "wrapper_pid": sup.FAILED_WRAPPER_PID,
+            "child_pid": sup.FAILED_CHILD_PID,
+            "command": ["/bin/bash", "/pinned/launcher.sh"],
+        }
+        observed = []
+        def absent(path):
+            observed.append(path)
+            return False
+        with mock.patch.object(sup.os.path, "lexists", side_effect=absent):
+            proof = sup._failed_process_proof(status, 1.0)
+        self.assertEqual(
+            observed,
+            ["/proc/%d" % sup.FAILED_WRAPPER_PID,
+             "/proc/%d" % sup.FAILED_CHILD_PID],
+        )
+        self.assertEqual(proof["wrapper_proc_state"], "absent")
+        self.assertEqual(proof["child_proc_state"], "absent")
+        self.assertEqual(proof["runner_command"], status["command"])
+        with mock.patch.object(
+            sup.os.path, "lexists",
+            side_effect=lambda path: path.endswith(str(sup.FAILED_CHILD_PID)),
+        ):
+            with self.assertRaisesRegex(sup.SupervisorError, "still live"):
+                sup._failed_process_proof(status, 1.0)
+
+    def test_failed_run_inventory_requires_exact_zero_output_tree(self) -> None:
+        root = self.fx.root / "failed-run"
+        fixture_pins = write_failed_run_fixture(root)
+        with mock.patch.object(sup, "FAILED_RUN_FILE_PINS", fixture_pins):
+            inventory = sup._failed_run_inventory(root)
+            self.assertEqual(inventory["semantic_outputs"], [])
+            self.assertEqual(len(inventory["files"]), 13)
+            write_bytes(root / "work-preflight.json", b"tampered\n")
+            with self.assertRaisesRegex(sup.SupervisorError, "SHA/byte pins"):
+                sup._failed_run_inventory(root)
+            write_bytes(
+                root / "work-preflight.json",
+                b"work-preflight.json\n",
+            )
+            write_bytes(root / "candidates/e1/shards/receipt.json", b"forbidden\n")
+            with self.assertRaisesRegex(sup.SupervisorError, "zero-semantic-output"):
+                sup._failed_run_inventory(root)
+
+    def test_failed_runner_status_is_exact_rc1_with_pinned_processes(self) -> None:
+        campaign = self.fx.campaign()
+        authority = write_json(self.fx.root / "failed-authority.json", {"x": 1})
+        job = {**self.fx.jobs[0], "work_authority": authority,
+               "_campaign": campaign}
+        value = {
+            "updated_at": "2026-08-02T00:00:00Z", "state": "failed",
+            "wrapper_pid": sup.FAILED_WRAPPER_PID,
+            "child_pid": sup.FAILED_CHILD_PID, "return_code": 1,
+            "received_signal": None, "error": None, "cleanup_error": None,
+            "restored_guards": {str(i): 300000 + i for i in range(8)},
+            "restore_error": None,
+            "command": sup._runner_workload(job, campaign),
+        }
+        artifact = write_json(Path(job["runner_status_path"]), value)
+        sup._failed_runner_status(job, artifact["sha256"])
+        value["return_code"] = 2
+        write_json(Path(job["runner_status_path"]), value)
+        with self.assertRaisesRegex(sup.SupervisorError, "exact rc1"):
+            sup._failed_runner_status(job)
 
     def test_official_selection_requires_selected_state_and_v2_format(self) -> None:
         selection_root = self.fx.root / "selection"

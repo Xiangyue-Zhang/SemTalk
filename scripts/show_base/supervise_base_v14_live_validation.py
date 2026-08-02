@@ -41,7 +41,7 @@ CAMPAIGN_FORMAT = "semtalk_show_base_v14_live_validation_campaign_v3"
 CAMPAIGN_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_campaign_claim_v1"
 ACTIVE_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_active_claim_v1"
 JOB_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_job_claim_v2"
-COMPLETION_FORMAT = "semtalk_show_base_v14_live_validation_completion_v3"
+COMPLETION_FORMAT = "semtalk_show_base_v14_live_validation_completion_v4"
 SUMMARY_FORMAT = "semtalk_show_base_v14_live_validation_summary_v3"
 MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v2"
 SELECTION_FORMAT = "semtalk_show_base_live_val_22way_selection_v2"
@@ -66,6 +66,23 @@ RUNTIME_VALIDATION_MEASUREMENT_SHA256 = "e985056c889c9803212a236597066877726826b
 RUNTIME_VALIDATION_LONG_SELECTOR_SHA256 = "d813864a33a5ff2109096453f956329a96480dd11f26c8a9144228df34d67269"
 RUNTIME_VALIDATION_SOURCE_FORMAT = "semtalk_show_base_runtime_validation_source_v1"
 AUTHORIZATION_FORMAT = "semtalk_show_base_v14_live_authorization_v1"
+RECOVERY_AUTHORIZATION_FORMAT = "semtalk_show_base_v14_live_recovery_authorization_v1"
+RECOVERY_REQUEST_FORMAT = "semtalk_show_base_v14_failed_consumer_recovery_request_v1"
+RECOVERY_CONTROL_MIN_COMMIT = "8532272130e14098fdef3f54c7733d4ba6033f4c"
+FAILED_CAMPAIGN_SHA256 = "9f299db9dc874826808142bfec4a69e403102a90293a42e2aa6c9ad52e3fab0a"
+FAILED_CAMPAIGN_BYTES = 33838
+FAILED_CONTROL_COMMIT = "58407ed3207fdd76dbf9a6e480de8af579bdb747"
+FAILED_CONTROL_TREE = "b71f20161677fc68b4f9220a71d25e40632b17a0"
+FAILED_JOB_CLAIM_SHA256 = "195994203d9f762b29c612c00aa1f185a9b407b1cfca687baa0fbc535d4c3b9b"
+FAILED_ACTIVE_CLAIM_SHA256 = "0f4349f368b532334f6540252d2d7609d0f5ca13d7ed1d5307a74a5432f25f4a"
+FAILED_AUTHORIZATION_SHA256 = "c122131f1198a431e927fc45e6ea529c21fc6dbf49e0cdfe0f3ca166e3647207"
+FAILED_WORK_AUTHORITY_SHA256 = "31c2930acf1bc608687351132b0ce135ddddc7d8d75655857ca9334fb51142d2"
+FAILED_CONSUMER_CLAIM_SHA256 = "b8449bf107ca4c97a543676e8883ad4218231524241e3ff685fbcc1cbff940b3"
+FAILED_RUNNER_STATUS_SHA256 = "b0c3f8a9a7ffd203621ac6d5bbcc29fdc2ff008ce9c6a2825b934139cee6fd2d"
+FAILED_RUNNER_LOG_SHA256 = "dd2a04e4989df737ca48fd55c3df02c027d0e5c9a2e3b2540d3908c864628ad8"
+FAILED_CANDIDATE_RECEIPT_SHA256 = "16b2fe66a7f8ec0c38c7ab326b540a6a14043c74cd85fe013e7ca6cf10b24d8a"
+FAILED_WRAPPER_PID = 261736
+FAILED_CHILD_PID = 261737
 PRODUCER_RECONCILE_CLAIM_FORMAT = "semtalk_show_base_v14_producer_reconcile_claim_v1"
 BRIDGE_RECONCILE_CLAIM_FORMAT = "semtalk_show_base_v14_bridge_reconcile_claim_v1"
 
@@ -94,6 +111,7 @@ COMPLETION_KEYS = frozenset({
     "bridge_replay_argv", "bridge_replay_stdout",
     "guard_verifier", "guard_verifier_argv", "guard_verifier_stdout",
     "restored_guards", "validation_diffsheg_fgd", "completed_unix",
+    "consumer_recovery",
     "receipt_payload_sha256",
 })
 RUNNER_STATUS_KEYS = frozenset({
@@ -151,6 +169,23 @@ AUTHORIZATION_KEYS = frozenset({
     "work_authority", "adapter", "adapter_argv", "adapter_stdout_sha256",
     "runner_argv",
     "completed_unix", "receipt_payload_sha256",
+})
+RECOVERY_AUTHORIZATION_KEYS = AUTHORIZATION_KEYS | frozenset({
+    "recovery_request", "recovery_authority", "recovery_claim",
+})
+RECOVERY_REQUEST_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "failed_campaign", "failed_job_claim",
+    "failed_active_claim", "failed_authorization", "failed_work_authority",
+    "failed_consumer_claim", "failed_runner_status", "failed_runner_log",
+    "failed_run_root", "failed_run_inventory", "failed_process_proof",
+    "guard_proof",
+    "new_campaign", "new_control_source", "new_work_authority",
+    "new_run_root", "created_unix", "receipt_payload_sha256",
+})
+ACTIVE_CLAIM_KEYS = frozenset({
+    "format", "status", "operation", "campaign", "created_unix",
+    "claim_payload_sha256",
 })
 JOB_CLAIM_KEYS = frozenset({
     "format", "status", "candidate_epoch", "campaign", "candidate_receipt",
@@ -831,7 +866,7 @@ def _candidate_receipt_artifact(job: Mapping[str, Any]) -> Dict[str, Any]:
 def _runner_workload(job: Mapping[str, Any], campaign: Mapping[str, Any]) -> List[str]:
     source = campaign["_control_source"]
     formal = campaign["_formal_python"]
-    return [
+    argv = [
         "/bin/bash", source["launcher"]["path"],
         "--repo-root", source["root"],
         "--python", formal["argv0"],
@@ -845,6 +880,26 @@ def _runner_workload(job: Mapping[str, Any], campaign: Mapping[str, Any]) -> Lis
         "--seed", str(campaign["_seed"]),
         "--diffsheg-batch-size", str(campaign["_diffsheg_batch_size"]),
     ]
+    recovery = job.get("consumer_recovery")
+    if recovery is not None:
+        require(
+            isinstance(recovery, dict)
+            and set(recovery) == {
+                "request", "authority", "claim",
+            },
+            "consumer recovery runner binding changed",
+        )
+        normalized = {
+            label: _artifact(recovery[label], "consumer recovery %s" % label)
+            for label in ("request", "authority", "claim")
+        }
+        argv.extend([
+            "--recovery-authority", normalized["authority"]["path"],
+            "--expected-recovery-authority-sha256", normalized["authority"]["sha256"],
+            "--recovery-claim", normalized["claim"]["path"],
+            "--expected-recovery-claim-sha256", normalized["claim"]["sha256"],
+        ])
+    return argv
 
 
 def _runner_argv_v2(job: Mapping[str, Any], campaign: Mapping[str, Any]) -> List[str]:
@@ -969,6 +1024,230 @@ def _runner_status(job: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, An
     return {"path": str(artifact), "sha256": digest, "bytes": size}, value
 
 
+def _failed_runner_status(
+    job: Mapping[str, Any], expected_sha256: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    artifact, raw, digest, size = safe_regular_bytes(
+        job["runner_status_path"], "failed runner status", expected_sha256
+    )
+    value = _strict_json_document(raw, "failed runner status")
+    require(set(value) == RUNNER_STATUS_KEYS, "failed runner status schema changed")
+    require(
+        value.get("state") == "failed"
+        and type(value.get("return_code")) is int
+        and value["return_code"] == 1,
+        "failed runner is not the exact rc1 incident",
+    )
+    for key in ("error", "cleanup_error", "restore_error", "received_signal"):
+        require(
+            key in value and value[key] is None,
+            "failed runner status %s is not explicit null" % key,
+        )
+    require(
+        value.get("command") == _runner_workload(job, job["_campaign"]),
+        "failed runner command changed",
+    )
+    _exact_int(value.get("wrapper_pid"), "failed runner wrapper PID", 2)
+    _exact_int(value.get("child_pid"), "failed runner child PID", 2)
+    require(
+        value["wrapper_pid"] != value["child_pid"],
+        "failed runner wrapper/child PIDs collide",
+    )
+    require(
+        value["wrapper_pid"] == FAILED_WRAPPER_PID
+        and value["child_pid"] == FAILED_CHILD_PID,
+        "failed runner is not the pinned wrapper/child process pair",
+    )
+    restored = value.get("restored_guards")
+    require(
+        isinstance(restored, dict)
+        and set(restored) == {str(i) for i in GPU_INDICES}
+        and all(type(restored[str(i)]) is int and restored[str(i)] > 1 for i in GPU_INDICES)
+        and len(set(restored.values())) == 8,
+        "failed runner did not restore eight distinct guards",
+    )
+    require(
+        value["wrapper_pid"] not in restored.values()
+        and value["child_pid"] not in restored.values(),
+        "failed runner PID collides with restored guard",
+    )
+    return {"path": str(artifact), "sha256": digest, "bytes": size}, value
+
+
+FAILED_RUN_INVENTORY_FORMAT = "semtalk_show_base_failed_consumer_run_inventory_v1"
+FAILED_SHARD_MARKER = (
+    "ValInferenceContractError: scripts.show_base.build_base_features "
+    "was imported from another checkout"
+)
+FAILED_RUN_FILE_PINS = {
+    "diffsheg-evaluator-bundle.json": (
+        "de641ffb88c5393c5df7327f21b704588f18ece21bb1b0c4cabe4556c7550bd6",
+        1347,
+    ),
+    "logs/e1-shard0.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard1.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard2.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard3.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard4.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard5.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard6.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/e1-shard7.log": (
+        "eea9c651b4777b8ad068a8530655385dd7c0bc4c450c3dd493d0ed8c8673a2a8",
+        1521,
+    ),
+    "logs/evaluator-preflight.log": (
+        "71ca30c56e0e8db4d7de2b59e419e24d7f0bdd9589f24b60e9bd27b8a7ef814c",
+        1402,
+    ),
+    "logs/work-inspect.json": (
+        "dc27d291061f4157ba73704e8323a55472b3484a0a60c123d13204565293734f",
+        433,
+    ),
+    "logs/work-preflight.log": (
+        "12d1b367af40a8135348230c04b2ec2d40f76950fd391c7b0d226bff185db875",
+        818,
+    ),
+    "work-preflight.json": (
+        "5c42928d3af37cce915ada37bd98b90b4da28e82869d6f383f4fa5621ca9c6c0",
+        6294,
+    ),
+}
+
+
+def _failed_run_inventory(path_text: Any) -> Dict[str, Any]:
+    root = canonical_directory(path_text, "failed e1 run root")
+    expected_directories = [
+        ".", "candidates", "candidates/e1", "candidates/e1/shards", "logs",
+    ]
+    expected_files = [
+        "diffsheg-evaluator-bundle.json", "work-preflight.json",
+        "logs/evaluator-preflight.log", "logs/work-inspect.json",
+        "logs/work-preflight.log",
+        *["logs/e1-shard%d.log" % shard for shard in GPU_INDICES],
+    ]
+    observed_directories = ["."]
+    observed_files: List[str] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for child in sorted(directory.iterdir(), key=lambda item: item.name):
+            relative = child.relative_to(root).as_posix()
+            metadata = child.lstat()
+            require(not stat.S_ISLNK(metadata.st_mode), "failed run contains a symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                observed_directories.append(relative)
+                pending.append(child)
+            else:
+                require(
+                    stat.S_ISREG(metadata.st_mode),
+                    "failed run contains a non-regular artifact",
+                )
+                observed_files.append(relative)
+    observed_directories.sort()
+    observed_files.sort()
+    require(
+        observed_directories == sorted(expected_directories)
+        and observed_files == sorted(expected_files),
+        "failed run is not the exact zero-semantic-output tree",
+    )
+    files: List[Dict[str, Any]] = []
+    shard_payloads: List[bytes] = []
+    shard_shas: List[str] = []
+    for relative in observed_files:
+        _path, raw, digest, size = safe_regular_bytes(
+            root / relative, "failed run artifact %s" % relative
+        )
+        files.append({"relative_path": relative, "sha256": digest, "bytes": size})
+        if re.fullmatch(r"logs/e1-shard[0-7]\.log", relative):
+            shard_payloads.append(raw)
+            shard_shas.append(digest)
+    observed_pins = {
+        row["relative_path"]: (row["sha256"], row["bytes"])
+        for row in files
+    }
+    require(
+        observed_pins == FAILED_RUN_FILE_PINS,
+        "failed run artifact SHA/byte pins changed",
+    )
+    require(
+        len(shard_payloads) == 8
+        and len(set(shard_shas)) == 1
+        and len(set(shard_payloads)) == 1,
+        "failed shard logs are not eight identical pre-inference failures",
+    )
+    try:
+        shard_text = shard_payloads[0].decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise SupervisorError("failed shard log is not UTF-8") from error
+    require(
+        shard_text.count(FAILED_SHARD_MARKER) == 1,
+        "failed shard log does not contain the exact pinned failure marker",
+    )
+    return {
+        "format": FAILED_RUN_INVENTORY_FORMAT,
+        "root": str(root),
+        "directories": sorted(expected_directories),
+        "files": files,
+        "shard_log_sha256": shard_shas[0],
+        "shard_failure_marker": FAILED_SHARD_MARKER,
+        "semantic_outputs": [],
+    }
+
+
+def _failed_process_proof(
+    status: Mapping[str, Any], now: float,
+) -> Dict[str, Any]:
+    wrapper_pid = _exact_int(
+        status.get("wrapper_pid"), "failed runner wrapper PID", 2
+    )
+    child_pid = _exact_int(
+        status.get("child_pid"), "failed runner child PID", 2
+    )
+    require(wrapper_pid != child_pid, "failed runner PIDs collide")
+    for pid, role in ((wrapper_pid, "wrapper"), (child_pid, "child")):
+        require(
+            not os.path.lexists("/proc/%d" % pid),
+            "failed runner %s PID %d is still live or has been reused" % (role, pid),
+        )
+    command = status.get("command")
+    require(
+        isinstance(command, list)
+        and all(isinstance(token, str) and token and "\0" not in token for token in command),
+        "failed runner command proof changed",
+    )
+    return {
+        "wrapper_pid": wrapper_pid,
+        "child_pid": child_pid,
+        "wrapper_proc_state": "absent",
+        "child_proc_state": "absent",
+        "runner_command": list(command),
+        "checked_unix": _finite_number(
+            now, "failed runner process proof time", 0.000001
+        ),
+    }
+
+
 def _measurement(job: Mapping[str, Any], expected_sha: str, expected_payload_sha: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     path, raw, digest, size = safe_regular_bytes(job["measurement_path"], "live measurement", expected_sha)
     value = _strict_json_document(raw, "live measurement")
@@ -1044,6 +1323,102 @@ def _bridge_replay(campaign: Mapping[str, Any], job: Mapping[str, Any], measurem
     return argv
 
 
+def _recovery_bridge_argv(
+    campaign: Mapping[str, Any], command: str,
+    request: Mapping[str, Any],
+) -> List[str]:
+    require(
+        command in {"inspect-recovery", "reserve-recovery"},
+        "unknown recovery bridge command",
+    )
+    request_artifact = _artifact(request, "consumer recovery request")
+    return [
+        campaign["_formal_python"]["argv0"], "-I",
+        campaign["_control_source"]["bridge"]["path"], command,
+        "--request", request_artifact["path"],
+        "--expected-request-sha256", request_artifact["sha256"],
+        "--output-authority",
+        str(campaign["_state_root"] / "recovery-authority.epoch-0001.json"),
+    ]
+
+
+def _recovery_stdout_document(
+    raw: bytes, label: str,
+) -> Dict[str, Any]:
+    require(0 < len(raw) <= 4096, "%s stdout is empty/oversize" % label)
+    value = _strict_json_document(raw, "%s stdout" % label)
+    require(
+        raw == (
+            json.dumps(value, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8"),
+        "%s stdout is not one canonical JSON line" % label,
+    )
+    return value
+
+
+def _recovery_core_preview(
+    value: Any, expected_path: Path, label: str,
+) -> Dict[str, Any]:
+    require(isinstance(value, dict) and set(value) == ARTIFACT_KEYS, "%s schema changed" % label)
+    path = canonical_output_path(value.get("path"), "%s path" % label)
+    require(path == expected_path, "%s path changed" % label)
+    digest = value.get("sha256")
+    size = value.get("bytes")
+    require(isinstance(digest, str) and HEX64.fullmatch(digest) is not None, "%s SHA changed" % label)
+    _exact_int(size, "%s bytes" % label, 1)
+    return {"path": str(path), "sha256": digest, "bytes": size}
+
+
+def _inspect_recovery_stdout(
+    campaign: Mapping[str, Any], raw: bytes,
+) -> Tuple[Dict[str, Any], str]:
+    value = _recovery_stdout_document(raw, "inspect-recovery")
+    require(
+        set(value) == {"status", "recovery_authority", "recovery_claim_path"}
+        and value.get("status") == "ready",
+        "inspect-recovery stdout schema/state changed",
+    )
+    expected_authority = campaign["_state_root"] / "recovery-authority.epoch-0001.json"
+    authority = _recovery_core_preview(
+        value["recovery_authority"], expected_authority,
+        "inspect-recovery authority preview",
+    )
+    expected_claim = (
+        Path(campaign["_adapter_config"]["train_root"])
+        / "live_val_consumer_recovery_claims" / "epoch-0001.json"
+    )
+    claim_path = _lexical_absolute(
+        value.get("recovery_claim_path"), "inspect-recovery claim path"
+    )
+    require(claim_path == expected_claim, "inspect-recovery claim path changed")
+    return authority, str(claim_path)
+
+
+def _reserve_recovery_stdout(
+    campaign: Mapping[str, Any], raw: bytes,
+    preview_authority: Mapping[str, Any], preview_claim_path: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    value = _recovery_stdout_document(raw, "reserve-recovery")
+    require(
+        set(value) == {"status", "recovery_authority", "recovery_claim"}
+        and value.get("status") == "reserved",
+        "reserve-recovery stdout schema/state changed",
+    )
+    authority = _artifact(
+        value["recovery_authority"], "reserved recovery authority"
+    )
+    claim = _artifact(value["recovery_claim"], "reserved recovery claim")
+    require(
+        strict_json_equal(authority, preview_authority),
+        "reserved recovery authority differs from inspected preview",
+    )
+    require(
+        claim["path"] == preview_claim_path,
+        "reserved recovery claim path differs from inspected preview",
+    )
+    return authority, claim
+
+
 def _revalidate_control(campaign: Mapping[str, Any]) -> None:
     _control_source(campaign["control_source"], campaign["_control_source"]["supervisor"]["path"])
     runtime = _runtime_validation_source(campaign["runtime_validation_source"])
@@ -1061,6 +1436,28 @@ def _runtime_contract_check(campaign: Mapping[str, Any], capture: Callable[[Sequ
 
 
 def _completion_body(campaign: Mapping[str, Any], job: Mapping[str, Any], status_artifact: Mapping[str, Any], status: Mapping[str, Any], log_artifact: Mapping[str, Any], measurement: Mapping[str, Any], measurement_value: Mapping[str, Any], bridge_replay_argv: Sequence[str], verifier_argv: Sequence[str], verifier_stdout: str, guards: Mapping[str, int], now: float) -> Dict[str, Any]:
+    recovery = job.get("consumer_recovery")
+    normalized_recovery = None
+    if recovery is not None:
+        require(
+            isinstance(recovery, dict)
+            and set(recovery) == {"request", "authority", "claim"},
+            "completion recovery binding changed",
+        )
+        normalized_recovery = {
+            label: _artifact(recovery[label], "completion recovery %s" % label)
+            for label in ("request", "authority", "claim")
+        }
+        observed_claim = measurement_value.get("consumer_claim")
+        require(
+            isinstance(observed_claim, dict)
+            and all(
+                observed_claim.get(key) == normalized_recovery["claim"][key]
+                and type(observed_claim.get(key)) is type(normalized_recovery["claim"][key])
+                for key in ARTIFACT_KEYS
+            ),
+            "recovered measurement does not bind the reserved recovery claim",
+        )
     return _add_self_hash({
         "format": COMPLETION_FORMAT, "status": "complete", "split": "val",
         "test_visible": False, "selection_eligible": False,
@@ -1074,6 +1471,7 @@ def _completion_body(campaign: Mapping[str, Any], job: Mapping[str, Any], status
         "guard_verifier_argv": list(verifier_argv),
         "guard_verifier_stdout": verifier_stdout, "restored_guards": dict(guards),
         "validation_diffsheg_fgd": measurement_value["metrics"]["fgd"],
+        "consumer_recovery": normalized_recovery,
         "completed_unix": _finite_number(now, "completion time", 0.000001),
     }, "receipt_payload_sha256")
 
@@ -1106,8 +1504,13 @@ def _load_job_claim_v2(campaign: Mapping[str, Any], job: Mapping[str, Any], cand
 
 
 def _authorization_body(campaign: Mapping[str, Any], job: Mapping[str, Any], authorize_argv: Sequence[str], adapter_stdout_sha: str, runner_argv: Sequence[str], now: float) -> Dict[str, Any]:
-    return _add_self_hash({
-        "format": AUTHORIZATION_FORMAT, "status": "complete",
+    recovery = job.get("consumer_recovery")
+    body = {
+        "format": (
+            RECOVERY_AUTHORIZATION_FORMAT if recovery is not None
+            else AUTHORIZATION_FORMAT
+        ),
+        "status": "complete",
         "candidate_epoch": job["epoch"], "campaign": campaign["_artifact"],
         "candidate_receipt": job["candidate_receipt"],
         "work_authority": job["work_authority"],
@@ -1115,17 +1518,56 @@ def _authorization_body(campaign: Mapping[str, Any], job: Mapping[str, Any], aut
         "adapter_argv": list(authorize_argv), "adapter_stdout_sha256": adapter_stdout_sha,
         "runner_argv": list(runner_argv),
         "completed_unix": _finite_number(now, "authorization time", 0.000001),
-    }, "receipt_payload_sha256")
+    }
+    if recovery is not None:
+        require(
+            isinstance(recovery, dict)
+            and set(recovery) == {"request", "authority", "claim"},
+            "recovery authorization binding changed",
+        )
+        body.update({
+            "recovery_request": _artifact(
+                recovery["request"], "recovery authorization request"
+            ),
+            "recovery_authority": _artifact(
+                recovery["authority"], "recovery authorization authority"
+            ),
+            "recovery_claim": _artifact(
+                recovery["claim"], "recovery authorization claim"
+            ),
+        })
+    return _add_self_hash(body, "receipt_payload_sha256")
 
 
 def _load_authorization(campaign: Mapping[str, Any], job: Mapping[str, Any], candidate_receipt: Mapping[str, Any], authority: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     artifact, value = _read_existing_json(Path(job["authorization_path"]), "authorization receipt")
-    require(set(value) == AUTHORIZATION_KEYS and value.get("format") == AUTHORIZATION_FORMAT and value.get("status") == "complete" and value.get("candidate_epoch") == job["epoch"], "authorization receipt schema/state changed")
+    recovery = job.get("consumer_recovery")
+    expected_keys = (
+        RECOVERY_AUTHORIZATION_KEYS if recovery is not None else AUTHORIZATION_KEYS
+    )
+    expected_format = (
+        RECOVERY_AUTHORIZATION_FORMAT if recovery is not None
+        else AUTHORIZATION_FORMAT
+    )
+    require(set(value) == expected_keys and value.get("format") == expected_format and value.get("status") == "complete" and value.get("candidate_epoch") == job["epoch"], "authorization receipt schema/state changed")
     _self_hashed(value, "receipt_payload_sha256", "authorization receipt")
     require(strict_json_equal(value.get("campaign"), campaign["_artifact"]) and strict_json_equal(value.get("candidate_receipt"), candidate_receipt) and strict_json_equal(value.get("work_authority"), authority), "authorization receipt authority changed")
     require(value.get("adapter") == campaign["_control_source"]["authority_adapter"] and value.get("adapter_argv") == _authorize_argv(campaign, job), "authorization adapter command changed")
     expected_runner = _validate_runner_argv_v2(value.get("runner_argv"), {**job, "work_authority": authority}, campaign)
     require(value["runner_argv"] == expected_runner and isinstance(value.get("adapter_stdout_sha256"), str) and HEX64.fullmatch(value["adapter_stdout_sha256"]) is not None, "authorization runner/stdout binding changed")
+    if recovery is not None:
+        require(
+            isinstance(recovery, dict)
+            and set(recovery) == {"request", "authority", "claim"}
+            and all(
+                strict_json_equal(
+                    value["recovery_%s" % label],
+                    _artifact(recovery[label], "recovery authorization %s" % label),
+                )
+                for label in ("request", "authority", "claim")
+            ),
+            "recovery authorization artifacts changed",
+        )
     _finite_number(value.get("completed_unix"), "authorization time", 0.000001)
     return artifact, value
 
@@ -1142,12 +1584,42 @@ def _load_completion_v2(campaign: Mapping[str, Any], job: Mapping[str, Any]) -> 
     require(authority["path"] == job["authority_path"], "completed work authority path changed")
     _work_authority_runtime_binding(authority, campaign["_runtime_validation_source"], job["epoch"])
     _work_authority_candidate_binding(authority, candidate_receipt, job["epoch"])
-    replay_job = {**job, "candidate_receipt": candidate_receipt, "work_authority": authority}
+    recovery_value = value.get("consumer_recovery")
+    recovery = None
+    if recovery_value is not None:
+        require(
+            isinstance(recovery_value, dict)
+            and set(recovery_value) == {"request", "authority", "claim"},
+            "completion recovery schema changed",
+        )
+        recovery = {
+            label: _artifact(recovery_value[label], "completed recovery %s" % label)
+            for label in ("request", "authority", "claim")
+        }
+        require(
+            strict_json_equal(recovery, recovery_value),
+            "completion recovery artifacts changed",
+        )
+    replay_job = {
+        **job, "candidate_receipt": candidate_receipt,
+        "work_authority": authority, "consumer_recovery": recovery,
+    }
     authorization_artifact, authorization = _load_authorization(campaign, replay_job, candidate_receipt, authority)
     require(strict_json_equal(value.get("authorization"), authorization_artifact), "completion authorization receipt changed")
     replay_job["authorization"] = authorization_artifact
     measurement, measurement_value = _measurement(replay_job, value["measurement"]["sha256"], value["measurement"]["receipt_payload_sha256"])
     require(strict_json_equal(measurement, value["measurement"]), "completion measurement changed")
+    if recovery is not None:
+        observed_claim = measurement_value.get("consumer_claim")
+        require(
+            isinstance(observed_claim, dict)
+            and all(
+                observed_claim.get(key) == recovery["claim"][key]
+                and type(observed_claim.get(key)) is type(recovery["claim"][key])
+                for key in ARTIFACT_KEYS
+            ),
+            "completed recovered measurement claim changed",
+        )
     replay_job["_campaign"] = campaign
     status_artifact, status = _runner_status(replay_job)
     require(strict_json_equal(status_artifact, value["runner_status"]), "completion runner status changed")
@@ -1187,6 +1659,8 @@ def _scan_v2(campaign: Mapping[str, Any]) -> Tuple[List[Tuple[Dict[str, Any], Di
         "campaign.json", "campaign.claim.json", "final_summary.json",
         "active_invocation.claim.json", "producer_reconcile.claim.json",
         "bridge_reconcile.claim.json", "reconciliation.json",
+        "recovery-request.epoch-0001.json",
+        "recovery-authority.epoch-0001.json",
         "job_claims", "completions", "runner_status", "runner_logs",
         "authorities", "authorizations",
     }
@@ -1224,6 +1698,226 @@ def _scan_v2(campaign: Mapping[str, Any]) -> Tuple[List[Tuple[Dict[str, Any], Di
         ):
             require(not os.path.lexists(path), "%s exists before all 22 completions" % label)
     return completed, head
+
+
+FAILED_GLOBAL_CLAIM_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "expected_shards", "work_authority", "run_root",
+    "receipt_payload_sha256",
+})
+
+
+def _load_failed_campaign(
+    path_text: Any, expected_sha256: str, expected_bytes: int,
+) -> Dict[str, Any]:
+    require(
+        expected_sha256 == FAILED_CAMPAIGN_SHA256
+        and expected_bytes == FAILED_CAMPAIGN_BYTES,
+        "recovery may reference only the pinned 58407ed e1 failure campaign",
+    )
+    path, raw, _digest, _size = safe_regular_bytes(
+        path_text, "failed recovery campaign", expected_sha256, expected_bytes
+    )
+    preview = strict_json(raw, "failed recovery campaign")
+    control = preview.get("control_source")
+    formal = preview.get("formal_python")
+    require(
+        isinstance(control, dict)
+        and isinstance(control.get("supervisor"), dict)
+        and isinstance(formal, dict)
+        and isinstance(formal.get("argv0"), str),
+        "failed recovery campaign lacks source/runtime bindings",
+    )
+    failed = load_campaign(
+        str(path), expected_sha256, expected_bytes,
+        running_script=control["supervisor"].get("path"),
+        running_executable=formal["argv0"],
+    )
+    require(
+        failed["_control_source"]["commit"] == FAILED_CONTROL_COMMIT
+        and failed["_control_source"]["tree"] == FAILED_CONTROL_TREE,
+        "recovery source is not the pinned 58407ed incident",
+    )
+    return failed
+
+
+def _failed_global_claim(
+    failed: Mapping[str, Any], old_job: Mapping[str, Any],
+    old_authority: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    claim_path = (
+        Path(failed["_adapter_config"]["train_root"])
+        / "live_val_consumer_claims" / "epoch-0001.json"
+    )
+    artifact, value = _read_existing_json(claim_path, "failed global consumer claim")
+    require(
+        artifact["sha256"] == FAILED_CONSUMER_CLAIM_SHA256
+        and set(value) == FAILED_GLOBAL_CLAIM_KEYS
+        and value.get("format") == "semtalk_show_base_live_val_consumer_claim_v2"
+        and value.get("status") == "claimed"
+        and value.get("split") == "val"
+        and value.get("test_visible") is False
+        and value.get("selection_eligible") is False
+        and value.get("candidate_epoch") == 1
+        and value.get("expected_shards") == 8
+        and value.get("run_root") == old_job["run_root"]
+        and value.get("receipt_payload_sha256") == _bridge_payload_sha(value),
+        "failed global consumer claim changed",
+    )
+    claimed_authority = value.get("work_authority")
+    require(
+        isinstance(claimed_authority, dict)
+        and all(
+            claimed_authority.get(key) == old_authority[key]
+            for key in ARTIFACT_KEYS
+        ),
+        "failed global claim work authority changed",
+    )
+    return artifact, value
+
+
+def _recovery_request_value(
+    campaign: Mapping[str, Any], job: Mapping[str, Any],
+    candidate_receipt: Mapping[str, Any],
+    failed: Mapping[str, Any], capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]],
+    clock: Callable[[], float],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    require(job["epoch"] == 1, "only e1 is eligible for failed-claim recovery")
+    require(
+        _git_stdout(
+            Path(campaign["_control_source"]["root"]), "merge-base",
+            "--is-ancestor", RECOVERY_CONTROL_MIN_COMMIT,
+            campaign["_control_source"]["commit"],
+        ) == "",
+        "recovery control is not a descendant of the proven 8532272 fix",
+    )
+    old_job = dict(failed["_jobs"][0])
+    old_job["_campaign"] = failed
+    old_candidate = _candidate_receipt_artifact(old_job)
+    require(
+        old_candidate["sha256"] == FAILED_CANDIDATE_RECEIPT_SHA256
+        and strict_json_equal(old_candidate, candidate_receipt),
+        "recovery candidate is not the exact failed e1 candidate",
+    )
+    old_claim, old_claim_value = _load_job_claim_v2(
+        failed, old_job, old_candidate
+    )
+    require(
+        old_claim["sha256"] == FAILED_JOB_CLAIM_SHA256,
+        "failed private job claim changed",
+    )
+    active_artifact, active_value = _read_existing_json(
+        failed["_state_root"] / "active_invocation.claim.json",
+        "failed active invocation claim",
+    )
+    require(
+        active_artifact["sha256"] == FAILED_ACTIVE_CLAIM_SHA256
+        and set(active_value) == ACTIVE_CLAIM_KEYS
+        and active_value.get("format") == ACTIVE_CLAIM_FORMAT
+        and active_value.get("status") == "active"
+        and active_value.get("operation") == "run-next"
+        and strict_json_equal(active_value.get("campaign"), failed["_artifact"]),
+        "failed active invocation claim changed",
+    )
+    _self_hashed(active_value, "claim_payload_sha256", "failed active invocation claim")
+    old_authority = _artifact_from_path(
+        old_job["authority_path"], "failed work authority"
+    )
+    require(
+        old_authority["sha256"] == FAILED_WORK_AUTHORITY_SHA256,
+        "failed e1 work authority changed",
+    )
+    new_authority = {
+        "path": job["authority_path"],
+        "sha256": old_authority["sha256"],
+        "bytes": old_authority["bytes"],
+    }
+    _work_authority_runtime_binding(
+        old_authority, failed["_runtime_validation_source"], 1
+    )
+    _work_authority_candidate_binding(old_authority, old_candidate, 1)
+    old_dynamic = {
+        **old_job, "candidate_receipt": old_candidate,
+        "work_authority": old_authority,
+    }
+    authorization_artifact, _authorization = _load_authorization(
+        failed, old_dynamic, old_candidate, old_authority
+    )
+    require(
+        authorization_artifact["sha256"] == FAILED_AUTHORIZATION_SHA256,
+        "failed authorization changed",
+    )
+    old_dynamic["_campaign"] = failed
+    status_artifact, status = _failed_runner_status(
+        old_dynamic, FAILED_RUNNER_STATUS_SHA256
+    )
+    log_path, log_raw, log_sha, log_size = safe_regular_bytes(
+        old_job["runner_log_path"], "failed runner log", FAILED_RUNNER_LOG_SHA256
+    )
+    require(
+        log_raw == b"eight-shard live validation failed for e1\n",
+        "failed runner log changed",
+    )
+    log_artifact = {"path": str(log_path), "sha256": log_sha, "bytes": log_size}
+    global_claim, _global_claim_value = _failed_global_claim(
+        failed, old_job, old_authority
+    )
+    inventory = _failed_run_inventory(old_job["run_root"])
+    _failed_process_proof(status, clock())
+    require(
+        strict_json_equal(
+            campaign["_guard_verifier"], failed["_guard_verifier"]
+        ),
+        "new campaign guard verifier differs from the failed incident verifier",
+    )
+    verifier_argv, verifier_stdout, guards = _guard_verify(
+        failed, status, capture
+    )
+    # The runner status and immutable failed tree are read again after the
+    # independent verifier, closing the admission-time TOCTOU window.
+    status_artifact_2, status_2 = _failed_runner_status(
+        old_dynamic, FAILED_RUNNER_STATUS_SHA256
+    )
+    require(
+        strict_json_equal(status_artifact_2, status_artifact)
+        and strict_json_equal(status_2, status)
+        and strict_json_equal(_failed_run_inventory(old_job["run_root"]), inventory),
+        "failed incident changed during recovery admission",
+    )
+    process_proof = _failed_process_proof(status_2, clock())
+    request_value = _add_self_hash({
+        "format": RECOVERY_REQUEST_FORMAT,
+        "status": "ready_for_single_recovery",
+        "split": "val", "test_visible": False,
+        "selection_eligible": False, "candidate_epoch": 1,
+        "failed_campaign": failed["_artifact"],
+        "failed_job_claim": old_claim,
+        "failed_active_claim": active_artifact,
+        "failed_authorization": authorization_artifact,
+        "failed_work_authority": old_authority,
+        "failed_consumer_claim": global_claim,
+        "failed_runner_status": status_artifact,
+        "failed_runner_log": log_artifact,
+        "failed_run_root": old_job["run_root"],
+        "failed_run_inventory": inventory,
+        "failed_process_proof": process_proof,
+        "guard_proof": {
+            "verifier": campaign["_guard_verifier"],
+            "argv": verifier_argv, "stdout": verifier_stdout,
+            "restored_guards": guards,
+            "verified_unix": _finite_number(
+                clock(), "failed guard verification time", 0.000001
+            ),
+        },
+        "new_campaign": campaign["_artifact"],
+        "new_control_source": campaign["control_source"],
+        "new_work_authority": new_authority,
+        "new_run_root": job["run_root"],
+        "created_unix": _finite_number(
+            clock(), "recovery request time", 0.000001
+        ),
+    }, "receipt_payload_sha256")
+    return request_value, new_authority
 
 
 def _campaign_claim_v2(campaign: Mapping[str, Any], clock: Callable[[], float]) -> Dict[str, Any]:
@@ -1536,6 +2230,10 @@ def finalize_campaign(
     capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
     clock: Callable[[], float] = time.time,
 ) -> Dict[str, Any]:
+    # The read-only admission above consumes no durable slot.  From this first
+    # private write onward the new campaign attempt is terminal on every
+    # failure, but the one global recovery slot remains unconsumed until the
+    # bridge's reserve-recovery operation publishes its global claim.
     _campaign_claim_v2(campaign, clock)
     completed, head = _scan_v2(campaign)
     require(head is None and len(completed) == 22, "cannot finalize before all 22 completions")
@@ -1573,6 +2271,15 @@ def run_next(
             "completion_count": len(completed), "selection_eligible": False,
             "job_claim_created": False, "active_claim_created": False,
         }
+    if head["epoch"] == 1:
+        original_claim_path = (
+            Path(campaign["_adapter_config"]["train_root"])
+            / "live_val_consumer_claims" / "epoch-0001.json"
+        )
+        require(
+            not os.path.lexists(original_claim_path),
+            "the global e1 consumer claim is already occupied; use the pinned recover-e1 command",
+        )
     candidate_receipt = _candidate_receipt_artifact(head)
     active = _active_v2(campaign, "run-next", clock)
     require(not os.path.lexists(head["authority_path"]) and not os.path.lexists(head["authorization_path"]) and not os.path.lexists(head["run_root"]) and not os.path.lexists(head["runner_status_path"]) and not os.path.lexists(head["runner_log_path"]), "queue head outputs already exist")
@@ -1621,6 +2328,251 @@ def run_next(
     completion = write_new_json(dynamic["completion_path"], completion_value, "completion")
     _release_active_v2(campaign, active)
     return {"status": "job_complete", "candidate_epoch": dynamic["epoch"], "selection_eligible": False, "job_claim": claim, "authorization": authorization, "completion": completion, "validation_diffsheg_fgd": completion_value["validation_diffsheg_fgd"], "remaining": 21 - len(completed)}
+
+
+def recover_e1(
+    campaign: Mapping[str, Any], failed_campaign_path: Any,
+    expected_failed_campaign_sha256: str,
+    expected_failed_campaign_bytes: int,
+    runner: Callable[[Sequence[str]], int] = _run_process,
+    capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
+    clock: Callable[[], float] = time.time,
+) -> Dict[str, Any]:
+    """Consume the one globally reserved recovery slot for the pinned e1 incident."""
+
+    failed = _load_failed_campaign(
+        failed_campaign_path, expected_failed_campaign_sha256,
+        expected_failed_campaign_bytes,
+    )
+    completed, head = _scan_v2(campaign)
+    require(
+        not completed and head is not None and head["epoch"] == 1,
+        "recover-e1 requires a fresh campaign whose exact queue head is e1",
+    )
+    require(
+        os.path.lexists(head["candidate_receipt_path"]),
+        "recover-e1 requires the exact e1 candidate-ready receipt",
+    )
+    original_claim_path = (
+        Path(campaign["_adapter_config"]["train_root"])
+        / "live_val_consumer_claims" / "epoch-0001.json"
+    )
+    recovery_claim_path = (
+        Path(campaign["_adapter_config"]["train_root"])
+        / "live_val_consumer_recovery_claims" / "epoch-0001.json"
+    )
+    request_path = campaign["_state_root"] / "recovery-request.epoch-0001.json"
+    recovery_authority_path = (
+        campaign["_state_root"] / "recovery-authority.epoch-0001.json"
+    )
+    require(
+        os.path.lexists(original_claim_path),
+        "the pinned failed e1 global consumer claim is absent",
+    )
+    for path, label in (
+        (Path(campaign["campaign_claim_path"]), "new campaign claim"),
+        (campaign["_state_root"] / "active_invocation.claim.json", "new active claim"),
+        (recovery_claim_path, "global e1 recovery claim"),
+        (request_path, "e1 recovery request"),
+        (recovery_authority_path, "e1 recovery authority"),
+    ):
+        require(
+            not os.path.lexists(path),
+            "%s already exists; the one-time recovery is consumed or terminal" % label,
+        )
+    candidate_receipt = _candidate_receipt_artifact(head)
+    require(
+        not os.path.lexists(head["authority_path"])
+        and not os.path.lexists(head["authorization_path"])
+        and not os.path.lexists(head["run_root"])
+        and not os.path.lexists(head["runner_status_path"])
+        and not os.path.lexists(head["runner_log_path"]),
+        "recovery queue-head outputs already exist",
+    )
+    # Everything through the request preview is a read-only admission phase.
+    # In particular, the pinned guard verifier runs before any campaign,
+    # active, private-job, work-authority, request, or recovery-slot write.
+    _revalidate_control(campaign)
+    _runtime_contract_check(campaign, capture)
+    request_value, authority_preview = _recovery_request_value(
+        campaign, head, candidate_receipt, failed, capture, clock,
+    )
+
+    _campaign_claim_v2(campaign, clock)
+    active = _active_v2(campaign, "recover-e1", clock)
+    authorize_argv = _authorize_argv(campaign, head)
+    claim = write_new_json(
+        _job_claim_path_v2(campaign, 1),
+        _job_claim_v2(
+            campaign, head, candidate_receipt, authorize_argv, clock()
+        ),
+        "recovery job claim",
+    )
+    authorize_rc, authorize_stdout, authorize_stderr = capture(authorize_argv)
+    require(
+        type(authorize_rc) is int and authorize_rc == 0
+        and authorize_stderr == b"",
+        "recovery authority adapter authorize failed; recovery is terminal",
+    )
+    authority = _artifact_from_path(
+        head["authority_path"], "recovery queue-head work authority"
+    )
+    require(
+        strict_json_equal(authority, authority_preview),
+        "new work authority is not byte-identical to the read-only recovery preview",
+    )
+    adapter_stdout_sha = _adapter_stdout_artifact(
+        authorize_stdout, authority, "recovery authority adapter authorize"
+    )
+    _work_authority_runtime_binding(
+        authority, campaign["_runtime_validation_source"], 1
+    )
+    _work_authority_candidate_binding(authority, candidate_receipt, 1)
+    require(
+        strict_json_equal(
+            _candidate_receipt_artifact(head), candidate_receipt
+        ),
+        "candidate-ready receipt changed during recovery authorization",
+    )
+    dynamic = dict(head)
+    dynamic.update({
+        "candidate_receipt": candidate_receipt,
+        "work_authority": authority,
+    })
+    require(
+        strict_json_equal(
+            request_value.get("new_work_authority"), authority
+        ),
+        "recovery request work-authority preview changed",
+    )
+    request = write_new_json(
+        request_path, request_value,
+        "failed consumer recovery request",
+    )
+    inspect_argv = _recovery_bridge_argv(
+        campaign, "inspect-recovery", request
+    )
+    inspect_rc, inspect_stdout, inspect_stderr = capture(inspect_argv)
+    require(
+        type(inspect_rc) is int and inspect_rc == 0
+        and inspect_stderr == b"",
+        "inspect-recovery failed; no recovery reservation was authorized",
+    )
+    preview_authority, preview_claim_path = _inspect_recovery_stdout(
+        campaign, inspect_stdout
+    )
+    require(
+        not os.path.lexists(recovery_claim_path)
+        and not os.path.lexists(recovery_authority_path),
+        "inspect-recovery changed durable recovery state",
+    )
+    # inspect-recovery is still read-only with respect to the global slot.  A
+    # failure through inspect leaves this private campaign terminal; reserve is
+    # the exact boundary after which the global recovery can never be reused.
+    reserve_argv = _recovery_bridge_argv(
+        campaign, "reserve-recovery", request
+    )
+    reserve_rc, reserve_stdout, reserve_stderr = capture(reserve_argv)
+    require(
+        type(reserve_rc) is int and reserve_rc == 0
+        and reserve_stderr == b"",
+        "reserve-recovery failed; the recovery slot is terminal and must not be retried",
+    )
+    recovery_authority, recovery_claim = _reserve_recovery_stdout(
+        campaign, reserve_stdout, preview_authority, preview_claim_path
+    )
+    recovery = {
+        "request": request,
+        "authority": recovery_authority,
+        "claim": recovery_claim,
+    }
+    dynamic["consumer_recovery"] = recovery
+    runner_argv = _runner_argv_v2(dynamic, campaign)
+    _validate_runner_argv_v2(runner_argv, dynamic, campaign)
+    authorization = write_new_json(
+        dynamic["authorization_path"],
+        _authorization_body(
+            campaign, dynamic, authorize_argv, adapter_stdout_sha,
+            runner_argv, clock(),
+        ),
+        "recovery authorization receipt",
+    )
+    dynamic["authorization"] = authorization
+    # Reservation is deliberately durable before this only GPU-capable call.
+    # Any failure below is terminal: no code path removes or reuses the slot.
+    rc = runner(runner_argv)
+    require(
+        type(rc) is int and rc == 0,
+        "recovery guarded runner returned nonzero; recovery is terminal",
+    )
+    dynamic["_campaign"] = campaign
+    status_artifact, status = _runner_status(dynamic)
+    log_artifact, measurement, measurement_value = _verify_runner_log(dynamic)
+    _revalidate_control(campaign)
+    _runtime_contract_check(campaign, capture)
+    bridge_replay_argv = _bridge_replay(
+        campaign, dynamic, measurement, capture
+    )
+    verifier_argv, verifier_stdout, guards = _guard_verify(
+        campaign, status, capture
+    )
+    status_artifact_2, status_2 = _runner_status(dynamic)
+    require(
+        strict_json_equal(status_artifact, status_artifact_2)
+        and strict_json_equal(status, status_2),
+        "recovery runner status changed during guard verification",
+    )
+    _measurement(
+        dynamic, measurement["sha256"],
+        measurement["receipt_payload_sha256"],
+    )
+    require(
+        strict_json_equal(
+            _candidate_receipt_artifact(dynamic), candidate_receipt
+        ),
+        "candidate-ready receipt changed during recovered validation",
+    )
+    require(
+        strict_json_equal(
+            _artifact_from_path(
+                dynamic["authority_path"],
+                "recovery queue-head work authority",
+            ),
+            authority,
+        )
+        and strict_json_equal(
+            _artifact(request, "consumer recovery request"), request
+        )
+        and strict_json_equal(
+            _artifact(recovery_authority, "consumer recovery authority"),
+            recovery_authority,
+        )
+        and strict_json_equal(
+            _artifact(recovery_claim, "consumer recovery claim"),
+            recovery_claim,
+        ),
+        "recovery authority chain changed during validation",
+    )
+    completion_value = _completion_body(
+        campaign, dynamic, status_artifact, status, log_artifact,
+        measurement, measurement_value, bridge_replay_argv,
+        verifier_argv, verifier_stdout, guards, clock(),
+    )
+    completion = write_new_json(
+        dynamic["completion_path"], completion_value,
+        "recovery completion",
+    )
+    _release_active_v2(campaign, active)
+    return {
+        "status": "job_complete", "candidate_epoch": 1,
+        "selection_eligible": False, "job_claim": claim,
+        "recovery_request": request,
+        "recovery_authority": recovery_authority,
+        "recovery_claim": recovery_claim,
+        "authorization": authorization, "completion": completion,
+        "validation_diffsheg_fgd": completion_value["validation_diffsheg_fgd"],
+        "remaining": 21,
+    }
 
 
 def _artifact_from_path(path_text: Any, label: str, *, executable: bool = False) -> Dict[str, Any]:
@@ -1852,11 +2804,19 @@ def build_campaign(args: argparse.Namespace) -> Dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("run-next", "finalize"):
+    for name in ("run-next", "recover-e1", "finalize"):
         sub = commands.add_parser(name, allow_abbrev=False)
         sub.add_argument("--campaign", required=True)
         sub.add_argument("--expected-campaign-sha256", required=True)
         sub.add_argument("--expected-campaign-bytes", type=int, required=True)
+        if name == "recover-e1":
+            sub.add_argument("--failed-campaign", required=True)
+            sub.add_argument(
+                "--expected-failed-campaign-sha256", required=True
+            )
+            sub.add_argument(
+                "--expected-failed-campaign-bytes", type=int, required=True
+            )
     build = commands.add_parser("build-campaign", allow_abbrev=False)
     build.add_argument("--output", required=True)
     build.add_argument("--state-root", required=True)
@@ -1912,7 +2872,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     campaign = load_campaign(
         args.campaign, args.expected_campaign_sha256, args.expected_campaign_bytes
     )
-    result = run_next(campaign) if args.command == "run-next" else finalize_campaign(campaign)
+    if args.command == "run-next":
+        result = run_next(campaign)
+    elif args.command == "recover-e1":
+        result = recover_e1(
+            campaign, args.failed_campaign,
+            args.expected_failed_campaign_sha256,
+            args.expected_failed_campaign_bytes,
+        )
+    else:
+        result = finalize_campaign(campaign)
     sys.stdout.buffer.write(canonical_json_bytes(result))
     return 0
 

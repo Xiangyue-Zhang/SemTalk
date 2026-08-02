@@ -800,6 +800,396 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
             with self.assertRaises(BRIDGE.DuplicateConsumptionError):
                 BRIDGE._write_new_or_identical(output, conflict)
 
+    def test_failed_run_inventory_is_exact_and_has_zero_semantic_outputs(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-recovery-inventory-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            for relative in BRIDGE.FAILED_RUN_DIRECTORIES:
+                if relative != ".":
+                    (root / relative).mkdir(parents=True, exist_ok=True)
+            marker_payload = (
+                "Traceback (most recent call last):\n"
+                + BRIDGE.FAILED_SHARD_FAILURE_MARKER
+                + "\n"
+            ).encode()
+            for relative in BRIDGE.FAILED_RUN_FILES:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = (
+                    marker_payload
+                    if relative in BRIDGE.FAILED_SHARD_LOGS
+                    else ("fixture:" + relative + "\n").encode()
+                )
+                path.write_bytes(payload)
+            fixture_pins = {
+                relative: (
+                    hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+                    (root / relative).stat().st_size,
+                )
+                for relative in BRIDGE.FAILED_RUN_FILES
+            }
+            with mock.patch.object(
+                BRIDGE, "FAILED_RUN_FILE_PINS", fixture_pins
+            ):
+                inventory = BRIDGE._relative_inventory(root)
+                self.assertEqual(inventory["semantic_outputs"], [])
+                self.assertEqual(
+                    inventory["directories"], sorted(BRIDGE.FAILED_RUN_DIRECTORIES)
+                )
+                self.assertEqual(
+                    [row["relative_path"] for row in inventory["files"]],
+                    sorted(BRIDGE.FAILED_RUN_FILES),
+                )
+                self.assertEqual(
+                    inventory["shard_log_sha256"],
+                    hashlib.sha256(marker_payload).hexdigest(),
+                )
+
+                non_shard = root / "work-preflight.json"
+                original = non_shard.read_bytes()
+                non_shard.write_bytes(b"tampered\n")
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "SHA/byte pins"
+                ):
+                    BRIDGE._relative_inventory(root)
+                non_shard.write_bytes(original)
+
+                semantic = root / "candidates/e1/shards/receipt.json"
+                semantic.write_text("{}\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "semantic or unknown output"
+                ):
+                    BRIDGE._relative_inventory(root)
+
+    def test_recovery_control_rejects_unrelated_and_predates_minimum(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-recovery-control-", dir="/private/tmp"
+        ) as raw:
+            core = {"path": str(Path(raw) / "unused"), "sha256": "a" * 64, "bytes": 1}
+            source = {
+                "root": str(Path(raw).resolve()),
+                "origin": BRIDGE.EXPECTED_ORIGIN,
+                "commit": BRIDGE.REJECTED_RECOVERY_CONTROL_COMMIT,
+                "tree": BRIDGE.REJECTED_RECOVERY_CONTROL_TREE,
+                "supervisor": core,
+                "launcher": core,
+                "bridge": core,
+                "authority_adapter": core,
+            }
+            with mock.patch.object(BRIDGE, "_git", return_value=(0, "")):
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "clean detached branchless"
+                ):
+                    BRIDGE._validate_recovery_control_source(source)
+
+            source["commit"] = "1" * 40
+            source["tree"] = "2" * 40
+            with mock.patch.object(BRIDGE, "_git", return_value=(1, "")):
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "clean detached branchless"
+                ):
+                    BRIDGE._validate_recovery_control_source(source)
+
+    def test_failed_incident_artifacts_are_sha_and_byte_pinned(self) -> None:
+        for role, (digest, size) in BRIDGE.FAILED_INCIDENT_ARTIFACTS.items():
+            with self.subTest(role=role):
+                BRIDGE._require_failed_incident_artifact(
+                    {"path": "/pinned", "sha256": digest, "bytes": size}, role
+                )
+                with self.assertRaises(BRIDGE.LiveConsumerError):
+                    BRIDGE._require_failed_incident_artifact(
+                        {"path": "/pinned", "sha256": "f" * 64, "bytes": size},
+                        role,
+                    )
+                with self.assertRaises(BRIDGE.LiveConsumerError):
+                    BRIDGE._require_failed_incident_artifact(
+                        {"path": "/pinned", "sha256": digest, "bytes": size + 1},
+                        role,
+                    )
+
+    def test_direct_recovery_request_rejects_rehashed_fake_incident(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-recovery-forgery-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            artifact = {"path": str(root / "x.json"), "sha256": "1" * 64, "bytes": 1}
+            request = {
+                "format": BRIDGE.RECOVERY_REQUEST_FORMAT,
+                "status": "ready_for_single_recovery",
+                "split": "val",
+                "test_visible": False,
+                "selection_eligible": False,
+                "candidate_epoch": 1,
+                "failed_campaign": artifact,
+                "failed_job_claim": artifact,
+                "failed_active_claim": artifact,
+                "failed_authorization": artifact,
+                "failed_work_authority": artifact,
+                "failed_consumer_claim": artifact,
+                "failed_runner_status": artifact,
+                "failed_runner_log": artifact,
+                "failed_run_root": str(root / "failed"),
+                "failed_run_inventory": {},
+                "failed_process_proof": {},
+                "guard_proof": {},
+                "new_campaign": artifact,
+                "new_control_source": {},
+                "new_work_authority": artifact,
+                "new_run_root": str(root / "new"),
+                "created_unix": 1.0,
+            }
+            request = BRIDGE._with_payload_sha(request)
+            request_path = root / "request.json"
+            payload = BRIDGE._canonical_json(request, newline=True)
+            request_path.write_bytes(payload)
+            forged_campaign = {
+                "path": str(root / "forged-campaign.json"),
+                "sha256": "f" * 64,
+                "bytes": BRIDGE.FAILED_INCIDENT_ARTIFACTS["campaign"][1],
+            }
+            with mock.patch.object(
+                BRIDGE,
+                "_campaign_document",
+                return_value=(forged_campaign, {}),
+            ):
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "pinned artifact"
+                ):
+                    BRIDGE._validate_recovery_request(
+                        request_path,
+                        hashlib.sha256(payload).hexdigest(),
+                        new_run_must_exist=False,
+                    )
+
+    def test_failed_process_proof_is_exact_pid_only_and_read_only(self) -> None:
+        status = {
+            "wrapper_pid": 900_000_001,
+            "child_pid": 900_000_002,
+            "command": ["/bin/bash", "/formal/val/launcher.sh"],
+        }
+        proof = {
+            "wrapper_pid": status["wrapper_pid"],
+            "child_pid": status["child_pid"],
+            "wrapper_proc_state": "absent",
+            "child_proc_state": "absent",
+            "runner_command": list(status["command"]),
+            "checked_unix": 1.0,
+        }
+        self.assertEqual(
+            BRIDGE._validate_failed_process_proof(proof, status), proof
+        )
+        tampered = dict(proof)
+        tampered["runner_command"] = ["/bin/bash", "/other/launcher.sh"]
+        with self.assertRaises(BRIDGE.LiveConsumerError):
+            BRIDGE._validate_failed_process_proof(tampered, status)
+        with mock.patch("os.path.lexists", return_value=True):
+            with self.assertRaisesRegex(
+                BRIDGE.LiveConsumerError, "no longer absent"
+            ):
+                BRIDGE._validate_failed_process_proof(proof, status)
+
+    def test_inspect_is_read_only_and_reserve_publishes_claim_first(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-recovery-reserve-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            state = root / "state"
+            state.mkdir()
+            claim_parent = root / "training/live_val_consumer_recovery_claims"
+            claim_parent.mkdir(parents=True)
+            claim_path = claim_parent / "epoch-0001.json"
+            output = state / "recovery-authority.epoch-0001.json"
+            request_artifact = {
+                "path": str(root / "request.json"),
+                "sha256": "1" * 64,
+                "bytes": 100,
+            }
+            request = {"receipt_payload_sha256": "2" * 64}
+            bindings = {
+                "failed_consumer_claim": {
+                    "path": str(root / "old-claim.json"),
+                    "sha256": "3" * 64,
+                    "bytes": 10,
+                },
+                "failed_runner_status": {
+                    "path": str(root / "old-status.json"),
+                    "sha256": "4" * 64,
+                    "bytes": 11,
+                },
+                "new_campaign": {
+                    "path": str(state / "campaign.json"),
+                    "sha256": "5" * 64,
+                    "bytes": 12,
+                },
+                "new_control_source": {"commit": "6" * 40},
+                "new_work_authority": {
+                    "path": str(state / "authorities/epoch-0001.json"),
+                    "sha256": "7" * 64,
+                    "bytes": 13,
+                },
+                "new_work_authority_value": {"candidate_epoch": 1},
+                "new_run_root": str(root / "new-run"),
+            }
+            validated = (
+                request_artifact,
+                request,
+                bindings,
+                claim_path,
+                output,
+            )
+            args = argparse.Namespace(
+                request=Path(request_artifact["path"]),
+                expected_request_sha256=request_artifact["sha256"],
+                output_authority=output,
+            )
+            with (
+                mock.patch.object(
+                    BRIDGE, "_validate_recovery_request", return_value=validated
+                ),
+                mock.patch.object(
+                    BRIDGE, "_recovery_claim_path", return_value=claim_path
+                ),
+            ):
+                inspected = BRIDGE.inspect_recovery(args)
+                self.assertEqual(
+                    set(inspected),
+                    {"status", "recovery_authority", "recovery_claim_path"},
+                )
+                self.assertFalse(claim_path.exists())
+                self.assertFalse(output.exists())
+
+                order = []
+                original = BRIDGE._write_strict_new
+
+                def write(path, value, label):
+                    order.append(label)
+                    return original(path, value, label)
+
+                with mock.patch.object(
+                    BRIDGE, "_write_strict_new", side_effect=write
+                ):
+                    reserved = BRIDGE.reserve_recovery(args)
+                self.assertEqual(
+                    order,
+                    ["consumer recovery claim", "consumer recovery authority"],
+                )
+                self.assertEqual(
+                    set(reserved),
+                    {"status", "recovery_authority", "recovery_claim"},
+                )
+                claim = json.loads(claim_path.read_bytes())
+                authority = json.loads(output.read_bytes())
+                self.assertEqual(
+                    claim["recovery_authority"], reserved["recovery_authority"]
+                )
+                self.assertEqual(authority["recovery_claim_path"], str(claim_path))
+                with self.assertRaises(BRIDGE.DuplicateConsumptionError):
+                    BRIDGE.reserve_recovery(args)
+
+            failed_claim_path = (
+                root / "training-failed/live_val_consumer_recovery_claims"
+                / "epoch-0001.json"
+            )
+            failed_claim_path.parent.mkdir(parents=True)
+            failed_output = state / "recovery-authority-failed.epoch-0001.json"
+            failed_validated = (
+                request_artifact,
+                request,
+                bindings,
+                failed_claim_path,
+                failed_output,
+            )
+            failed_args = argparse.Namespace(
+                request=Path(request_artifact["path"]),
+                expected_request_sha256=request_artifact["sha256"],
+                output_authority=failed_output,
+            )
+            with (
+                mock.patch.object(
+                    BRIDGE, "_validate_recovery_request",
+                    return_value=failed_validated,
+                ),
+                mock.patch.object(
+                    BRIDGE, "_recovery_claim_path",
+                    return_value=failed_claim_path,
+                ),
+            ):
+                order = []
+                original = BRIDGE._write_strict_new
+
+                def fail_authority(path, value, label):
+                    order.append(label)
+                    if label == "consumer recovery authority":
+                        raise BRIDGE.LiveConsumerError(
+                            "injected recovery authority failure"
+                        )
+                    return original(path, value, label)
+
+                with mock.patch.object(
+                    BRIDGE, "_write_strict_new", side_effect=fail_authority
+                ):
+                    with self.assertRaisesRegex(
+                        BRIDGE.LiveConsumerError, "authority failure"
+                    ):
+                        BRIDGE.reserve_recovery(failed_args)
+                self.assertEqual(
+                    order,
+                    ["consumer recovery claim", "consumer recovery authority"],
+                )
+                self.assertTrue(failed_claim_path.exists())
+                self.assertFalse(failed_output.exists())
+                with self.assertRaises(BRIDGE.DuplicateConsumptionError):
+                    BRIDGE.reserve_recovery(failed_args)
+
+    def test_recovery_cli_and_prepare_arguments_are_exact(self) -> None:
+        request = "/formal/val/recovery-request.json"
+        output = "/formal/val/state/recovery-authority.epoch-0001.json"
+        parsed = BRIDGE.build_parser().parse_args(
+            [
+                "inspect-recovery", "--request", request,
+                "--expected-request-sha256", "a" * 64,
+                "--output-authority", output,
+            ]
+        )
+        self.assertEqual(parsed.command, "inspect-recovery")
+        parsed = BRIDGE.build_parser().parse_args(
+            [
+                "reserve-recovery", "--request", request,
+                "--expected-request-sha256", "a" * 64,
+                "--output-authority", output,
+            ]
+        )
+        self.assertEqual(parsed.command, "reserve-recovery")
+
+        with tempfile.TemporaryDirectory(
+            prefix="live-recovery-prepare-", dir="/private/tmp"
+        ) as raw:
+            run_root = Path(raw).resolve()
+            args = argparse.Namespace(
+                run_root=run_root,
+                output=run_root / "work-preflight.json",
+                work_authority=run_root / "work.json",
+                expected_work_authority_sha256="b" * 64,
+                recovery_authority=run_root / "recovery.json",
+                expected_recovery_authority_sha256=None,
+                recovery_claim=None,
+                expected_recovery_claim_sha256=None,
+            )
+            with mock.patch.object(
+                BRIDGE,
+                "_validate_work_authority",
+                return_value=(
+                    {"path": str(args.work_authority), "sha256": "b" * 64},
+                    {"candidate_epoch": 1},
+                    None,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError, "all-or-none"
+                ):
+                    BRIDGE.prepare(args)
+
     def test_copied_authority_uses_the_same_producer_claim_slot(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="live-bridge-claim-anchor-", dir="/private/tmp"

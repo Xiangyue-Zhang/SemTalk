@@ -198,6 +198,29 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
         )
         self.assertIn('--formal-host-slot "$host_slot"', launcher)
 
+    def test_live_validation_launcher_forwards_recovery_binding_all_or_none(self) -> None:
+        path = (
+            REPOSITORY / "scripts" / "show_base"
+            / "run_base_live_val_8shard.sh"
+        )
+        source = path.read_text(encoding="utf-8")
+        syntax = subprocess.run(
+            ["bash", "-n", str(path)], check=False,
+            capture_output=True, text=True,
+        )
+        self.assertEqual((syntax.returncode, syntax.stderr), (0, ""))
+        self.assertIn("recovery options must be supplied all-or-none", source)
+        self.assertIn('if ((recovery_option_count == 4)); then', source)
+        self.assertIn('--recovery-authority "$recovery_authority"', source)
+        self.assertIn(
+            '--expected-recovery-authority-sha256', source,
+        )
+        self.assertIn('--recovery-claim "$recovery_claim"', source)
+        self.assertIn(
+            '--expected-recovery-claim-sha256 "$expected_recovery_claim_sha256"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

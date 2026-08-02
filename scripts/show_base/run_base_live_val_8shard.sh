@@ -9,7 +9,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --repo-root PATH --python PATH --work-authority PATH --expected-work-authority-sha256 SHA --run-root NEW_PATH --source-commit OID --source-tree OID --paspa-root PATH --diffsheg-root PATH --seed INT --diffsheg-batch-size INT"
+        "Usage: $0 --repo-root PATH --python PATH --work-authority PATH --expected-work-authority-sha256 SHA --run-root NEW_PATH --source-commit OID --source-tree OID --paspa-root PATH --diffsheg-root PATH --seed INT --diffsheg-batch-size INT [--recovery-authority PATH --expected-recovery-authority-sha256 SHA --recovery-claim PATH --expected-recovery-claim-sha256 SHA]"
 }
 
 if ((BASH_VERSINFO[0] < 5)); then
@@ -29,6 +29,10 @@ paspa_root=
 diffsheg_root=
 seed=
 diffsheg_batch_size=
+recovery_authority=
+expected_recovery_authority_sha256=
+recovery_claim=
+expected_recovery_claim_sha256=
 
 set_option() {
     local option=$1 variable=$2 value=$3
@@ -63,6 +67,14 @@ while (($#)); do
         --seed) set_option "$1" seed "$2" ;;
         --diffsheg-batch-size)
             set_option "$1" diffsheg_batch_size "$2" ;;
+        --recovery-authority)
+            set_option "$1" recovery_authority "$2" ;;
+        --expected-recovery-authority-sha256)
+            set_option "$1" expected_recovery_authority_sha256 "$2" ;;
+        --recovery-claim)
+            set_option "$1" recovery_claim "$2" ;;
+        --expected-recovery-claim-sha256)
+            set_option "$1" expected_recovery_claim_sha256 "$2" ;;
         *)
             printf 'unknown option: %s\n' "$1" >&2
             usage >&2
@@ -81,12 +93,28 @@ for required in \
         exit 2
     fi
 done
+recovery_option_count=0
+for optional in \
+    recovery_authority expected_recovery_authority_sha256 recovery_claim \
+    expected_recovery_claim_sha256; do
+    [[ -n ${!optional} ]] && ((recovery_option_count += 1))
+done
+if ((recovery_option_count != 0 && recovery_option_count != 4)); then
+    printf 'recovery options must be supplied all-or-none\n' >&2
+    exit 2
+fi
 if [[ ! $expected_work_authority_sha256 =~ ^[0-9a-f]{64}$ || \
       ! $source_commit =~ ^[0-9a-f]{40}$ || \
       ! $source_tree =~ ^[0-9a-f]{40}$ || \
       ! $seed =~ ^[0-9]+$ || \
       ! $diffsheg_batch_size =~ ^[1-9][0-9]*$ ]]; then
     printf 'invalid SHA, Git OID, seed, or DiffSHEG batch size\n' >&2
+    exit 2
+fi
+if ((recovery_option_count == 4)) && \
+   [[ ! $expected_recovery_authority_sha256 =~ ^[0-9a-f]{64}$ || \
+      ! $expected_recovery_claim_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'invalid recovery SHA\n' >&2
     exit 2
 fi
 for path_value in \
@@ -97,6 +125,14 @@ for path_value in \
         exit 2
     }
 done
+if ((recovery_option_count == 4)); then
+    for path_value in "$recovery_authority" "$recovery_claim"; do
+        [[ $path_value == /* ]] || {
+            printf 'every recovery path must be absolute\n' >&2
+            exit 2
+        }
+    done
+fi
 
 raw_repo_root=$repo_root
 repo_root=$(realpath -e -- "$repo_root")
@@ -114,6 +150,19 @@ if [[ $work_authority != "$raw_work_authority" || \
       ! -f $work_authority || -L $raw_work_authority ]]; then
     printf 'work authority must be one canonical regular file\n' >&2
     exit 1
+fi
+if ((recovery_option_count == 4)); then
+    raw_recovery_authority=$recovery_authority
+    recovery_authority=$(realpath -e -- "$recovery_authority")
+    raw_recovery_claim=$recovery_claim
+    recovery_claim=$(realpath -e -- "$recovery_claim")
+    if [[ $recovery_authority != "$raw_recovery_authority" || \
+          ! -f $recovery_authority || -L $raw_recovery_authority || \
+          $recovery_claim != "$raw_recovery_claim" || \
+          ! -f $recovery_claim || -L $raw_recovery_claim ]]; then
+        printf 'recovery authority/claim must be canonical regular files\n' >&2
+        exit 1
+    fi
 fi
 run_parent=$(realpath -e -- "$(dirname -- "$run_root")")
 if [[ $run_root != "$run_parent/$(basename -- "$run_root")" || \
@@ -221,11 +270,20 @@ evaluator_bundle=$run_root/diffsheg-evaluator-bundle.json
 artifact_fields "$evaluator_bundle" true
 
 preflight=$run_root/work-preflight.json
-"$python_bin" "$bridge" prepare \
+prepare_command=("$python_bin" "$bridge" prepare \
     --work-authority "$work_authority" \
     --expected-work-authority-sha256 "$expected_work_authority_sha256" \
-    --run-root "$run_root" --output "$preflight" \
-    >"$run_root/logs/work-preflight.log" 2>&1
+    --run-root "$run_root" --output "$preflight")
+if ((recovery_option_count == 4)); then
+    prepare_command+=(
+        --recovery-authority "$recovery_authority"
+        --expected-recovery-authority-sha256 \
+            "$expected_recovery_authority_sha256"
+        --recovery-claim "$recovery_claim"
+        --expected-recovery-claim-sha256 "$expected_recovery_claim_sha256"
+    )
+fi
+"${prepare_command[@]}" >"$run_root/logs/work-preflight.log" 2>&1
 artifact_fields "$preflight" true
 preflight_sha=${artifact_result[0]}
 
