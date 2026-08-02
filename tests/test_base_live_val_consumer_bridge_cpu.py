@@ -7,8 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -16,6 +17,79 @@ from scripts.show_base import base_live_val_consumer_bridge as BRIDGE
 
 
 class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
+    def test_scripts_namespace_is_single_root_and_rejects_preload(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-scripts-namespace-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            scripts_root = root / "scripts"
+            scripts_root.mkdir()
+            project_names = [
+                name
+                for name in tuple(sys.modules)
+                if name == "scripts" or name.startswith("scripts.")
+            ]
+            saved = {name: sys.modules.pop(name) for name in project_names}
+            try:
+                BRIDGE._bind_exact_scripts_namespace(root)
+                namespace = sys.modules["scripts"]
+                self.assertIsNone(namespace.__file__)
+                self.assertEqual(namespace.__path__, [str(scripts_root)])
+                self.assertEqual(
+                    namespace.__spec__.submodule_search_locations,
+                    [str(scripts_root)],
+                )
+                BRIDGE._project_modules_are_from(root)
+                BRIDGE._bind_exact_scripts_namespace(root)
+
+                sys.modules.pop("scripts")
+                polluted = ModuleType("scripts")
+                polluted.__file__ = None
+                polluted.__path__ = [str(root / "other"), "/site/scripts"]
+                sys.modules["scripts"] = polluted
+                with self.assertRaisesRegex(
+                    BRIDGE.LiveConsumerError,
+                    "preloaded scripts namespace is not exactly runtime-bound",
+                ):
+                    BRIDGE._bind_exact_scripts_namespace(root)
+            finally:
+                for name in tuple(sys.modules):
+                    if name == "scripts" or name.startswith("scripts."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved)
+
+    def test_scripts_namespace_prevents_python312_namespace_merging(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-scripts-merge-", dir="/private/tmp"
+        ) as raw:
+            root = Path(raw).resolve()
+            runtime = root / "runtime"
+            launch = root / "launch"
+            site = root / "site"
+            for source in (runtime, launch, site):
+                (source / "scripts").mkdir(parents=True)
+            project_names = [
+                name
+                for name in tuple(sys.modules)
+                if name == "scripts" or name.startswith("scripts.")
+            ]
+            saved = {name: sys.modules.pop(name) for name in project_names}
+            old_path = list(sys.path)
+            try:
+                sys.path[:] = [str(launch), str(site), *old_path]
+                BRIDGE._bind_exact_scripts_namespace(runtime)
+                namespace = sys.modules["scripts"]
+                self.assertEqual(
+                    list(namespace.__path__), [str(runtime / "scripts")]
+                )
+                BRIDGE._project_modules_are_from(runtime)
+            finally:
+                sys.path[:] = old_path
+                for name in tuple(sys.modules):
+                    if name == "scripts" or name.startswith("scripts."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(saved)
+
     def test_strict_json_rejects_duplicate_and_nonfinite_tokens(self) -> None:
         with self.assertRaisesRegex(BRIDGE.LiveConsumerError, "duplicate JSON"):
             BRIDGE._strict_json_bytes(b'{"epoch":1,"epoch":2}', "duplicate")

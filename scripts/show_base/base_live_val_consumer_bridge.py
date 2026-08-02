@@ -25,6 +25,7 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -703,10 +704,53 @@ def _project_modules_are_from(root: Path) -> None:
                 ) from error
 
 
+def _bind_exact_scripts_namespace(source_root: Path) -> None:
+    """Bind SemTalk's namespace-package ``scripts`` to one checkout only.
+
+    The repository deliberately has no ``scripts/__init__.py``.  Letting the
+    default namespace-package finder construct ``scripts`` can therefore merge
+    the pinned runtime checkout with the launcher's checkout or an unrelated
+    site-packages directory.  Install a one-path namespace before importing
+    any runtime module so the post-import provenance audit remains exact.
+    """
+
+    scripts_root = _canonical_path(
+        source_root / "scripts", "runtime validation scripts namespace"
+    )
+    if not scripts_root.is_dir():
+        raise LiveConsumerError(
+            "runtime validation scripts namespace is not a directory"
+        )
+    existing = sys.modules.get("scripts")
+    if existing is not None:
+        module_file = getattr(existing, "__file__", None)
+        module_paths = list(getattr(existing, "__path__", []) or [])
+        if module_file is not None or module_paths != [str(scripts_root)]:
+            raise LiveConsumerError(
+                "preloaded scripts namespace is not exactly runtime-bound"
+            )
+        return
+    namespace = ModuleType("scripts")
+    namespace.__file__ = None
+    namespace.__package__ = "scripts"
+    namespace.__path__ = [str(scripts_root)]
+    specification = importlib.util.spec_from_loader(
+        "scripts", loader=None, is_package=True
+    )
+    if specification is None:
+        raise LiveConsumerError(
+            "cannot construct runtime validation scripts namespace"
+        )
+    specification.submodule_search_locations = [str(scripts_root)]
+    namespace.__spec__ = specification
+    sys.modules["scripts"] = namespace
+
+
 def _load_validation_modules(source_root: Path) -> dict[str, ModuleType]:
     _project_modules_are_from(source_root)
     sys.path.insert(0, str(source_root))
     try:
+        _bind_exact_scripts_namespace(source_root)
         modules = {
             "contract": importlib.import_module(
                 "scripts.show_base.base_long_val_contract"
