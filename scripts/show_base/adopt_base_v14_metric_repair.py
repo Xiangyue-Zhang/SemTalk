@@ -5,6 +5,13 @@ The failed formal-v2 state and run roots are immutable inputs.  ``run`` must
 itself be launched by ``/tmp/globaldiff_guarded_runner.py``; it writes only
 inside the new repair root and executes the exact frozen 4066 evaluator
 followed by the unmodified 73ff bridge ``complete`` command.
+
+The ``*-recovery`` commands are deliberately separate.  They recover only
+from the pinned incident where the evaluator produced a complete report but
+the original wrapper rejected its normal progress output on stderr.  Recovery
+never invokes an evaluator or inference process: it validates the immutable
+incident, consumes the already-produced report with the pinned bridge, and
+seals a v2 adoption receipt.
 """
 
 from __future__ import annotations
@@ -30,6 +37,18 @@ SPEC_FORMAT = "semtalk_show_base_v14_metric_repair_spec_v1"
 AUTHORITY_FORMAT = "semtalk_show_base_v14_metric_repair_authority_v1"
 RESULT_FORMAT = "semtalk_show_base_v14_metric_repair_result_v1"
 ADOPTION_FORMAT = "semtalk_show_base_v14_metric_repair_adoption_receipt_v1"
+RECOVERY_SPEC_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_incident_recovery_spec_v1"
+)
+RECOVERY_AUTHORITY_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_incident_recovery_authority_v1"
+)
+RECOVERY_RESULT_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_incident_recovery_result_v1"
+)
+RECOVERY_ADOPTION_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_adoption_receipt_v2"
+)
 MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v2"
 EXPECTED_FGD_BINARY64_HEX = "3f9a0662d796da74"
 OFFICIAL_ORIGIN = "git@github.com:Xiangyue-Zhang/SemTalk.git"
@@ -94,6 +113,64 @@ GUARD_VERIFIER_SHA256 = (
     "dd183d09c9ddf07634b0ca4a2db4da45274c124efc2bbd03489f0c9d82c31888"
 )
 GUARD_VERIFIER_BYTES = 2988
+ORIGINAL_REPAIR_SOURCE_ROOT = (
+    "/local-ssd/xiangyuezhang/semtalk_final_control_6e4cfdb_20260803"
+)
+ORIGINAL_REPAIR_SOURCE_COMMIT = "6e4cfdba892a4d60a30b2366a3620ff902d720aa"
+ORIGINAL_REPAIR_SOURCE_TREE = "3d2230917c0d107031d300520030eda73e6afd8c"
+ORIGINAL_REPAIR_TOOL_SHA256 = (
+    "480f5370bbb6e3ea7f576e6f25502a359735afaac1bfbb30433b3a129ba49edb"
+)
+ORIGINAL_REPAIR_TOOL_BYTES = 65980
+INCIDENT_SPEC = {
+    "path": SPEC_PATH,
+    "sha256": "ed841da496221aad7d7f18ed24d766823f97a087aae6ad5a47d172ed930c8203",
+    "bytes": 8032,
+}
+INCIDENT_AUTHORITY = {
+    "path": AUTHORITY_PATH,
+    "sha256": "e0dbd46dc9d5b6d388a07cb7ebdc874c778964fda3f988bd94fff10d48e9be94",
+    "bytes": 979,
+}
+INCIDENT_RUNNER_STATUS = {
+    "path": RUNNER_STATUS_PATH,
+    "sha256": "03758d9d9ead84462c3f802845b206dc220e4107906f61819e5a29f429a3e543",
+    "bytes": 979,
+}
+INCIDENT_RUNNER_LOG = {
+    "path": RUNNER_LOG_PATH,
+    "sha256": "362b88296bcca8ba159b4c9d71f7921467b9b6e493e7a8475ced8fcf4595ea6f",
+    "bytes": 68,
+}
+INCIDENT_REPAIRED_REPORT = {
+    "path": REPAIR_ROOT + "/diffsheg-val-fgd.frozen-4066.json",
+    "sha256": "4b9c1d155ded2ec6ae3fbd6fa2110102db8a30363595ca740e6db2d9f6ef1ed9",
+    "bytes": 3946,
+}
+INCIDENT_EVALUATOR_LOG = {
+    "path": REPAIR_ROOT + "/evaluator.log",
+    "sha256": "da3e0d39f172f26187b95d28552acd02d1d1ae2865d59dfb9ae860a713517bcc",
+    "bytes": 1389,
+}
+RECOVERY_SPEC_PATH = (
+    TRAIN_ROOT + "/live_val_metric_repair_recovery_specs/epoch-0001.v1.json"
+)
+RECOVERY_AUTHORITY_PATH = (
+    TRAIN_ROOT + "/live_val_metric_repair_recovery_claims/epoch-0001.json"
+)
+RECOVERY_ROOT = (
+    TRAIN_ROOT + "/live_val_metric_repair_recovery_runs/epoch-0001.v1"
+)
+RECOVERY_RESULT_PATH = RECOVERY_ROOT + "/recovery-result.json"
+RECOVERY_RUNNER_CONTROL_ROOT = (
+    TRAIN_ROOT
+    + "/live_val_metric_repair_recovery_runner_controls/epoch-0001.v1"
+)
+RECOVERY_RUNNER_STATUS_PATH = (
+    RECOVERY_RUNNER_CONTROL_ROOT + "/.guarded_status.json"
+)
+RECOVERY_RUNNER_LOG_PATH = RECOVERY_RUNNER_CONTROL_ROOT + "/runner.log"
+RECOVERY_GUARD_PROOF_PATH = RECOVERY_RUNNER_CONTROL_ROOT + "/guard-proof.txt"
 PREDECESSOR_FIXED = {
     "predecessor_campaign": (
         PREDECESSOR_STATE_ROOT + "/campaign.json",
@@ -215,6 +292,74 @@ ADOPTION_KEYS = frozenset({
     "validation_diffsheg_fgd", "validation_diffsheg_fgd_binary64_hex",
     "inference_reruns", "metric_replays", "predecessor_return_code",
     "repair_return_code", "failure_phase", "completed_unix",
+    "receipt_payload_sha256",
+})
+RECOVERY_SPEC_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "metric_repair_spec", "metric_repair_authority",
+    "failed_metric_repair_runner_status", "failed_metric_repair_runner_log",
+    "partial_repaired_report", "partial_evaluator_log",
+    "frozen_evaluator_source", "predecessor_control_source",
+    "original_repair_tool_source", "original_repair_tool",
+    "recovery_tool_source", "recovery_tool", "bridge", "formal_python",
+    "guarded_runner", "guard_verifier", "predecessor_state_root",
+    "predecessor_run_root", "terminal_snapshot", "incident_snapshot",
+    "incident_runner_control_snapshot",
+    "recovery_evaluator_invocations_authorized",
+    "recovery_inference_runs_authorized",
+    "recovery_metric_replays_authorized", "metric_replays_total",
+    "recovery_root", "recovery_result_path", "recovery_runner_control_root",
+    "recovery_runner_status_path", "recovery_runner_log_path",
+    "recovery_guard_proof_path", "receipt_payload_sha256",
+})
+RECOVERY_AUTHORITY_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "recovery_evaluator_invocations_allowed",
+    "recovery_inference_runs_allowed", "recovery_metric_replays_allowed",
+    "metric_replays_total", "spec", "terminal_snapshot",
+    "incident_snapshot", "incident_runner_control_snapshot", "created_unix",
+    "receipt_payload_sha256",
+})
+RECOVERY_RESULT_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "recovery_evaluator_invocations",
+    "recovery_inference_runs", "recovery_metric_replays",
+    "metric_replays_total", "authority", "terminal_snapshot_before",
+    "terminal_snapshot_after", "incident_snapshot_before",
+    "incident_snapshot_after", "incident_runner_control_snapshot_before",
+    "incident_runner_control_snapshot_after", "bridge_complete_argv",
+    "bridge_complete_stdout_sha256", "bridge_measurement_replay_argv",
+    "bridge_measurement_replay_stdout", "partial_repaired_report",
+    "partial_evaluator_log", "report_comparison", "measurement",
+    "completed_unix", "receipt_payload_sha256",
+})
+RECOVERY_ADOPTION_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "test_measurements_authorized", "candidate_epoch", "candidate_receipt",
+    "predecessor_campaign", "predecessor_job_claim",
+    "predecessor_active_claim", "predecessor_work_authority",
+    "predecessor_authorization", "predecessor_runner_status",
+    "predecessor_recovery_request", "predecessor_recovery_authority",
+    "predecessor_recovery_claim", "predecessor_failure_log",
+    "metric_repair_spec", "metric_repair_authority",
+    "failed_metric_repair_runner_status", "failed_metric_repair_runner_log",
+    "partial_repaired_report", "partial_evaluator_log",
+    "metric_repair_recovery_spec", "metric_repair_recovery_authority",
+    "metric_repair_recovery_result", "frozen_evaluator_source",
+    "predecessor_control_source", "original_repair_tool_source",
+    "recovery_tool_source", "frozen_evaluator", "bridge", "repaired_report",
+    "report_comparison", "measurement", "guarded_runner",
+    "recovery_runner_status", "recovery_runner_log", "guard_verifier",
+    "guard_proof", "guard_verifier_argv", "guard_verifier_stdout",
+    "restored_guards", "terminal_snapshot_before", "terminal_snapshot_after",
+    "incident_snapshot_before", "incident_snapshot_after",
+    "incident_runner_control_snapshot_before",
+    "incident_runner_control_snapshot_after", "validation_diffsheg_fgd",
+    "validation_diffsheg_fgd_binary64_hex", "original_metric_replays",
+    "recovery_evaluator_invocations", "recovery_inference_runs",
+    "recovery_metric_replays", "metric_replays_total",
+    "predecessor_return_code", "original_repair_return_code",
+    "recovery_return_code", "failure_phase", "completed_unix",
     "receipt_payload_sha256",
 })
 
@@ -532,6 +677,357 @@ def tree_snapshot(roots: Sequence[str]) -> dict[str, Any]:
         "roots": list(roots), "entry_count": len(entries), "total_bytes": total,
         "inventory_sha256": hashlib.sha256(encoded).hexdigest(),
     }
+
+
+def exact_directory_snapshot(
+    root_text: str,
+    expected: Mapping[str, tuple[Mapping[str, Any], int]],
+    label: str,
+) -> dict[str, Any]:
+    """Return a content/mode snapshot of an exact, flat incident directory."""
+    root = Path(root_text)
+    try:
+        root_metadata = root.lstat()
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise RepairError("%s root is absent" % label) from error
+    require(
+        resolved == root
+        and stat.S_ISDIR(root_metadata.st_mode)
+        and root_metadata.st_nlink >= 2
+        and stat.S_IMODE(root_metadata.st_mode) == 0o700,
+        "%s root identity/mode changed" % label,
+    )
+    root_signature = (
+        root_metadata.st_dev, root_metadata.st_ino, root_metadata.st_mode,
+        root_metadata.st_nlink, root_metadata.st_size, root_metadata.st_mtime_ns,
+        root_metadata.st_ctime_ns,
+    )
+    children = sorted(root.iterdir(), key=lambda item: item.name)
+    require(
+        [child.name for child in children] == sorted(expected),
+        "%s inventory changed" % label,
+    )
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for child in children:
+        reference, expected_mode = expected[child.name]
+        metadata = child.lstat()
+        require(
+            stat.S_ISREG(metadata.st_mode)
+            and stat.S_IMODE(metadata.st_mode) == expected_mode,
+            "%s mode/type changed for %s" % (label, child.name),
+        )
+        observed = artifact(str(child), "%s %s" % (label, child.name), reference)
+        total += observed["bytes"]
+        entries.append({
+            "name": child.name,
+            "type": "regular",
+            "mode": expected_mode,
+            "bytes": observed["bytes"],
+            "sha256": observed["sha256"],
+        })
+    require(
+        [child.name for child in sorted(root.iterdir(), key=lambda item: item.name)]
+        == sorted(expected),
+        "%s inventory changed while reading" % label,
+    )
+    root_after = root.lstat()
+    require(
+        (
+            root_after.st_dev, root_after.st_ino, root_after.st_mode,
+            root_after.st_nlink, root_after.st_size, root_after.st_mtime_ns,
+            root_after.st_ctime_ns,
+        )
+        == root_signature,
+        "%s root changed while reading" % label,
+    )
+    encoded = json.dumps(
+        entries, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "root": root_text,
+        "root_mode": 0o700,
+        "entry_count": len(entries),
+        "total_bytes": total,
+        "entries": entries,
+        "inventory_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def incident_partial_snapshot() -> dict[str, Any]:
+    return exact_directory_snapshot(
+        REPAIR_ROOT,
+        {
+            "diffsheg-val-fgd.frozen-4066.json": (
+                INCIDENT_REPAIRED_REPORT, 0o600,
+            ),
+            "evaluator.log": (INCIDENT_EVALUATOR_LOG, 0o400),
+        },
+        "partial metric repair",
+    )
+
+
+def incident_runner_control_snapshot() -> dict[str, Any]:
+    return exact_directory_snapshot(
+        RUNNER_CONTROL_ROOT,
+        {
+            ".guarded_status.json": (INCIDENT_RUNNER_STATUS, 0o644),
+            "runner.log": (INCIDENT_RUNNER_LOG, 0o644),
+        },
+        "failed metric repair runner control",
+    )
+
+
+def validate_incident_report_and_log(
+    old_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    comparison = compare_reports(old_report, INCIDENT_REPAIRED_REPORT)
+    _report_artifact, report = read_document(
+        INCIDENT_REPAIRED_REPORT, "partial repaired DiffSHEG report",
+    )
+    fgd = report.get("metrics", {}).get("fgd")
+    inputs = report.get("inputs")
+    diagnostics = report.get("diagnostics")
+    adapter = report.get("provenance", {}).get("adapter")
+    require(
+        report.get("status") == "ok"
+        and type(fgd) is float
+        and struct.pack(">d", fgd).hex() == EXPECTED_FGD_BINARY64_HEX
+        and isinstance(inputs, dict)
+        and inputs.get("clip_count") == 1715
+        and inputs.get("frame_count") == 418020
+        and inputs.get("window_count") == 4119
+        and isinstance(diagnostics, dict)
+        and diagnostics.get("gesture_feature_count") == 4119
+        and diagnostics.get("gesture_feature_dim") == 300
+        and isinstance(adapter, dict)
+        and adapter.get("path")
+        == FROZEN_ROOT + "/scripts/show_base/evaluate_diffsheg_val_fgd.py"
+        and adapter.get("repository_root") == FROZEN_ROOT
+        and adapter.get("repository_git_head") == FROZEN_COMMIT
+        and adapter.get("sha256") == FROZEN_EVALUATOR_SHA256,
+        "partial repaired report completion/provenance changed",
+    )
+    _log_path, log_raw = regular_bytes(
+        INCIDENT_EVALUATOR_LOG["path"], "partial evaluator log",
+    )
+    fgd_marker = ("[FGD] %.17g\n" % fgd).encode("ascii")
+    done_marker = (
+        "[done] validation-only DiffSHEG FGD report: "
+        + INCIDENT_REPAIRED_REPORT["path"] + "\n"
+    ).encode("utf-8")
+    require(
+        log_raw.count(fgd_marker) == 1
+        and log_raw.count(done_marker) == 1
+        and log_raw.count(b"[validate] 1/1715 ") == 1
+        and log_raw.count(b"[validate] 1715/1715 ") == 1
+        and log_raw.count(b"[gesture AE] 1024/4119 windows\n") == 1
+        and log_raw.count(b"[gesture AE] 4032/4119 windows\n") == 1,
+        "partial evaluator log lacks unique completion evidence",
+    )
+    return comparison
+
+
+def load_incident_repair_chain() -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any],
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any],
+]:
+    """Validate the exact failed 6e4 run without invoking its current tool."""
+    require(
+        type_sensitive_equal(INCIDENT_SPEC, {
+            "path": SPEC_PATH,
+            "sha256": INCIDENT_SPEC["sha256"],
+            "bytes": INCIDENT_SPEC["bytes"],
+        })
+        and type_sensitive_equal(INCIDENT_AUTHORITY, {
+            "path": AUTHORITY_PATH,
+            "sha256": INCIDENT_AUTHORITY["sha256"],
+            "bytes": INCIDENT_AUTHORITY["bytes"],
+        }),
+        "incident spec/authority paths changed",
+    )
+    spec_artifact, spec = read_document(INCIDENT_SPEC, "incident metric repair spec")
+    require(
+        set(spec) == SPEC_KEYS
+        and spec.get("format") == SPEC_FORMAT
+        and spec.get("status") == "frozen"
+        and spec.get("receipt_payload_sha256") == payload_sha(spec)
+        and spec.get("split") == "val"
+        and spec.get("test_visible") is False
+        and spec.get("selection_eligible") is False
+        and spec.get("candidate_epoch") == 1
+        and spec.get("predecessor_state_root") == PREDECESSOR_STATE_ROOT
+        and spec.get("predecessor_run_root") == PREDECESSOR_RUN_ROOT,
+        "incident metric repair spec changed",
+    )
+    for key, (path, digest, size) in PREDECESSOR_FIXED.items():
+        expected = {"path": path, "sha256": digest, "bytes": size}
+        require(
+            type_sensitive_equal(spec.get(key), expected),
+            "%s is not the pinned formal-v2 artifact" % key,
+        )
+        artifact(path, key, expected)
+    for key in ("frozen_evaluator", "bridge", "guarded_runner", "guard_verifier"):
+        reference = spec.get(key)
+        require(
+            isinstance(reference, Mapping) and set(reference) == ARTIFACT_KEYS,
+            "incident %s reference changed" % key,
+        )
+        artifact(reference["path"], "incident %s" % key, reference)
+    expected_original_source = {
+        "origin": OFFICIAL_ORIGIN,
+        "source_root": ORIGINAL_REPAIR_SOURCE_ROOT,
+        "commit": ORIGINAL_REPAIR_SOURCE_COMMIT,
+        "tree": ORIGINAL_REPAIR_SOURCE_TREE,
+        "clean": True,
+        "detached": True,
+        "local_branches_at_commit": [],
+    }
+    require(
+        type_sensitive_equal(spec.get("repair_tool_source"), expected_original_source)
+        and type_sensitive_equal(
+            inspect_source_checkout(
+                ORIGINAL_REPAIR_SOURCE_ROOT, ORIGINAL_REPAIR_SOURCE_COMMIT,
+                ORIGINAL_REPAIR_SOURCE_TREE, "original repair tool",
+            ),
+            expected_original_source,
+        ),
+        "original repair tool source changed",
+    )
+    expected_original_tool = {
+        "path": ORIGINAL_REPAIR_SOURCE_ROOT
+        + "/scripts/show_base/adopt_base_v14_metric_repair.py",
+        "sha256": ORIGINAL_REPAIR_TOOL_SHA256,
+        "bytes": ORIGINAL_REPAIR_TOOL_BYTES,
+    }
+    require(
+        type_sensitive_equal(spec.get("repair_tool"), expected_original_tool),
+        "original repair tool reference changed",
+    )
+    artifact(expected_original_tool["path"], "original repair tool", expected_original_tool)
+    expected_frozen_source = {
+        "origin": OFFICIAL_ORIGIN, "source_root": FROZEN_ROOT,
+        "commit": FROZEN_COMMIT, "tree": FROZEN_TREE, "clean": True,
+        "detached": True, "local_branches_at_commit": [],
+    }
+    expected_control_source = {
+        "origin": OFFICIAL_ORIGIN, "source_root": PREDECESSOR_CONTROL_ROOT,
+        "commit": PREDECESSOR_CONTROL_COMMIT, "tree": PREDECESSOR_CONTROL_TREE,
+        "clean": True, "detached": True, "local_branches_at_commit": [],
+    }
+    require(
+        type_sensitive_equal(spec.get("frozen_evaluator_source"), expected_frozen_source)
+        and type_sensitive_equal(
+            inspect_source_checkout(FROZEN_ROOT, FROZEN_COMMIT, FROZEN_TREE, "frozen evaluator"),
+            expected_frozen_source,
+        )
+        and type_sensitive_equal(spec.get("predecessor_control_source"), expected_control_source)
+        and type_sensitive_equal(
+            inspect_source_checkout(
+                PREDECESSOR_CONTROL_ROOT, PREDECESSOR_CONTROL_COMMIT,
+                PREDECESSOR_CONTROL_TREE, "predecessor control",
+            ),
+            expected_control_source,
+        ),
+        "incident evaluator/bridge source changed",
+    )
+    require(
+        spec.get("formal_python") == FORMAL_PYTHON
+        and spec.get("repair_root") == REPAIR_ROOT
+        and spec.get("result_path") == RESULT_PATH
+        and spec.get("runner_control_root") == RUNNER_CONTROL_ROOT
+        and spec.get("runner_status_path") == RUNNER_STATUS_PATH
+        and spec.get("runner_log_path") == RUNNER_LOG_PATH
+        and spec.get("guard_proof_path") == GUARD_PROOF_PATH,
+        "incident runtime/output roots changed",
+    )
+    validate_formal_python()
+    assert_predecessor_incident(spec)
+    authority_artifact, authority = read_document(
+        INCIDENT_AUTHORITY, "incident metric repair authority",
+    )
+    require(
+        set(authority) == AUTHORITY_KEYS
+        and authority.get("format") == AUTHORITY_FORMAT
+        and authority.get("status") == "authorized"
+        and authority.get("split") == "val"
+        and authority.get("test_visible") is False
+        and authority.get("selection_eligible") is False
+        and authority.get("inference_allowed") is False
+        and authority.get("metric_replay_count") == 1
+        and authority.get("candidate_epoch") == 1
+        and type_sensitive_equal(authority.get("spec"), spec_artifact)
+        and authority.get("receipt_payload_sha256") == payload_sha(authority)
+        and type(authority.get("created_unix")) is float
+        and math.isfinite(authority["created_unix"]),
+        "incident metric repair authority changed",
+    )
+    terminal = tree_snapshot([PREDECESSOR_STATE_ROOT, PREDECESSOR_RUN_ROOT])
+    require(
+        type_sensitive_equal(authority.get("terminal_snapshot"), terminal),
+        "terminal predecessor changed after incident authorization",
+    )
+    status_artifact, status = read_document(
+        INCIDENT_RUNNER_STATUS, "failed metric repair runner status",
+    )
+    status_keys = {
+        "updated_at", "state", "wrapper_pid", "child_pid", "return_code",
+        "received_signal", "error", "cleanup_error", "restored_guards",
+        "restore_error", "command",
+    }
+    expected_command = [
+        FORMAL_PYTHON, "-I", expected_original_tool["path"], "run",
+        "--authority", authority_artifact["path"],
+        "--expected-authority-sha256", authority_artifact["sha256"],
+        "--expected-authority-bytes", str(authority_artifact["bytes"]),
+    ]
+    restored = status.get("restored_guards")
+    require(
+        set(status) == status_keys
+        and status.get("state") == "failed"
+        and status.get("return_code") == 1
+        and valid_runner_timestamp(status.get("updated_at"))
+        and type(status.get("wrapper_pid")) is int and status["wrapper_pid"] > 1
+        and type(status.get("child_pid")) is int and status["child_pid"] > 1
+        and status["wrapper_pid"] != status["child_pid"]
+        and type_sensitive_equal(status.get("command"), expected_command)
+        and all(status.get(key) is None for key in (
+            "received_signal", "error", "cleanup_error", "restore_error",
+        ))
+        and isinstance(restored, dict)
+        and set(restored) == {str(index) for index in range(8)}
+        and len(set(restored.values())) == 8
+        and all(type(restored[str(index)]) is int and restored[str(index)] > 1 for index in range(8)),
+        "failed metric repair runner evidence changed",
+    )
+    runner_log = artifact(
+        INCIDENT_RUNNER_LOG["path"], "failed metric repair runner log",
+        INCIDENT_RUNNER_LOG,
+    )
+    _runner_log_path, runner_log_raw = regular_bytes(
+        runner_log["path"], "failed metric repair runner log",
+    )
+    require(
+        runner_log_raw
+        == b"metric-repair-error: frozen 4066 evaluator failed or emitted stderr\n",
+        "failed metric repair runner log changed",
+    )
+    incident = incident_partial_snapshot()
+    runner_control = incident_runner_control_snapshot()
+    validate_incident_report_and_log(spec["old_report"])
+    require(
+        not os.path.lexists(RESULT_PATH)
+        and not os.path.lexists(REPAIR_ROOT + "/report-comparison.json")
+        and not os.path.lexists(REPAIR_ROOT + "/live-measurement.json")
+        and not os.path.lexists(GUARD_PROOF_PATH)
+        and not os.path.lexists(ADOPTION_PATH),
+        "incident gained a forbidden result/comparison/measurement/proof/adoption",
+    )
+    return (
+        spec_artifact, spec, authority_artifact, authority,
+        status_artifact, runner_log, incident, runner_control,
+    )
 
 
 def assert_predecessor_incident(spec: Mapping[str, Any]) -> None:
@@ -1036,6 +1532,327 @@ def bridge_argv_for(
     ]
 
 
+def build_recovery_spec(args: argparse.Namespace) -> dict[str, Any]:
+    require(args.output == RECOVERY_SPEC_PATH, "recovery spec path changed")
+    require(not os.path.lexists(RECOVERY_SPEC_PATH), "recovery spec already exists")
+    for path in (
+        RECOVERY_AUTHORITY_PATH, RECOVERY_ROOT, RECOVERY_RUNNER_CONTROL_ROOT,
+        ADOPTION_PATH,
+    ):
+        require(not os.path.lexists(path), "recovery output already exists")
+    (
+        incident_spec_artifact, incident_spec, incident_authority_artifact,
+        incident_authority, failed_status, failed_log, incident,
+        incident_control,
+    ) = load_incident_repair_chain()
+    recovery_source = inspect_repair_tool_source()
+    recovery_tool = artifact(
+        str(Path(__file__).resolve(strict=True)), "recovery tool",
+    )
+    value = self_hashed({
+        "format": RECOVERY_SPEC_FORMAT, "status": "frozen", "split": "val",
+        "test_visible": False, "selection_eligible": False,
+        "candidate_epoch": 1, "metric_repair_spec": incident_spec_artifact,
+        "metric_repair_authority": incident_authority_artifact,
+        "failed_metric_repair_runner_status": failed_status,
+        "failed_metric_repair_runner_log": failed_log,
+        "partial_repaired_report": dict(INCIDENT_REPAIRED_REPORT),
+        "partial_evaluator_log": dict(INCIDENT_EVALUATOR_LOG),
+        "frozen_evaluator_source": incident_spec["frozen_evaluator_source"],
+        "predecessor_control_source": incident_spec["predecessor_control_source"],
+        "original_repair_tool_source": incident_spec["repair_tool_source"],
+        "original_repair_tool": incident_spec["repair_tool"],
+        "recovery_tool_source": recovery_source, "recovery_tool": recovery_tool,
+        "bridge": incident_spec["bridge"], "formal_python": FORMAL_PYTHON,
+        "guarded_runner": incident_spec["guarded_runner"],
+        "guard_verifier": incident_spec["guard_verifier"],
+        "predecessor_state_root": PREDECESSOR_STATE_ROOT,
+        "predecessor_run_root": PREDECESSOR_RUN_ROOT,
+        "terminal_snapshot": incident_authority["terminal_snapshot"],
+        "incident_snapshot": incident,
+        "incident_runner_control_snapshot": incident_control,
+        "recovery_evaluator_invocations_authorized": 0,
+        "recovery_inference_runs_authorized": 0,
+        "recovery_metric_replays_authorized": 0,
+        "metric_replays_total": 1,
+        "recovery_root": RECOVERY_ROOT,
+        "recovery_result_path": RECOVERY_RESULT_PATH,
+        "recovery_runner_control_root": RECOVERY_RUNNER_CONTROL_ROOT,
+        "recovery_runner_status_path": RECOVERY_RUNNER_STATUS_PATH,
+        "recovery_runner_log_path": RECOVERY_RUNNER_LOG_PATH,
+        "recovery_guard_proof_path": RECOVERY_GUARD_PROOF_PATH,
+    })
+    require(set(value) == RECOVERY_SPEC_KEYS, "constructed recovery spec schema changed")
+    return {"status": "frozen", "spec": write_new(args.output, value, "recovery spec")}
+
+
+def load_recovery_spec(reference: Mapping[str, Any]) -> dict[str, Any]:
+    require(reference.get("path") == RECOVERY_SPEC_PATH, "recovery spec path changed")
+    _observed, value = read_document(reference, "recovery spec")
+    require(
+        set(value) == RECOVERY_SPEC_KEYS
+        and value.get("format") == RECOVERY_SPEC_FORMAT
+        and value.get("status") == "frozen"
+        and value.get("split") == "val"
+        and value.get("test_visible") is False
+        and value.get("selection_eligible") is False
+        and value.get("candidate_epoch") == 1
+        and value.get("receipt_payload_sha256") == payload_sha(value)
+        and value.get("recovery_evaluator_invocations_authorized") == 0
+        and value.get("recovery_inference_runs_authorized") == 0
+        and value.get("recovery_metric_replays_authorized") == 0
+        and value.get("metric_replays_total") == 1,
+        "recovery spec schema/state changed",
+    )
+    (
+        incident_spec_artifact, incident_spec, incident_authority_artifact,
+        incident_authority, failed_status, failed_log, incident,
+        incident_control,
+    ) = load_incident_repair_chain()
+    require(
+        type_sensitive_equal(value.get("metric_repair_spec"), incident_spec_artifact)
+        and type_sensitive_equal(value.get("metric_repair_authority"), incident_authority_artifact)
+        and type_sensitive_equal(value.get("failed_metric_repair_runner_status"), failed_status)
+        and type_sensitive_equal(value.get("failed_metric_repair_runner_log"), failed_log)
+        and type_sensitive_equal(value.get("partial_repaired_report"), INCIDENT_REPAIRED_REPORT)
+        and type_sensitive_equal(value.get("partial_evaluator_log"), INCIDENT_EVALUATOR_LOG)
+        and type_sensitive_equal(value.get("frozen_evaluator_source"), incident_spec["frozen_evaluator_source"])
+        and type_sensitive_equal(value.get("predecessor_control_source"), incident_spec["predecessor_control_source"])
+        and type_sensitive_equal(value.get("original_repair_tool_source"), incident_spec["repair_tool_source"])
+        and type_sensitive_equal(value.get("original_repair_tool"), incident_spec["repair_tool"])
+        and type_sensitive_equal(value.get("bridge"), incident_spec["bridge"])
+        and type_sensitive_equal(value.get("guarded_runner"), incident_spec["guarded_runner"])
+        and type_sensitive_equal(value.get("guard_verifier"), incident_spec["guard_verifier"])
+        and type_sensitive_equal(
+            value.get("terminal_snapshot"),
+            incident_authority["terminal_snapshot"],
+        )
+        and type_sensitive_equal(value.get("incident_snapshot"), incident)
+        and type_sensitive_equal(value.get("incident_runner_control_snapshot"), incident_control),
+        "recovery spec incident binding changed",
+    )
+    require(
+        value.get("formal_python") == FORMAL_PYTHON
+        and value.get("predecessor_state_root") == PREDECESSOR_STATE_ROOT
+        and value.get("predecessor_run_root") == PREDECESSOR_RUN_ROOT
+        and value.get("recovery_root") == RECOVERY_ROOT
+        and value.get("recovery_result_path") == RECOVERY_RESULT_PATH
+        and value.get("recovery_runner_control_root") == RECOVERY_RUNNER_CONTROL_ROOT
+        and value.get("recovery_runner_status_path") == RECOVERY_RUNNER_STATUS_PATH
+        and value.get("recovery_runner_log_path") == RECOVERY_RUNNER_LOG_PATH
+        and value.get("recovery_guard_proof_path") == RECOVERY_GUARD_PROOF_PATH,
+        "recovery output/runtime roots changed",
+    )
+    source = value.get("recovery_tool_source")
+    require(isinstance(source, Mapping) and set(source) == SOURCE_KEYS, "recovery tool source schema changed")
+    inspect_repair_tool_source(source)
+    current_tool = artifact(str(Path(__file__).resolve(strict=True)), "recovery tool")
+    require(type_sensitive_equal(value.get("recovery_tool"), current_tool), "recovery tool changed")
+    return value
+
+
+def authorize_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    spec_ref = {
+        "path": args.spec, "sha256": args.expected_spec_sha256,
+        "bytes": args.expected_spec_bytes,
+    }
+    spec = load_recovery_spec(spec_ref)
+    require(args.output == RECOVERY_AUTHORITY_PATH, "recovery authority path changed")
+    for path in (RECOVERY_AUTHORITY_PATH, RECOVERY_ROOT, RECOVERY_RUNNER_CONTROL_ROOT):
+        require(not os.path.lexists(path), "recovery output already exists")
+    value = self_hashed({
+        "format": RECOVERY_AUTHORITY_FORMAT, "status": "authorized",
+        "split": "val", "test_visible": False, "selection_eligible": False,
+        "candidate_epoch": 1, "recovery_evaluator_invocations_allowed": 0,
+        "recovery_inference_runs_allowed": 0,
+        "recovery_metric_replays_allowed": 0, "metric_replays_total": 1,
+        "spec": spec_ref, "terminal_snapshot": spec["terminal_snapshot"],
+        "incident_snapshot": spec["incident_snapshot"],
+        "incident_runner_control_snapshot": spec["incident_runner_control_snapshot"],
+        "created_unix": float(time.time()),
+    })
+    require(set(value) == RECOVERY_AUTHORITY_KEYS, "constructed recovery authority schema changed")
+    return {"status": "authorized", "authority": write_new(args.output, value, "recovery authority")}
+
+
+def load_recovery_authority(
+    path_text: str, expected_sha: str, expected_bytes: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    require(path_text == RECOVERY_AUTHORITY_PATH, "recovery authority path changed")
+    reference = {"path": path_text, "sha256": expected_sha, "bytes": expected_bytes}
+    observed, value = read_document(reference, "recovery authority")
+    require(
+        set(value) == RECOVERY_AUTHORITY_KEYS
+        and value.get("format") == RECOVERY_AUTHORITY_FORMAT
+        and value.get("status") == "authorized"
+        and value.get("split") == "val"
+        and value.get("test_visible") is False
+        and value.get("selection_eligible") is False
+        and value.get("candidate_epoch") == 1
+        and value.get("recovery_evaluator_invocations_allowed") == 0
+        and value.get("recovery_inference_runs_allowed") == 0
+        and value.get("recovery_metric_replays_allowed") == 0
+        and value.get("metric_replays_total") == 1
+        and type(value.get("created_unix")) is float
+        and math.isfinite(value["created_unix"])
+        and value.get("receipt_payload_sha256") == payload_sha(value),
+        "recovery authority changed",
+    )
+    spec = load_recovery_spec(value["spec"])
+    require(
+        type_sensitive_equal(value.get("terminal_snapshot"), spec["terminal_snapshot"])
+        and type_sensitive_equal(value.get("incident_snapshot"), spec["incident_snapshot"])
+        and type_sensitive_equal(value.get("incident_runner_control_snapshot"), spec["incident_runner_control_snapshot"]),
+        "recovery authority snapshots changed",
+    )
+    return observed, value, spec
+
+
+def prepare_recovery_runner_control(args: argparse.Namespace) -> dict[str, Any]:
+    _artifact, _authority, spec = load_recovery_authority(
+        args.authority, args.expected_authority_sha256, args.expected_authority_bytes,
+    )
+    require(args.output == RECOVERY_RUNNER_CONTROL_ROOT == spec["recovery_runner_control_root"], "recovery runner control root changed")
+    require(
+        not os.path.lexists(RECOVERY_ROOT)
+        and not os.path.lexists(RECOVERY_RESULT_PATH)
+        and not os.path.lexists(ADOPTION_PATH),
+        "recovery result/adoption already exists",
+    )
+    control = Path(args.output)
+    require(not os.path.lexists(control), "recovery runner control root already exists")
+    control.parent.mkdir(parents=True, exist_ok=True)
+    require(control.parent.resolve(strict=True) / control.name == control, "recovery runner control parent changed")
+    os.mkdir(control, 0o700)
+    metadata = control.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o700, "recovery runner control root did not seal")
+    fsync_parent(control, "recovery runner control root")
+    return {"status": "prepared", "runner_control_root": str(control)}
+
+
+def validate_measurement(
+    measurement_artifact: Mapping[str, Any], report_artifact: Mapping[str, Any],
+) -> tuple[dict[str, Any], float]:
+    _observed, measurement = read_document(measurement_artifact, "recovery live measurement")
+    fgd = measurement.get("metrics", {}).get("fgd")
+    _report_observed, report = read_document(report_artifact, "partial repaired DiffSHEG report")
+    report_fgd = report.get("metrics", {}).get("fgd")
+    require(
+        measurement.get("format") == MEASUREMENT_FORMAT
+        and measurement.get("status") == "complete"
+        and measurement.get("candidate_epoch") == 1
+        and measurement.get("split") == "val"
+        and measurement.get("test_visible") is False
+        and measurement.get("selection_eligible") is False
+        and measurement.get("receipt_payload_sha256") == payload_sha(measurement)
+        and type_sensitive_equal(
+            measurement.get("diffsheg_report"), {
+                "path": report_artifact["path"],
+                "sha256": report_artifact["sha256"],
+            },
+        )
+        and type(fgd) is float and type(report_fgd) is float
+        and struct.pack(">d", fgd) == struct.pack(">d", report_fgd)
+        and struct.pack(">d", fgd).hex() == EXPECTED_FGD_BINARY64_HEX,
+        "recovery measurement changed",
+    )
+    return measurement, fgd
+
+
+def run_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    authority_artifact, authority, spec = load_recovery_authority(
+        args.authority, args.expected_authority_sha256, args.expected_authority_bytes,
+    )
+    root = Path(RECOVERY_ROOT)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    require(root.parent.resolve(strict=True) / root.name == root and not os.path.lexists(root), "recovery root changed/already exists")
+    os.mkdir(root, 0o700)
+    metadata = root.lstat()
+    require(
+        root.resolve(strict=True) == root
+        and stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700,
+        "recovery root did not seal",
+    )
+    fsync_parent(root, "recovery root")
+    terminal_before = tree_snapshot([PREDECESSOR_STATE_ROOT, PREDECESSOR_RUN_ROOT])
+    incident_before = incident_partial_snapshot()
+    control_before = incident_runner_control_snapshot()
+    require(
+        type_sensitive_equal(terminal_before, authority["terminal_snapshot"])
+        and type_sensitive_equal(incident_before, authority["incident_snapshot"])
+        and type_sensitive_equal(control_before, authority["incident_runner_control_snapshot"]),
+        "incident changed before recovery",
+    )
+    comparison_value = compare_reports(
+        fixed_artifact("old_report"), INCIDENT_REPAIRED_REPORT,
+    )
+    comparison = write_new(str(root / "report-comparison.json"), comparison_value, "recovery report comparison")
+    measurement_path = str(root / "live-measurement.json")
+    bridge_argv = bridge_argv_for(
+        {"formal_python": spec["formal_python"], "bridge": spec["bridge"],
+         "preflight": fixed_artifact("preflight"),
+         "inference_lineage": fixed_artifact("inference_lineage")},
+        INCIDENT_REPAIRED_REPORT, measurement_path,
+    )
+    bridge_stdout = capture(bridge_argv, root / "bridge-complete.log", "recovery bridge complete")
+    os.chmod(measurement_path, 0o400, follow_symlinks=False)
+    measurement_artifact = artifact(measurement_path, "recovery live measurement")
+    measurement, fgd = validate_measurement(measurement_artifact, INCIDENT_REPAIRED_REPORT)
+    bridge_result = strict_json(bridge_stdout, "recovery bridge complete stdout")
+    measurement_ref = {**measurement_artifact, "receipt_payload_sha256": measurement["receipt_payload_sha256"]}
+    expected_bridge = {
+        "status": "complete", "split": "val", "test_visible": False,
+        "selection_eligible": False, "epoch": 1, "fgd": fgd,
+        "created": True, "measurement": measurement_ref,
+    }
+    require(
+        type_sensitive_equal(bridge_result, expected_bridge)
+        and bridge_stdout == (json.dumps(expected_bridge, sort_keys=True, allow_nan=False) + "\n").encode(),
+        "recovery bridge stdout changed",
+    )
+    replay_argv = [
+        spec["formal_python"], "-I", "-B", "-c",
+        BRIDGE_MEASUREMENT_REPLAY_CODE, spec["bridge"]["path"],
+        measurement_artifact["path"], measurement_artifact["sha256"],
+    ]
+    replay_stdout = capture(replay_argv, root / "bridge-measurement-replay.log", "recovery bridge measurement replay")
+    require(replay_stdout == b"PASS\n", "recovery bridge measurement replay changed")
+    terminal_after = tree_snapshot([PREDECESSOR_STATE_ROOT, PREDECESSOR_RUN_ROOT])
+    incident_after = incident_partial_snapshot()
+    control_after = incident_runner_control_snapshot()
+    require(
+        type_sensitive_equal(terminal_before, terminal_after)
+        and type_sensitive_equal(incident_before, incident_after)
+        and type_sensitive_equal(control_before, control_after),
+        "incident changed during recovery",
+    )
+    result = self_hashed({
+        "format": RECOVERY_RESULT_FORMAT, "status": "complete", "split": "val",
+        "test_visible": False, "selection_eligible": False,
+        "candidate_epoch": 1, "recovery_evaluator_invocations": 0,
+        "recovery_inference_runs": 0, "recovery_metric_replays": 0,
+        "metric_replays_total": 1, "authority": authority_artifact,
+        "terminal_snapshot_before": terminal_before,
+        "terminal_snapshot_after": terminal_after,
+        "incident_snapshot_before": incident_before,
+        "incident_snapshot_after": incident_after,
+        "incident_runner_control_snapshot_before": control_before,
+        "incident_runner_control_snapshot_after": control_after,
+        "bridge_complete_argv": bridge_argv,
+        "bridge_complete_stdout_sha256": hashlib.sha256(bridge_stdout).hexdigest(),
+        "bridge_measurement_replay_argv": replay_argv,
+        "bridge_measurement_replay_stdout": "PASS\n",
+        "partial_repaired_report": dict(INCIDENT_REPAIRED_REPORT),
+        "partial_evaluator_log": dict(INCIDENT_EVALUATOR_LOG),
+        "report_comparison": comparison, "measurement": measurement_ref,
+        "completed_unix": float(time.time()),
+    })
+    require(set(result) == RECOVERY_RESULT_KEYS, "constructed recovery result schema changed")
+    result_artifact = write_new(RECOVERY_RESULT_PATH, result, "recovery result")
+    return {"status": "complete", "result": result_artifact}
+
+
 def run_repair(args: argparse.Namespace) -> dict[str, Any]:
     authority_artifact, authority, spec = load_authority(args.authority, args.expected_authority_sha256, args.expected_authority_bytes)
     lexical_repair_root = Path(spec["repair_root"])
@@ -1409,6 +2226,309 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "complete", "adoption_receipt": output}
 
 
+def finalize_recovery(args: argparse.Namespace) -> dict[str, Any]:
+    authority_artifact, authority, spec = load_recovery_authority(
+        args.authority, args.expected_authority_sha256,
+        args.expected_authority_bytes,
+    )
+    require(args.output == ADOPTION_PATH, "recovery adoption path changed")
+    require(
+        args.result == RECOVERY_RESULT_PATH
+        and args.runner_status == RECOVERY_RUNNER_STATUS_PATH
+        and args.runner_log == RECOVERY_RUNNER_LOG_PATH
+        and args.guard_proof == RECOVERY_GUARD_PROOF_PATH,
+        "recovery evidence paths changed",
+    )
+    result_reference = {
+        "path": args.result, "sha256": args.expected_result_sha256,
+        "bytes": args.expected_result_bytes,
+    }
+    result_artifact, result = read_document(result_reference, "recovery result")
+    require(
+        set(result) == RECOVERY_RESULT_KEYS
+        and result.get("format") == RECOVERY_RESULT_FORMAT
+        and result.get("status") == "complete"
+        and result.get("split") == "val"
+        and result.get("test_visible") is False
+        and result.get("selection_eligible") is False
+        and result.get("candidate_epoch") == 1
+        and result.get("recovery_evaluator_invocations") == 0
+        and result.get("recovery_inference_runs") == 0
+        and result.get("recovery_metric_replays") == 0
+        and result.get("metric_replays_total") == 1
+        and type_sensitive_equal(result.get("authority"), authority_artifact)
+        and type_sensitive_equal(result.get("terminal_snapshot_before"), authority["terminal_snapshot"])
+        and type_sensitive_equal(result.get("terminal_snapshot_after"), authority["terminal_snapshot"])
+        and type_sensitive_equal(result.get("incident_snapshot_before"), authority["incident_snapshot"])
+        and type_sensitive_equal(result.get("incident_snapshot_after"), authority["incident_snapshot"])
+        and type_sensitive_equal(
+            result.get("incident_runner_control_snapshot_before"),
+            authority["incident_runner_control_snapshot"],
+        )
+        and type_sensitive_equal(
+            result.get("incident_runner_control_snapshot_after"),
+            authority["incident_runner_control_snapshot"],
+        )
+        and type_sensitive_equal(result.get("partial_repaired_report"), INCIDENT_REPAIRED_REPORT)
+        and type_sensitive_equal(result.get("partial_evaluator_log"), INCIDENT_EVALUATOR_LOG)
+        and type(result.get("completed_unix")) is float
+        and math.isfinite(result["completed_unix"])
+        and result.get("receipt_payload_sha256") == payload_sha(result),
+        "recovery result changed",
+    )
+    status_reference = {
+        "path": args.runner_status,
+        "sha256": args.expected_runner_status_sha256,
+        "bytes": args.expected_runner_status_bytes,
+    }
+    status_artifact, status = read_document(
+        status_reference, "recovery runner status",
+    )
+    status_keys = {
+        "updated_at", "state", "wrapper_pid", "child_pid", "return_code",
+        "received_signal", "error", "cleanup_error", "restored_guards",
+        "restore_error", "command",
+    }
+    expected_command = [
+        spec["formal_python"], "-I", spec["recovery_tool"]["path"],
+        "run-recovery", "--authority", authority_artifact["path"],
+        "--expected-authority-sha256", authority_artifact["sha256"],
+        "--expected-authority-bytes", str(authority_artifact["bytes"]),
+    ]
+    restored = status.get("restored_guards")
+    require(
+        set(status) == status_keys
+        and status.get("state") == "finished"
+        and status.get("return_code") == 0
+        and valid_runner_timestamp(status.get("updated_at"))
+        and type(status.get("wrapper_pid")) is int and status["wrapper_pid"] > 1
+        and type(status.get("child_pid")) is int and status["child_pid"] > 1
+        and type_sensitive_equal(status.get("command"), expected_command)
+        and all(status.get(key) is None for key in (
+            "received_signal", "error", "cleanup_error", "restore_error",
+        ))
+        and isinstance(restored, dict)
+        and set(restored) == {str(index) for index in range(8)}
+        and len(set(restored.values())) == 8
+        and all(type(restored[str(index)]) is int and restored[str(index)] > 1 for index in range(8))
+        and status["wrapper_pid"] not in restored.values()
+        and status["child_pid"] not in restored.values(),
+        "recovery runner failed or command changed",
+    )
+    runner_log = artifact(
+        args.runner_log, "recovery runner log", {
+            "path": args.runner_log, "sha256": args.expected_runner_log_sha256,
+            "bytes": args.expected_runner_log_bytes,
+        },
+    )
+    _runner_log_path, runner_log_raw = regular_bytes(
+        runner_log["path"], "recovery runner log",
+    )
+    expected_runner_stdout = {
+        "status": "complete", "result": result_artifact,
+    }
+    require(
+        runner_log_raw
+        == (
+            json.dumps(
+                expected_runner_stdout, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8"),
+        "recovery runner stdout changed",
+    )
+    pins = (args.expected_guard_proof_sha256, args.expected_guard_proof_bytes)
+    require(
+        all(value is None for value in pins)
+        or all(value is not None for value in pins),
+        "recovery guard proof pins must be all-or-none",
+    )
+    expected_control_entries: dict[str, tuple[Mapping[str, Any], int]] = {
+        ".guarded_status.json": (status_artifact, 0o644),
+        "runner.log": (runner_log, 0o644),
+    }
+    if pins[0] is not None:
+        expected_control_entries["guard-proof.txt"] = ({
+            "path": args.guard_proof,
+            "sha256": args.expected_guard_proof_sha256,
+            "bytes": args.expected_guard_proof_bytes,
+        }, 0o400)
+    exact_directory_snapshot(
+        RECOVERY_RUNNER_CONTROL_ROOT, expected_control_entries,
+        "recovery runner control before adoption",
+    )
+    measurement_reference = result.get("measurement")
+    require(
+        isinstance(measurement_reference, dict)
+        and set(measurement_reference) == ARTIFACT_KEYS | {"receipt_payload_sha256"},
+        "recovery measurement reference changed",
+    )
+    measurement_artifact = {
+        key: measurement_reference[key] for key in ARTIFACT_KEYS
+    }
+    measurement, fgd = validate_measurement(
+        measurement_artifact, INCIDENT_REPAIRED_REPORT,
+    )
+    require(
+        measurement_reference["receipt_payload_sha256"]
+        == measurement["receipt_payload_sha256"],
+        "recovery measurement payload binding changed",
+    )
+    comparison_artifact, comparison = read_document(
+        result["report_comparison"], "recovery report comparison",
+    )
+    expected_comparison = compare_reports(
+        fixed_artifact("old_report"), INCIDENT_REPAIRED_REPORT,
+    )
+    require(
+        type_sensitive_equal(comparison, expected_comparison)
+        and comparison.get("receipt_payload_sha256") == payload_sha(comparison),
+        "recovery report comparison changed",
+    )
+    expected_bridge_argv = bridge_argv_for(
+        {"formal_python": spec["formal_python"], "bridge": spec["bridge"],
+         "preflight": fixed_artifact("preflight"),
+         "inference_lineage": fixed_artifact("inference_lineage")},
+        INCIDENT_REPAIRED_REPORT, measurement_artifact["path"],
+    )
+    expected_bridge_stdout = (
+        json.dumps({
+            "status": "complete", "split": "val", "test_visible": False,
+            "selection_eligible": False, "epoch": 1, "fgd": fgd,
+            "created": True, "measurement": measurement_reference,
+        }, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    expected_replay_argv = [
+        spec["formal_python"], "-I", "-B", "-c",
+        BRIDGE_MEASUREMENT_REPLAY_CODE, spec["bridge"]["path"],
+        measurement_artifact["path"], measurement_artifact["sha256"],
+    ]
+    require(
+        type_sensitive_equal(result.get("bridge_complete_argv"), expected_bridge_argv)
+        and result.get("bridge_complete_stdout_sha256")
+        == hashlib.sha256(expected_bridge_stdout).hexdigest()
+        and type_sensitive_equal(result.get("bridge_measurement_replay_argv"), expected_replay_argv)
+        and result.get("bridge_measurement_replay_stdout") == "PASS\n"
+        and comparison.get("fgd_binary64_hex") == EXPECTED_FGD_BINARY64_HEX
+        and struct.pack(">d", fgd).hex() == EXPECTED_FGD_BINARY64_HEX,
+        "recovery command/FGD evidence changed",
+    )
+    bridge_log = artifact(str(Path(RECOVERY_ROOT) / "bridge-complete.log"), "recovery bridge log")
+    _bridge_log_path, bridge_log_raw = regular_bytes(bridge_log["path"], "recovery bridge log")
+    replay_log = artifact(str(Path(RECOVERY_ROOT) / "bridge-measurement-replay.log"), "recovery replay log")
+    _replay_log_path, replay_log_raw = regular_bytes(replay_log["path"], "recovery replay log")
+    require(bridge_log_raw == expected_bridge_stdout and replay_log_raw == b"PASS\n", "recovery bridge logs changed")
+    exact_directory_snapshot(
+        RECOVERY_ROOT,
+        {
+            "bridge-complete.log": (bridge_log, 0o400),
+            "bridge-measurement-replay.log": (replay_log, 0o400),
+            "live-measurement.json": (measurement_artifact, 0o400),
+            "report-comparison.json": (comparison_artifact, 0o400),
+            "recovery-result.json": (result_artifact, 0o400),
+        },
+        "recovery result root",
+    )
+    replay = subprocess.run(
+        expected_replay_argv, shell=False, check=False,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    require(replay.returncode == 0 and replay.stdout == b"PASS\n" and replay.stderr == b"", "independent recovery measurement replay failed")
+    expected_guard_text = "PASS " + " ".join(
+        "GPU%d=PID%d" % (index, restored[str(index)]) for index in range(8)
+    ) + "\n"
+    verifier_argv = [
+        spec["formal_python"], spec["guard_verifier"]["path"],
+        *[str(restored[str(index)]) for index in range(8)],
+    ]
+    verifier = subprocess.run(
+        verifier_argv, shell=False, check=False, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    require(
+        verifier.returncode == 0 and verifier.stderr == b""
+        and verifier.stdout == expected_guard_text.encode("ascii"),
+        "independent recovery guard verification failed",
+    )
+    if pins[0] is None:
+        require(not os.path.lexists(args.guard_proof), "recovery guard proof already exists without pins")
+        guard_proof = write_new_bytes(Path(args.guard_proof), verifier.stdout, "recovery guard proof")
+    else:
+        guard_proof = artifact(args.guard_proof, "recovery guard proof", {
+            "path": args.guard_proof, "sha256": args.expected_guard_proof_sha256,
+            "bytes": args.expected_guard_proof_bytes,
+        })
+        require(regular_bytes(guard_proof["path"], "recovery guard proof")[1] == verifier.stdout, "recovery guard proof changed")
+    terminal_now = tree_snapshot([PREDECESSOR_STATE_ROOT, PREDECESSOR_RUN_ROOT])
+    incident_now = incident_partial_snapshot()
+    control_now = incident_runner_control_snapshot()
+    require(
+        type_sensitive_equal(terminal_now, result["terminal_snapshot_after"])
+        and type_sensitive_equal(incident_now, result["incident_snapshot_after"])
+        and type_sensitive_equal(control_now, result["incident_runner_control_snapshot_after"]),
+        "incident changed before recovery finalize",
+    )
+    _original_spec_artifact, original_spec = read_document(
+        spec["metric_repair_spec"], "incident metric repair spec",
+    )
+    receipt = self_hashed({
+        "format": RECOVERY_ADOPTION_FORMAT, "status": "complete",
+        "split": "val", "test_visible": False, "selection_eligible": False,
+        "test_measurements_authorized": 0, "candidate_epoch": 1,
+        "candidate_receipt": original_spec["candidate_receipt"],
+        "predecessor_campaign": original_spec["predecessor_campaign"],
+        "predecessor_job_claim": original_spec["predecessor_job_claim"],
+        "predecessor_active_claim": original_spec["predecessor_active_claim"],
+        "predecessor_work_authority": original_spec["predecessor_work_authority"],
+        "predecessor_authorization": original_spec["predecessor_authorization"],
+        "predecessor_runner_status": original_spec["predecessor_runner_status"],
+        "predecessor_recovery_request": original_spec["predecessor_recovery_request"],
+        "predecessor_recovery_authority": original_spec["predecessor_recovery_authority"],
+        "predecessor_recovery_claim": original_spec["predecessor_recovery_claim"],
+        "predecessor_failure_log": original_spec["predecessor_failure_log"],
+        "metric_repair_spec": spec["metric_repair_spec"],
+        "metric_repair_authority": spec["metric_repair_authority"],
+        "failed_metric_repair_runner_status": spec["failed_metric_repair_runner_status"],
+        "failed_metric_repair_runner_log": spec["failed_metric_repair_runner_log"],
+        "partial_repaired_report": spec["partial_repaired_report"],
+        "partial_evaluator_log": spec["partial_evaluator_log"],
+        "metric_repair_recovery_spec": authority["spec"],
+        "metric_repair_recovery_authority": authority_artifact,
+        "metric_repair_recovery_result": result_artifact,
+        "frozen_evaluator_source": spec["frozen_evaluator_source"],
+        "predecessor_control_source": spec["predecessor_control_source"],
+        "original_repair_tool_source": spec["original_repair_tool_source"],
+        "recovery_tool_source": spec["recovery_tool_source"],
+        "frozen_evaluator": original_spec["frozen_evaluator"],
+        "bridge": spec["bridge"], "repaired_report": spec["partial_repaired_report"],
+        "report_comparison": comparison_artifact,
+        "measurement": measurement_reference,
+        "guarded_runner": spec["guarded_runner"],
+        "recovery_runner_status": status_artifact,
+        "recovery_runner_log": runner_log,
+        "guard_verifier": spec["guard_verifier"], "guard_proof": guard_proof,
+        "guard_verifier_argv": verifier_argv,
+        "guard_verifier_stdout": expected_guard_text,
+        "restored_guards": restored,
+        "terminal_snapshot_before": result["terminal_snapshot_before"],
+        "terminal_snapshot_after": result["terminal_snapshot_after"],
+        "incident_snapshot_before": result["incident_snapshot_before"],
+        "incident_snapshot_after": result["incident_snapshot_after"],
+        "incident_runner_control_snapshot_before": result["incident_runner_control_snapshot_before"],
+        "incident_runner_control_snapshot_after": result["incident_runner_control_snapshot_after"],
+        "validation_diffsheg_fgd": fgd,
+        "validation_diffsheg_fgd_binary64_hex": struct.pack(">d", fgd).hex(),
+        "original_metric_replays": 1, "recovery_evaluator_invocations": 0,
+        "recovery_inference_runs": 0, "recovery_metric_replays": 0,
+        "metric_replays_total": 1, "predecessor_return_code": 1,
+        "original_repair_return_code": 1, "recovery_return_code": 0,
+        "failure_phase": "post_evaluator_stderr_policy_rejection",
+        "completed_unix": float(time.time()),
+    })
+    require(set(receipt) == RECOVERY_ADOPTION_KEYS, "constructed recovery adoption schema changed")
+    return {"status": "complete", "adoption_receipt": write_new(args.output, receipt, "recovery adoption receipt")}
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     commands = value.add_subparsers(dest="command", required=True)
@@ -1440,6 +2560,34 @@ def parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--expected-guard-proof-sha256")
     finalize_parser.add_argument("--expected-guard-proof-bytes", type=int)
     finalize_parser.add_argument("--output", required=True)
+    recovery_spec_parser = commands.add_parser("build-recovery-spec")
+    recovery_spec_parser.add_argument("--output", required=True)
+    recovery_authorize_parser = commands.add_parser("authorize-recovery")
+    recovery_authorize_parser.add_argument("--spec", required=True)
+    recovery_authorize_parser.add_argument("--expected-spec-sha256", required=True)
+    recovery_authorize_parser.add_argument("--expected-spec-bytes", required=True, type=int)
+    recovery_authorize_parser.add_argument("--output", required=True)
+    recovery_prepare_parser = commands.add_parser("prepare-recovery-runner-control")
+    recovery_prepare_parser.add_argument("--authority", required=True)
+    recovery_prepare_parser.add_argument("--expected-authority-sha256", required=True)
+    recovery_prepare_parser.add_argument("--expected-authority-bytes", required=True, type=int)
+    recovery_prepare_parser.add_argument("--output", required=True)
+    recovery_run_parser = commands.add_parser("run-recovery")
+    recovery_run_parser.add_argument("--authority", required=True)
+    recovery_run_parser.add_argument("--expected-authority-sha256", required=True)
+    recovery_run_parser.add_argument("--expected-authority-bytes", required=True, type=int)
+    recovery_finalize_parser = commands.add_parser("finalize-recovery")
+    recovery_finalize_parser.add_argument("--authority", required=True)
+    recovery_finalize_parser.add_argument("--expected-authority-sha256", required=True)
+    recovery_finalize_parser.add_argument("--expected-authority-bytes", required=True, type=int)
+    for name in ("result", "runner-status", "runner-log"):
+        recovery_finalize_parser.add_argument("--" + name, required=True)
+        recovery_finalize_parser.add_argument("--expected-" + name + "-sha256", required=True)
+        recovery_finalize_parser.add_argument("--expected-" + name + "-bytes", required=True, type=int)
+    recovery_finalize_parser.add_argument("--guard-proof", required=True)
+    recovery_finalize_parser.add_argument("--expected-guard-proof-sha256")
+    recovery_finalize_parser.add_argument("--expected-guard-proof-bytes", type=int)
+    recovery_finalize_parser.add_argument("--output", required=True)
     return value
 
 
@@ -1453,8 +2601,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = prepare_runner_control(args)
     elif args.command == "run":
         result = run_repair(args)
-    else:
+    elif args.command == "finalize":
         result = finalize(args)
+    elif args.command == "build-recovery-spec":
+        result = build_recovery_spec(args)
+    elif args.command == "authorize-recovery":
+        result = authorize_recovery(args)
+    elif args.command == "prepare-recovery-runner-control":
+        result = prepare_recovery_runner_control(args)
+    elif args.command == "run-recovery":
+        result = run_recovery(args)
+    else:
+        result = finalize_recovery(args)
     sys.stdout.write(
         json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
         + "\n"

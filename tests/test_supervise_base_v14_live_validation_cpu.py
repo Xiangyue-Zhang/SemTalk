@@ -535,6 +535,130 @@ class ContractTests(unittest.TestCase):
                 repair_value, "receipt_payload_sha256", "wrong ABI fixture"
             )
 
+    def test_recovered_e1_schema_uses_unambiguous_total_and_recovery_counts(self) -> None:
+        value = {
+            key: None
+            for key in sup.RECOVERED_E1_KEYS
+        }
+        value.update({
+            "format": sup.RECOVERED_E1_FORMAT,
+            "original_metric_replays": 1,
+            "recovery_evaluator_invocations": 0,
+            "recovery_inference_runs": 0,
+            "recovery_metric_replays": 0,
+            "metric_replays_total": 1,
+        })
+        self.assertTrue(sup._adopted_e1_schema(value))
+        self.assertNotIn("evaluator_invocations", sup.RECOVERED_E1_KEYS)
+        self.assertNotIn("inference_reruns", sup.RECOVERED_E1_KEYS)
+        self.assertNotIn("metric_replays", sup.RECOVERED_E1_KEYS)
+        missing = dict(value)
+        missing.pop("recovery_metric_replays")
+        self.assertFalse(sup._adopted_e1_schema(missing))
+
+    def test_load_adopted_e1_dispatches_recovery_format_before_legacy_chain(self) -> None:
+        campaign = self.fx.campaign()
+        artifact = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        campaign["_adopted_e1"] = artifact
+        value = {key: None for key in sup.RECOVERED_E1_KEYS}
+        value["format"] = sup.RECOVERED_E1_FORMAT
+        expected = (artifact, {"status": "recovered"})
+        with mock.patch.object(
+            sup, "_read_existing_json", return_value=(artifact, value)
+        ), mock.patch.object(
+            sup, "_load_recovered_e1", return_value=expected
+        ) as loader, mock.patch.object(
+            sup, "_load_metric_repair_chain"
+        ) as legacy:
+            self.assertEqual(sup._load_adopted_e1(campaign), expected)
+        loader.assert_called_once()
+        legacy.assert_not_called()
+
+    def test_incident_snapshots_require_exact_two_file_inventories(self) -> None:
+        repair_root = self.fx.root / "incident-repair"
+        repair_root.mkdir(mode=0o700)
+        report_raw = b"report\n"
+        evaluator_raw = b"evaluator\n"
+        report = repair_root / "diffsheg-val-fgd.frozen-4066.json"
+        evaluator = repair_root / "evaluator.log"
+        report.write_bytes(report_raw)
+        evaluator.write_bytes(evaluator_raw)
+        report.chmod(0o600)
+        evaluator.chmod(0o400)
+        entries = [
+            {
+                "name": "diffsheg-val-fgd.frozen-4066.json",
+                "bytes": len(report_raw),
+                "sha256": hashlib.sha256(report_raw).hexdigest(),
+                "mode": 0o600,
+                "type": "regular",
+            },
+            {
+                "name": "evaluator.log",
+                "bytes": len(evaluator_raw),
+                "sha256": hashlib.sha256(evaluator_raw).hexdigest(),
+                "mode": 0o400,
+                "type": "regular",
+            },
+        ]
+        snapshot = {
+            "root": str(repair_root), "root_mode": 0o700,
+            "entry_count": 2,
+            "total_bytes": len(report_raw) + len(evaluator_raw),
+            "entries": entries,
+            "inventory_sha256": hashlib.sha256(json.dumps(
+                entries, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")).hexdigest(),
+        }
+        with mock.patch.multiple(
+            sup,
+            METRIC_REPAIR_INCIDENT_REPORT_SHA256=entries[0]["sha256"],
+            METRIC_REPAIR_INCIDENT_REPORT_BYTES=len(report_raw),
+            METRIC_REPAIR_INCIDENT_EVALUATOR_LOG_SHA256=entries[1]["sha256"],
+            METRIC_REPAIR_INCIDENT_EVALUATOR_LOG_BYTES=len(evaluator_raw),
+        ):
+            self.assertEqual(
+                sup._metric_repair_incident_snapshot(
+                    repair_root, snapshot, "incident fixture"
+                ),
+                snapshot,
+            )
+            (repair_root / "forbidden-result.json").write_bytes(b"{}\n")
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "inventory changed"
+            ):
+                sup._metric_repair_incident_snapshot(
+                    repair_root, snapshot, "incident fixture"
+                )
+
+    def test_recovery_chain_has_no_evaluator_invocation_surface(self) -> None:
+        tree = ast.parse(Path(sup.__file__).read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_load_metric_repair_recovery_chain"
+        )
+        literals = {
+            node.value for node in ast.walk(function)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("run-recovery", literals)
+        self.assertNotIn("--pred-dir", literals)
+        self.assertNotIn("evaluator_argv", literals)
+        self.assertIn(
+            "recovery_evaluator_invocations_authorized",
+            sup.METRIC_REPAIR_RECOVERY_SPEC_KEYS,
+        )
+        self.assertIn(
+            "incident_runner_control_snapshot_after",
+            sup.METRIC_REPAIR_RECOVERY_RESULT_KEYS,
+        )
+
     def test_finalize_revalidates_adoption_before_consuming_state(self) -> None:
         campaign = self.fx.campaign()
         campaign["_adopted_e1"] = {
