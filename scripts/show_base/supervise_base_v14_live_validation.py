@@ -740,6 +740,37 @@ def _read_existing_json(path: Path, label: str) -> Tuple[Dict[str, Any], Dict[st
     return {"path": str(resolved), "sha256": digest, "bytes": size}, strict_json(raw, label)
 
 
+def _read_existing_runner_status(
+    path: Path, label: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Read the guarded runner's newline-terminated, pretty JSON status.
+
+    The guarded runner intentionally emits indented JSON rather than this
+    supervisor's compact canonical JSON.  Status integrity is still bound by
+    the caller's artifact triple and the exact runner-status schema/argv
+    checks; requiring the unrelated compact serializer would reject genuine
+    historical and current runner output after it had already been sealed.
+    """
+
+    resolved, raw, digest, size = safe_regular_bytes(str(path), label)
+    return (
+        {"path": str(resolved), "sha256": digest, "bytes": size},
+        _strict_pretty_json_document(raw, label, ensure_ascii=True),
+    )
+
+
+def _read_existing_evaluator_report(
+    path: Path, label: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Read the frozen evaluator's exact indented JSON serialization."""
+
+    resolved, raw, digest, size = safe_regular_bytes(str(path), label)
+    return (
+        {"path": str(resolved), "sha256": digest, "bytes": size},
+        _strict_pretty_json_document(raw, label, ensure_ascii=False),
+    )
+
+
 def write_new_json(path_text: Any, payload: Mapping[str, Any], label: str) -> Dict[str, Any]:
     path = canonical_output_path(path_text, label)
     require(not os.path.lexists(path), "%s already exists" % label)
@@ -829,6 +860,26 @@ def _strict_json_document(raw: bytes, label: str) -> Dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SupervisorError("%s is not strict JSON" % label) from error
     require(isinstance(value, dict), "%s must be a JSON object" % label)
+    return value
+
+
+def _strict_pretty_json_document(
+    raw: bytes, label: str, *, ensure_ascii: bool
+) -> Dict[str, Any]:
+    """Validate the exact ``json.dumps(..., indent=2, sort_keys=True)`` ABI."""
+
+    value = _strict_json_document(raw, label)
+    try:
+        expected = (
+            json.dumps(
+                value, indent=2, sort_keys=True, ensure_ascii=ensure_ascii,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii" if ensure_ascii else "utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise SupervisorError("%s is not finite strict pretty JSON" % label) from error
+    require(raw == expected, "%s is not exact pretty newline JSON" % label)
     return value
 
 
@@ -2741,7 +2792,7 @@ def _load_metric_repair_chain(
         Path(status_reference["path"]) == status_path,
         "metric repair runner status path changed",
     )
-    status_artifact, status = _read_existing_json(
+    status_artifact, status = _read_existing_runner_status(
         status_path, "metric repair runner status"
     )
     expected_run_argv = [
@@ -3050,7 +3101,7 @@ def _load_failed_metric_repair_incident(
         and status_reference["bytes"] == METRIC_REPAIR_INCIDENT_STATUS_BYTES,
         "failed metric repair runner status artifact changed",
     )
-    status_artifact, status = _read_existing_json(
+    status_artifact, status = _read_existing_runner_status(
         status_path, "failed metric repair runner status"
     )
     expected_run_argv = [
@@ -3130,7 +3181,7 @@ def _load_failed_metric_repair_incident(
         and strict_json_equal(receipt.get("repaired_report"), report_reference),
         "partial evaluator output artifacts changed",
     )
-    observed_report_artifact, report = _read_existing_json(
+    observed_report_artifact, report = _read_existing_evaluator_report(
         report_path, "partial repaired report"
     )
     require(
@@ -3544,7 +3595,7 @@ def _load_metric_repair_recovery_chain(
     status_reference = _artifact(
         receipt.get("recovery_runner_status"), "recovery runner status"
     )
-    status_artifact, status = _read_existing_json(
+    status_artifact, status = _read_existing_runner_status(
         status_path, "recovery runner status"
     )
     expected_run_argv = [
@@ -3785,7 +3836,7 @@ def _load_recovered_e1(
         value.get("predecessor_runner_status"),
         "recovered e1 predecessor runner status",
     )
-    observed_predecessor_status, predecessor_status = _read_existing_json(
+    observed_predecessor_status, predecessor_status = _read_existing_runner_status(
         Path(predecessor_status_artifact["path"]),
         "recovered e1 predecessor runner status",
     )
@@ -3902,7 +3953,7 @@ def _load_recovered_e1(
     _repair_self_hashed(
         comparison, "receipt_payload_sha256", "recovered e1 report comparison"
     )
-    _old_artifact, old_report = _read_existing_json(
+    _old_artifact, old_report = _read_existing_evaluator_report(
         Path(ADOPTION_PREDECESSOR_REPORT["path"]),
         "recovered e1 predecessor report",
     )
@@ -4159,7 +4210,7 @@ def _load_adopted_e1(
         value.get("predecessor_runner_status"),
         "adopted e1 predecessor runner status",
     )
-    _status_artifact, predecessor_status = _read_existing_json(
+    _status_artifact, predecessor_status = _read_existing_runner_status(
         Path(predecessor_status_artifact["path"]),
         "adopted e1 predecessor runner status",
     )
@@ -4285,11 +4336,11 @@ def _load_adopted_e1(
     _repair_self_hashed(
         comparison, "receipt_payload_sha256", "metric report comparison"
     )
-    _old_report_artifact, old_report = _read_existing_json(
+    _old_report_artifact, old_report = _read_existing_evaluator_report(
         Path(ADOPTION_PREDECESSOR_REPORT["path"]),
         "adopted predecessor diagnostic report",
     )
-    _new_report_artifact, new_report = _read_existing_json(
+    _new_report_artifact, new_report = _read_existing_evaluator_report(
         Path(repaired_report["path"]), "adopted repaired DiffSHEG report"
     )
     require(
@@ -4352,7 +4403,7 @@ def _load_adopted_e1(
     repair_status_artifact = _artifact(
         value.get("repair_runner_status"), "metric repair runner status"
     )
-    _repair_status_artifact, repair_status = _read_existing_json(
+    _repair_status_artifact, repair_status = _read_existing_runner_status(
         Path(repair_status_artifact["path"]), "metric repair runner status"
     )
     require(

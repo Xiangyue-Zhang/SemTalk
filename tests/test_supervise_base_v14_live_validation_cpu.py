@@ -233,6 +233,84 @@ class ContractTests(unittest.TestCase):
     def test_exact_candidate_queue(self) -> None:
         self.assertEqual(sup.CANDIDATE_EPOCHS, (1, 2, 4, 8, 16, 32, 40, 50, 60, 70, 80, 100, 120, 140, 160, 180, 200, 240, 280, 320, 360, 400))
 
+    def test_guarded_runner_status_accepts_exact_pretty_json_not_duplicate_keys(self) -> None:
+        value = {
+            "updated_at": "2026-08-03T14:21:33+0800",
+            "state": "finished",
+            "wrapper_pid": 101,
+            "child_pid": 102,
+            "return_code": 0,
+            "received_signal": None,
+            "error": None,
+            "cleanup_error": None,
+            "restored_guards": {str(index): 200 + index for index in range(8)},
+            "restore_error": None,
+            "command": ["/bin/true"],
+        }
+        path = self.fx.root / "guarded-status.json"
+        raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("ascii")
+        artifact = write_bytes(path, raw)
+        observed, parsed = sup._read_existing_runner_status(
+            path, "pretty guarded runner status"
+        )
+        self.assertEqual(observed, artifact)
+        self.assertEqual(parsed, value)
+        self.assertNotEqual(raw, sup.canonical_json_bytes(value))
+
+        evaluator_path = self.fx.root / "pretty-evaluator-report.json"
+        evaluator_artifact = write_bytes(evaluator_path, raw)
+        evaluator_observed, evaluator_value = sup._read_existing_evaluator_report(
+            evaluator_path, "pretty evaluator report"
+        )
+        self.assertEqual(evaluator_observed, evaluator_artifact)
+        self.assertEqual(evaluator_value, value)
+
+        unicode_evaluator_value = {"label": "验证", "metric": 0.1}
+        unicode_evaluator_raw = (
+            json.dumps(
+                unicode_evaluator_value, indent=2, sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        unicode_evaluator_path = self.fx.root / "unicode-evaluator-report.json"
+        unicode_evaluator_artifact = write_bytes(
+            unicode_evaluator_path, unicode_evaluator_raw
+        )
+        unicode_observed, unicode_value = sup._read_existing_evaluator_report(
+            unicode_evaluator_path, "unicode evaluator report"
+        )
+        self.assertEqual(unicode_observed, unicode_evaluator_artifact)
+        self.assertEqual(unicode_value, unicode_evaluator_value)
+        with self.assertRaises(sup.SupervisorError):
+            sup._read_existing_runner_status(
+                unicode_evaluator_path, "unicode guarded runner status"
+            )
+
+        duplicate = self.fx.root / "duplicate-guarded-status.json"
+        duplicate.write_bytes(b'{"state":"failed","state":"finished"}\n')
+        with self.assertRaisesRegex(sup.SupervisorError, "duplicate"):
+            sup._read_existing_runner_status(
+                duplicate, "duplicate guarded runner status"
+            )
+
+        malformed_documents = {
+            "no-newline": raw.rstrip(b"\n"),
+            "leading-space": b" " + raw,
+            "trailing-space": raw.rstrip(b"\n") + b" \n",
+            "extra-line": raw + b"\n",
+            "crlf": raw.replace(b"\n", b"\r\n"),
+            "nonfinite-overflow": b'{\n  "value": 1e999\n}\n',
+        }
+        for name, malformed in malformed_documents.items():
+            with self.subTest(name=name):
+                malformed_path = self.fx.root / (name + ".json")
+                malformed_path.write_bytes(malformed)
+                with self.assertRaises(sup.SupervisorError):
+                    sup._read_existing_runner_status(
+                        malformed_path, name + " guarded runner status"
+                    )
+
     def test_formal_producer_is_frozen_at_8f_not_the_control_successor(self) -> None:
         self.assertEqual(
             sup.PRODUCER_SOURCE_COMMIT,
