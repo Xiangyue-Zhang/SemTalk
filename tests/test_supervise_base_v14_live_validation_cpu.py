@@ -737,6 +737,72 @@ class ContractTests(unittest.TestCase):
             sup.METRIC_REPAIR_RECOVERY_RESULT_KEYS,
         )
 
+    def test_recovery_producer_is_frozen_independently_of_future_consumer(self) -> None:
+        self.assertEqual(
+            sup.METRIC_REPAIR_RECOVERY_CONTROL_ROOT,
+            "/local-ssd/xiangyuezhang/semtalk_final_control_0e99227_20260803",
+        )
+        self.assertEqual(
+            sup.METRIC_REPAIR_RECOVERY_CONTROL_COMMIT,
+            "0e9922769defeb29ba4ab2c89839aadd635e4592",
+        )
+        self.assertEqual(
+            sup.METRIC_REPAIR_RECOVERY_CONTROL_TREE,
+            "78f1d80d4805dd8377ab7334e964e3353379213c",
+        )
+        self.assertEqual(
+            sup.METRIC_REPAIR_RECOVERY_TOOL_SHA256,
+            "bf05434f9b163184053b542f4941c960bd356a27e4fdeac82c2b5de429ea58f4",
+        )
+        self.assertEqual(sup.METRIC_REPAIR_RECOVERY_TOOL_BYTES, 122828)
+        tree = ast.parse(Path(sup.__file__).read_text(encoding="utf-8"))
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_load_metric_repair_recovery_chain"
+        )
+        names = {
+            node.id for node in ast.walk(function)
+            if isinstance(node, ast.Name)
+        }
+        self.assertTrue({
+            "METRIC_REPAIR_RECOVERY_CONTROL_ROOT",
+            "METRIC_REPAIR_RECOVERY_CONTROL_COMMIT",
+            "METRIC_REPAIR_RECOVERY_CONTROL_TREE",
+            "METRIC_REPAIR_RECOVERY_TOOL_SHA256",
+            "METRIC_REPAIR_RECOVERY_TOOL_BYTES",
+        }.issubset(names))
+        source_calls = [
+            node for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_metric_repair_source_reference"
+        ]
+        self.assertEqual(len(source_calls), 1)
+        self.assertEqual(
+            [ast.unparse(argument) for argument in source_calls[0].args],
+            [
+                "METRIC_REPAIR_RECOVERY_CONTROL_ROOT",
+                "METRIC_REPAIR_RECOVERY_CONTROL_COMMIT",
+                "METRIC_REPAIR_RECOVERY_CONTROL_TREE",
+            ],
+        )
+        ancestry_calls = [
+            node for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_git_is_ancestor"
+        ]
+        self.assertEqual(len(ancestry_calls), 1)
+        self.assertEqual(
+            [ast.unparse(argument) for argument in ancestry_calls[0].args[:3]],
+            [
+                "Path(campaign['_control_source']['root'])",
+                "METRIC_REPAIR_RECOVERY_CONTROL_COMMIT",
+                "campaign['_control_source']['commit']",
+            ],
+        )
+
     def test_finalize_revalidates_adoption_before_consuming_state(self) -> None:
         campaign = self.fx.campaign()
         campaign["_adopted_e1"] = {

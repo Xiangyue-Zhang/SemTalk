@@ -273,6 +273,19 @@ METRIC_REPAIR_INCIDENT_EVALUATOR_LOG_SHA256 = (
     "da3e0d39f172f26187b95d28552acd02d1d1ae2865d59dfb9ae860a713517bcc"
 )
 METRIC_REPAIR_INCIDENT_EVALUATOR_LOG_BYTES = 1389
+METRIC_REPAIR_RECOVERY_CONTROL_ROOT = (
+    "/local-ssd/xiangyuezhang/semtalk_final_control_0e99227_20260803"
+)
+METRIC_REPAIR_RECOVERY_CONTROL_COMMIT = (
+    "0e9922769defeb29ba4ab2c89839aadd635e4592"
+)
+METRIC_REPAIR_RECOVERY_CONTROL_TREE = (
+    "78f1d80d4805dd8377ab7334e964e3353379213c"
+)
+METRIC_REPAIR_RECOVERY_TOOL_SHA256 = (
+    "bf05434f9b163184053b542f4941c960bd356a27e4fdeac82c2b5de429ea58f4"
+)
+METRIC_REPAIR_RECOVERY_TOOL_BYTES = 122828
 
 ARTIFACT_KEYS = frozenset({"path", "sha256", "bytes"})
 CAMPAIGN_KEYS = frozenset({
@@ -1039,14 +1052,20 @@ def _control_source(value: Any, running_script: str) -> Dict[str, Any]:
     return source
 
 
-def _git_is_ancestor(root: Path, ancestor: str, descendant: str) -> None:
+def _git_is_ancestor(
+    root: Path, ancestor: str, descendant: str,
+    label: str = (
+        "runtime validation source is not a proved descendant of "
+        "validation semantics 4066"
+    ),
+) -> None:
     completed = subprocess.run(
         ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
         check=False, capture_output=True, text=True,
     )
     require(
         completed.returncode == 0 and completed.stdout == "" and completed.stderr == "",
-        "runtime validation source is not a proved descendant of validation semantics 4066",
+        label,
     )
 
 
@@ -3290,9 +3309,9 @@ def _load_metric_repair_recovery_chain(
         spec, "receipt_payload_sha256", "metric repair recovery spec"
     )
     expected_recovery_source = _metric_repair_source_reference(
-        campaign["_control_source"]["root"],
-        campaign["_control_source"]["commit"],
-        campaign["_control_source"]["tree"],
+        METRIC_REPAIR_RECOVERY_CONTROL_ROOT,
+        METRIC_REPAIR_RECOVERY_CONTROL_COMMIT,
+        METRIC_REPAIR_RECOVERY_CONTROL_TREE,
     )
     require(
         strict_json_equal(
@@ -3363,16 +3382,30 @@ def _load_metric_repair_recovery_chain(
         spec.get("recovery_tool"), "metric repair recovery tool"
     )
     expected_recovery_tool = (
-        Path(campaign["_control_source"]["root"])
+        Path(METRIC_REPAIR_RECOVERY_CONTROL_ROOT)
         / "scripts/show_base/adopt_base_v14_metric_repair.py"
     )
     require(
         Path(recovery_tool["path"]) == expected_recovery_tool
+        and recovery_tool["sha256"] == METRIC_REPAIR_RECOVERY_TOOL_SHA256
+        and recovery_tool["bytes"] == METRIC_REPAIR_RECOVERY_TOOL_BYTES
         and _git_stdout(
-            Path(campaign["_control_source"]["root"]), "ls-files",
+            Path(METRIC_REPAIR_RECOVERY_CONTROL_ROOT), "ls-files",
             "--error-unmatch", "scripts/show_base/adopt_base_v14_metric_repair.py",
         ) == "scripts/show_base/adopt_base_v14_metric_repair.py",
-        "metric repair recovery tool is not tracked by current control source",
+        "metric repair recovery tool is not the frozen recovery producer",
+    )
+    _git_authority(
+        Path(METRIC_REPAIR_RECOVERY_CONTROL_ROOT),
+        METRIC_REPAIR_RECOVERY_CONTROL_COMMIT,
+        METRIC_REPAIR_RECOVERY_CONTROL_TREE,
+        "metric repair recovery producer",
+    )
+    _git_is_ancestor(
+        Path(campaign["_control_source"]["root"]),
+        METRIC_REPAIR_RECOVERY_CONTROL_COMMIT,
+        campaign["_control_source"]["commit"],
+        "metric repair recovery consumer is not a descendant of its producer",
     )
     incident_snapshot = _metric_repair_incident_snapshot(
         incident["repair_root"], spec.get("incident_snapshot"),
