@@ -895,6 +895,64 @@ class LiveValidationAdapterTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         return Fixture(Path(temporary.name).resolve(), mode)
 
+    def adopted_reconciliation_fixture(self):
+        fixture = self.fixture()
+        legacy_dir = fixture.root / "legacy-authorities"
+        legacy_dir.mkdir()
+        adopted_path = legacy_dir / "epoch-0001.json"
+        for epoch in ADAPTER.CANDIDATE_EPOCHS:
+            fixture.publish_candidate(epoch)
+            ADAPTER.authorize_candidate(
+                fixture.config(
+                    epoch,
+                    output=(
+                        adopted_path
+                        if epoch == ADAPTER.CANDIDATE_EPOCHS[0]
+                        else None
+                    ),
+                ),
+                hooks=fixture.hooks,
+            )
+        manifest, manifest_sha, status, status_sha = fixture.finalize()
+        _, adopted_sha, adopted_bytes = ADAPTER.safe_regular_hash(
+            adopted_path, "adopted authority fixture"
+        )
+        return (
+            fixture,
+            adopted_path,
+            adopted_sha,
+            adopted_bytes,
+            manifest,
+            manifest_sha,
+            status,
+            status_sha,
+        )
+
+    def adopted_reconcile_config(
+        self,
+        fixture,
+        adopted_path,
+        adopted_sha,
+        adopted_bytes,
+        manifest,
+        manifest_sha,
+        status,
+        status_sha,
+    ):
+        return ADAPTER.ReconcileConfig(
+            common=fixture.config(
+                1, output=fixture.reconcile_dir / "reconciliation.json"
+            ),
+            authority_dir=fixture.authority_dir,
+            final_manifest=manifest,
+            expected_final_manifest_sha256=manifest_sha,
+            final_status=status,
+            expected_final_status_sha256=status_sha,
+            adopted_e1_authority=adopted_path,
+            expected_adopted_e1_authority_sha256=adopted_sha,
+            expected_adopted_e1_authority_bytes=adopted_bytes,
+        )
+
     def test_default_hooks_do_not_execute_before_source_validation(self):
         validation_fixture = Path(
             "/private/tmp/semtalk_final_integration_20260801"
@@ -1853,6 +1911,160 @@ class LiveValidationAdapterTests(unittest.TestCase):
                 ),
                 hooks=second.hooks,
             )
+
+    def test_reconciliation_accepts_exact_adopted_e1_plus_21_fresh(self):
+        values = self.adopted_reconciliation_fixture()
+        fixture, adopted_path, adopted_sha, adopted_bytes, *final = values
+        config = self.adopted_reconcile_config(
+            fixture,
+            adopted_path,
+            adopted_sha,
+            adopted_bytes,
+            *final,
+        )
+        result = ADAPTER.reconcile(config, hooks=fixture.hooks)
+        payload = json.loads(Path(result["path"]).read_text())
+        self.assertEqual(len(payload["work_authorities"]), 22)
+        self.assertEqual(
+            payload["work_authorities"][0],
+            {
+                "path": str(adopted_path),
+                "sha256": adopted_sha,
+                "bytes": adopted_bytes,
+            },
+        )
+        self.assertEqual(
+            [item["path"] for item in payload["work_authorities"][1:]],
+            [
+                str(fixture.authority_dir / f"epoch-{epoch:04d}.json")
+                for epoch in ADAPTER.CANDIDATE_EPOCHS[1:]
+            ],
+        )
+
+    def test_adopted_e1_binding_is_all_or_none_and_exact(self):
+        values = self.adopted_reconciliation_fixture()
+        fixture, adopted_path, adopted_sha, adopted_bytes, *final = values
+        base = self.adopted_reconcile_config(
+            fixture,
+            adopted_path,
+            adopted_sha,
+            adopted_bytes,
+            *final,
+        )
+        attacks = (
+            {"expected_adopted_e1_authority_sha256": None},
+            {"expected_adopted_e1_authority_bytes": None},
+            {"adopted_e1_authority": None},
+            {"expected_adopted_e1_authority_sha256": "f" * 64},
+            {"expected_adopted_e1_authority_bytes": adopted_bytes + 1},
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                config = ADAPTER.ReconcileConfig(
+                    **{**base.__dict__, **attack}
+                )
+                with self.assertRaises(ADAPTER.LiveValidationContractError):
+                    ADAPTER.reconcile(config, hooks=fixture.hooks)
+
+    def test_adopted_e1_must_be_external_and_fresh_set_exact(self):
+        values = self.adopted_reconciliation_fixture()
+        fixture, adopted_path, adopted_sha, adopted_bytes, *final = values
+        base = self.adopted_reconcile_config(
+            fixture,
+            adopted_path,
+            adopted_sha,
+            adopted_bytes,
+            *final,
+        )
+        in_directory = fixture.authority_dir / "epoch-0001.json"
+        ADAPTER.authorize_candidate(
+            fixture.config(1, output=in_directory), hooks=fixture.hooks
+        )
+        _, in_sha, in_bytes = ADAPTER.safe_regular_hash(
+            in_directory, "in-directory adopted authority"
+        )
+        with self.assertRaises(ADAPTER.LiveValidationContractError):
+            ADAPTER.reconcile(
+                ADAPTER.ReconcileConfig(
+                    **{
+                        **base.__dict__,
+                        "adopted_e1_authority": in_directory,
+                        "expected_adopted_e1_authority_sha256": in_sha,
+                        "expected_adopted_e1_authority_bytes": in_bytes,
+                    }
+                ),
+                hooks=fixture.hooks,
+            )
+        in_directory.unlink()
+        missing = fixture.authority_dir / "epoch-0400.json"
+        missing.rename(fixture.root / "saved-epoch-0400.json")
+        with self.assertRaises(ADAPTER.LiveValidationContractError):
+            ADAPTER.reconcile(base, hooks=fixture.hooks)
+
+    def test_adopted_e1_wrong_epoch_schema_and_semantics_are_rejected(self):
+        attacks = (
+            lambda payload: payload.__setitem__("candidate_epoch", 2),
+            lambda payload: payload.__setitem__("format", "wrong"),
+            lambda payload: payload["execution_contract"].__setitem__(
+                "may_influence_training", True
+            ),
+        )
+        for mutate in attacks:
+            with self.subTest(mutate=mutate):
+                values = self.adopted_reconciliation_fixture()
+                (
+                    fixture,
+                    adopted_path,
+                    _adopted_sha,
+                    _adopted_bytes,
+                    *final,
+                ) = values
+                payload = json.loads(adopted_path.read_text())
+                mutate(payload)
+                payload = self_hash(payload, "receipt_payload_sha256")
+                adopted_path.chmod(0o644)
+                new_sha = write_json(adopted_path, payload)
+                adopted_path.chmod(0o444)
+                new_bytes = adopted_path.stat().st_size
+                config = self.adopted_reconcile_config(
+                    fixture,
+                    adopted_path,
+                    new_sha,
+                    new_bytes,
+                    *final,
+                )
+                with self.assertRaises(ADAPTER.LiveValidationContractError):
+                    ADAPTER.reconcile(config, hooks=fixture.hooks)
+
+    def test_adopted_authority_artifact_path_and_sha_collisions_are_rejected(self):
+        for field in ("path", "sha256"):
+            with self.subTest(field=field):
+                values = self.adopted_reconciliation_fixture()
+                fixture, adopted_path, adopted_sha, adopted_bytes, *final = values
+                config = self.adopted_reconcile_config(
+                    fixture,
+                    adopted_path,
+                    adopted_sha,
+                    adopted_bytes,
+                    *final,
+                )
+                real_loader = ADAPTER._load_work_authority
+
+                def colliding_loader(path, expected_epoch):
+                    artifact, payload = real_loader(path, expected_epoch)
+                    if expected_epoch == ADAPTER.CANDIDATE_EPOCHS[1]:
+                        artifact[field] = (
+                            str(adopted_path) if field == "path" else adopted_sha
+                        )
+                    return artifact, payload
+
+                with mock.patch.object(
+                    ADAPTER,
+                    "_load_work_authority",
+                    side_effect=colliding_loader,
+                ):
+                    with self.assertRaises(ADAPTER.LiveValidationContractError):
+                        ADAPTER.reconcile(config, hooks=fixture.hooks)
 
     def test_rehashed_authority_field_attack_is_rejected_at_reconciliation(self):
         fixture = self.fixture()

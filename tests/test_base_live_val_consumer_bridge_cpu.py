@@ -454,6 +454,135 @@ class BaseLiveValConsumerBridgeCpuTest(unittest.TestCase):
                 runtime["receipt_payload_sha256"], BRIDGE._payload_sha(runtime)
             )
 
+    def test_inspect_exposes_exact_frozen_evidence_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-evidence-evaluator-", dir="/private/tmp"
+        ) as raw:
+            fixture = self._runtime_projection_fixture(Path(raw).resolve())
+            preflight_artifact = {
+                "path": str(Path(raw).resolve() / "work-preflight.json"),
+                "sha256": "1" * 64,
+                "bytes": 123,
+                "receipt_payload_sha256": "2" * 64,
+            }
+            authority_reference = {
+                "path": str(Path(raw).resolve() / "work-authority.json"),
+                "sha256": "3" * 64,
+                "bytes": 456,
+                "receipt_payload_sha256": "4" * 64,
+            }
+            preflight = {
+                "candidate_epochs": [1],
+                "work_authority": authority_reference,
+            }
+            authority_artifact = {
+                key: authority_reference[key]
+                for key in ("path", "sha256", "bytes")
+            }
+            modules = fixture["modules_for"](fixture["runtime_receipt"])
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_preflight_artifact",
+                    return_value=(preflight_artifact, preflight),
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_work_authority",
+                    return_value=(
+                        authority_artifact,
+                        fixture["authority"],
+                        modules,
+                    ),
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_validate_runtime_validation_roles",
+                    return_value=(
+                        fixture["evidence_root"], fixture["runtime_root"]
+                    ),
+                ),
+            ):
+                result = BRIDGE.inspect_preflight(
+                    SimpleNamespace(
+                        preflight=Path(preflight_artifact["path"]),
+                        expected_preflight_sha256=preflight_artifact["sha256"],
+                    )
+                )
+
+            relative = BRIDGE.DIFFSHEG_EVALUATOR_RELATIVE
+            expected_entry = fixture["evidence_pipeline"]["source_closure"][
+                relative
+            ]
+            expected_source = fixture["evidence_pipeline"]["source"]
+            self.assertEqual(
+                set(result),
+                {
+                    "status", "split", "test_visible",
+                    "selection_eligible", "epoch", "preflight",
+                    "frozen_evidence_evaluator",
+                },
+            )
+            self.assertEqual(result["preflight"], preflight_artifact)
+            self.assertEqual(
+                result["frozen_evidence_evaluator"],
+                {
+                    **expected_entry,
+                    "repository_root": expected_source["source_root"],
+                    "repository_git_head": expected_source["commit"],
+                    "repository_git_tree": expected_source["tree"],
+                    "repository_origin": expected_source["origin"],
+                    "repository_clean": True,
+                    "repository_detached": True,
+                    "repository_local_branches_at_commit": [],
+                },
+            )
+            self.assertNotEqual(
+                result["frozen_evidence_evaluator"]["path"],
+                fixture["runtime_receipt"]["files"][relative]["path"],
+            )
+
+    def test_frozen_evidence_evaluator_rejects_relocated_or_tampered_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="live-evidence-evaluator-tamper-", dir="/private/tmp"
+        ) as raw:
+            fixture = self._runtime_projection_fixture(Path(raw).resolve())
+            original = fixture["evidence_pipeline"]
+            before = copy.deepcopy(original)
+            relative = BRIDGE.DIFFSHEG_EVALUATOR_RELATIVE
+            mutations = []
+
+            missing = copy.deepcopy(original)
+            missing["source_closure"].pop(relative)
+            mutations.append(missing)
+
+            relocated = copy.deepcopy(original)
+            relocated["source_closure"][relative]["path"] = str(
+                fixture["evidence_root"] / "elsewhere.py"
+            )
+            mutations.append(relocated)
+
+            bad_sha = copy.deepcopy(original)
+            bad_sha["source_closure"][relative]["sha256"] = "not-a-sha"
+            mutations.append(bad_sha)
+
+            dirty = copy.deepcopy(original)
+            dirty["source"]["clean"] = False
+            mutations.append(dirty)
+
+            headed = copy.deepcopy(original)
+            headed["source"]["local_branches_at_commit"] = ["refs/heads/main"]
+            mutations.append(headed)
+
+            for index, pipeline in enumerate(mutations):
+                with self.subTest(index=index), self.assertRaises(
+                    BRIDGE.LiveConsumerError
+                ):
+                    BRIDGE._frozen_evidence_evaluator_binding(pipeline)
+            self.assertEqual(fixture["evidence_pipeline"], before)
+
     def test_runtime_projection_rejects_closure_tamper_before_engine_use(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="live-runtime-tamper-", dir="/private/tmp"

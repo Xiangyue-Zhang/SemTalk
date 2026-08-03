@@ -132,6 +132,25 @@ RUNTIME_EXECUTION_SOURCE_FILES = (
     "models/utils/layer.py",
     "models/utils/skeleton.py",
 )
+DIFFSHEG_EVALUATOR_RELATIVE = (
+    "scripts/show_base/evaluate_diffsheg_val_fgd.py"
+)
+FROZEN_EVIDENCE_EVALUATOR_KEYS = frozenset(
+    {
+        "path",
+        "sha256",
+        "bytes",
+        "git_mode",
+        "git_blob_sha1",
+        "repository_root",
+        "repository_git_head",
+        "repository_git_tree",
+        "repository_origin",
+        "repository_clean",
+        "repository_detached",
+        "repository_local_branches_at_commit",
+    }
+)
 RUNTIME_EXECUTION_CHANGED_FILES = frozenset(
     {
         "scripts/show_base/base_long_val_contract.py",
@@ -1343,6 +1362,102 @@ def _runtime_execution_pipeline(
             "runtime execution projection mutated immutable evidence"
         )
     return evidence_pipeline, runtime_pipeline, runtime_root
+
+
+def _frozen_evidence_evaluator_binding(
+    evidence_pipeline: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact evaluator identity from the immutable pipeline.
+
+    The tracked live launcher belongs to a newer control checkout, whereas
+    validation-report provenance is deliberately bound to the immutable
+    evidence pipeline.  The launcher must therefore execute this exact file,
+    rather than a byte-identical copy from the control checkout.
+    """
+
+    source = _exact_keys(
+        evidence_pipeline.get("source"),
+        SOURCE_KEYS,
+        "frozen evidence evaluator source",
+    )
+    closure = evidence_pipeline.get("source_closure")
+    if (
+        not isinstance(closure, dict)
+        or set(closure) != set(RUNTIME_EXECUTION_SOURCE_FILES)
+    ):
+        raise LiveConsumerError(
+            "frozen evidence evaluator closure is not the exact pinned 29 files"
+        )
+    entry = _exact_keys(
+        closure.get(DIFFSHEG_EVALUATOR_RELATIVE),
+        SOURCE_FILE_KEYS,
+        "frozen evidence evaluator source entry",
+    )
+    root = Path(str(source["source_root"]))
+    expected_path = root / DIFFSHEG_EVALUATOR_RELATIVE
+    if Path(str(entry["path"])) != expected_path:
+        raise LiveConsumerError(
+            "frozen evidence evaluator escaped its pipeline checkout"
+        )
+    _sha(entry["sha256"], "frozen evidence evaluator SHA")
+    _integer(entry["bytes"], "frozen evidence evaluator bytes", minimum=1)
+    if entry["git_mode"] not in {"100644", "100755"}:
+        raise LiveConsumerError("frozen evidence evaluator Git mode changed")
+    _oid(entry["git_blob_sha1"], "frozen evidence evaluator Git blob")
+    if (
+        source["origin"] != EXPECTED_ORIGIN
+        or source["clean"] is not True
+        or source["detached"] is not True
+        or source["local_branches_at_commit"] != []
+    ):
+        raise LiveConsumerError(
+            "frozen evidence evaluator repository identity changed"
+        )
+    return _exact_keys(
+        {
+            **copy.deepcopy(entry),
+            "repository_root": source["source_root"],
+            "repository_git_head": source["commit"],
+            "repository_git_tree": source["tree"],
+            "repository_origin": source["origin"],
+            "repository_clean": source["clean"],
+            "repository_detached": source["detached"],
+            "repository_local_branches_at_commit": copy.deepcopy(
+                source["local_branches_at_commit"]
+            ),
+        },
+        FROZEN_EVIDENCE_EVALUATOR_KEYS,
+        "frozen evidence evaluator binding",
+    )
+
+
+def inspect_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    artifact, payload = _preflight_artifact(
+        args.preflight, args.expected_preflight_sha256
+    )
+    authority_reference = _exact_keys(
+        payload["work_authority"],
+        ARTIFACT_CORE_KEYS | frozenset({"receipt_payload_sha256"}),
+        "inspected work authority reference",
+    )
+    _authority_artifact, authority, modules = _validate_work_authority(
+        Path(authority_reference["path"]), authority_reference["sha256"]
+    )
+    assert modules is not None
+    evidence_pipeline, _runtime_pipeline, _runtime_root = (
+        _runtime_execution_pipeline(authority, modules)
+    )
+    return {
+        "status": "ready",
+        "split": "val",
+        "test_visible": False,
+        "selection_eligible": False,
+        "epoch": payload["candidate_epochs"][0],
+        "preflight": artifact,
+        "frozen_evidence_evaluator": _frozen_evidence_evaluator_binding(
+            evidence_pipeline
+        ),
+    }
 
 
 def _validate_execution_contract(value: Any, epoch: int) -> dict[str, Any]:
@@ -3557,14 +3672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "reserve-recovery":
             result = reserve_recovery(args)
         elif args.command == "inspect":
-            artifact, payload = _preflight_artifact(
-                args.preflight, args.expected_preflight_sha256
-            )
-            result = {
-                "status": "ready", "split": "val", "test_visible": False,
-                "selection_eligible": False,
-                "epoch": payload["candidate_epochs"][0], "preflight": artifact,
-            }
+            result = inspect_preflight(args)
         elif args.command in {"shard", "finalize"}:
             result = _engine_command(args, args.command)
         elif args.command == "complete":

@@ -189,12 +189,12 @@ if [[ $launcher_path != "$launcher_dir/$launcher_name" ]]; then
     exit 1
 fi
 bridge=$launcher_dir/base_live_val_consumer_bridge.py
-evaluator=$launcher_dir/evaluate_diffsheg_val_fgd.py
+control_evaluator=$launcher_dir/evaluate_diffsheg_val_fgd.py
 partition_contract=$launcher_dir/base_diffsheg_val_partition_contract.py
 guard_contract=$launcher_dir/guarded_runner_contract.sh
 python_runtime_contract=$launcher_dir/formal_python_runtime_contract.sh
 for required_path in \
-    "$bridge" "$evaluator" "$partition_contract" "$guard_contract" \
+    "$bridge" "$control_evaluator" "$partition_contract" "$guard_contract" \
     "$python_runtime_contract"; do
     if [[ ! -f $required_path || -L $required_path ]]; then
         printf 'required tracked source is unavailable: %s\n' "$required_path" >&2
@@ -291,20 +291,150 @@ preflight_sha=${artifact_result[0]}
     --preflight "$preflight" \
     --expected-preflight-sha256 "$preflight_sha" \
     >"$run_root/logs/work-inspect.json"
-epoch=$("$python_bin" - "$run_root/logs/work-inspect.json" <<'PY'
+mapfile -d '' -t inspected_work < <(
+"$python_bin" - "$run_root/logs/work-inspect.json" <<'PY'
 import json
 from pathlib import Path
+import re
 import sys
 
-value = json.loads(Path(sys.argv[1]).read_bytes())
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+def exact_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+value = json.loads(
+    Path(sys.argv[1]).read_bytes(),
+    object_pairs_hook=exact_object,
+    parse_constant=reject_constant,
+)
+if type(value) is not dict or set(value) != {
+    "status", "split", "test_visible", "selection_eligible", "epoch",
+    "preflight", "frozen_evidence_evaluator",
+}:
+    raise SystemExit("inspect result schema changed")
 epoch = value.get("epoch")
-if type(epoch) is not int:
-    raise SystemExit("inspected candidate epoch is not an exact integer")
-print(epoch)
+preflight = value.get("preflight")
+adapter = value.get("frozen_evidence_evaluator")
+if (
+    value.get("status") != "ready"
+    or value.get("split") != "val"
+    or value.get("test_visible") is not False
+    or value.get("selection_eligible") is not False
+    or type(epoch) is not int
+    or epoch < 1
+    or type(preflight) is not dict
+    or set(preflight) != {
+        "path", "sha256", "bytes", "receipt_payload_sha256"
+    }
+    or type(adapter) is not dict
+    or set(adapter) != {
+        "path", "sha256", "bytes", "git_mode", "git_blob_sha1",
+        "repository_root", "repository_git_head", "repository_git_tree",
+        "repository_origin", "repository_clean", "repository_detached",
+        "repository_local_branches_at_commit",
+    }
+):
+    raise SystemExit("inspect result is not one exact frozen evaluator binding")
+hex40 = re.compile(r"[0-9a-f]{40}\Z")
+hex64 = re.compile(r"[0-9a-f]{64}\Z")
+if (
+    type(preflight["path"]) is not str
+    or not preflight["path"].startswith("/")
+    or type(preflight["sha256"]) is not str
+    or hex64.fullmatch(preflight["sha256"]) is None
+    or type(preflight["bytes"]) is not int
+    or preflight["bytes"] < 1
+    or type(preflight["receipt_payload_sha256"]) is not str
+    or hex64.fullmatch(preflight["receipt_payload_sha256"]) is None
+    or type(adapter["path"]) is not str
+    or not adapter["path"].startswith("/")
+    or type(adapter["sha256"]) is not str
+    or hex64.fullmatch(adapter["sha256"]) is None
+    or type(adapter["bytes"]) is not int
+    or adapter["bytes"] < 1
+    or adapter["git_mode"] not in {"100644", "100755"}
+    or type(adapter["git_blob_sha1"]) is not str
+    or hex40.fullmatch(adapter["git_blob_sha1"]) is None
+    or type(adapter["repository_root"]) is not str
+    or not adapter["repository_root"].startswith("/")
+    or type(adapter["repository_git_head"]) is not str
+    or hex40.fullmatch(adapter["repository_git_head"]) is None
+    or type(adapter["repository_git_tree"]) is not str
+    or hex40.fullmatch(adapter["repository_git_tree"]) is None
+    or adapter["repository_origin"]
+    != "git@github.com:Xiangyue-Zhang/SemTalk.git"
+    or adapter["repository_clean"] is not True
+    or adapter["repository_detached"] is not True
+    or adapter["repository_local_branches_at_commit"] != []
+):
+    raise SystemExit("frozen evaluator identity is invalid")
+fields = (
+    str(epoch), adapter["path"], adapter["sha256"], str(adapter["bytes"]),
+    adapter["git_mode"], adapter["git_blob_sha1"],
+    adapter["repository_root"], adapter["repository_git_head"],
+    adapter["repository_git_tree"], adapter["repository_origin"],
+)
+sys.stdout.buffer.write(b"\0".join(item.encode("utf-8") for item in fields) + b"\0")
 PY
 )
-if [[ ! $epoch =~ ^[1-9][0-9]*$ ]]; then
-    printf 'bridge did not expose one exact candidate epoch\n' >&2
+if [[ ${#inspected_work[@]} -ne 10 ]]; then
+    printf 'bridge did not expose one exact frozen evaluator binding\n' >&2
+    exit 1
+fi
+epoch=${inspected_work[0]}
+raw_evaluator=${inspected_work[1]}
+evaluator_sha256=${inspected_work[2]}
+evaluator_bytes=${inspected_work[3]}
+evaluator_git_mode=${inspected_work[4]}
+evaluator_git_blob=${inspected_work[5]}
+raw_evaluator_root=${inspected_work[6]}
+evaluator_git_head=${inspected_work[7]}
+evaluator_git_tree=${inspected_work[8]}
+evaluator_origin=${inspected_work[9]}
+evaluator=$(realpath -e -- "$raw_evaluator")
+evaluator_root=$(realpath -e -- "$raw_evaluator_root")
+evaluator_relative=scripts/show_base/evaluate_diffsheg_val_fgd.py
+if [[ ! $epoch =~ ^[1-9][0-9]*$ || \
+      $evaluator != "$raw_evaluator" || ! -f $evaluator || \
+      -L $raw_evaluator || $evaluator_root != "$raw_evaluator_root" || \
+      ! -d $evaluator_root || -L $raw_evaluator_root || \
+      $evaluator != "$evaluator_root/$evaluator_relative" || \
+      $(sha256sum "$evaluator" | awk '{print $1}') != "$evaluator_sha256" || \
+      $(stat -c '%s' "$evaluator") != "$evaluator_bytes" || \
+      $evaluator_origin != git@github.com:Xiangyue-Zhang/SemTalk.git ]]; then
+    printf 'frozen evidence evaluator file binding changed\n' >&2
+    exit 1
+fi
+mapfile -t evaluator_remotes < <(git -C "$evaluator_root" remote)
+set +e
+evaluator_symbolic_ref=$(git -C "$evaluator_root" \
+    symbolic-ref -q --short HEAD 2>/dev/null)
+evaluator_symbolic_rc=$?
+set -e
+expected_evaluator_tree_entry="$evaluator_git_mode blob $evaluator_git_blob"$'\t'"$evaluator_relative"
+if [[ ${#evaluator_remotes[@]} -ne 1 || \
+      ${evaluator_remotes[0]} != origin || \
+      $(git -C "$evaluator_root" remote get-url origin) != "$evaluator_origin" || \
+      $(git -C "$evaluator_root" remote get-url --push origin) != "$evaluator_origin" || \
+      $(git -C "$evaluator_root" rev-parse HEAD) != "$evaluator_git_head" || \
+      $(git -C "$evaluator_root" rev-parse 'HEAD^{tree}') != "$evaluator_git_tree" || \
+      $(git -C "$evaluator_root" ls-files --error-unmatch \
+          "$evaluator_relative") != "$evaluator_relative" || \
+      $(git -C "$evaluator_root" ls-tree HEAD -- \
+          "$evaluator_relative") != "$expected_evaluator_tree_entry" || \
+      -n "$(git -C "$evaluator_root" status --porcelain=v1 \
+          --untracked-files=all)" || $evaluator_symbolic_rc -ne 1 || \
+      -n $evaluator_symbolic_ref || \
+      -n "$(git -C "$evaluator_root" for-each-ref \
+          --format='%(refname)' refs/heads)" ]]; then
+    printf 'frozen evidence evaluator repository identity changed\n' >&2
     exit 1
 fi
 

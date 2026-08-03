@@ -15,13 +15,16 @@ terminal/manual state.  Nothing is retried automatically.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -38,11 +41,23 @@ GPU_INDICES: Tuple[int, ...] = tuple(range(8))
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 CAMPAIGN_FORMAT = "semtalk_show_base_v14_live_validation_campaign_v3"
+ADOPTION_CAMPAIGN_FORMAT = (
+    "semtalk_show_base_v14_live_validation_adoption_campaign_v1"
+)
+ADOPTED_E1_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_adoption_receipt_v1"
+)
+METRIC_REPAIR_SPEC_FORMAT = "semtalk_show_base_v14_metric_repair_spec_v1"
+METRIC_REPAIR_AUTHORITY_FORMAT = (
+    "semtalk_show_base_v14_metric_repair_authority_v1"
+)
+METRIC_REPAIR_RESULT_FORMAT = "semtalk_show_base_v14_metric_repair_result_v1"
+METRIC_REPAIR_EXPECTED_FGD_BINARY64_HEX = "3f9a0662d796da74"
 CAMPAIGN_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_campaign_claim_v1"
 ACTIVE_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_active_claim_v1"
 JOB_CLAIM_FORMAT = "semtalk_show_base_v14_live_validation_job_claim_v2"
 COMPLETION_FORMAT = "semtalk_show_base_v14_live_validation_completion_v4"
-SUMMARY_FORMAT = "semtalk_show_base_v14_live_validation_summary_v3"
+SUMMARY_FORMAT = "semtalk_show_base_v14_live_validation_summary_v4"
 MEASUREMENT_FORMAT = "semtalk_show_base_live_val_measurement_v2"
 SELECTION_FORMAT = "semtalk_show_base_live_val_22way_selection_v2"
 RECONCILIATION_FORMAT = "semtalk_show_base_live_val_reconciliation_v2"
@@ -65,6 +80,14 @@ RUNTIME_VALIDATION_INFERENCE_SHA256 = "ec3de79ce1e45ff5385db40797bbcfa0dc91ab3e6
 RUNTIME_VALIDATION_MEASUREMENT_SHA256 = "e985056c889c9803212a236597066877726826badfcd1fa91f329e5b00e56550"
 RUNTIME_VALIDATION_LONG_SELECTOR_SHA256 = "d813864a33a5ff2109096453f956329a96480dd11f26c8a9144228df34d67269"
 RUNTIME_VALIDATION_SOURCE_FORMAT = "semtalk_show_base_runtime_validation_source_v1"
+DUAL_DISPATCH_DIR_NAME = "dual_dispatch"
+DUAL_DISPATCH_TOPOLOGY_NAME = "topology.json"
+DUAL_DISPATCH_CLAIM_NAME = "claim.json"
+DUAL_DISPATCH_ACTIVE_NAME = "active-wave.lock.json"
+DUAL_DISPATCH_WAVES_NAME = "waves"
+DUAL_DISPATCH_RELATIVE_PATH = Path(
+    "scripts/show_base/dispatch_base_v14_live_validation_dual_host.py"
+)
 AUTHORIZATION_FORMAT = "semtalk_show_base_v14_live_authorization_v1"
 RECOVERY_AUTHORIZATION_FORMAT = "semtalk_show_base_v14_live_recovery_authorization_v1"
 RECOVERY_REQUEST_FORMAT = "semtalk_show_base_v14_failed_consumer_recovery_request_v1"
@@ -85,6 +108,122 @@ FAILED_WRAPPER_PID = 261736
 FAILED_CHILD_PID = 261737
 PRODUCER_RECONCILE_CLAIM_FORMAT = "semtalk_show_base_v14_producer_reconcile_claim_v1"
 BRIDGE_RECONCILE_CLAIM_FORMAT = "semtalk_show_base_v14_bridge_reconcile_claim_v1"
+ADOPTION_PREDECESSOR_STATE_ROOT = (
+    "/efs/xiangyuezhang/semtalk_show_base_v14_formal_400e_20260802_v1/"
+    "live_validation_state_73ff184_v2"
+)
+ADOPTION_PREDECESSOR_RUN_ROOT = (
+    "/efs/xiangyuezhang/semtalk_show_base_v14_formal_400e_20260802_v1/"
+    "live_validation_runs_73ff184_v2/e1"
+)
+ADOPTION_PREDECESSOR_CONTROL_ROOT = (
+    "/local-ssd/xiangyuezhang/semtalk_final_control_73ff184_20260802"
+)
+ADOPTION_PREDECESSOR_CONTROL_COMMIT = (
+    "73ff184a62fb2d1c3064a4fb03a11b48e6309f7f"
+)
+ADOPTION_PREDECESSOR_CONTROL_TREE = (
+    "2d568cd3f793c0131ee1489b679aa9c7bd76da53"
+)
+ADOPTION_PREDECESSOR_CAMPAIGN = {
+    "path": ADOPTION_PREDECESSOR_STATE_ROOT + "/campaign.json",
+    "sha256": "9cc1e0f9c7f85556a9598bb8725f76609bde58dd74f1b3886bc5ced0a6482f87",
+    "bytes": 33839,
+}
+ADOPTION_PREDECESSOR_FAILURE_LOG = {
+    "path": ADOPTION_PREDECESSOR_RUN_ROOT + "/logs/e1-live-measurement.log",
+    "sha256": "d5e46b5d9fdd7a501c86064e783c107c05799bef60b4112c7c55d2c7328b38d5",
+    "bytes": 1294,
+}
+ADOPTION_PREDECESSOR_REPORT = {
+    "path": ADOPTION_PREDECESSOR_RUN_ROOT
+    + "/candidates/e1/diffsheg-val-fgd.json",
+    "sha256": "30afef8b6fa7757723a45422f6c2e6d371af3767fcaf69ce9e40e4e1e52c98e7",
+    "bytes": 3962,
+}
+ADOPTION_PREDECESSOR_FIXED = {
+    "predecessor_campaign": ADOPTION_PREDECESSOR_CAMPAIGN,
+    "predecessor_job_claim": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/job_claims/epoch-0001.json",
+        "sha256": "e54f31e167581e60282ca50963a6e6d3b3033373dcd323b3b4be809db80277d2",
+        "bytes": 1231,
+    },
+    "predecessor_active_claim": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/active_invocation.claim.json",
+        "sha256": "71e0c6020dfbce480dbe7ef47db4187b228fc0f74f3b6fc9b849820e5ca53a13",
+        "bytes": 457,
+    },
+    "predecessor_work_authority": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/authorities/epoch-0001.json",
+        "sha256": "995bc4ce5ae9a11dc2707e958eaf4cd60fbb7fbc54ef4fcaeee99843990cb81f",
+        "bytes": 23578,
+    },
+    "predecessor_authorization": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/authorizations/epoch-0001.json",
+        "sha256": "111d0048c90c82fbd3b7f4e961c5c86605682dbbc99e76e2d473ea88e64f0618",
+        "bytes": 6549,
+    },
+    "predecessor_runner_status": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/runner_status/epoch-0001.json",
+        "sha256": "da361716d68b32fe3427a5660eca2af2e85914ee8d093e325fe57e5be7bdc7cf",
+        "bytes": 2113,
+    },
+    "predecessor_recovery_request": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/recovery-request.epoch-0001.json",
+        "sha256": "f5e1b57f3dc1aa284f35b265c3d7b36e25abb604cdabb00879893bcdabc89a5a",
+        "bytes": 8214,
+    },
+    "predecessor_recovery_authority": {
+        "path": ADOPTION_PREDECESSOR_STATE_ROOT
+        + "/recovery-authority.epoch-0001.json",
+        "sha256": "84a2a0d8c1210ffff235f5b14f4620814e8023b273eab3df5045a7eb2d13661e",
+        "bytes": 3125,
+    },
+    "predecessor_recovery_claim": {
+        "path": (
+            "/efs/xiangyuezhang/semtalk_show_base_v14_formal_400e_20260802_v1/"
+            "semtalk_show_base_v14_formal_w8g2048_400e_20260802_v1/"
+            "live_val_consumer_recovery_claims/epoch-0001.json"
+        ),
+        "sha256": "0fea907f839c38dd4f2e8eb7c0dac4cbb3ca5318cffd8ef63a302d03bb1b0ad8",
+        "bytes": 3179,
+    },
+    "predecessor_failure_log": ADOPTION_PREDECESSOR_FAILURE_LOG,
+}
+ADOPTION_REPAIR_FIXED_INPUTS = {
+    "preflight": {
+        "path": ADOPTION_PREDECESSOR_RUN_ROOT + "/work-preflight.json",
+        "sha256": "497895011915f94d71897a73cbb1aeda13d1f480627fedb3811a4f34c3ed31dc",
+        "bytes": 6304,
+    },
+    "inference_lineage": {
+        "path": ADOPTION_PREDECESSOR_RUN_ROOT
+        + "/candidates/e1/final/val-inference-lineage.json",
+        "sha256": "bf788d4ec635af39526cc0a1068101ed84ca276954a67830a99399e9f64d64b2",
+        "bytes": 2344,
+    },
+    "final_manifest": {
+        "path": ADOPTION_PREDECESSOR_RUN_ROOT
+        + "/candidates/e1/final/final_manifest.jsonl",
+        "sha256": "1f916610617d5dbc34832d88385acd05a53d2fb50856eeedd45888cecb95df71",
+        "bytes": 1561219,
+    },
+    "clip_manifest": {
+        "path": ADOPTION_PREDECESSOR_RUN_ROOT
+        + "/candidates/e1/final/diffsheg_eval_clip_ids.txt",
+        "sha256": "f6ab4334c13f461b99b5d6f8024fcd270ccb812724a8e83f2e5f12c0c57c1fee",
+        "bytes": 55677,
+    },
+}
+ADOPTION_PREDECESSOR_BRIDGE_SHA256 = (
+    "739e241bc18412ca7368549714f4fdce17ed6e4719d48699a6e17037e13565e7"
+)
 
 ARTIFACT_KEYS = frozenset({"path", "sha256", "bytes"})
 CAMPAIGN_KEYS = frozenset({
@@ -98,6 +237,7 @@ CAMPAIGN_KEYS = frozenset({
     "guard_verifier", "reconciliation_path", "reconcile_selection_root",
     "jobs", "campaign_payload_sha256",
 })
+ADOPTION_CAMPAIGN_KEYS = CAMPAIGN_KEYS | frozenset({"adopted_e1"})
 JOB_KEYS = frozenset({
     "epoch", "candidate_receipt_path", "authority_path",
     "authorization_path", "run_root", "measurement_path",
@@ -141,7 +281,9 @@ SUMMARY_KEYS = frozenset({
     "test_measurements_authorized", "campaign", "candidate_epochs",
     "completion_count", "producer_reconcile_claim", "bridge_reconcile_claim",
     "official_selection",
-    "selected", "completed_unix", "receipt_payload_sha256",
+    "selected", "adoption_receipt", "adopted_candidate_count",
+    "fresh_candidate_count", "inference_reruns", "metric_replays",
+    "completed_unix", "receipt_payload_sha256",
 })
 FORMAL_PYTHON_KEYS = frozenset({
     "format", "argv0", "venv_root", "symlink_chain", "resolved_target",
@@ -204,6 +346,77 @@ SOURCE_REFERENCE_KEYS = frozenset({
     "origin", "source_root", "commit", "tree", "clean", "detached",
     "local_branches_at_commit",
 })
+ADOPTED_E1_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "test_measurements_authorized", "candidate_epoch", "candidate_receipt",
+    "predecessor_campaign",
+    "predecessor_job_claim", "predecessor_active_claim",
+    "predecessor_work_authority", "predecessor_authorization",
+    "predecessor_runner_status", "predecessor_recovery_request",
+    "predecessor_recovery_authority", "predecessor_recovery_claim",
+    "predecessor_failure_log", "metric_repair_spec",
+    "metric_repair_authority", "metric_repair_result",
+    "repair_tool_source",
+    "frozen_evaluator_source", "predecessor_control_source",
+    "frozen_evaluator", "repaired_report", "report_comparison",
+    "measurement", "guarded_runner", "repair_runner_status",
+    "repair_runner_log", "guard_verifier", "guard_proof",
+    "guard_verifier_argv", "guard_verifier_stdout",
+    "restored_guards", "terminal_snapshot_before",
+    "terminal_snapshot_after", "validation_diffsheg_fgd",
+    "validation_diffsheg_fgd_binary64_hex",
+    "inference_reruns", "metric_replays", "predecessor_return_code",
+    "repair_return_code", "failure_phase",
+    "completed_unix", "receipt_payload_sha256",
+})
+METRIC_REPAIR_SPEC_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "predecessor_state_root", "predecessor_run_root",
+    "predecessor_campaign", "predecessor_job_claim",
+    "predecessor_active_claim", "predecessor_work_authority",
+    "predecessor_authorization", "predecessor_runner_status",
+    "predecessor_recovery_request", "predecessor_recovery_authority",
+    "predecessor_recovery_claim", "candidate_receipt", "preflight",
+    "inference_lineage", "final_manifest", "clip_manifest", "old_report",
+    "predecessor_failure_log", "frozen_evaluator_source",
+    "predecessor_control_source", "frozen_evaluator", "bridge",
+    "formal_python", "paspa_root", "diffsheg_root", "batch_size",
+    "repair_root", "guard_verifier", "guarded_runner", "repair_tool",
+    "result_path", "runner_control_root", "runner_status_path",
+    "runner_log_path", "guard_proof_path", "repair_tool_source",
+    "receipt_payload_sha256",
+})
+METRIC_REPAIR_AUTHORITY_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "inference_allowed", "metric_replay_count", "candidate_epoch", "spec",
+    "terminal_snapshot", "created_unix", "receipt_payload_sha256",
+})
+METRIC_REPAIR_RESULT_KEYS = frozenset({
+    "format", "status", "split", "test_visible", "selection_eligible",
+    "candidate_epoch", "inference_reruns", "metric_replays", "authority",
+    "terminal_snapshot_before", "terminal_snapshot_after", "evaluator_argv",
+    "bridge_complete_argv", "bridge_complete_stdout_sha256",
+    "bridge_measurement_replay_argv", "bridge_measurement_replay_stdout",
+    "repaired_report", "report_comparison", "measurement", "completed_unix",
+    "receipt_payload_sha256",
+})
+
+METRIC_REPAIR_BRIDGE_REPLAY_CODE = """\
+import importlib.util
+import sys
+from pathlib import Path
+path, measurement_path, measurement_sha = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("metric_repair_bridge", path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("cannot load pinned bridge")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+artifact, value = module._validate_live_measurement(Path(measurement_path), measurement_sha)
+if artifact.get("sha256") != measurement_sha or value.get("candidate_epoch") != 1:
+    raise RuntimeError("measurement replay changed")
+sys.stdout.write("PASS\\n")
+"""
 
 
 class SupervisorError(RuntimeError):
@@ -495,6 +708,24 @@ def _bridge_payload_sha(value: Mapping[str, Any]) -> str:
     return _sha256(raw)
 
 
+def _repair_self_hashed(
+    payload: Mapping[str, Any], field: str, label: str,
+) -> Dict[str, Any]:
+    """Validate the repair/bridge no-trailing-newline payload ABI."""
+
+    result = dict(payload)
+    claimed = result.pop(field, None)
+    require(
+        isinstance(claimed, str) and HEX64.fullmatch(claimed) is not None,
+        "%s self-hash is invalid" % label,
+    )
+    require(
+        _bridge_payload_sha(result) == claimed,
+        "%s self-hash changed" % label,
+    )
+    return dict(payload)
+
+
 def _add_bridge_self_hash(
     payload: Mapping[str, Any], field: str,
 ) -> Dict[str, Any]:
@@ -778,6 +1009,96 @@ def _work_authority_candidate_binding(artifact: Mapping[str, Any], candidate_rec
         require(ready.get(key) == candidate_receipt[key] and type(ready.get(key)) is type(candidate_receipt[key]), "e%d work authority producer receipt %s changed" % (epoch, key))
 
 
+def _work_authority_campaign_binding(
+    artifact: Mapping[str, Any], config: Mapping[str, Any], epoch: int
+) -> None:
+    _path, raw, _digest, _size = safe_regular_bytes(
+        artifact["path"], "e%d work authority campaign binding" % epoch,
+        artifact["sha256"], artifact["bytes"],
+    )
+    value = _strict_json_document(
+        raw, "e%d work authority campaign binding" % epoch
+    )
+    topology = value.get("selected_topology")
+    schedule = value.get("schedule")
+    frozen_inputs = value.get("frozen_inputs")
+    val_inputs = value.get("val_inputs_receipt")
+    pipeline = value.get("pipeline_receipt")
+    producer = value.get("producer_source")
+    candidate = value.get("candidate_checkpoint")
+    train_root = Path(config["train_root"])
+    producer_root = Path(config["producer_source_root"])
+    require(
+        isinstance(topology, dict)
+        and topology.get("mode") == config["topology_mode"]
+        and type(topology.get("world_size")) is int
+        and topology["world_size"] == 8,
+        "e%d work authority topology differs from successor campaign" % epoch,
+    )
+    require(
+        isinstance(schedule, dict)
+        and all(
+            type(schedule.get(key)) is type(config["schedule"][key])
+            and schedule.get(key) == config["schedule"][key]
+            for key in ARTIFACT_KEYS
+        ),
+        "e%d work authority schedule differs from successor campaign" % epoch,
+    )
+    require(
+        isinstance(frozen_inputs, dict)
+        and frozen_inputs.get("path") == str(train_root / "frozen_inputs.json")
+        and frozen_inputs.get("sha256")
+        == config["expected_frozen_inputs_sha256"],
+        "e%d work authority frozen inputs differ from successor campaign" % epoch,
+    )
+    require(
+        isinstance(val_inputs, dict)
+        and all(
+            type(val_inputs.get(key)) is type(config["val_inputs"][key])
+            and val_inputs.get(key) == config["val_inputs"][key]
+            for key in ("path", "sha256")
+        ),
+        "e%d work authority validation inputs differ from successor campaign"
+        % epoch,
+    )
+    require(
+        isinstance(pipeline, dict)
+        and all(
+            type(pipeline.get(key)) is type(config["pipeline"][key])
+            and pipeline.get(key) == config["pipeline"][key]
+            for key in ("path", "sha256")
+        ),
+        "e%d work authority pipeline differs from successor campaign" % epoch,
+    )
+    clones = producer.get("node_local_clones") if isinstance(producer, dict) else None
+    require(
+        isinstance(producer, dict)
+        and producer.get("origin")
+        == "git@github.com:Xiangyue-Zhang/SemTalk.git"
+        and producer.get("commit") == PRODUCER_SOURCE_COMMIT
+        and producer.get("tree") == PRODUCER_SOURCE_TREE
+        and producer.get("entrypoint_sha256")
+        == config["expected_producer_trainer_sha256"]
+        and isinstance(clones, list)
+        and len(clones) == 1
+        and clones[0].get("entrypoint")
+        == str(
+            producer_root
+            / "scripts/show_base/train_base_official_adapt_long.py"
+        ),
+        "e%d work authority producer differs from successor campaign" % epoch,
+    )
+    require(
+        isinstance(candidate, dict)
+        and candidate.get("path")
+        == str(
+            train_root
+            / ("candidates/base_official_adapt_epoch_%02d.bin" % epoch)
+        ),
+        "e%d work authority candidate path differs from successor campaign" % epoch,
+    )
+
+
 def _authority_adapter_config(value: Any, runtime: Mapping[str, Any]) -> Dict[str, Any]:
     require(isinstance(value, dict) and set(value) == AUTHORITY_ADAPTER_CONFIG_KEYS, "authority adapter config schema changed")
     config = dict(value)
@@ -936,9 +1257,19 @@ def load_campaign(
 ) -> Dict[str, Any]:
     campaign_path, raw, digest, size = safe_regular_bytes(path_text, "campaign", expected_sha256, expected_bytes)
     payload = strict_json(raw, "campaign")
-    require(set(payload) == CAMPAIGN_KEYS, "campaign schema changed")
+    adoption_campaign = payload.get("format") == ADOPTION_CAMPAIGN_FORMAT
+    require(
+        set(payload)
+        == (ADOPTION_CAMPAIGN_KEYS if adoption_campaign else CAMPAIGN_KEYS),
+        "campaign schema changed",
+    )
     _self_hashed(payload, "campaign_payload_sha256", "campaign")
-    require(payload.get("format") == CAMPAIGN_FORMAT and payload.get("status") == "frozen_before_execution", "campaign state changed")
+    require(
+        payload.get("format")
+        in {CAMPAIGN_FORMAT, ADOPTION_CAMPAIGN_FORMAT}
+        and payload.get("status") == "frozen_before_execution",
+        "campaign state changed",
+    )
     require(payload.get("split") == "val" and payload.get("test_visible") is False and type(payload.get("test_measurements_authorized")) is int and payload["test_measurements_authorized"] == 0, "campaign is not val-only")
     require(payload.get("candidate_epochs") == list(CANDIDATE_EPOCHS) and all(type(x) is int for x in payload["candidate_epochs"]), "campaign epoch queue changed")
     state_root = canonical_directory(payload.get("state_root"), "state root")
@@ -1008,6 +1339,10 @@ def load_campaign(
         require(job.get("runner_log_path") == str(logs / ("epoch-%04d.log" % epoch)), "runner log path changed")
         jobs.append(job)
     result["_jobs"] = jobs
+    result["_adopted_e1"] = (
+        _artifact(payload["adopted_e1"], "adopted e1 receipt")
+        if adoption_campaign else None
+    )
     return result
 
 
@@ -1653,6 +1988,1122 @@ def _load_completion_v2(campaign: Mapping[str, Any], job: Mapping[str, Any]) -> 
     return artifact, value
 
 
+def _terminal_snapshot(value: Any, label: str) -> Dict[str, Any]:
+    require(
+        isinstance(value, dict)
+        and set(value)
+        == {"roots", "entry_count", "total_bytes", "inventory_sha256"},
+        "%s schema changed" % label,
+    )
+    roots = value.get("roots")
+    require(
+        isinstance(roots, list)
+        and roots
+        == [ADOPTION_PREDECESSOR_STATE_ROOT, ADOPTION_PREDECESSOR_RUN_ROOT],
+        "%s roots changed" % label,
+    )
+    _exact_int(value.get("entry_count"), "%s entry count" % label, 1)
+    _exact_int(value.get("total_bytes"), "%s total bytes" % label, 1)
+    require(
+        isinstance(value.get("inventory_sha256"), str)
+        and HEX64.fullmatch(value["inventory_sha256"]) is not None,
+        "%s inventory SHA changed" % label,
+    )
+    return dict(value)
+
+
+def _current_terminal_snapshot() -> Dict[str, Any]:
+    roots = [ADOPTION_PREDECESSOR_STATE_ROOT, ADOPTION_PREDECESSOR_RUN_ROOT]
+    entries: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for root_text in roots:
+        root = canonical_directory(root_text, "terminal predecessor root")
+        paths = sorted([root, *root.rglob("*")], key=lambda item: str(item))
+        for path in paths:
+            metadata = path.lstat()
+            require(
+                not stat.S_ISLNK(metadata.st_mode),
+                "terminal predecessor contains a symlink",
+            )
+            relative = "." if path == root else str(path.relative_to(root))
+            if stat.S_ISDIR(metadata.st_mode):
+                entries.append({
+                    "root": root_text,
+                    "path": relative,
+                    "type": "directory",
+                })
+                continue
+            require(
+                stat.S_ISREG(metadata.st_mode),
+                "terminal predecessor contains a special file",
+            )
+            _canonical, raw, digest, size = safe_regular_bytes(
+                path, "terminal predecessor file"
+            )
+            total_bytes += size
+            entries.append({
+                "root": root_text,
+                "path": relative,
+                "type": "regular",
+                "bytes": size,
+                "sha256": digest,
+            })
+    encoded = json.dumps(
+        entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "roots": roots,
+        "entry_count": len(entries),
+        "total_bytes": total_bytes,
+        "inventory_sha256": _sha256(encoded),
+    }
+
+
+def _valid_runner_timestamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S%z") == value
+
+
+def _load_metric_repair_chain(
+    campaign: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    verify_live_guards: bool = False,
+    capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Independently replay the complete metric-only repair evidence chain."""
+
+    train_root = Path(campaign["_adapter_config"]["train_root"])
+    spec_path = train_root / "live_val_metric_repair_specs/epoch-0001.v1.json"
+    authority_path = train_root / "live_val_metric_repair_claims/epoch-0001.json"
+    repair_root = train_root / "live_val_metric_repair_runs/epoch-0001.v1"
+    control_root = (
+        train_root / "live_val_metric_repair_runner_controls/epoch-0001.v1"
+    )
+    result_path = repair_root / "repair-result.json"
+    status_path = control_root / ".guarded_status.json"
+    log_path = control_root / "runner.log"
+    proof_path = control_root / "guard-proof.txt"
+
+    spec_reference = _artifact(
+        receipt.get("metric_repair_spec"), "metric repair spec"
+    )
+    require(
+        Path(spec_reference["path"]) == spec_path,
+        "metric repair spec path changed",
+    )
+    spec_artifact, spec = _read_existing_json(spec_path, "metric repair spec")
+    require(
+        strict_json_equal(spec_artifact, spec_reference)
+        and set(spec) == METRIC_REPAIR_SPEC_KEYS
+        and spec.get("format") == METRIC_REPAIR_SPEC_FORMAT
+        and spec.get("status") == "frozen"
+        and spec.get("split") == "val"
+        and spec.get("test_visible") is False
+        and spec.get("selection_eligible") is False
+        and type(spec.get("candidate_epoch")) is int
+        and spec["candidate_epoch"] == 1,
+        "metric repair spec schema/state changed",
+    )
+    _repair_self_hashed(spec, "receipt_payload_sha256", "metric repair spec")
+    require(
+        spec.get("predecessor_state_root") == ADOPTION_PREDECESSOR_STATE_ROOT
+        and spec.get("predecessor_run_root") == ADOPTION_PREDECESSOR_RUN_ROOT,
+        "metric repair predecessor roots changed",
+    )
+    for key, expected in ADOPTION_PREDECESSOR_FIXED.items():
+        require(
+            strict_json_equal(spec.get(key), expected),
+            "metric repair spec %s changed" % key,
+        )
+    for key, expected in ADOPTION_REPAIR_FIXED_INPUTS.items():
+        require(
+            strict_json_equal(spec.get(key), expected)
+            and strict_json_equal(
+                _artifact(spec[key], "metric repair %s" % key), expected
+            ),
+            "metric repair input %s changed" % key,
+        )
+    require(
+        strict_json_equal(spec.get("candidate_receipt"), receipt["candidate_receipt"])
+        and strict_json_equal(spec.get("old_report"), ADOPTION_PREDECESSOR_REPORT)
+        and strict_json_equal(
+            spec.get("predecessor_failure_log"),
+            ADOPTION_PREDECESSOR_FAILURE_LOG,
+        )
+        and strict_json_equal(
+            spec.get("frozen_evaluator_source"),
+            receipt["frozen_evaluator_source"],
+        )
+        and strict_json_equal(
+            spec.get("predecessor_control_source"),
+            receipt["predecessor_control_source"],
+        )
+        and strict_json_equal(
+            spec.get("repair_tool_source"), receipt["repair_tool_source"]
+        )
+        and strict_json_equal(
+            spec.get("frozen_evaluator"), receipt["frozen_evaluator"]
+        )
+        and strict_json_equal(
+            spec.get("guarded_runner"), receipt["guarded_runner"]
+        )
+        and strict_json_equal(
+            spec.get("guard_verifier"), receipt["guard_verifier"]
+        ),
+        "metric repair spec/receipt bindings changed",
+    )
+    bridge = _artifact(spec.get("bridge"), "metric repair predecessor bridge")
+    expected_bridge_path = (
+        Path(ADOPTION_PREDECESSOR_CONTROL_ROOT)
+        / "scripts/show_base/base_live_val_consumer_bridge.py"
+    )
+    require(
+        Path(bridge["path"]) == expected_bridge_path
+        and bridge["sha256"] == ADOPTION_PREDECESSOR_BRIDGE_SHA256
+        and _git_stdout(
+            Path(ADOPTION_PREDECESSOR_CONTROL_ROOT), "ls-files",
+            "--error-unmatch", "scripts/show_base/base_live_val_consumer_bridge.py",
+        ) == "scripts/show_base/base_live_val_consumer_bridge.py",
+        "metric repair bridge is not the frozen predecessor bridge",
+    )
+    repair_tool = _artifact(spec.get("repair_tool"), "metric repair tool")
+    expected_repair_tool = (
+        Path(campaign["_control_source"]["root"])
+        / "scripts/show_base/adopt_base_v14_metric_repair.py"
+    )
+    require(
+        Path(repair_tool["path"]) == expected_repair_tool
+        and _git_stdout(
+            Path(campaign["_control_source"]["root"]), "ls-files",
+            "--error-unmatch", "scripts/show_base/adopt_base_v14_metric_repair.py",
+        ) == "scripts/show_base/adopt_base_v14_metric_repair.py",
+        "metric repair tool is not tracked by the successor control source",
+    )
+    campaign_paspa_root = campaign.get("_paspa_root", campaign.get("paspa_root"))
+    campaign_diffsheg_root = campaign.get(
+        "_diffsheg_root", campaign.get("diffsheg_root")
+    )
+    campaign_batch_size = campaign.get(
+        "_diffsheg_batch_size", campaign.get("diffsheg_batch_size")
+    )
+    require(
+        spec.get("formal_python") == campaign["_formal_python"]["argv0"]
+        and spec.get("paspa_root") == campaign_paspa_root
+        and spec.get("diffsheg_root") == campaign_diffsheg_root
+        and type(spec.get("batch_size")) is int
+        and spec["batch_size"] == campaign_batch_size
+        and spec.get("repair_root") == str(repair_root)
+        and spec.get("result_path") == str(result_path)
+        and spec.get("runner_control_root") == str(control_root)
+        and spec.get("runner_status_path") == str(status_path)
+        and spec.get("runner_log_path") == str(log_path)
+        and spec.get("guard_proof_path") == str(proof_path),
+        "metric repair runtime/output contract changed",
+    )
+
+    authority_reference = _artifact(
+        receipt.get("metric_repair_authority"), "metric repair authority"
+    )
+    require(
+        Path(authority_reference["path"]) == authority_path,
+        "metric repair authority path changed",
+    )
+    authority_artifact, authority = _read_existing_json(
+        authority_path, "metric repair authority"
+    )
+    require(
+        strict_json_equal(authority_artifact, authority_reference)
+        and set(authority) == METRIC_REPAIR_AUTHORITY_KEYS
+        and authority.get("format") == METRIC_REPAIR_AUTHORITY_FORMAT
+        and authority.get("status") == "authorized"
+        and authority.get("split") == "val"
+        and authority.get("test_visible") is False
+        and authority.get("selection_eligible") is False
+        and authority.get("inference_allowed") is False
+        and type(authority.get("metric_replay_count")) is int
+        and authority["metric_replay_count"] == 1
+        and type(authority.get("candidate_epoch")) is int
+        and authority["candidate_epoch"] == 1
+        and strict_json_equal(authority.get("spec"), spec_artifact),
+        "metric repair authority changed",
+    )
+    _repair_self_hashed(
+        authority, "receipt_payload_sha256", "metric repair authority"
+    )
+    _finite_number(
+        authority.get("created_unix"), "metric repair authority time", 0.000001
+    )
+    authority_snapshot = _terminal_snapshot(
+        authority.get("terminal_snapshot"), "metric repair authority snapshot"
+    )
+
+    result_reference = _artifact(
+        receipt.get("metric_repair_result"), "metric repair result"
+    )
+    require(
+        Path(result_reference["path"]) == result_path,
+        "metric repair result path changed",
+    )
+    result_artifact, result = _read_existing_json(
+        result_path, "metric repair result"
+    )
+    require(
+        strict_json_equal(result_artifact, result_reference)
+        and set(result) == METRIC_REPAIR_RESULT_KEYS
+        and result.get("format") == METRIC_REPAIR_RESULT_FORMAT
+        and result.get("status") == "complete"
+        and result.get("split") == "val"
+        and result.get("test_visible") is False
+        and result.get("selection_eligible") is False
+        and type(result.get("candidate_epoch")) is int
+        and result["candidate_epoch"] == 1
+        and type(result.get("inference_reruns")) is int
+        and result["inference_reruns"] == 0
+        and type(result.get("metric_replays")) is int
+        and result["metric_replays"] == 1
+        and strict_json_equal(result.get("authority"), authority_artifact),
+        "metric repair result changed",
+    )
+    _repair_self_hashed(result, "receipt_payload_sha256", "metric repair result")
+    _finite_number(result.get("completed_unix"), "metric repair result time", 0.000001)
+    before = _terminal_snapshot(
+        result.get("terminal_snapshot_before"), "repair result snapshot before"
+    )
+    after = _terminal_snapshot(
+        result.get("terminal_snapshot_after"), "repair result snapshot after"
+    )
+    require(
+        strict_json_equal(before, after)
+        and strict_json_equal(after, authority_snapshot)
+        and strict_json_equal(before, receipt["terminal_snapshot_before"])
+        and strict_json_equal(after, receipt["terminal_snapshot_after"]),
+        "metric repair terminal snapshots changed",
+    )
+    measurement_reference = receipt.get("measurement")
+    require(
+        isinstance(measurement_reference, dict)
+        and set(measurement_reference)
+        == ARTIFACT_KEYS | {"receipt_payload_sha256"}
+        and strict_json_equal(result.get("measurement"), measurement_reference),
+        "metric repair result measurement changed",
+    )
+    synthetic_job = {
+        "epoch": 1,
+        "measurement_path": measurement_reference["path"],
+        "work_authority": receipt["predecessor_work_authority"],
+    }
+    observed_measurement, measurement = _measurement(
+        synthetic_job,
+        measurement_reference["sha256"],
+        measurement_reference["receipt_payload_sha256"],
+    )
+    require(
+        strict_json_equal(observed_measurement, measurement_reference)
+        and strict_json_equal(result.get("repaired_report"), receipt["repaired_report"])
+        and strict_json_equal(
+            result.get("report_comparison"), receipt["report_comparison"]
+        ),
+        "metric repair result artifacts changed",
+    )
+    report = _artifact(result["repaired_report"], "metric repair report")
+    comparison = _artifact(
+        result["report_comparison"], "metric repair report comparison"
+    )
+    require(
+        report["path"] == str(repair_root / "diffsheg-val-fgd.frozen-4066.json")
+        and comparison["path"] == str(repair_root / "report-comparison.json")
+        and measurement_reference["path"] == str(repair_root / "live-measurement.json"),
+        "metric repair output paths changed",
+    )
+    evaluator_argv = [
+        spec["formal_python"], spec["frozen_evaluator"]["path"],
+        "--pred-dir", ADOPTION_PREDECESSOR_RUN_ROOT
+        + "/candidates/e1/final/predictions/val",
+        "--gt-dir", ADOPTION_PREDECESSOR_RUN_ROOT
+        + "/candidates/e1/final/ground-truth/val",
+        "--clip-manifest", spec["clip_manifest"]["path"],
+        "--clip-manifest-sha256", spec["clip_manifest"]["sha256"],
+        "--paspa-root", spec["paspa_root"],
+        "--diffsheg-root", spec["diffsheg_root"],
+        "--device", "cuda:0", "--batch-size", str(spec["batch_size"]),
+        "--output", report["path"],
+    ]
+    bridge_argv = [
+        spec["formal_python"], bridge["path"], "complete",
+        "--preflight", spec["preflight"]["path"],
+        "--expected-preflight-sha256", spec["preflight"]["sha256"],
+        "--inference-lineage", spec["inference_lineage"]["path"],
+        "--expected-inference-lineage-sha256",
+        spec["inference_lineage"]["sha256"],
+        "--diffsheg-report", report["path"],
+        "--expected-diffsheg-report-sha256", report["sha256"],
+        "--output", measurement_reference["path"],
+    ]
+    replay_argv = [
+        spec["formal_python"], "-I", "-B", "-c",
+        METRIC_REPAIR_BRIDGE_REPLAY_CODE, bridge["path"],
+        measurement_reference["path"], measurement_reference["sha256"],
+    ]
+    fgd = _finite_number(
+        measurement.get("metrics", {}).get("fgd"), "metric repair FGD", 0.0
+    )
+    expected_bridge_stdout = (
+        json.dumps({
+            "status": "complete", "split": "val", "test_visible": False,
+            "selection_eligible": False, "epoch": 1, "fgd": fgd,
+            "created": True, "measurement": measurement_reference,
+        }, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
+    require(
+        strict_json_equal(result.get("evaluator_argv"), evaluator_argv)
+        and strict_json_equal(result.get("bridge_complete_argv"), bridge_argv)
+        and result.get("bridge_complete_stdout_sha256")
+        == _sha256(expected_bridge_stdout)
+        and strict_json_equal(
+            result.get("bridge_measurement_replay_argv"), replay_argv
+        )
+        and result.get("bridge_measurement_replay_stdout") == "PASS\n"
+        and struct.pack(">d", float(fgd)).hex()
+        == METRIC_REPAIR_EXPECTED_FGD_BINARY64_HEX,
+        "metric repair command/FGD evidence changed",
+    )
+    replay_rc, replay_stdout, replay_stderr = capture(replay_argv)
+    require(
+        type(replay_rc) is int
+        and replay_rc == 0
+        and replay_stdout == b"PASS\n"
+        and replay_stderr == b"",
+        "metric repair bridge measurement replay failed",
+    )
+
+    status_reference = _artifact(
+        receipt.get("repair_runner_status"), "metric repair runner status"
+    )
+    require(
+        Path(status_reference["path"]) == status_path,
+        "metric repair runner status path changed",
+    )
+    status_artifact, status = _read_existing_json(
+        status_path, "metric repair runner status"
+    )
+    expected_run_argv = [
+        spec["formal_python"], "-I", repair_tool["path"], "run",
+        "--authority", authority_artifact["path"],
+        "--expected-authority-sha256", authority_artifact["sha256"],
+        "--expected-authority-bytes", str(authority_artifact["bytes"]),
+    ]
+    require(
+        strict_json_equal(status_artifact, status_reference)
+        and set(status) == RUNNER_STATUS_KEYS
+        and status.get("state") == "finished"
+        and _valid_runner_timestamp(status.get("updated_at"))
+        and type(status.get("wrapper_pid")) is int
+        and status["wrapper_pid"] > 1
+        and type(status.get("child_pid")) is int
+        and status["child_pid"] > 1
+        and status["wrapper_pid"] != status["child_pid"]
+        and type(status.get("return_code")) is int
+        and status["return_code"] == 0
+        and strict_json_equal(status.get("command"), expected_run_argv)
+        and all(
+            status.get(key) is None
+            for key in (
+                "received_signal", "error", "cleanup_error", "restore_error"
+            )
+        ),
+        "metric repair runner status/command changed",
+    )
+    restored = status.get("restored_guards")
+    require(
+        isinstance(restored, dict)
+        and set(restored) == {str(i) for i in GPU_INDICES}
+        and len(set(restored.values())) == 8
+        and all(
+            type(restored[str(i)]) is int and restored[str(i)] > 1
+            for i in GPU_INDICES
+        )
+        and strict_json_equal(restored, receipt.get("restored_guards")),
+        "metric repair restored guards changed",
+    )
+    log_reference = _artifact(
+        receipt.get("repair_runner_log"), "metric repair runner log"
+    )
+    require(
+        Path(log_reference["path"]) == log_path,
+        "metric repair runner log path changed",
+    )
+    _log_path, log_raw, log_sha, log_bytes = safe_regular_bytes(
+        log_path, "metric repair runner log",
+        log_reference["sha256"], log_reference["bytes"],
+    )
+    require(
+        log_sha == log_reference["sha256"]
+        and log_bytes == log_reference["bytes"]
+        and log_raw
+        == canonical_json_bytes({"status": "complete", "result": result_artifact}),
+        "metric repair runner log changed",
+    )
+    proof_reference = _artifact(
+        receipt.get("guard_proof"), "metric repair guard proof"
+    )
+    require(
+        Path(proof_reference["path"]) == proof_path,
+        "metric repair guard proof path changed",
+    )
+    _proof_path, proof_raw, _proof_sha, _proof_bytes = safe_regular_bytes(
+        proof_path, "metric repair guard proof",
+        proof_reference["sha256"], proof_reference["bytes"],
+    )
+    expected_guard_text = "PASS " + " ".join(
+        "GPU%d=PID%d" % (i, restored[str(i)]) for i in GPU_INDICES
+    ) + "\n"
+    require(
+        proof_raw == expected_guard_text.encode("ascii")
+        and receipt.get("guard_verifier_stdout") == expected_guard_text
+        and strict_json_equal(
+            receipt.get("guard_verifier_argv"),
+            [
+                spec["formal_python"], spec["guard_verifier"]["path"],
+                *[str(restored[str(i)]) for i in GPU_INDICES],
+            ],
+        ),
+        "metric repair guard proof/argv changed",
+    )
+    if verify_live_guards:
+        guard_rc, guard_stdout, guard_stderr = capture(
+            receipt["guard_verifier_argv"]
+        )
+        require(
+            type(guard_rc) is int
+            and guard_rc == 0
+            and guard_stdout == proof_raw
+            and guard_stderr == b"",
+            "metric repair live guard verification failed",
+        )
+    return spec, authority, result
+
+
+def _load_adopted_e1(
+    campaign: Mapping[str, Any], *, revalidate_terminal_tree: bool = False,
+    verify_live_guards: bool = False,
+    capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    receipt_artifact = campaign.get("_adopted_e1")
+    require(isinstance(receipt_artifact, dict), "adopted e1 receipt is absent")
+    artifact, value = _read_existing_json(
+        Path(receipt_artifact["path"]), "adopted e1 receipt"
+    )
+    expected_adoption_path = (
+        Path(campaign["_adapter_config"]["train_root"])
+        / "live_val_consumer_adoption_claims/epoch-0001.json"
+    )
+    require(
+        strict_json_equal(artifact, receipt_artifact)
+        and Path(artifact["path"]) == expected_adoption_path
+        and set(value) == ADOPTED_E1_KEYS
+        and value.get("format") == ADOPTED_E1_FORMAT
+        and value.get("status") == "complete"
+        and value.get("split") == "val"
+        and value.get("test_visible") is False
+        and value.get("selection_eligible") is False
+        and type(value.get("test_measurements_authorized")) is int
+        and value["test_measurements_authorized"] == 0
+        and type(value.get("candidate_epoch")) is int
+        and value["candidate_epoch"] == 1,
+        "adopted e1 receipt schema/state changed",
+    )
+    _repair_self_hashed(
+        value, "receipt_payload_sha256", "adopted e1 receipt"
+    )
+    job = campaign["_jobs"][0]
+    candidate_receipt = _artifact(
+        value.get("candidate_receipt"), "adopted e1 candidate receipt"
+    )
+    require(
+        candidate_receipt["path"] == job["candidate_receipt_path"]
+        and strict_json_equal(
+            candidate_receipt, _candidate_receipt_artifact(job)
+        ),
+        "adopted e1 candidate receipt changed",
+    )
+    predecessor_authority = _artifact(
+        value.get("predecessor_work_authority"),
+        "adopted e1 predecessor work authority",
+    )
+    _work_authority_runtime_binding(
+        predecessor_authority, campaign["_runtime_validation_source"], 1
+    )
+    _work_authority_candidate_binding(predecessor_authority, candidate_receipt, 1)
+    _work_authority_campaign_binding(
+        predecessor_authority, campaign["_adapter_config"], 1
+    )
+    referenced: Dict[str, Dict[str, Any]] = {}
+    for key, label in (
+        ("predecessor_campaign", "predecessor campaign"),
+        ("predecessor_job_claim", "predecessor job claim"),
+        ("predecessor_active_claim", "predecessor active claim"),
+        ("predecessor_authorization", "predecessor authorization"),
+        ("predecessor_runner_status", "predecessor runner status"),
+        ("predecessor_recovery_request", "predecessor recovery request"),
+        ("predecessor_recovery_authority", "predecessor recovery authority"),
+        ("predecessor_recovery_claim", "predecessor recovery claim"),
+        ("predecessor_failure_log", "predecessor failure log"),
+        ("metric_repair_spec", "metric repair spec"),
+        ("metric_repair_authority", "metric repair authority"),
+        ("metric_repair_result", "metric repair result"),
+        ("repair_runner_log", "metric repair runner log"),
+        ("report_comparison", "metric report comparison"),
+        ("guard_proof", "metric repair guard proof"),
+    ):
+        referenced[key] = _artifact(value.get(key), "adopted e1 %s" % label)
+    require(
+        all(
+            strict_json_equal(value.get(key), expected)
+            for key, expected in ADOPTION_PREDECESSOR_FIXED.items()
+        ),
+        "adopted e1 predecessor incident artifact set changed",
+    )
+    expected_repair_claim = (
+        Path(campaign["_adapter_config"]["train_root"])
+        / "live_val_metric_repair_claims/epoch-0001.json"
+    )
+    require(
+        Path(referenced["metric_repair_authority"]["path"])
+        == expected_repair_claim,
+        "metric repair authority path changed",
+    )
+    _repair_authority_artifact, repair_authority = _read_existing_json(
+        expected_repair_claim, "metric repair authority"
+    )
+    require(
+        strict_json_equal(
+            _repair_authority_artifact, referenced["metric_repair_authority"]
+        )
+        and repair_authority.get("status") == "authorized"
+        and repair_authority.get("split") == "val"
+        and repair_authority.get("test_visible") is False
+        and repair_authority.get("selection_eligible") is False
+        and repair_authority.get("inference_allowed") is False
+        and type(repair_authority.get("metric_replay_count")) is int
+        and repair_authority["metric_replay_count"] == 1,
+        "metric repair authority permissions changed",
+    )
+    _repair_self_hashed(
+        repair_authority, "receipt_payload_sha256", "metric repair authority"
+    )
+    _failure_path, failure_raw, _failure_sha, _failure_bytes = safe_regular_bytes(
+        ADOPTION_PREDECESSOR_FAILURE_LOG["path"],
+        "adopted predecessor failure log",
+        ADOPTION_PREDECESSOR_FAILURE_LOG["sha256"],
+        ADOPTION_PREDECESSOR_FAILURE_LOG["bytes"],
+    )
+    failure_marker = b"DiffSHEG adapter provenance is not the frozen pipeline source"
+    require(
+        failure_raw.count(failure_marker) == 1
+        and failure_raw.rstrip().endswith(failure_marker),
+        "adopted predecessor failure is not uniquely provenance-only",
+    )
+    _old_campaign_artifact, old_campaign = _read_existing_json(
+        Path(ADOPTION_PREDECESSOR_CAMPAIGN["path"]),
+        "adopted predecessor campaign",
+    )
+    require(
+        strict_json_equal(_old_campaign_artifact, ADOPTION_PREDECESSOR_CAMPAIGN),
+        "adopted predecessor campaign artifact changed",
+    )
+    old_jobs = old_campaign.get("jobs")
+    require(
+        isinstance(old_jobs, list)
+        and [job.get("epoch") for job in old_jobs] == list(CANDIDATE_EPOCHS),
+        "adopted predecessor queue changed",
+    )
+    old_absent = [
+        ADOPTION_PREDECESSOR_STATE_ROOT + "/completions/epoch-0001.json",
+        ADOPTION_PREDECESSOR_RUN_ROOT + "/candidates/e1/live-measurement.json",
+    ]
+    for old_job in old_jobs[1:]:
+        epoch = old_job["epoch"]
+        old_absent.extend([
+            ADOPTION_PREDECESSOR_STATE_ROOT
+            + "/job_claims/epoch-%04d.json" % epoch,
+            old_job["authority_path"], old_job["authorization_path"],
+            old_job["run_root"], old_job["measurement_path"],
+            old_job["completion_path"], old_job["runner_status_path"],
+            old_job["runner_log_path"],
+        ])
+    require(
+        all(not os.path.lexists(path) for path in old_absent),
+        "adopted predecessor contains forbidden e1/e2+ outputs",
+    )
+    predecessor_status_artifact = _artifact(
+        value.get("predecessor_runner_status"),
+        "adopted e1 predecessor runner status",
+    )
+    _status_artifact, predecessor_status = _read_existing_json(
+        Path(predecessor_status_artifact["path"]),
+        "adopted e1 predecessor runner status",
+    )
+    require(
+        strict_json_equal(_status_artifact, predecessor_status_artifact)
+        and set(predecessor_status) == RUNNER_STATUS_KEYS
+        and predecessor_status.get("state") == "failed"
+        and type(predecessor_status.get("return_code")) is int
+        and predecessor_status["return_code"] == 1,
+        "adopted e1 predecessor is not terminal failed work",
+    )
+    control = campaign["_control_source"]
+    expected_repair_source = {
+        "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+        "source_root": control["root"],
+        "commit": control["commit"],
+        "tree": control["tree"],
+        "clean": True,
+        "detached": True,
+        "local_branches_at_commit": [],
+    }
+    require(
+        isinstance(value.get("repair_tool_source"), dict)
+        and set(value["repair_tool_source"]) == SOURCE_REFERENCE_KEYS
+        and strict_json_equal(
+            value["repair_tool_source"], expected_repair_source
+        ),
+        "metric repair tool source differs from the successor control source",
+    )
+    expected_predecessor_control = {
+        "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+        "source_root": ADOPTION_PREDECESSOR_CONTROL_ROOT,
+        "commit": ADOPTION_PREDECESSOR_CONTROL_COMMIT,
+        "tree": ADOPTION_PREDECESSOR_CONTROL_TREE,
+        "clean": True,
+        "detached": True,
+        "local_branches_at_commit": [],
+    }
+    require(
+        isinstance(value.get("predecessor_control_source"), dict)
+        and set(value["predecessor_control_source"]) == SOURCE_REFERENCE_KEYS
+        and strict_json_equal(
+            value["predecessor_control_source"],
+            expected_predecessor_control,
+        ),
+        "metric repair predecessor control source changed",
+    )
+    _git_authority(
+        Path(ADOPTION_PREDECESSOR_CONTROL_ROOT),
+        ADOPTION_PREDECESSOR_CONTROL_COMMIT,
+        ADOPTION_PREDECESSOR_CONTROL_TREE,
+        "metric repair predecessor control source",
+    )
+    require(
+        strict_json_equal(
+            value.get("guarded_runner"), campaign["_guarded_runner"]
+        ),
+        "metric repair guarded runner differs from the successor campaign",
+    )
+    frozen_source = value.get("frozen_evaluator_source")
+    expected_frozen_source = {
+        "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+        "source_root": VALIDATION_SEMANTICS_ROOT,
+        "commit": VALIDATION_SEMANTICS_COMMIT,
+        "tree": VALIDATION_SEMANTICS_TREE,
+        "clean": True,
+        "detached": True,
+        "local_branches_at_commit": [],
+    }
+    require(
+        isinstance(frozen_source, dict)
+        and set(frozen_source) == SOURCE_REFERENCE_KEYS
+        and strict_json_equal(frozen_source, expected_frozen_source),
+        "adopted e1 evaluator is not the frozen pipeline source",
+    )
+    frozen_evaluator = _artifact(
+        value.get("frozen_evaluator"), "adopted e1 frozen evaluator"
+    )
+    require(
+        frozen_evaluator["path"]
+        == str(
+            Path(VALIDATION_SEMANTICS_ROOT)
+            / "scripts/show_base/evaluate_diffsheg_val_fgd.py"
+        )
+        and frozen_evaluator["sha256"] == RUNTIME_VALIDATION_EVALUATOR_SHA256,
+        "adopted e1 frozen evaluator artifact changed",
+    )
+    _load_metric_repair_chain(
+        campaign, value, verify_live_guards=verify_live_guards,
+        capture=capture,
+    )
+    repaired_report = _artifact(
+        value.get("repaired_report"), "adopted e1 repaired report"
+    )
+    comparison_artifact = referenced["report_comparison"]
+    _comparison_artifact, comparison = _read_existing_json(
+        Path(comparison_artifact["path"]), "metric report comparison"
+    )
+    require(
+        strict_json_equal(_comparison_artifact, comparison_artifact)
+        and comparison.get("format")
+        == "semtalk_show_base_v14_metric_report_comparison_v1"
+        and comparison.get("status") == "equivalent_except_provenance"
+        and comparison.get("split") == "val"
+        and comparison.get("test_visible") is False
+        and comparison.get("selection_eligible") is False
+        and comparison.get("candidate_epoch") == 1
+        and comparison.get("inference_reruns") == 0
+        and comparison.get("metric_replays") == 1
+        and comparison.get("raw_feature_bytes_compared") is False
+        and strict_json_equal(
+            comparison.get("old_report"), ADOPTION_PREDECESSOR_REPORT
+        )
+        and comparison.get("new_report") == repaired_report
+        and comparison.get("allowed_differences")
+        == [
+            "provenance.adapter.path",
+            "provenance.adapter.repository_git_head",
+            "provenance.adapter.repository_root",
+        ],
+        "metric report comparison evidence changed",
+    )
+    _repair_self_hashed(
+        comparison, "receipt_payload_sha256", "metric report comparison"
+    )
+    _old_report_artifact, old_report = _read_existing_json(
+        Path(ADOPTION_PREDECESSOR_REPORT["path"]),
+        "adopted predecessor diagnostic report",
+    )
+    _new_report_artifact, new_report = _read_existing_json(
+        Path(repaired_report["path"]), "adopted repaired DiffSHEG report"
+    )
+    require(
+        strict_json_equal(_old_report_artifact, ADOPTION_PREDECESSOR_REPORT)
+        and strict_json_equal(_new_report_artifact, repaired_report),
+        "metric report artifacts changed",
+    )
+    old_adapter = old_report.get("provenance", {}).get("adapter")
+    new_adapter = new_report.get("provenance", {}).get("adapter")
+    require(
+        isinstance(old_adapter, dict)
+        and isinstance(new_adapter, dict)
+        and old_adapter.get("path")
+        == "/local-ssd/xiangyuezhang/semtalk_final_control_73ff184_20260802/scripts/show_base/evaluate_diffsheg_val_fgd.py"
+        and old_adapter.get("repository_root")
+        == "/local-ssd/xiangyuezhang/semtalk_final_control_73ff184_20260802"
+        and old_adapter.get("repository_git_head")
+        == "73ff184a62fb2d1c3064a4fb03a11b48e6309f7f"
+        and new_adapter.get("path") == frozen_evaluator["path"]
+        and new_adapter.get("repository_root") == VALIDATION_SEMANTICS_ROOT
+        and new_adapter.get("repository_git_head") == VALIDATION_SEMANTICS_COMMIT,
+        "metric report provenance transition changed",
+    )
+    normalized_report = json.loads(json.dumps(new_report))
+    for key in ("path", "repository_root", "repository_git_head"):
+        normalized_report["provenance"]["adapter"][key] = old_adapter[key]
+    old_fgd = old_report.get("metrics", {}).get("fgd")
+    new_fgd = new_report.get("metrics", {}).get("fgd")
+    require(
+        strict_json_equal(old_report, normalized_report)
+        and type(old_fgd) is float
+        and type(new_fgd) is float
+        and struct.pack(">d", old_fgd) == struct.pack(">d", new_fgd),
+        "metric reports differ beyond the authorized provenance repair",
+    )
+    measurement_ref = value.get("measurement")
+    require(
+        isinstance(measurement_ref, dict)
+        and set(measurement_ref) == ARTIFACT_KEYS | {"receipt_payload_sha256"},
+        "adopted e1 measurement reference changed",
+    )
+    synthetic_job = {
+        "epoch": 1,
+        "measurement_path": measurement_ref["path"],
+        "work_authority": predecessor_authority,
+    }
+    measurement, measurement_value = _measurement(
+        synthetic_job,
+        measurement_ref["sha256"],
+        measurement_ref["receipt_payload_sha256"],
+    )
+    require(
+        strict_json_equal(measurement, measurement_ref)
+        and measurement_value["diffsheg_report"].get("path")
+        == repaired_report["path"]
+        and measurement_value["diffsheg_report"].get("sha256")
+        == repaired_report["sha256"],
+        "adopted e1 measurement/report binding changed",
+    )
+    repair_status_artifact = _artifact(
+        value.get("repair_runner_status"), "metric repair runner status"
+    )
+    _repair_status_artifact, repair_status = _read_existing_json(
+        Path(repair_status_artifact["path"]), "metric repair runner status"
+    )
+    require(
+        strict_json_equal(_repair_status_artifact, repair_status_artifact)
+        and set(repair_status) == RUNNER_STATUS_KEYS
+        and repair_status.get("state") == "finished"
+        and type(repair_status.get("return_code")) is int
+        and repair_status["return_code"] == 0
+        and all(
+            repair_status.get(key) is None
+            for key in ("error", "cleanup_error", "restore_error", "received_signal")
+        ),
+        "metric repair runner did not finish successfully",
+    )
+    restored = repair_status.get("restored_guards")
+    require(
+        isinstance(restored, dict)
+        and set(restored) == {str(i) for i in GPU_INDICES}
+        and all(type(restored[str(i)]) is int and restored[str(i)] > 1 for i in GPU_INDICES)
+        and len(set(restored.values())) == 8
+        and strict_json_equal(value.get("restored_guards"), restored),
+        "metric repair guards changed",
+    )
+    require(
+        strict_json_equal(value.get("guard_verifier"), campaign["_guard_verifier"])
+        and value.get("guard_verifier_argv")
+        == [
+            campaign["_formal_python"]["argv0"],
+            campaign["_guard_verifier"]["path"],
+            *[str(restored[str(i)]) for i in GPU_INDICES],
+        ],
+        "metric repair guard verifier authority changed",
+    )
+    guard_match = GUARD_PASS_RE.fullmatch(value.get("guard_verifier_stdout", ""))
+    require(
+        guard_match is not None
+        and {str(i): int(guard_match.group(i + 1)) for i in GPU_INDICES}
+        == restored,
+        "metric repair guard proof changed",
+    )
+    before = _terminal_snapshot(
+        value.get("terminal_snapshot_before"), "terminal snapshot before repair"
+    )
+    after = _terminal_snapshot(
+        value.get("terminal_snapshot_after"), "terminal snapshot after repair"
+    )
+    require(
+        strict_json_equal(before, after),
+        "terminal predecessor changed during metric repair",
+    )
+    if revalidate_terminal_tree:
+        require(
+            strict_json_equal(_current_terminal_snapshot(), after),
+            "terminal predecessor changed after metric repair",
+        )
+    fgd = _finite_number(
+        value.get("validation_diffsheg_fgd"), "adopted e1 FGD", 0.0
+    )
+    fgd_binary64_hex = struct.pack(">d", float(fgd)).hex()
+    require(
+        fgd == float(measurement_value["metrics"]["fgd"])
+        and comparison.get("fgd_binary64_hex")
+        == fgd_binary64_hex
+        and value.get("validation_diffsheg_fgd_binary64_hex")
+        == fgd_binary64_hex,
+        "adopted e1 FGD changed",
+    )
+    require(
+        type(value.get("inference_reruns")) is int
+        and value["inference_reruns"] == 0
+        and type(value.get("metric_replays")) is int
+        and value["metric_replays"] == 1
+        and type(value.get("predecessor_return_code")) is int
+        and value["predecessor_return_code"] == 1
+        and type(value.get("repair_return_code")) is int
+        and value["repair_return_code"] == 0
+        and value.get("failure_phase") == "provenance_only",
+        "adopted e1 repair accounting changed",
+    )
+    _finite_number(value.get("completed_unix"), "adopted e1 completion time", 0.000001)
+    return artifact, {
+        "format": ADOPTED_E1_FORMAT,
+        "status": "complete",
+        "candidate_epoch": 1,
+        "measurement": measurement,
+        "validation_diffsheg_fgd": fgd,
+        "adoption_receipt": artifact,
+    }
+
+
+def _dual_dispatch_inventory(
+    campaign: Mapping[str, Any],
+) -> Tuple[Path, frozenset[str]]:
+    """Return the exact private dispatcher inventory without creating state."""
+
+    root = Path(campaign["_state_root"]) / DUAL_DISPATCH_DIR_NAME
+    if not os.path.lexists(root):
+        return root, frozenset()
+    metadata = root.lstat()
+    require(
+        stat.S_ISDIR(metadata.st_mode) and not root.is_symlink(),
+        "dual-dispatch root is not a canonical directory",
+    )
+    require(
+        root.resolve(strict=True) == root,
+        "dual-dispatch root path changed",
+    )
+    names = frozenset(entry.name for entry in root.iterdir())
+    allowed = frozenset({
+        DUAL_DISPATCH_TOPOLOGY_NAME,
+        DUAL_DISPATCH_CLAIM_NAME,
+        DUAL_DISPATCH_ACTIVE_NAME,
+        DUAL_DISPATCH_WAVES_NAME,
+    })
+    require(
+        names.issubset(allowed),
+        "dual-dispatch root contains an unknown entry",
+    )
+    return root, names
+
+
+def _legacy_run_next_dual_dispatch_gate(
+    campaign: Mapping[str, Any],
+) -> None:
+    """Permanently exclude the legacy scheduler once dispatcher state exists."""
+
+    _root, names = _dual_dispatch_inventory(campaign)
+    require(
+        not names,
+        "legacy run-next is disabled after dual-dispatch authority exists",
+    )
+
+
+def _load_dual_dispatcher_module(campaign: Mapping[str, Any]) -> Any:
+    """Load the tracked dispatcher only at finalization replay time.
+
+    The dispatcher imports this supervisor, so importing it at module import
+    time would create a cycle.  A runtime import also keeps legacy campaigns
+    independent from a dispatcher they never claimed.
+    """
+
+    _revalidate_control(campaign)
+    control_root = Path(campaign["_control_source"]["root"])
+    path = control_root / DUAL_DISPATCH_RELATIVE_PATH
+    artifact = _artifact_from_path(path, "dual dispatcher control source")
+    relative = str(DUAL_DISPATCH_RELATIVE_PATH)
+    require(
+        artifact["path"] == str(path)
+        and _git_stdout(
+            control_root, "ls-files", "--error-unmatch", relative
+        ) == relative,
+        "dual dispatcher is not tracked by the frozen control source",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_semtalk_show_base_dual_dispatch_finalize_" + artifact["sha256"],
+        path,
+    )
+    require(
+        spec is not None and spec.loader is not None,
+        "dual dispatcher import specification is unavailable",
+    )
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise SupervisorError(
+            "dual dispatcher control source could not be loaded: %s" % exc
+        ) from exc
+    return module
+
+
+def _validate_dual_dispatch_for_finalize(
+    campaign: Mapping[str, Any],
+) -> bool:
+    """Replay a complete 11-wave/21-fresh dispatcher ledger read-only."""
+
+    root, names = _dual_dispatch_inventory(campaign)
+    if not names:
+        require(
+            campaign.get("_adopted_e1") is None,
+            "adopted-e1 finalization requires the complete dual-dispatch ledger",
+        )
+        return False
+    require(
+        campaign.get("_adopted_e1") is not None,
+        "dual dispatch requires the adopted e1 campaign",
+    )
+    require(
+        DUAL_DISPATCH_ACTIVE_NAME not in names
+        and not os.path.lexists(
+            Path(campaign["_state_root"]) / "active_invocation.claim.json"
+        ),
+        "cannot finalize while a dual-dispatch wave is active",
+    )
+    expected_root_names = frozenset({
+        DUAL_DISPATCH_TOPOLOGY_NAME,
+        DUAL_DISPATCH_CLAIM_NAME,
+        DUAL_DISPATCH_WAVES_NAME,
+    })
+    require(
+        names == expected_root_names,
+        "dual-dispatch final inventory is incomplete",
+    )
+    waves_root = root / DUAL_DISPATCH_WAVES_NAME
+    require(
+        waves_root.is_dir() and not waves_root.is_symlink()
+        and waves_root.resolve(strict=True) == waves_root,
+        "dual-dispatch waves root changed",
+    )
+    expected_wave_names = {
+        "wave-%04d" % index for index in range(1, 12)
+    }
+    require(
+        {entry.name for entry in waves_root.iterdir()} == expected_wave_names,
+        "dual-dispatch finalization requires exactly 11 committed waves",
+    )
+    try:
+        dispatcher = _load_dual_dispatcher_module(campaign)
+        require(
+            dispatcher.DUAL_DIR_NAME == DUAL_DISPATCH_DIR_NAME
+            and dispatcher.TOPOLOGY_NAME == DUAL_DISPATCH_TOPOLOGY_NAME
+            and dispatcher.CLAIM_NAME == DUAL_DISPATCH_CLAIM_NAME
+            and dispatcher.ACTIVE_LOCK_NAME == DUAL_DISPATCH_ACTIVE_NAME
+            and dispatcher.WAVES_DIR_NAME == DUAL_DISPATCH_WAVES_NAME,
+            "dual dispatcher filesystem contract changed",
+        )
+        fresh_waves = dispatcher.fresh_waves()
+        require(
+            fresh_waves
+            == [
+                list(CANDIDATE_EPOCHS[1:])[index:index + 2]
+                for index in range(0, 21, 2)
+            ]
+            and len(fresh_waves) == 11
+            and sum(len(wave) for wave in fresh_waves) == 21,
+            "dual dispatcher 21-candidate wave plan changed",
+        )
+        topology_input = _artifact_from_path(
+            root / DUAL_DISPATCH_TOPOLOGY_NAME,
+            "dual-dispatch topology",
+        )
+        topology, topology_value = dispatcher.load_topology(
+            campaign, topology_input
+        )
+        dispatcher_claim, _claim_value = (
+            dispatcher.load_or_create_dispatcher_claim(campaign, topology)
+        )
+        require(
+            dispatcher_claim["path"]
+            == str(root / DUAL_DISPATCH_CLAIM_NAME),
+            "dual dispatcher claim path changed",
+        )
+        dispatcher._validate_prior_waves(
+            campaign, dispatcher_claim, topology, topology_value, 11
+        )
+    except SupervisorError:
+        raise
+    except Exception as exc:
+        raise SupervisorError(
+            "dual-dispatch finalization evidence is invalid: %s" % exc
+        ) from exc
+    return True
+
+
 def _scan_v2(campaign: Mapping[str, Any]) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], Optional[Dict[str, Any]]]:
     allowed_epoch_names = {"epoch-%04d.json" % epoch for epoch in CANDIDATE_EPOCHS}
     allowed_log_names = {"epoch-%04d.log" % epoch for epoch in CANDIDATE_EPOCHS}
@@ -1673,15 +3124,35 @@ def _scan_v2(campaign: Mapping[str, Any]) -> Tuple[List[Tuple[Dict[str, Any], Di
         "recovery-request.epoch-0001.json",
         "recovery-authority.epoch-0001.json",
         "job_claims", "completions", "runner_status", "runner_logs",
-        "authorities", "authorizations",
+        "authorities", "authorizations", DUAL_DISPATCH_DIR_NAME,
     }
     require({entry.name for entry in campaign["_state_root"].iterdir()}.issubset(state_allowed), "state root contains an unknown entry")
+    _dual_dispatch_inventory(campaign)
     completed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     head: Optional[Dict[str, Any]] = None
     gap = False
     for job in campaign["_jobs"]:
         claim = os.path.lexists(_job_claim_path_v2(campaign, job["epoch"]))
         done = os.path.lexists(_completion_path_v2(campaign, job["epoch"]))
+        if job["epoch"] == 1 and campaign.get("_adopted_e1") is not None:
+            require(
+                not claim
+                and not done
+                and not os.path.lexists(job["authority_path"])
+                and not os.path.lexists(job["authorization_path"])
+                and not os.path.lexists(job["run_root"])
+                and not os.path.lexists(job["runner_status_path"])
+                and not os.path.lexists(job["runner_log_path"])
+                and not os.path.lexists(
+                    campaign["_state_root"] / "recovery-request.epoch-0001.json"
+                )
+                and not os.path.lexists(
+                    campaign["_state_root"] / "recovery-authority.epoch-0001.json"
+                ),
+                "adopted e1 state must not contain successor execution output",
+            )
+            completed.append(_load_adopted_e1(campaign))
+            continue
         if done:
             require(claim and not gap, "queue skipped ahead")
             completed.append(_load_completion_v2(campaign, job))
@@ -2027,7 +3498,7 @@ def _authority_reconcile_argv(
     config = campaign["_adapter_config"]
     runtime = campaign["_runtime_validation_source"]
     semantics = runtime["validation_semantics_source"]
-    return [
+    argv = [
         campaign["_formal_python"]["argv0"], "-I",
         campaign["_control_source"]["authority_adapter"]["path"], "reconcile",
         "--train-root", config["train_root"],
@@ -2049,12 +3520,43 @@ def _authority_reconcile_argv(
         "--pipeline", config["pipeline"]["path"],
         "--expected-pipeline-sha256", config["pipeline"]["sha256"],
         "--authority-dir", str(campaign["_authorities_dir"]),
+    ]
+    if campaign.get("_adopted_e1") is not None:
+        receipt_artifact, receipt = _read_existing_json(
+            Path(campaign["_adopted_e1"]["path"]), "adopted e1 receipt"
+        )
+        require(
+            strict_json_equal(receipt_artifact, campaign["_adopted_e1"])
+            and set(receipt) == ADOPTED_E1_KEYS
+            and receipt.get("format") == ADOPTED_E1_FORMAT,
+            "adopted e1 receipt changed before producer reconcile",
+        )
+        adopted_authority = _artifact(
+            receipt.get("predecessor_work_authority"),
+            "adopted e1 predecessor work authority",
+        )
+        require(
+            strict_json_equal(
+                adopted_authority,
+                ADOPTION_PREDECESSOR_FIXED["predecessor_work_authority"],
+            ),
+            "adopted e1 authority differs from the pinned predecessor",
+        )
+        argv.extend([
+            "--adopted-e1-authority", adopted_authority["path"],
+            "--expected-adopted-e1-authority-sha256",
+            adopted_authority["sha256"],
+            "--expected-adopted-e1-authority-bytes",
+            str(adopted_authority["bytes"]),
+        ])
+    argv.extend([
         "--final-manifest", final_manifest["path"],
         "--expected-final-manifest-sha256", final_manifest["sha256"],
         "--final-status", final_status["path"],
         "--expected-final-status-sha256", final_status["sha256"],
         "--output", str(campaign["_reconciliation_path"]),
-    ]
+    ])
+    return argv
 
 
 def _reconciliation_artifact(campaign: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -2269,6 +3771,16 @@ def _finalize_v2(
     selection_artifact, selection = _selection_v2(campaign, completed, reconciliation_artifact)
     _validate_bridge_reconcile_stdout(bridge_stdout, selection_artifact, selection)
     selected = selection.get("selected")
+    adoption_receipt = campaign.get("_adopted_e1")
+    if adoption_receipt is not None:
+        observed_adoption, _adopted_completion = _load_adopted_e1(
+            campaign, revalidate_terminal_tree=True, capture=capture,
+        )
+        require(
+            strict_json_equal(observed_adoption, adoption_receipt),
+            "adopted e1 changed before final summary",
+        )
+    adopted_count = 1 if adoption_receipt is not None else 0
     summary = write_new_json(campaign["summary_path"], _add_self_hash({
         "format": SUMMARY_FORMAT, "status": "complete", "split": "val",
         "test_visible": False, "selection_eligible": True,
@@ -2277,7 +3789,12 @@ def _finalize_v2(
         "producer_reconcile_claim": producer_claim,
         "bridge_reconcile_claim": bridge_claim,
         "official_selection": selection_artifact,
-        "selected": selected, "completed_unix": _finite_number(clock(), "summary time", 0.000001),
+        "selected": selected, "adoption_receipt": adoption_receipt,
+        "adopted_candidate_count": adopted_count,
+        "fresh_candidate_count": len(CANDIDATE_EPOCHS) - adopted_count,
+        "inference_reruns": 0,
+        "metric_replays": adopted_count,
+        "completed_unix": _finite_number(clock(), "summary time", 0.000001),
     }, "receipt_payload_sha256"), "final summary")
     _release_active_v2(campaign, active)
     return {"status": "complete", "selection_eligible": True, "summary": summary, "selected": selected}
@@ -2288,6 +3805,15 @@ def finalize_campaign(
     capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
     clock: Callable[[], float] = time.time,
 ) -> Dict[str, Any]:
+    if campaign.get("_adopted_e1") is not None:
+        observed_adoption, _adopted_completion = _load_adopted_e1(
+            campaign, revalidate_terminal_tree=True, capture=capture,
+        )
+        require(
+            strict_json_equal(observed_adoption, campaign["_adopted_e1"]),
+            "adopted e1 changed before finalization",
+        )
+    _validate_dual_dispatch_for_finalize(campaign)
     # The read-only admission above consumes no durable slot.  From this first
     # private write onward the new campaign attempt is terminal on every
     # failure, but the one global recovery slot remains unconsumed until the
@@ -2307,6 +3833,22 @@ def finalize_campaign(
         require(strict_json_equal(value.get("producer_reconcile_claim"), producer_claim) and strict_json_equal(value.get("bridge_reconcile_claim"), bridge_claim), "final summary reconcile claim artifacts changed")
         selection_artifact, selection = _selection_v2(campaign, completed, reconciliation_artifact)
         require(strict_json_equal(value.get("official_selection"), selection_artifact) and strict_json_equal(value.get("selected"), selection["selected"]), "final summary selection changed")
+        adopted_count = 1 if campaign.get("_adopted_e1") is not None else 0
+        require(
+            strict_json_equal(
+                value.get("adoption_receipt"), campaign.get("_adopted_e1")
+            )
+            and type(value.get("adopted_candidate_count")) is int
+            and value["adopted_candidate_count"] == adopted_count
+            and type(value.get("fresh_candidate_count")) is int
+            and value["fresh_candidate_count"]
+            == len(CANDIDATE_EPOCHS) - adopted_count
+            and type(value.get("inference_reruns")) is int
+            and value["inference_reruns"] == 0
+            and type(value.get("metric_replays")) is int
+            and value["metric_replays"] == adopted_count,
+            "final summary adoption/fresh-work accounting changed",
+        )
         _finite_number(value.get("completed_unix"), "summary time", 0.000001)
         return {"status": "complete", "selection_eligible": True, "summary": artifact, "selected": value["selected"]}
     return _finalize_v2(campaign, completed, runner, capture, clock)
@@ -2317,6 +3859,7 @@ def run_next(
     capture: Callable[[Sequence[str]], Tuple[int, bytes, bytes]] = _run_capture,
     clock: Callable[[], float] = time.time,
 ) -> Dict[str, Any]:
+    _legacy_run_next_dual_dispatch_gate(campaign)
     _campaign_claim_v2(campaign, clock)
     completed, head = _scan_v2(campaign)
     if head is None:
@@ -2781,6 +4324,52 @@ def build_campaign(args: argparse.Namespace) -> Dict[str, Any]:
         "val_inputs": _artifact_from_path(args.val_inputs, "authority validation inputs"),
         "pipeline": _artifact_from_path(args.pipeline, "authority validation pipeline"),
     }, runtime_validation)
+    adopted_values = (
+        getattr(args, "adopted_e1", None),
+        getattr(args, "expected_adopted_e1_sha256", None),
+        getattr(args, "expected_adopted_e1_bytes", None),
+    )
+    require(
+        all(value is None for value in adopted_values)
+        or all(value is not None for value in adopted_values),
+        "adopted e1 artifact triple must be all-or-none",
+    )
+    adopted_e1: Optional[Dict[str, Any]] = None
+    if adopted_values[0] is not None:
+        adopted_e1 = _artifact(
+            {
+                "path": adopted_values[0],
+                "sha256": adopted_values[1],
+                "bytes": adopted_values[2],
+            },
+            "adopted e1 receipt",
+        )
+        expected_adoption_path = (
+            Path(adapter_config["train_root"])
+            / "live_val_consumer_adoption_claims/epoch-0001.json"
+        )
+        require(
+            Path(adopted_e1["path"]) == expected_adoption_path,
+            "adopted e1 receipt path changed",
+        )
+        _adoption_artifact, adoption_value = _read_existing_json(
+            expected_adoption_path, "adopted e1 receipt"
+        )
+        require(
+            strict_json_equal(_adoption_artifact, adopted_e1)
+            and set(adoption_value) == ADOPTED_E1_KEYS
+            and adoption_value.get("format") == ADOPTED_E1_FORMAT
+            and adoption_value.get("status") == "complete"
+            and adoption_value.get("split") == "val"
+            and adoption_value.get("test_visible") is False
+            and adoption_value.get("selection_eligible") is False
+            and type(adoption_value.get("candidate_epoch")) is int
+            and adoption_value["candidate_epoch"] == 1,
+            "adopted e1 receipt is not a complete val-only e1 adoption",
+        )
+        _repair_self_hashed(
+            adoption_value, "receipt_payload_sha256", "adopted e1 receipt"
+        )
     require(adapter_config["schedule"]["sha256"] == args.expected_schedule_sha256, "schedule SHA differs from explicit builder pin")
     require(adapter_config["val_inputs"]["sha256"] == args.expected_val_inputs_sha256, "validation inputs SHA differs from explicit builder pin")
     require(adapter_config["pipeline"]["sha256"] == args.expected_pipeline_sha256, "validation pipeline SHA differs from explicit builder pin")
@@ -2835,11 +4424,31 @@ def build_campaign(args: argparse.Namespace) -> Dict[str, Any]:
             "completion_path": str(completion), "runner_status_path": str(status),
             "runner_log_path": str(log),
         })
+    if adopted_e1 is not None:
+        # Replay the full e1 adoption contract before creating any successor
+        # queue state.  A malformed or lineage-incompatible adoption therefore
+        # cannot consume the create-new campaign attempt.
+        _load_adopted_e1({
+            "_adopted_e1": adopted_e1,
+            "_adapter_config": adapter_config,
+            "_runtime_validation_source": runtime_validation,
+            "_control_source": control,
+            "_formal_python": formal,
+            "_guarded_runner": runner,
+            "_guard_verifier": verifier,
+            "_jobs": jobs,
+            "paspa_root": str(paspa_root),
+            "diffsheg_root": str(diffsheg_root),
+            "diffsheg_batch_size": args.diffsheg_batch_size,
+        }, revalidate_terminal_tree=True, verify_live_guards=True)
     os.mkdir(state, 0o700)
     for name in ("job_claims", "completions", "runner_status", "runner_logs", "authorities", "authorizations"):
         os.mkdir(state / name, 0o700)
-    body = _add_self_hash({
-        "format": CAMPAIGN_FORMAT, "status": "frozen_before_execution", "split": "val",
+    campaign_body = {
+        "format": (
+            ADOPTION_CAMPAIGN_FORMAT if adopted_e1 is not None else CAMPAIGN_FORMAT
+        ),
+        "status": "frozen_before_execution", "split": "val",
         "test_visible": False, "test_measurements_authorized": 0,
         "candidate_epochs": list(CANDIDATE_EPOCHS), "state_root": str(state),
         "campaign_claim_path": str(state / "campaign.claim.json"),
@@ -2854,7 +4463,10 @@ def build_campaign(args: argparse.Namespace) -> Dict[str, Any]:
         "guarded_runner": runner, "guard_verifier": verifier,
         "reconciliation_path": str(reconciliation), "reconcile_selection_root": str(selection_root),
         "jobs": jobs,
-    }, "campaign_payload_sha256")
+    }
+    if adopted_e1 is not None:
+        campaign_body["adopted_e1"] = adopted_e1
+    body = _add_self_hash(campaign_body, "campaign_payload_sha256")
     artifact = write_new_json(str(output), body, "campaign")
     # Full replay is the last builder step; no campaign can be returned unless
     # the same parser used by run-next accepts it.
@@ -2921,6 +4533,9 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--diffsheg-root", required=True)
     build.add_argument("--seed", type=int, default=20260731)
     build.add_argument("--diffsheg-batch-size", type=int, required=True)
+    build.add_argument("--adopted-e1")
+    build.add_argument("--expected-adopted-e1-sha256")
+    build.add_argument("--expected-adopted-e1-bytes", type=int)
     return parser
 
 

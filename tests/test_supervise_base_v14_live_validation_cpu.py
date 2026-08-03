@@ -386,6 +386,349 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(list((build_root / "state/authorities").iterdir()), [])
         self.assertNotIn("work_authority", campaign["jobs"][0])
 
+        adoption_value = {
+            key: None
+            for key in sup.ADOPTED_E1_KEYS
+            if key != "receipt_payload_sha256"
+        }
+        adoption_value.update({
+            "format": sup.ADOPTED_E1_FORMAT,
+            "status": "complete",
+            "split": "val",
+            "test_visible": False,
+            "selection_eligible": False,
+            "candidate_epoch": 1,
+        })
+        adoption_value["receipt_payload_sha256"] = sup._bridge_payload_sha(
+            adoption_value
+        )
+        adoption = write_json(
+            build_root
+            / "train/live_val_consumer_adoption_claims/epoch-0001.json",
+            adoption_value,
+        )
+        (build_root / "runs-adopted").mkdir()
+        adopted_args = argparse.Namespace(**vars(args))
+        adopted_args.state_root = str(build_root / "state-adopted")
+        adopted_args.output = str(
+            build_root / "state-adopted/campaign.json"
+        )
+        adopted_args.run_root_base = str(build_root / "runs-adopted")
+        adopted_args.reconcile_selection_root = str(
+            build_root / "selection-adopted"
+        )
+        adopted_args.adopted_e1 = adoption["path"]
+        adopted_args.expected_adopted_e1_sha256 = adoption["sha256"]
+        adopted_args.expected_adopted_e1_bytes = adoption["bytes"]
+        with mock.patch.object(
+            sup, "_freeze_control_source", return_value=control
+        ), mock.patch.object(
+            sup, "_freeze_runtime_validation_source", return_value=runtime
+        ), mock.patch.object(
+            sup, "_capture_formal_python_binding", return_value=formal
+        ), mock.patch.object(
+            sup, "_artifact_from_path", side_effect=fake_artifact
+        ), mock.patch.object(
+            sup, "_git_authority"
+        ), mock.patch.object(
+            sup, "_git_stdout", side_effect=lambda _root, *items: items[-1]
+        ), mock.patch.object(
+            sup,
+            "_load_adopted_e1",
+            return_value=(adoption, {"candidate_epoch": 1}),
+        ) as adoption_loader, mock.patch.object(sup, "load_campaign"):
+            adopted_result = sup.build_campaign(adopted_args)
+        adoption_loader.assert_called_once()
+        self.assertTrue(
+            adoption_loader.call_args.kwargs["revalidate_terminal_tree"]
+        )
+        self.assertTrue(
+            adoption_loader.call_args.kwargs["verify_live_guards"]
+        )
+        self.assertEqual(adopted_result["candidate_count"], 22)
+        adopted_campaign = json.loads(
+            (build_root / "state-adopted/campaign.json").read_text()
+        )
+        self.assertEqual(
+            adopted_campaign["format"], sup.ADOPTION_CAMPAIGN_FORMAT
+        )
+        self.assertEqual(adopted_campaign["adopted_e1"], adoption)
+        self.assertEqual(
+            list((build_root / "state-adopted/authorities").iterdir()), []
+        )
+
+        (build_root / "runs-rejected").mkdir()
+        rejected_args = argparse.Namespace(**vars(adopted_args))
+        rejected_args.state_root = str(build_root / "state-rejected")
+        rejected_args.output = str(
+            build_root / "state-rejected/campaign.json"
+        )
+        rejected_args.run_root_base = str(build_root / "runs-rejected")
+        rejected_args.reconcile_selection_root = str(
+            build_root / "selection-rejected"
+        )
+        with mock.patch.object(
+            sup, "_freeze_control_source", return_value=control
+        ), mock.patch.object(
+            sup, "_freeze_runtime_validation_source", return_value=runtime
+        ), mock.patch.object(
+            sup, "_capture_formal_python_binding", return_value=formal
+        ), mock.patch.object(
+            sup, "_artifact_from_path", side_effect=fake_artifact
+        ), mock.patch.object(sup, "_git_authority"), mock.patch.object(
+            sup, "_git_stdout", side_effect=lambda _root, *items: items[-1]
+        ), mock.patch.object(
+            sup,
+            "_load_adopted_e1",
+            side_effect=sup.SupervisorError("adoption replay failed"),
+        ):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "adoption replay failed"
+            ):
+                sup.build_campaign(rejected_args)
+        self.assertFalse((build_root / "state-rejected").exists())
+
+        partial_args = argparse.Namespace(**vars(args))
+        partial_args.state_root = str(build_root / "state-partial")
+        partial_args.output = str(build_root / "state-partial/campaign.json")
+        partial_args.adopted_e1 = adoption["path"]
+        partial_args.expected_adopted_e1_sha256 = None
+        partial_args.expected_adopted_e1_bytes = adoption["bytes"]
+        with mock.patch.object(
+            sup, "_freeze_control_source", return_value=control
+        ), mock.patch.object(
+            sup, "_freeze_runtime_validation_source", return_value=runtime
+        ), mock.patch.object(
+            sup, "_capture_formal_python_binding", return_value=formal
+        ), mock.patch.object(
+            sup, "_artifact_from_path", side_effect=fake_artifact
+        ), mock.patch.object(sup, "_git_authority"), mock.patch.object(
+            sup, "_git_stdout", side_effect=lambda _root, *items: items[-1]
+        ):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "artifact triple must be all-or-none"
+            ):
+                sup.build_campaign(partial_args)
+
+    def test_repair_hash_abi_is_distinct_and_fail_closed(self) -> None:
+        payload = {
+            "format": sup.ADOPTED_E1_FORMAT,
+            "status": "complete",
+            "candidate_epoch": 1,
+        }
+        repair_value = dict(payload)
+        repair_value["receipt_payload_sha256"] = sup._bridge_payload_sha(
+            repair_value
+        )
+        self.assertNotEqual(
+            repair_value["receipt_payload_sha256"],
+            sup.payload_sha256(payload),
+        )
+        self.assertEqual(
+            sup._repair_self_hashed(
+                repair_value, "receipt_payload_sha256", "repair fixture"
+            ),
+            repair_value,
+        )
+        with self.assertRaisesRegex(sup.SupervisorError, "self-hash changed"):
+            sup._self_hashed(
+                repair_value, "receipt_payload_sha256", "wrong ABI fixture"
+            )
+
+    def test_finalize_revalidates_adoption_before_consuming_state(self) -> None:
+        campaign = self.fx.campaign()
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        with mock.patch.object(
+            sup, "_load_adopted_e1",
+            side_effect=sup.SupervisorError("terminal predecessor changed"),
+        ), mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "terminal predecessor changed"
+            ):
+                sup.finalize_campaign(campaign)
+        campaign_claim.assert_not_called()
+
+    def test_dual_dispatch_state_is_allowlisted_only_as_a_canonical_directory(self) -> None:
+        campaign = self.fx.campaign()
+        dual = self.fx.state / sup.DUAL_DISPATCH_DIR_NAME
+        dual.mkdir()
+        completed, head = sup._scan_v2(campaign)
+        self.assertEqual(completed, [])
+        self.assertEqual(head["epoch"], 1)
+        dual.rmdir()
+        target = self.fx.root / "redirected-dual"
+        target.mkdir()
+        dual.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            sup.SupervisorError, "not a canonical directory"
+        ):
+            sup._scan_v2(campaign)
+
+    def test_legacy_run_next_refuses_dispatcher_state_before_claiming_campaign(self) -> None:
+        campaign = self.fx.campaign()
+        dual = self.fx.state / sup.DUAL_DISPATCH_DIR_NAME
+        dual.mkdir()
+        (dual / sup.DUAL_DISPATCH_WAVES_NAME).mkdir()
+        with mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "legacy run-next is disabled"
+            ):
+                sup.run_next(campaign, clock=lambda: 1.0)
+        campaign_claim.assert_not_called()
+
+    def test_finalize_refuses_active_dual_wave_before_campaign_claim(self) -> None:
+        campaign = self.fx.campaign()
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        dual = self.fx.state / sup.DUAL_DISPATCH_DIR_NAME
+        dual.mkdir()
+        for name in (
+            sup.DUAL_DISPATCH_TOPOLOGY_NAME,
+            sup.DUAL_DISPATCH_CLAIM_NAME,
+            sup.DUAL_DISPATCH_ACTIVE_NAME,
+        ):
+            write_bytes(dual / name, b"evidence\n")
+        (dual / sup.DUAL_DISPATCH_WAVES_NAME).mkdir()
+        adopted = (campaign["_adopted_e1"], {"candidate_epoch": 1})
+        with mock.patch.object(
+            sup, "_load_adopted_e1", return_value=adopted
+        ), mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "dual-dispatch wave is active"
+            ):
+                sup.finalize_campaign(campaign)
+        campaign_claim.assert_not_called()
+
+    def test_adopted_finalize_refuses_missing_dual_ledger_without_writing(self) -> None:
+        campaign = self.fx.campaign()
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        adopted = (campaign["_adopted_e1"], {"candidate_epoch": 1})
+        with mock.patch.object(
+            sup, "_load_adopted_e1", return_value=adopted
+        ), mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "complete dual-dispatch ledger"
+            ):
+                sup.finalize_campaign(campaign)
+        campaign_claim.assert_not_called()
+
+    def test_finalize_refuses_incomplete_dual_wave_coverage_without_writing(self) -> None:
+        campaign = self.fx.campaign()
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        dual = self.fx.state / sup.DUAL_DISPATCH_DIR_NAME
+        dual.mkdir()
+        write_bytes(dual / sup.DUAL_DISPATCH_TOPOLOGY_NAME, b"topology\n")
+        write_bytes(dual / sup.DUAL_DISPATCH_CLAIM_NAME, b"claim\n")
+        waves = dual / sup.DUAL_DISPATCH_WAVES_NAME
+        waves.mkdir()
+        for index in range(1, 11):
+            (waves / ("wave-%04d" % index)).mkdir()
+        adopted = (campaign["_adopted_e1"], {"candidate_epoch": 1})
+        with mock.patch.object(
+            sup, "_load_adopted_e1", return_value=adopted
+        ), mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "exactly 11 committed waves"
+            ):
+                sup.finalize_campaign(campaign)
+        campaign_claim.assert_not_called()
+
+    def _complete_dual_fixture(self, campaign: dict):
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        dual = self.fx.state / sup.DUAL_DISPATCH_DIR_NAME
+        dual.mkdir()
+        topology = write_bytes(
+            dual / sup.DUAL_DISPATCH_TOPOLOGY_NAME, b"topology\n"
+        )
+        claim = write_bytes(
+            dual / sup.DUAL_DISPATCH_CLAIM_NAME, b"claim\n"
+        )
+        waves = dual / sup.DUAL_DISPATCH_WAVES_NAME
+        waves.mkdir()
+        for index in range(1, 12):
+            (waves / ("wave-%04d" % index)).mkdir()
+        dispatcher = mock.Mock()
+        dispatcher.DUAL_DIR_NAME = sup.DUAL_DISPATCH_DIR_NAME
+        dispatcher.TOPOLOGY_NAME = sup.DUAL_DISPATCH_TOPOLOGY_NAME
+        dispatcher.CLAIM_NAME = sup.DUAL_DISPATCH_CLAIM_NAME
+        dispatcher.ACTIVE_LOCK_NAME = sup.DUAL_DISPATCH_ACTIVE_NAME
+        dispatcher.WAVES_DIR_NAME = sup.DUAL_DISPATCH_WAVES_NAME
+        fresh = list(sup.CANDIDATE_EPOCHS[1:])
+        dispatcher.fresh_waves.return_value = [
+            fresh[index:index + 2] for index in range(0, 21, 2)
+        ]
+        dispatcher.load_topology.side_effect = (
+            lambda _campaign, artifact: (artifact, {"complete": True})
+        )
+        dispatcher.load_or_create_dispatcher_claim.return_value = (
+            claim, {"complete": True}
+        )
+        return dispatcher, topology, claim
+
+    def test_finalize_accepts_exact_11_wave_21_fresh_dispatcher_ledger(self) -> None:
+        campaign = self.fx.campaign()
+        dispatcher, topology, claim = self._complete_dual_fixture(campaign)
+        adopted = (campaign["_adopted_e1"], {"candidate_epoch": 1})
+        expected = {"status": "finalized-after-dual-replay"}
+        completed = [({}, {}) for _ in sup.CANDIDATE_EPOCHS]
+        with mock.patch.object(
+            sup, "_load_adopted_e1", return_value=adopted
+        ), mock.patch.object(
+            sup, "_load_dual_dispatcher_module", return_value=dispatcher
+        ), mock.patch.object(
+            sup, "_campaign_claim_v2"
+        ), mock.patch.object(
+            sup, "_scan_v2", return_value=(completed, None)
+        ), mock.patch.object(
+            sup, "_finalize_v2", return_value=expected
+        ):
+            self.assertEqual(sup.finalize_campaign(campaign), expected)
+        dispatcher.load_topology.assert_called_once_with(campaign, topology)
+        dispatcher.load_or_create_dispatcher_claim.assert_called_once_with(
+            campaign, topology
+        )
+        dispatcher._validate_prior_waves.assert_called_once_with(
+            campaign, claim, topology, {"complete": True}, 11
+        )
+
+    def test_finalize_maps_dispatcher_wave_tamper_to_fail_closed_error(self) -> None:
+        campaign = self.fx.campaign()
+        dispatcher, _topology, _claim = self._complete_dual_fixture(campaign)
+        dispatcher._validate_prior_waves.side_effect = RuntimeError(
+            "commit payload changed"
+        )
+        adopted = (campaign["_adopted_e1"], {"candidate_epoch": 1})
+        with mock.patch.object(
+            sup, "_load_adopted_e1", return_value=adopted
+        ), mock.patch.object(
+            sup, "_load_dual_dispatcher_module", return_value=dispatcher
+        ), mock.patch.object(sup, "_campaign_claim_v2") as campaign_claim:
+            with self.assertRaisesRegex(
+                sup.SupervisorError,
+                "finalization evidence is invalid: commit payload changed",
+            ):
+                sup.finalize_campaign(campaign)
+        campaign_claim.assert_not_called()
+
     def test_no_receipt_returns_waiting_without_job_or_active_claim(self) -> None:
         campaign = self.fx.campaign()
         result = sup.run_next(campaign, clock=lambda: 1.0)
@@ -393,6 +736,140 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(result["job_claim_created"])
         self.assertFalse((self.fx.state / "job_claims/epoch-0001.json").exists())
         self.assertFalse((self.fx.state / "active_invocation.claim.json").exists())
+
+    def test_adopted_e1_advances_to_e2_without_successor_authority(self) -> None:
+        campaign = self.fx.campaign()
+        campaign["_adopted_e1"] = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        adopted = (
+            campaign["_adopted_e1"],
+            {
+                "format": sup.ADOPTED_E1_FORMAT,
+                "status": "complete",
+                "candidate_epoch": 1,
+                "measurement": {
+                    "path": str(self.fx.root / "measurement.json"),
+                    "sha256": "b" * 64,
+                    "bytes": 1,
+                    "receipt_payload_sha256": "c" * 64,
+                },
+                "validation_diffsheg_fgd": 0.25,
+            },
+        )
+        with mock.patch.object(sup, "_load_adopted_e1", return_value=adopted):
+            completed, head = sup._scan_v2(campaign)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(head["epoch"], 2)
+        Path(self.fx.jobs[0]["authority_path"]).write_text("forbidden\n")
+        with mock.patch.object(sup, "_load_adopted_e1", return_value=adopted):
+            with self.assertRaisesRegex(
+                sup.SupervisorError, "must not contain successor execution output"
+            ):
+                sup._scan_v2(campaign)
+
+    def test_adopted_reconcile_uses_pinned_old_e1_authority(self) -> None:
+        campaign = self.fx.campaign()
+        receipt_artifact = {
+            "path": str(self.fx.root / "adoption.json"),
+            "sha256": "a" * 64,
+            "bytes": 1,
+        }
+        campaign["_adopted_e1"] = receipt_artifact
+        receipt = {
+            key: None
+            for key in sup.ADOPTED_E1_KEYS
+        }
+        receipt.update({
+            "format": sup.ADOPTED_E1_FORMAT,
+            "predecessor_work_authority": (
+                sup.ADOPTION_PREDECESSOR_FIXED["predecessor_work_authority"]
+            ),
+        })
+        with mock.patch.object(
+            sup, "_read_existing_json", return_value=(receipt_artifact, receipt)
+        ), mock.patch.object(
+            sup,
+            "_artifact",
+            return_value=sup.ADOPTION_PREDECESSOR_FIXED[
+                "predecessor_work_authority"
+            ],
+        ):
+            argv = sup._authority_reconcile_argv(
+                campaign,
+                {"path": "/manifest", "sha256": "b" * 64, "bytes": 1},
+                {"path": "/status", "sha256": "c" * 64, "bytes": 1},
+            )
+        authority = sup.ADOPTION_PREDECESSOR_FIXED[
+            "predecessor_work_authority"
+        ]
+        self.assertEqual(
+            argv[argv.index("--adopted-e1-authority") + 1],
+            authority["path"],
+        )
+        self.assertEqual(
+            argv[
+                argv.index("--expected-adopted-e1-authority-sha256") + 1
+            ],
+            authority["sha256"],
+        )
+        self.assertEqual(
+            argv[argv.index("--expected-adopted-e1-authority-bytes") + 1],
+            str(authority["bytes"]),
+        )
+
+    def test_adopted_authority_must_match_successor_campaign_inputs(self) -> None:
+        config = self.fx.adapter_config
+        value = {
+            "selected_topology": {
+                "mode": config["topology_mode"], "world_size": 8,
+            },
+            "schedule": dict(config["schedule"]),
+            "frozen_inputs": {
+                "path": str(self.fx.train / "frozen_inputs.json"),
+                "sha256": config["expected_frozen_inputs_sha256"],
+            },
+            "val_inputs_receipt": {
+                "path": config["val_inputs"]["path"],
+                "sha256": config["val_inputs"]["sha256"],
+            },
+            "pipeline_receipt": {
+                "path": config["pipeline"]["path"],
+                "sha256": config["pipeline"]["sha256"],
+            },
+            "producer_source": {
+                "origin": "git@github.com:Xiangyue-Zhang/SemTalk.git",
+                "commit": sup.PRODUCER_SOURCE_COMMIT,
+                "tree": sup.PRODUCER_SOURCE_TREE,
+                "entrypoint_sha256": config[
+                    "expected_producer_trainer_sha256"
+                ],
+                "node_local_clones": [{
+                    "entrypoint": str(
+                        Path(config["producer_source_root"])
+                        / "scripts/show_base/train_base_official_adapt_long.py"
+                    ),
+                }],
+            },
+            "candidate_checkpoint": {
+                "path": str(
+                    self.fx.train
+                    / "candidates/base_official_adapt_epoch_01.bin"
+                ),
+            },
+        }
+        artifact = write_json(self.fx.root / "old-authority.json", value)
+        sup._work_authority_campaign_binding(artifact, config, 1)
+        value["selected_topology"]["mode"] = (
+            "validation_gated_w8_l256_g2048_empirical_acceleration"
+        )
+        tampered = write_json(self.fx.root / "old-authority-bad.json", value)
+        with self.assertRaisesRegex(
+            sup.SupervisorError, "topology differs"
+        ):
+            sup._work_authority_campaign_binding(tampered, config, 1)
 
     def test_receipts_appearing_in_order_authorize_each_head(self) -> None:
         campaign = self.fx.campaign()

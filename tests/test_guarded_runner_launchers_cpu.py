@@ -221,6 +221,40 @@ class GuardedRunnerArgvContractTests(unittest.TestCase):
             source,
         )
 
+    def test_live_validation_uses_strict_frozen_evidence_evaluator(self) -> None:
+        path = (
+            REPOSITORY / "scripts" / "show_base"
+            / "run_base_live_val_8shard.sh"
+        )
+        source = path.read_text(encoding="utf-8")
+        syntax = subprocess.run(
+            ["bash", "-n", str(path)], check=False,
+            capture_output=True, text=True,
+        )
+        self.assertEqual((syntax.returncode, syntax.stderr), (0, ""))
+        self.assertIn('control_evaluator=$launcher_dir/', source)
+        self.assertNotIn('\nevaluator=$launcher_dir/', source)
+        self.assertIn('"frozen_evidence_evaluator"', source)
+        self.assertIn("inspect result schema changed", source)
+        self.assertIn("duplicate JSON key", source)
+        self.assertIn("non-finite JSON constant", source)
+        self.assertIn('mapfile -d \'\' -t inspected_work', source)
+        self.assertIn('evaluator=$(realpath -e -- "$raw_evaluator")', source)
+        self.assertIn(
+            '$(sha256sum "$evaluator" | awk \'{print $1}\')', source,
+        )
+        self.assertIn('$(stat -c \'%s\' "$evaluator")', source)
+        self.assertIn(
+            'git@github.com:Xiangyue-Zhang/SemTalk.git', source,
+        )
+        self.assertIn('remote get-url --push origin', source)
+        self.assertIn("rev-parse 'HEAD^{tree}'", source)
+        self.assertIn("symbolic-ref -q --short HEAD", source)
+        self.assertIn("--porcelain=v1", source)
+        self.assertIn("refs/heads", source)
+        self.assertIn("ls-tree HEAD", source)
+        self.assertIn('"$python_bin" "$evaluator"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -785,6 +785,9 @@ class ReconcileConfig:
     expected_final_manifest_sha256: str
     final_status: Path
     expected_final_status_sha256: str
+    adopted_e1_authority: Path | None = None
+    expected_adopted_e1_authority_sha256: str | None = None
+    expected_adopted_e1_authority_bytes: int | None = None
 
 
 def _top_level_definition_hashes(
@@ -3290,12 +3293,26 @@ def _validate_complete_manifest_status(
 def reconcile(config: ReconcileConfig, *, hooks: Any | None = None) -> dict[str, Any]:
     authority_dir = canonical_existing_directory(config.authority_dir, "authority directory")
     reject_test_path(authority_dir, "authority directory")
+    adopted_values = (
+        config.adopted_e1_authority,
+        config.expected_adopted_e1_authority_sha256,
+        config.expected_adopted_e1_authority_bytes,
+    )
+    adopted = all(value is not None for value in adopted_values)
+    if adopted != any(value is not None for value in adopted_values):
+        raise LiveValidationContractError(
+            "adopted e1 authority path, SHA-256, and bytes must be provided together"
+        )
+    fresh_epochs = CANDIDATE_EPOCHS[1:] if adopted else CANDIDATE_EPOCHS
     expected_authority_paths = {
-        authority_dir / f"epoch-{epoch:04d}.json" for epoch in CANDIDATE_EPOCHS
+        authority_dir / f"epoch-{epoch:04d}.json" for epoch in fresh_epochs
     }
     observed_authority_paths = set(authority_dir.iterdir())
     if observed_authority_paths != expected_authority_paths:
-        raise LiveValidationContractError("live authority set is not exact 22-way coverage")
+        expected_count = len(fresh_epochs)
+        raise LiveValidationContractError(
+            f"live authority set is not exact {expected_count}-way fresh coverage"
+        )
     if hooks is None:
         hooks = ValidationHooks(
             producer_source_root=config.common.producer_source_root,
@@ -3327,9 +3344,38 @@ def reconcile(config: ReconcileConfig, *, hooks: Any | None = None) -> dict[str,
     authority_artifacts: list[dict[str, Any]] = []
     authority_payloads: list[dict[str, Any]] = []
     replayed: list[dict[str, Any]] = []
-    for epoch in CANDIDATE_EPOCHS:
-        path = authority_dir / f"epoch-{epoch:04d}.json"
+    authority_inputs: list[tuple[int, Path]] = []
+    if adopted:
+        adopted_path = Path(str(config.adopted_e1_authority)).expanduser()
+        if authority_dir in adopted_path.parents:
+            raise LiveValidationContractError(
+                "adopted e1 authority must be outside the fresh authority directory"
+            )
+        reject_test_path(adopted_path, "adopted e1 authority")
+        authority_inputs.append((CANDIDATE_EPOCHS[0], adopted_path))
+    authority_inputs.extend(
+        (epoch, authority_dir / f"epoch-{epoch:04d}.json")
+        for epoch in fresh_epochs
+    )
+    for epoch, path in authority_inputs:
         authority_artifact, authority_payload = _load_work_authority(path, epoch)
+        if adopted and epoch == CANDIDATE_EPOCHS[0]:
+            expected_sha = require_sha256(
+                config.expected_adopted_e1_authority_sha256,
+                "expected adopted e1 authority SHA-256",
+            )
+            expected_bytes = exact_int(
+                config.expected_adopted_e1_authority_bytes,
+                "expected adopted e1 authority bytes",
+                minimum=1,
+            )
+            if (
+                authority_artifact["sha256"] != expected_sha
+                or not exact_int_equal(authority_artifact["bytes"], expected_bytes)
+            ):
+                raise LiveValidationContractError(
+                    "adopted e1 authority artifact binding changed"
+                )
         per_epoch = AuthorizeConfig(
             **{
                 **config.common.__dict__,
@@ -3350,6 +3396,12 @@ def reconcile(config: ReconcileConfig, *, hooks: Any | None = None) -> dict[str,
         authority_artifacts.append(authority_artifact)
         authority_payloads.append(authority_payload)
         replayed.append(replay)
+    authority_paths = [item["path"] for item in authority_artifacts]
+    authority_hashes = [item["sha256"] for item in authority_artifacts]
+    if len(set(authority_paths)) != len(authority_paths):
+        raise LiveValidationContractError("live authority paths collide")
+    if len(set(authority_hashes)) != len(authority_hashes):
+        raise LiveValidationContractError("live authority SHA-256 values collide")
     first = replayed[0]
     common_fields = (
         "frozen_inputs",
@@ -3514,6 +3566,11 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--pipeline", type=Path, required=True)
     reconcile_parser.add_argument("--expected-pipeline-sha256", required=True)
     reconcile_parser.add_argument("--authority-dir", type=Path, required=True)
+    reconcile_parser.add_argument("--adopted-e1-authority", type=Path)
+    reconcile_parser.add_argument("--expected-adopted-e1-authority-sha256")
+    reconcile_parser.add_argument(
+        "--expected-adopted-e1-authority-bytes", type=int
+    )
     reconcile_parser.add_argument("--final-manifest", type=Path, required=True)
     reconcile_parser.add_argument("--expected-final-manifest-sha256", required=True)
     reconcile_parser.add_argument("--final-status", type=Path, required=True)
@@ -3761,6 +3818,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_final_manifest_sha256=args.expected_final_manifest_sha256,
                 final_status=args.final_status,
                 expected_final_status_sha256=args.expected_final_status_sha256,
+                adopted_e1_authority=args.adopted_e1_authority,
+                expected_adopted_e1_authority_sha256=(
+                    args.expected_adopted_e1_authority_sha256
+                ),
+                expected_adopted_e1_authority_bytes=(
+                    args.expected_adopted_e1_authority_bytes
+                ),
             )
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
