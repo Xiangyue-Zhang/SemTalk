@@ -7,7 +7,11 @@
   <strong>✨ICCV 2025✨</strong>
 </p>
 
-<a href='https://arxiv.org/abs/2412.16563'><img src='https://img.shields.io/badge/ArXiv-2412.16563-red'></a> <a href='https://xiangyue-zhang.github.io/SemTalk/'><img src='https://img.shields.io/badge/Project-Page-purple'></a>
+<a href='https://arxiv.org/abs/2412.16563'><img src='https://img.shields.io/badge/ArXiv-2412.16563-red'></a> <a href='https://huggingface.co/papers/2412.16563'><img src='https://img.shields.io/badge/Hugging_Face-Paper-yellow'></a> <a href='https://xiangyuezhang.com/SemTalk/'><img src='https://img.shields.io/badge/Project-Page-purple'></a> <a href='https://huggingface.co/X-Zhang/SemTalk'><img src='https://img.shields.io/badge/%F0%9F%A4%97-Model_Weights-yellow'></a> <a href='https://huggingface.co/datasets/X-Zhang/SemTalk-Inference-Data'><img src='https://img.shields.io/badge/%F0%9F%A4%97-Inference_Data-yellow'></a>
+
+<p><strong>Official implementation and checkpoints for semantic-aware holistic co-speech gesture generation.</strong></p>
+
+<p><sub>Keywords: co-speech gesture generation, co-speech motion generation, speech-driven motion generation, semantic gestures, BEAT2, and SMPL-X.</sub></p>
 
 <img src="src/teaser.png" alt="SemTalk image" style="width:100%;"><br>
 
@@ -25,10 +29,12 @@
 The two releases use different training protocols and are provided separately:
 
 - **Speaker 2 (paper protocol):** download the original test `.npz` files from
-  [Google Drive](https://drive.google.com/file/d/1hm812R7QOIoLK9mxbDIKqNGF8xEuRzf9/view?usp=sharing).
+  [Hugging Face](https://huggingface.co/datasets/X-Zhang/SemTalk-Inference-Data/resolve/main/SemTalk_testnpz.zip)
+  or [Google Drive](https://drive.google.com/file/d/1hm812R7QOIoLK9mxbDIKqNGF8xEuRzf9/view?usp=sharing).
 - **All Speakers (25 English BEAT2 speakers):** download the paired test
   `.npz` files from
-  [Google Drive](https://drive.google.com/file/d/1mZF-oRygHMjUpx7lsmTPkjzfLgL_yS0V/view?usp=sharing).
+  [Hugging Face](https://huggingface.co/datasets/X-Zhang/SemTalk-Inference-Data/resolve/main/SemTalk_all_speakers_results_npz_25spk.zip)
+  or [Google Drive](https://drive.google.com/file/d/1mZF-oRygHMjUpx7lsmTPkjzfLgL_yS0V/view?usp=sharing).
 
 # 📊 Results
 
@@ -102,9 +108,11 @@ huggingface-cli download --resume-download Systran/faster-whisper-large-v3 --loc
 Choose the weights that match the intended protocol:
 
 - **Speaker 2 (paper protocol):** download the
-  [original pretrained models and weights](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing).
+  [original pretrained models and weights from Hugging Face](https://huggingface.co/X-Zhang/SemTalk/resolve/main/weights_semtalk.zip)
+  ([Google Drive mirror](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing)).
 - **All Speakers (25 English BEAT2 speakers):** download the
-  [all-speaker representation models and weights](https://drive.google.com/file/d/1j4Bem3_ZRCVGGiiyn6hFpc6_960cNphA/view?usp=sharing).
+  [all-speaker representation models and weights from Hugging Face](https://huggingface.co/X-Zhang/SemTalk/resolve/main/SemTalk_all_speakers_weights_25spk.zip)
+  ([Google Drive mirror](https://drive.google.com/file/d/1j4Bem3_ZRCVGGiiyn6hFpc6_960cNphA/view?usp=sharing)).
   This archive contains all five representation models and the selected Base
   and Sparse checkpoints.
 

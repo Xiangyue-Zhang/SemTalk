@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use SemTalk, please cite the ICCV 2025 paper."
+title: "SemTalk: Official Implementation"
+type: software
+authors:
+  - family-names: Zhang
+    given-names: Xiangyue
+  - family-names: Li
+    given-names: Jianfang
+  - family-names: Zhang
+    given-names: Jiaxu
+repository-code: "https://github.com/Xiangyue-Zhang/SemTalk"
+url: "https://xiangyuezhang.com/SemTalk/"
+abstract: "Official code and checkpoints for semantic-aware holistic co-speech gesture generation with frame-level semantic emphasis."
+keywords:
+  - co-speech gesture generation
+  - co-speech motion generation
+  - speech-driven motion generation
+  - human motion generation
+  - BEAT2
+  - SMPL-X
+preferred-citation:
+  type: conference-paper
+  title: "SemTalk: Holistic Co-speech Motion Generation with Frame-level Semantic Emphasis"
+  authors:
+    - family-names: Zhang
+      given-names: Xiangyue
+    - family-names: Li
+      given-names: Jianfang
+    - family-names: Zhang
+      given-names: Jiaxu
+    - family-names: Dang
+      given-names: Ziqiang
+    - family-names: Ren
+      given-names: Jianqiang
+    - family-names: Bo
+      given-names: Liefeng
+    - family-names: Tu
+      given-names: Zhigang
+  collection-title: "Proceedings of the IEEE/CVF International Conference on Computer Vision"
+  year: 2025
+  start: 13761
+  end: 13771
+  doi: "10.1109/ICCV51701.2025.01277"
+  url: "https://arxiv.org/abs/2412.16563"
