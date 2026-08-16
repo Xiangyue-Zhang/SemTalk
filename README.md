@@ -108,13 +108,17 @@ huggingface-cli download --resume-download Systran/faster-whisper-large-v3 --loc
 Choose the weights that match the intended protocol:
 
 - **Speaker 2 (paper protocol):** download the
-  [original pretrained models and weights from Hugging Face](https://huggingface.co/X-Zhang/SemTalk/resolve/main/weights_semtalk.zip)
+  [original pretrained models and weights from Hugging Face](https://huggingface.co/X-Zhang/SemTalk/resolve/main/weights_semtalk_no_smplx.zip)
   ([Google Drive mirror](https://drive.google.com/file/d/1U69gev4Ezvk7ArM986w0zAWE_QF-Pggw/view?usp=sharing)).
 - **All Speakers (25 English BEAT2 speakers):** download the
   [all-speaker representation models and weights from Hugging Face](https://huggingface.co/X-Zhang/SemTalk/resolve/main/SemTalk_all_speakers_weights_25spk.zip)
   ([Google Drive mirror](https://drive.google.com/file/d/1j4Bem3_ZRCVGGiiyn6hFpc6_960cNphA/view?usp=sharing)).
   This archive contains all five representation models and the selected Base
   and Sparse checkpoints.
+
+The Hugging Face archives exclude `SMPLX_NEUTRAL_2020.npz`. Download SMPL-X
+from the [official website](https://smpl-x.is.tue.mpg.de/) under its own
+license and place it in the path expected by the repository.
 
 Keep the original Speaker 2 archive in its documented locations. Install the
 All-Speaker archive without overwriting those files:
