@@ -94,7 +94,7 @@ mpmath
 msgpack==1.1.1
 multidict==6.1.0
 networkx
-nltk==3.9.1
+nltk==3.10.0
 numba==0.58.1
 numpy
 oauthlib==3.3.1
